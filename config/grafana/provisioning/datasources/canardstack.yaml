@@ -1,0 +1,51 @@
+apiVersion: 1
+
+datasources:
+  - name: Canardstack Prometheus
+    uid: canardstack-prometheus
+    type: prometheus
+    access: proxy
+    url: http://canardstack:4318
+    isDefault: true
+    editable: true
+    jsonData:
+      httpHeaderName1: Authorization
+      httpMethod: GET
+      timeInterval: 60s
+    secureJsonData:
+      httpHeaderValue1: Bearer ${CANARDSTACK_API_KEY}
+
+  - name: Canardstack Loki
+    uid: canardstack-loki
+    type: loki
+    access: proxy
+    url: http://canardstack:4318
+    editable: true
+    jsonData:
+      httpHeaderName1: Authorization
+      maxLines: 1000
+    secureJsonData:
+      httpHeaderValue1: Bearer ${CANARDSTACK_API_KEY}
+
+  - name: Canardstack Tempo
+    uid: canardstack-tempo
+    type: tempo
+    access: proxy
+    url: http://canardstack:4318
+    editable: true
+    jsonData:
+      httpHeaderName1: Authorization
+      tracesToLogsV2:
+        datasourceUid: canardstack-loki
+        filterByTraceID: true
+        spanStartTimeShift: -5m
+        spanEndTimeShift: 5m
+      serviceMap:
+        datasourceUid: canardstack-prometheus
+      search:
+        hide: false
+      streamingEnabled:
+        search: false
+        metrics: false
+    secureJsonData:
+      httpHeaderValue1: Bearer ${CANARDSTACK_API_KEY}

@@ -1,0 +1,9 @@
+/target/
+/.canardstack/
+/.canardstack-test-storage/
+*.duckdb
+*.duckdb.wal
+*.ducklake
+*.ducklake.files/
+
+.env

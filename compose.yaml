@@ -1,0 +1,62 @@
+services:
+  canardstack:
+    build:
+      context: .
+    image: canardstack:local
+    ports:
+      - "4318:4318"
+    environment:
+      CANARDSTACK_BIND: 0.0.0.0:4318
+      CANARDSTACK_API_KEY: ${CANARDSTACK_API_KEY:-dev-canardstack-key}
+      CANARDSTACK_ADMIN_API_KEY: ${CANARDSTACK_ADMIN_API_KEY:-dev-canardstack-admin-key}
+      CANARDSTACK_DATA_DIR: /var/lib/canardstack
+      CANARDSTACK_DUCKDB_PATH: /var/lib/canardstack/canardstack.duckdb
+      CANARDSTACK_STORAGE_DIR: /var/lib/canardstack/storage
+      CANARDSTACK_DUCKDB_EXTENSION_DIR: /usr/local/lib/duckdb/extensions
+      CANARDSTACK_USE_DUCKLAKE: "true"
+      CANARDSTACK_DUCKLAKE_ATTACH_URI: ${CANARDSTACK_DUCKLAKE_ATTACH_URI:-}
+      motherduck_token: ${motherduck_token:-${MOTHERDUCK_TOKEN:-}}
+    volumes:
+      - canardstack-data:/var/lib/canardstack
+    healthcheck:
+      test: ["CMD", "canardstack", "healthcheck", "http://127.0.0.1:4318/healthz"]
+      interval: 5s
+      timeout: 5s
+      start_period: 20s
+      retries: 12
+
+  grafana:
+    image: grafana/grafana-oss:latest
+    depends_on:
+      canardstack:
+        condition: service_healthy
+    ports:
+      - "3000:3000"
+    environment:
+      CANARDSTACK_API_KEY: ${CANARDSTACK_API_KEY:-dev-canardstack-key}
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_SECURITY_ADMIN_USER: admin
+      GF_USERS_DEFAULT_THEME: light
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./config/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./config/grafana/dashboards:/etc/grafana/dashboards:ro
+
+  smoke:
+    profiles: ["smoke"]
+    build:
+      context: .
+    image: canardstack:local
+    depends_on:
+      canardstack:
+        condition: service_healthy
+    environment:
+      CANARDSTACK_API_KEY: ${CANARDSTACK_API_KEY:-dev-canardstack-key}
+      CANARDSTACK_ADMIN_API_KEY: ${CANARDSTACK_ADMIN_API_KEY:-dev-canardstack-admin-key}
+    command: ["canardstack", "smoke-http", "http://canardstack:4318"]
+
+volumes:
+  canardstack-data:
+  grafana-data:

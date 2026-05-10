@@ -1,0 +1,56 @@
+use canardstack::cli::{healthcheck, smoke, smoke_http};
+use canardstack::{http, storage, AppState, Config, Scheduler};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+fn main() -> anyhow::Result<()> {
+    let mut args = std::env::args().skip(1);
+    match args.next().as_deref() {
+        Some("smoke") => smoke::run(),
+        Some("smoke-http") => smoke_http::run(args),
+        Some("healthcheck") => healthcheck::run(args.next()),
+        Some("install-ducklake-extension") => {
+            let config = Config::from_env()?;
+            storage::install_ducklake_extension(config.duckdb_extension_dir.as_deref())
+        }
+        Some("serve") | None => {
+            install_shutdown_signal_handlers();
+            let config = Config::from_env()?;
+            config.validate()?;
+            let state = Arc::new(AppState::new(config)?);
+            if !state.config.scheduler_enabled {
+                eprintln!(
+                    "canardstack scheduler disabled: 202 ingest acknowledgements remain memory-only until traffic-triggered or admin-triggered flush"
+                );
+            }
+            let _scheduler = state
+                .config
+                .scheduler_enabled
+                .then(|| Scheduler::spawn(state.clone()));
+            http::serve_until(state, &SHUTDOWN_REQUESTED)
+        }
+        Some(other) => anyhow::bail!("unknown command {other}; use serve, smoke, smoke-http, healthcheck, or install-ducklake-extension"),
+    }
+}
+
+extern "C" fn request_shutdown(_signal: i32) {
+    SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
+}
+
+#[cfg(unix)]
+fn install_shutdown_signal_handlers() {
+    const SIGINT: i32 = 2;
+    const SIGTERM: i32 = 15;
+    unsafe extern "C" {
+        fn signal(signal: i32, handler: extern "C" fn(i32)) -> extern "C" fn(i32);
+    }
+    unsafe {
+        let _ = signal(SIGINT, request_shutdown);
+        let _ = signal(SIGTERM, request_shutdown);
+    }
+}
+
+#[cfg(not(unix))]
+fn install_shutdown_signal_handlers() {}

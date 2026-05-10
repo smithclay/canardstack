@@ -1,0 +1,31 @@
+use crate::config::Config;
+use crate::ingest::Ingestor;
+use crate::maintenance::Maintenance;
+use crate::metrics::Metrics;
+use crate::query::QueryEngine;
+use crate::storage::Storage;
+use anyhow::Result;
+
+pub struct AppState {
+    pub config: Config,
+    pub storage: Storage,
+    pub ingestor: Ingestor,
+    pub queries: QueryEngine,
+    pub maintenance: Maintenance,
+    pub metrics: Metrics,
+}
+
+impl AppState {
+    pub fn new(config: Config) -> Result<Self> {
+        let storage = Storage::open(&config)?;
+        let ingestor = Ingestor::new(config.clone());
+        Ok(Self {
+            storage,
+            ingestor,
+            queries: QueryEngine::new(&config),
+            maintenance: Maintenance::new(&config),
+            metrics: Metrics::default(),
+            config,
+        })
+    }
+}
