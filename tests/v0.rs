@@ -4,6 +4,11 @@ use canardstack::validation;
 use canardstack::{AppState, Config, Scheduler};
 
 mod common;
+use arrow58::array::{
+    Float64Array, Int32Array, Int64Array, StringArray, TimestampMicrosecondArray,
+};
+use arrow58::datatypes::{DataType, Field, Schema, TimeUnit};
+use arrow58::record_batch::RecordBatch;
 use chrono::{Duration, TimeZone, Utc};
 use common::{log_fixture, metric_fixture, trace_fixture};
 use flate2::write::GzEncoder;
@@ -183,6 +188,134 @@ fn assert_metric_queue_rows(state: &AppState, expected: usize) {
     assert_eq!(snapshot.queued_rows, expected);
 }
 
+fn append_gauge_rows(state: &AppState, rows: &[(i64, &str, f64, &str)], source_format: &str) {
+    let len = rows.len();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new(
+            "timestamp",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            true,
+        ),
+        Field::new("start_timestamp", DataType::Int64, true),
+        Field::new("metric_name", DataType::Utf8, true),
+        Field::new("metric_description", DataType::Utf8, true),
+        Field::new("metric_unit", DataType::Utf8, true),
+        Field::new("value", DataType::Float64, true),
+        Field::new("service_name", DataType::Utf8, true),
+        Field::new("service_namespace", DataType::Utf8, true),
+        Field::new("service_instance_id", DataType::Utf8, true),
+        Field::new("resource_attributes", DataType::Utf8, true),
+        Field::new("scope_name", DataType::Utf8, true),
+        Field::new("scope_version", DataType::Utf8, true),
+        Field::new("scope_attributes", DataType::Utf8, true),
+        Field::new("metric_attributes", DataType::Utf8, true),
+        Field::new("flags", DataType::Int32, true),
+        Field::new("exemplars_json", DataType::Utf8, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(TimestampMicrosecondArray::from(
+                rows.iter()
+                    .map(|(ms, _, _, _)| Some(ms.saturating_mul(1000)))
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(Int64Array::from(vec![None; len])),
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|(_, name, _, _)| Some((*name).to_string()))
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(vec![None::<String>; len])),
+            Arc::new(StringArray::from(vec![None::<String>; len])),
+            Arc::new(Float64Array::from(
+                rows.iter()
+                    .map(|(_, _, value, _)| Some(*value))
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|(_, _, _, service)| Some((*service).to_string()))
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(vec![None::<String>; len])),
+            Arc::new(StringArray::from(vec![None::<String>; len])),
+            Arc::new(StringArray::from(vec![Some("{}".to_string()); len])),
+            Arc::new(StringArray::from(vec![None::<String>; len])),
+            Arc::new(StringArray::from(vec![None::<String>; len])),
+            Arc::new(StringArray::from(vec![None::<String>; len])),
+            Arc::new(StringArray::from(vec![None::<String>; len])),
+            Arc::new(Int32Array::from(vec![None; len])),
+            Arc::new(StringArray::from(vec![None::<String>; len])),
+        ],
+    )
+    .unwrap();
+    state
+        .storage
+        .insert_arrow_records(Signal::MetricGauge, &batch, source_format)
+        .unwrap();
+}
+
+fn append_log_rows(state: &AppState, rows: &[(i64, &str, &str)], source_format: &str) {
+    let len = rows.len();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new(
+            "timestamp",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            true,
+        ),
+        Field::new("trace_id", DataType::Utf8, true),
+        Field::new("span_id", DataType::Utf8, true),
+        Field::new("service_name", DataType::Utf8, true),
+        Field::new("service_namespace", DataType::Utf8, true),
+        Field::new("service_instance_id", DataType::Utf8, true),
+        Field::new("severity_number", DataType::Int32, true),
+        Field::new("severity_text", DataType::Utf8, true),
+        Field::new("body", DataType::Utf8, true),
+        Field::new("resource_attributes", DataType::Utf8, true),
+        Field::new("scope_name", DataType::Utf8, true),
+        Field::new("scope_version", DataType::Utf8, true),
+        Field::new("scope_attributes", DataType::Utf8, true),
+        Field::new("log_attributes", DataType::Utf8, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(TimestampMicrosecondArray::from(
+                rows.iter()
+                    .map(|(ms, _, _)| Some(ms.saturating_mul(1000)))
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(vec![None::<String>; len])),
+            Arc::new(StringArray::from(vec![None::<String>; len])),
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|(_, _, service)| Some((*service).to_string()))
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(vec![None::<String>; len])),
+            Arc::new(StringArray::from(vec![None::<String>; len])),
+            Arc::new(Int32Array::from(vec![None; len])),
+            Arc::new(StringArray::from(vec![None::<String>; len])),
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|(_, body, _)| Some((*body).to_string()))
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(vec![Some("{}".to_string()); len])),
+            Arc::new(StringArray::from(vec![None::<String>; len])),
+            Arc::new(StringArray::from(vec![None::<String>; len])),
+            Arc::new(StringArray::from(vec![None::<String>; len])),
+            Arc::new(StringArray::from(vec![Some("{}".to_string()); len])),
+        ],
+    )
+    .unwrap();
+    state
+        .storage
+        .insert_arrow_records(Signal::Logs, &batch, source_format)
+        .unwrap();
+}
+
 #[test]
 fn auth_rejects_missing_and_bad_keys() {
     let (_dir, state) = app();
@@ -290,12 +423,13 @@ fn ingest_rejects_missing_or_unparseable_event_timestamps() {
 
     let mut config = Config::test(tempdir().unwrap().path().join("canardstack.duckdb"));
     config.use_ducklake = false;
-    let err = validation::validate_timestamp_skew(
-        &[json!({"timestamp": "not-a-time"})],
-        Signal::Logs,
-        &config,
+    let invalid_batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new("body", DataType::Utf8, true)])),
+        vec![Arc::new(StringArray::from(vec![Some("not-a-time")]))],
     )
-    .unwrap_err();
+    .unwrap();
+    let err = validation::validate_arrow_timestamp_skew(&invalid_batch, Signal::Logs, &config)
+        .unwrap_err();
     assert_eq!(err.reason, "invalid_timestamp");
 }
 
@@ -569,17 +703,14 @@ fn prometheus_instant_query_returns_latest_bucket_in_lookback() {
     let at = Utc.with_ymd_and_hms(1970, 1, 1, 0, 11, 0).unwrap();
     let older = Utc.with_ymd_and_hms(1970, 1, 1, 0, 6, 30).unwrap();
     let newer = Utc.with_ymd_and_hms(1970, 1, 1, 0, 10, 30).unwrap();
-    state
-        .storage
-        .insert_records(
-            Signal::MetricGauge,
-            &[
-                json!({"timestamp": older.timestamp_millis(), "metric_name": "smoke.gauge", "value": 1.0, "service_name": "checkout"}),
-                json!({"timestamp": newer.timestamp_millis(), "metric_name": "smoke.gauge", "value": 2.0, "service_name": "checkout"}),
-            ],
-            "test",
-        )
-        .unwrap();
+    append_gauge_rows(
+        &state,
+        &[
+            (older.timestamp_millis(), "smoke.gauge", 1.0, "checkout"),
+            (newer.timestamp_millis(), "smoke.gauge", 2.0, "checkout"),
+        ],
+        "test",
+    );
 
     let response = http::route(
         "GET",
@@ -640,45 +771,22 @@ fn metric_flush_splits_oversized_batch_and_preserves_queue_accounting() {
 }
 
 #[test]
-fn storage_large_metric_insert_commits_across_internal_chunks() {
+fn storage_large_metric_arrow_insert_commits_large_batch() {
     let (_dir, state) = app();
     let now = Utc::now().timestamp_millis();
     let rows = (0..6_001)
-        .map(|idx| {
-            json!({
-                "timestamp": now + idx,
-                "metric_name": "bulk.gauge",
-                "value": idx as f64,
-                "service_name": "checkout"
-            })
-        })
+        .map(|idx| (now + idx, "bulk.gauge", idx as f64, "checkout"))
         .collect::<Vec<_>>();
 
-    let inserted = state
-        .storage
-        .insert_records(Signal::MetricGauge, &rows, "test")
-        .unwrap();
+    append_gauge_rows(&state, &rows, "test");
 
-    assert_eq!(inserted, rows.len());
     assert_eq!(metric_gauge_rows(&state), rows.len() as i64);
 }
 
 #[test]
 fn freshness_lag_tracks_ingest_visibility_not_event_time_age() {
     let (_dir, state) = app();
-    state
-        .storage
-        .insert_records(
-            Signal::MetricGauge,
-            &[json!({
-                "timestamp": 0,
-                "metric_name": "old.event",
-                "value": 1.0,
-                "service_name": "checkout"
-            })],
-            "test",
-        )
-        .unwrap();
+    append_gauge_rows(&state, &[(0, "old.event", 1.0, "checkout")], "test");
 
     let watermarks = state.storage.freshness_watermarks().unwrap();
     let metric = &watermarks["metric_gauge"];
@@ -694,17 +802,14 @@ fn loki_forward_direction_orders_entries_forward_within_stream() {
     let (_dir, state) = app();
     let older = Utc.with_ymd_and_hms(1970, 1, 1, 0, 0, 10).unwrap();
     let newer = Utc.with_ymd_and_hms(1970, 1, 1, 0, 0, 20).unwrap();
-    state
-        .storage
-        .insert_records(
-            Signal::Logs,
-            &[
-                json!({"timestamp": newer.timestamp_millis(), "body": "newer", "service_name": "checkout"}),
-                json!({"timestamp": older.timestamp_millis(), "body": "older", "service_name": "checkout"}),
-            ],
-            "test",
-        )
-        .unwrap();
+    append_log_rows(
+        &state,
+        &[
+            (newer.timestamp_millis(), "newer", "checkout"),
+            (older.timestamp_millis(), "older", "checkout"),
+        ],
+        "test",
+    );
 
     let response = http::route(
         "GET",
@@ -1386,17 +1491,14 @@ fn retention_run_deletes_whole_day_eligible_rows() {
     let state = AppState::new(config).unwrap();
     let old_ms = (Utc::now() - Duration::days(3)).timestamp_millis();
     let fresh_ms = Utc::now().timestamp_millis();
-    state
-        .storage
-        .insert_records(
-            Signal::Logs,
-            &[
-                json!({"timestamp": old_ms, "body": "old retained log"}),
-                json!({"timestamp": fresh_ms, "body": "fresh retained log"}),
-            ],
-            "otlp_json",
-        )
-        .unwrap();
+    append_log_rows(
+        &state,
+        &[
+            (old_ms, "old retained log", "checkout"),
+            (fresh_ms, "fresh retained log", "checkout"),
+        ],
+        "otlp_json",
+    );
 
     let response = http::route(
         "POST",

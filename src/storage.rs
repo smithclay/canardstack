@@ -1,7 +1,6 @@
 use crate::config::Config;
 use crate::ingest::Signal;
 use crate::sql::{escape_value, quote as sql_quote};
-use crate::validation::record_timestamp_ms;
 use crate::LockExt;
 use anyhow::{Context, Result};
 use arrow58::array as arrow58_array;
@@ -9,9 +8,8 @@ use arrow58::array::Array as _;
 use arrow58::array::ArrayRef;
 use arrow58::datatypes as arrow58_types;
 use arrow58::record_batch::RecordBatch;
-use chrono::{TimeZone, Utc};
-use duckdb::types::Value as DuckValue;
-use duckdb::{params_from_iter, Appender, Connection};
+use chrono::Utc;
+use duckdb::{Appender, Connection};
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::fs;
@@ -22,8 +20,6 @@ use std::thread;
 use std::time::Duration;
 
 const DUCKDB_THREADS: usize = 1;
-const INSERT_TRANSACTION_MAX_ROWS: usize = 500;
-const INSERT_TRANSACTION_MAX_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct StorageHealth {
@@ -255,36 +251,6 @@ impl Storage {
         }
     }
 
-    pub fn insert_records(
-        &self,
-        table: Signal,
-        records: &[Value],
-        source_format: &str,
-    ) -> Result<usize> {
-        if records.is_empty() {
-            return Ok(0);
-        }
-        let cols = table_columns(table);
-        let sql = insert_sql(&self.target_prefix, table.as_str(), cols);
-        let mut conn = self.writer.lock_or_poisoned();
-        configure_write_connection(&conn, &self.write_memory_limit)?;
-        let mut committed_rows = 0;
-        for chunk in insert_chunks(records) {
-            if let Err(err) = insert_record_chunk(&mut conn, table, chunk, source_format, &sql) {
-                *self.last_error.lock_or_poisoned() = Some(err.to_string());
-                return Err(anyhow::Error::new(InsertRecordsError {
-                    table,
-                    committed_rows,
-                    attempted_rows: records.len(),
-                    source: err,
-                }));
-            }
-            committed_rows += chunk.len();
-        }
-        *self.last_error.lock_or_poisoned() = None;
-        Ok(committed_rows)
-    }
-
     pub fn insert_arrow_records(
         &self,
         table: Signal,
@@ -294,12 +260,9 @@ impl Storage {
         if batch.num_rows() == 0 {
             return Ok(0);
         }
-        if !matches!(table, Signal::MetricGauge | Signal::MetricSum) {
-            anyhow::bail!("Arrow insert path is only implemented for metric tables");
-        }
 
         let rows = batch.num_rows();
-        let append_batch = metric_duckdb_batch(table, batch, source_format)?;
+        let append_batch = storage_duckdb_batch(table, batch, source_format)?;
         let conn = self.writer.lock_or_poisoned();
         configure_write_connection(&conn, &self.write_memory_limit)?;
         let append_result = (|| -> Result<()> {
@@ -560,67 +523,6 @@ pub fn install_ducklake_extension(extension_dir: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
-fn timestamp_string(record: &Value) -> String {
-    let ms = record_timestamp_ms(record).unwrap_or_else(|| Utc::now().timestamp_millis());
-    timestamp_ms_string(ms)
-}
-
-fn now_timestamp_string() -> String {
-    timestamp_ms_string(Utc::now().timestamp_millis())
-}
-
-fn timestamp_ms_string(ms: i64) -> String {
-    Utc.timestamp_millis_opt(ms)
-        .single()
-        .unwrap_or_else(Utc::now)
-        .format("%Y-%m-%d %H:%M:%S%.3f")
-        .to_string()
-}
-
-fn event_date(record: &Value) -> String {
-    let ms = record_timestamp_ms(record).unwrap_or_else(|| Utc::now().timestamp_millis());
-    Utc.timestamp_millis_opt(ms)
-        .single()
-        .unwrap_or_else(Utc::now)
-        .format("%Y-%m-%d")
-        .to_string()
-}
-
-fn opt_s(record: &Value, key: &str) -> Option<String> {
-    record.get(key).and_then(|v| {
-        if v.is_null() {
-            None
-        } else if let Some(s) = v.as_str() {
-            Some(s.to_string())
-        } else {
-            Some(v.to_string())
-        }
-    })
-}
-
-fn opt_i(record: &Value, key: &str) -> Option<i64> {
-    record
-        .get(key)
-        .and_then(|v| v.as_i64().or_else(|| v.as_str()?.parse().ok()))
-}
-
-fn opt_f(record: &Value, key: &str) -> Option<f64> {
-    record
-        .get(key)
-        .and_then(|v| v.as_f64().or_else(|| v.as_str()?.parse().ok()))
-}
-
-fn opt_b(record: &Value, key: &str) -> Option<bool> {
-    record
-        .get(key)
-        .and_then(|v| v.as_bool().or_else(|| v.as_str()?.parse().ok()))
-}
-
-fn promoted(record: &Value, attr_field: &str, attr_key: &str) -> Option<String> {
-    let raw = opt_s(record, attr_field)?;
-    promoted_from_attr_json(&raw, attr_key)
-}
-
 fn promoted_from_attr_json(raw: &str, attr_key: &str) -> Option<String> {
     let parsed: Value = serde_json::from_str(raw).ok()?;
     parsed.get(attr_key).map(|v| {
@@ -632,12 +534,12 @@ fn promoted_from_attr_json(raw: &str, attr_key: &str) -> Option<String> {
     })
 }
 
-fn promoted_i(record: &Value, attr_field: &str, attr_key: &str) -> Option<i64> {
-    let raw = opt_s(record, attr_field)?;
-    let parsed: Value = serde_json::from_str(&raw).ok()?;
+fn promoted_int_from_attr_json(raw: &str, attr_key: &str) -> Option<i32> {
+    let parsed: Value = serde_json::from_str(raw).ok()?;
     parsed
         .get(attr_key)
         .and_then(|v| v.as_i64().or_else(|| v.as_str()?.parse().ok()))
+        .and_then(|v| i32::try_from(v).ok())
 }
 
 fn sql_path(path: &Path) -> String {
@@ -802,7 +704,7 @@ fn create_appender<'a>(
     }
 }
 
-fn metric_duckdb_batch(
+fn storage_duckdb_batch(
     table: Signal,
     batch: &RecordBatch,
     source_format: &str,
@@ -840,9 +742,61 @@ fn metric_duckdb_batch(
                 arrow58_types::Field::new(name, arrow58_types::DataType::Utf8, true),
                 string_array_from_options((0..rows).map(|_| Some(source_format.to_string()))),
             ),
+            "deployment_environment" if matches!(table, Signal::Logs | Signal::Spans) => (
+                arrow58_types::Field::new(name, arrow58_types::DataType::Utf8, true),
+                string_promoted_column(batch, "resource_attributes", "deployment.environment")?,
+            ),
+            "http_method" if table == Signal::Logs => (
+                arrow58_types::Field::new(name, arrow58_types::DataType::Utf8, true),
+                string_promoted_alt_column(
+                    batch,
+                    "log_attributes",
+                    &["http.request.method", "http.method"],
+                )?,
+            ),
+            "http_method" if table == Signal::Spans => (
+                arrow58_types::Field::new(name, arrow58_types::DataType::Utf8, true),
+                string_promoted_alt_column(
+                    batch,
+                    "span_attributes",
+                    &["http.request.method", "http.method"],
+                )?,
+            ),
+            "http_status_code" if table == Signal::Logs => (
+                arrow58_types::Field::new(name, arrow58_types::DataType::Int32, true),
+                int_promoted_alt_column(
+                    batch,
+                    "log_attributes",
+                    &["http.response.status_code", "http.status_code"],
+                )?,
+            ),
+            "http_status_code" if table == Signal::Spans => (
+                arrow58_types::Field::new(name, arrow58_types::DataType::Int32, true),
+                int_promoted_alt_column(
+                    batch,
+                    "span_attributes",
+                    &["http.response.status_code", "http.status_code"],
+                )?,
+            ),
+            "http_route" if table == Signal::Logs => (
+                arrow58_types::Field::new(name, arrow58_types::DataType::Utf8, true),
+                string_promoted_column(batch, "log_attributes", "http.route")?,
+            ),
+            "http_route" if table == Signal::Spans => (
+                arrow58_types::Field::new(name, arrow58_types::DataType::Utf8, true),
+                string_promoted_column(batch, "span_attributes", "http.route")?,
+            ),
+            "exception_type" if table == Signal::Logs => (
+                arrow58_types::Field::new(name, arrow58_types::DataType::Utf8, true),
+                string_promoted_column(batch, "log_attributes", "exception.type")?,
+            ),
+            "exception_type" if table == Signal::Spans => (
+                arrow58_types::Field::new(name, arrow58_types::DataType::Utf8, true),
+                string_promoted_column(batch, "span_attributes", "exception.type")?,
+            ),
             "deployment_environment" => (
                 arrow58_types::Field::new(name, arrow58_types::DataType::Utf8, true),
-                deployment_environment_column(batch)?,
+                string_promoted_column(batch, "resource_attributes", "deployment.environment")?,
             ),
             _ => copy_arrow_column(batch, name)?,
         };
@@ -871,21 +825,62 @@ fn copy_arrow_column(batch: &RecordBatch, name: &str) -> Result<(arrow58_types::
     Ok((field, batch.column(idx).clone()))
 }
 
-fn deployment_environment_column(batch: &RecordBatch) -> Result<ArrayRef> {
+fn string_promoted_column(
+    batch: &RecordBatch,
+    attr_column: &str,
+    attr_key: &str,
+) -> Result<ArrayRef> {
+    string_promoted_alt_column(batch, attr_column, &[attr_key])
+}
+
+fn string_promoted_alt_column(
+    batch: &RecordBatch,
+    attr_column: &str,
+    attr_keys: &[&str],
+) -> Result<ArrayRef> {
     let schema = batch.schema();
-    let idx = schema.index_of("resource_attributes")?;
+    let idx = schema.index_of(attr_column)?;
     let src = batch
         .column(idx)
         .as_any()
         .downcast_ref::<arrow58_array::StringArray>()
-        .context("resource_attributes column is not StringArray")?;
+        .with_context(|| format!("{attr_column} column is not StringArray"))?;
     Ok(string_array_from_options((0..src.len()).map(|row| {
         if src.is_null(row) {
             None
         } else {
-            promoted_from_attr_json(src.value(row), "deployment.environment")
+            attr_keys
+                .iter()
+                .find_map(|key| promoted_from_attr_json(src.value(row), key))
         }
     })))
+}
+
+fn int_promoted_alt_column(
+    batch: &RecordBatch,
+    attr_column: &str,
+    attr_keys: &[&str],
+) -> Result<ArrayRef> {
+    let schema = batch.schema();
+    let idx = schema.index_of(attr_column)?;
+    let src = batch
+        .column(idx)
+        .as_any()
+        .downcast_ref::<arrow58_array::StringArray>()
+        .with_context(|| format!("{attr_column} column is not StringArray"))?;
+    Ok(Arc::new(arrow58_array::Int32Array::from(
+        (0..src.len())
+            .map(|row| {
+                if src.is_null(row) {
+                    None
+                } else {
+                    attr_keys
+                        .iter()
+                        .find_map(|key| promoted_int_from_attr_json(src.value(row), key))
+                }
+            })
+            .collect::<Vec<_>>(),
+    )) as ArrayRef)
 }
 
 fn string_array_from_options(values: impl IntoIterator<Item = Option<String>>) -> ArrayRef {
@@ -900,50 +895,6 @@ fn string_array_from_options(values: impl IntoIterator<Item = Option<String>>) -
         }
     }
     Arc::new(builder.finish())
-}
-
-fn insert_record_chunk(
-    conn: &mut Connection,
-    table: Signal,
-    records: &[Value],
-    source_format: &str,
-    sql: &str,
-) -> Result<()> {
-    let tx = conn.transaction()?;
-    {
-        let mut stmt = tx.prepare(sql)?;
-        for record in records {
-            let bound = bind_record(table, record, source_format);
-            stmt.execute(params_from_iter(bound.iter()))?;
-        }
-    }
-    tx.commit()?;
-    Ok(())
-}
-
-fn insert_chunks(records: &[Value]) -> Vec<&[Value]> {
-    let mut chunks = Vec::new();
-    let mut start = 0;
-    let mut rows = 0;
-    let mut bytes = 0;
-    for (idx, record) in records.iter().enumerate() {
-        let row_bytes = record.to_string().len().max(1);
-        let would_exceed = rows > 0
-            && (rows >= INSERT_TRANSACTION_MAX_ROWS
-                || bytes + row_bytes > INSERT_TRANSACTION_MAX_BYTES);
-        if would_exceed {
-            chunks.push(&records[start..idx]);
-            start = idx;
-            rows = 0;
-            bytes = 0;
-        }
-        rows += 1;
-        bytes += row_bytes;
-    }
-    if start < records.len() {
-        chunks.push(&records[start..]);
-    }
-    chunks
 }
 
 fn dir_size(path: &Path) -> Result<u64> {
@@ -1088,202 +1039,6 @@ fn create_table_sql(prefix: &str, name: &str, cols: &[(&str, &str)]) -> String {
         .collect::<Vec<_>>()
         .join(",\n");
     format!("CREATE TABLE IF NOT EXISTS {prefix}{name} (\n{body}\n);")
-}
-
-fn insert_sql(prefix: &str, name: &str, cols: &[(&str, &str)]) -> String {
-    let names = cols
-        .iter()
-        .map(|(col, _)| *col)
-        .collect::<Vec<_>>()
-        .join(", ");
-    let placeholders = cols
-        .iter()
-        .map(|(_, ty)| placeholder_for(ty))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("INSERT INTO {prefix}{name} ({names}) VALUES ({placeholders})")
-}
-
-fn placeholder_for(sql_type: &str) -> &'static str {
-    match sql_type {
-        "TIMESTAMP" => "CAST(? AS TIMESTAMP)",
-        "DATE" => "CAST(? AS DATE)",
-        _ => "?",
-    }
-}
-
-fn bind_record(table: Signal, record: &Value, source_format: &str) -> Vec<DuckValue> {
-    match table {
-        Signal::Logs => bind_logs(record, source_format),
-        Signal::Spans => bind_spans(record, source_format),
-        Signal::MetricGauge => bind_metric_gauge(record, source_format),
-        Signal::MetricSum => bind_metric_sum(record, source_format),
-    }
-}
-
-fn bind_logs(record: &Value, source_format: &str) -> Vec<DuckValue> {
-    vec![
-        DuckValue::Text(timestamp_string(record)),
-        DuckValue::Text(now_timestamp_string()),
-        DuckValue::Text(event_date(record)),
-        DuckValue::Text(source_format.to_string()),
-        opt_str(record, "trace_id"),
-        opt_str(record, "span_id"),
-        opt_str(record, "service_name"),
-        opt_str(record, "service_namespace"),
-        opt_str(record, "service_instance_id"),
-        opt_int(record, "severity_number"),
-        opt_str(record, "severity_text"),
-        opt_str(record, "body"),
-        opt_str(record, "resource_attributes"),
-        opt_str(record, "scope_name"),
-        opt_str(record, "scope_version"),
-        opt_str(record, "scope_attributes"),
-        opt_str(record, "log_attributes"),
-        promoted_str(record, "resource_attributes", "deployment.environment"),
-        promoted_str_alts(
-            record,
-            "log_attributes",
-            &["http.request.method", "http.method"],
-        ),
-        promoted_int_alts(
-            record,
-            "log_attributes",
-            &["http.response.status_code", "http.status_code"],
-        ),
-        promoted_str(record, "log_attributes", "http.route"),
-        promoted_str(record, "log_attributes", "exception.type"),
-    ]
-}
-
-fn bind_spans(record: &Value, source_format: &str) -> Vec<DuckValue> {
-    vec![
-        DuckValue::Text(timestamp_string(record)),
-        DuckValue::Text(now_timestamp_string()),
-        DuckValue::Text(event_date(record)),
-        DuckValue::Text(source_format.to_string()),
-        opt_int(record, "end_timestamp"),
-        opt_int(record, "duration"),
-        opt_str(record, "trace_id"),
-        opt_str(record, "span_id"),
-        opt_str(record, "parent_span_id"),
-        opt_str(record, "trace_state"),
-        opt_str(record, "span_name"),
-        opt_int(record, "span_kind"),
-        opt_int(record, "status_code"),
-        opt_str(record, "status_message"),
-        opt_str(record, "service_name"),
-        opt_str(record, "service_namespace"),
-        opt_str(record, "service_instance_id"),
-        opt_str(record, "scope_name"),
-        opt_str(record, "scope_version"),
-        opt_str(record, "scope_attributes"),
-        opt_str(record, "span_attributes"),
-        opt_str(record, "resource_attributes"),
-        opt_str(record, "events_json"),
-        opt_str(record, "links_json"),
-        opt_int(record, "dropped_attributes_count"),
-        opt_int(record, "dropped_events_count"),
-        opt_int(record, "dropped_links_count"),
-        opt_int(record, "flags"),
-        promoted_str(record, "resource_attributes", "deployment.environment"),
-        promoted_str_alts(
-            record,
-            "span_attributes",
-            &["http.request.method", "http.method"],
-        ),
-        promoted_int_alts(
-            record,
-            "span_attributes",
-            &["http.response.status_code", "http.status_code"],
-        ),
-        promoted_str(record, "span_attributes", "http.route"),
-        promoted_str(record, "span_attributes", "exception.type"),
-    ]
-}
-
-fn bind_metric_gauge(record: &Value, source_format: &str) -> Vec<DuckValue> {
-    metric_common_bind(record, source_format)
-}
-
-fn bind_metric_sum(record: &Value, source_format: &str) -> Vec<DuckValue> {
-    let mut values = metric_common_bind(record, source_format);
-    values.push(opt_int(record, "aggregation_temporality"));
-    values.push(opt_bool(record, "is_monotonic"));
-    values
-}
-
-fn metric_common_bind(record: &Value, source_format: &str) -> Vec<DuckValue> {
-    vec![
-        DuckValue::Text(timestamp_string(record)),
-        DuckValue::Text(now_timestamp_string()),
-        DuckValue::Text(event_date(record)),
-        DuckValue::Text(source_format.to_string()),
-        opt_int(record, "start_timestamp"),
-        opt_str(record, "metric_name"),
-        opt_str(record, "metric_description"),
-        opt_str(record, "metric_unit"),
-        opt_double(record, "value"),
-        opt_str(record, "service_name"),
-        opt_str(record, "service_namespace"),
-        opt_str(record, "service_instance_id"),
-        opt_str(record, "resource_attributes"),
-        opt_str(record, "scope_name"),
-        opt_str(record, "scope_version"),
-        opt_str(record, "scope_attributes"),
-        opt_str(record, "metric_attributes"),
-        opt_int(record, "flags"),
-        opt_str(record, "exemplars_json"),
-        promoted_str(record, "resource_attributes", "deployment.environment"),
-    ]
-}
-
-fn opt_str(record: &Value, key: &str) -> DuckValue {
-    opt_s(record, key)
-        .map(DuckValue::Text)
-        .unwrap_or(DuckValue::Null)
-}
-
-fn opt_int(record: &Value, key: &str) -> DuckValue {
-    opt_i(record, key)
-        .map(DuckValue::BigInt)
-        .unwrap_or(DuckValue::Null)
-}
-
-fn opt_double(record: &Value, key: &str) -> DuckValue {
-    opt_f(record, key)
-        .map(DuckValue::Double)
-        .unwrap_or(DuckValue::Null)
-}
-
-fn opt_bool(record: &Value, key: &str) -> DuckValue {
-    opt_b(record, key)
-        .map(DuckValue::Boolean)
-        .unwrap_or(DuckValue::Null)
-}
-
-fn promoted_str(record: &Value, attr_field: &str, attr_key: &str) -> DuckValue {
-    promoted(record, attr_field, attr_key)
-        .map(DuckValue::Text)
-        .unwrap_or(DuckValue::Null)
-}
-
-fn promoted_str_alts(record: &Value, attr_field: &str, keys: &[&str]) -> DuckValue {
-    for key in keys {
-        if let Some(value) = promoted(record, attr_field, key) {
-            return DuckValue::Text(value);
-        }
-    }
-    DuckValue::Null
-}
-
-fn promoted_int_alts(record: &Value, attr_field: &str, keys: &[&str]) -> DuckValue {
-    for key in keys {
-        if let Some(value) = promoted_i(record, attr_field, key) {
-            return DuckValue::BigInt(value);
-        }
-    }
-    DuckValue::Null
 }
 
 #[cfg(test)]

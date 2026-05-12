@@ -190,47 +190,6 @@ pub fn parse_limit(value: Option<&Value>, default: usize, max: usize) -> ApiResu
     }
 }
 
-pub fn validate_timestamp_skew(
-    records: &[Value],
-    signal: Signal,
-    config: &Config,
-) -> ApiResult<()> {
-    let now_ms = Utc::now().timestamp_millis();
-    let min_ms = now_ms - config.late_accept_secs * 1000;
-    let max_ms = now_ms + config.future_accept_secs * 1000;
-    for record in records {
-        let Some(ts) = record_timestamp_ms(record) else {
-            return Err(ApiError::new(
-                400,
-                "invalid_timestamp",
-                format!("{signal} timestamp is required and must be parseable"),
-            ));
-        };
-        if ts <= 0 {
-            return Err(ApiError::new(
-                400,
-                "invalid_timestamp",
-                format!("{signal} timestamp is required and must be positive"),
-            ));
-        }
-        if ts < min_ms {
-            return Err(ApiError::new(
-                400,
-                "timestamp_too_old",
-                format!("{signal} timestamp is outside late-arrival window"),
-            ));
-        }
-        if ts > max_ms {
-            return Err(ApiError::new(
-                400,
-                "timestamp_in_future",
-                format!("{signal} timestamp is outside future-skew window"),
-            ));
-        }
-    }
-    Ok(())
-}
-
 pub fn validate_arrow_timestamp_skew(
     batch: &RecordBatch,
     signal: Signal,
@@ -296,21 +255,4 @@ fn arrow_timestamp_micros(
                 format!("{signal} timestamp is required and must be parseable"),
             )
         })
-}
-
-pub fn record_timestamp_ms(record: &Value) -> Option<i64> {
-    let value = record.get("timestamp")?;
-    if let Some(n) = value.as_i64() {
-        return Some(if n > 100_000_000_000_000 { n / 1000 } else { n });
-    }
-    if let Some(s) = value.as_str() {
-        if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
-            return Some(dt.timestamp_millis());
-        }
-        return s
-            .parse::<i64>()
-            .ok()
-            .map(|n| if n > 100_000_000_000_000 { n / 1000 } else { n });
-    }
-    None
 }

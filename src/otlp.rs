@@ -2,15 +2,14 @@ use crate::ingest::Signal;
 use crate::validation::{ApiError, ApiResult};
 use arrow58::record_batch::RecordBatch;
 use flate2::read::GzDecoder;
-use otlp2records::{transform_logs_json, transform_metrics, transform_traces_json, InputFormat};
-use serde_json::Value;
+use otlp2records::{transform_logs, transform_metrics, transform_traces, InputFormat};
 use std::collections::HashMap;
 use std::io::Read;
 
 #[derive(Clone, Debug)]
 pub struct Transformed {
-    pub logs: Vec<Value>,
-    pub spans: Vec<Value>,
+    pub logs: Option<RecordBatch>,
+    pub spans: Option<RecordBatch>,
     pub gauge: Option<RecordBatch>,
     pub sum: Option<RecordBatch>,
     pub source_format: &'static str,
@@ -66,20 +65,20 @@ pub fn transform(
     };
 
     match signal {
-        Signal::Logs => transform_logs_json(body, format)
+        Signal::Logs => transform_logs(body, format)
             .map(|logs| Transformed {
-                logs,
-                spans: vec![],
+                logs: Some(logs),
+                spans: None,
                 gauge: None,
                 sum: None,
                 source_format,
                 unsupported_histograms: 0,
             })
             .map_err(|e| ApiError::new(400, "invalid_payload", e.to_string())),
-        Signal::Spans => transform_traces_json(body, format)
+        Signal::Spans => transform_traces(body, format)
             .map(|spans| Transformed {
-                logs: vec![],
-                spans,
+                logs: None,
+                spans: Some(spans),
                 gauge: None,
                 sum: None,
                 source_format,
@@ -100,8 +99,8 @@ pub fn transform(
                     .map(RecordBatch::num_rows)
                     .unwrap_or(0);
             Ok(Transformed {
-                logs: vec![],
-                spans: vec![],
+                logs: None,
+                spans: None,
                 gauge: batches.gauge,
                 sum: batches.sum,
                 source_format,
