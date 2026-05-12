@@ -4,6 +4,7 @@ use crate::otlp::{self, Transformed};
 use crate::storage::{InsertRecordsError, Storage};
 use crate::validation::{self, ApiError, ApiResult};
 use crate::LockExt;
+use arrow58::record_batch::RecordBatch;
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
@@ -67,7 +68,7 @@ impl std::error::Error for PartialFlushError {}
 
 #[derive(Clone)]
 struct QueuedBatch {
-    rows: Vec<Value>,
+    payload: BatchPayload,
     source_format: &'static str,
     accepted_at: Instant,
     approx_bytes: usize,
@@ -76,21 +77,21 @@ struct QueuedBatch {
 impl QueuedBatch {
     fn split_at(mut self, take_rows: usize) -> (Self, Self) {
         debug_assert!(take_rows > 0);
-        debug_assert!(take_rows < self.rows.len());
-        let original_rows = self.rows.len();
-        let rest_rows = self.rows.split_off(take_rows);
+        debug_assert!(take_rows < self.len());
+        let original_rows = self.len();
+        let rest_payload = self.payload.split_off(take_rows);
         let taken_bytes = proportional_bytes(self.approx_bytes, take_rows, original_rows);
         let rest_bytes = self.approx_bytes.saturating_sub(taken_bytes);
         let accepted_at = self.accepted_at;
         let source_format = self.source_format;
         let taken = Self {
-            rows: self.rows,
+            payload: self.payload,
             source_format,
             accepted_at,
             approx_bytes: taken_bytes,
         };
         let rest = Self {
-            rows: rest_rows,
+            payload: rest_payload,
             source_format,
             accepted_at,
             approx_bytes: rest_bytes,
@@ -99,23 +100,62 @@ impl QueuedBatch {
     }
 
     fn suffix(&self, committed_rows: usize) -> Option<Self> {
-        if committed_rows >= self.rows.len() {
+        if committed_rows >= self.len() {
             return None;
         }
-        let rows = self.rows[committed_rows..].to_vec();
-        let approx_bytes = proportional_bytes(self.approx_bytes, rows.len(), self.rows.len());
+        let payload = self.payload.suffix(committed_rows);
+        let approx_bytes = proportional_bytes(self.approx_bytes, payload.len(), self.len());
         Some(Self {
-            rows,
+            payload,
             source_format: self.source_format,
             accepted_at: self.accepted_at,
             approx_bytes,
         })
     }
+
+    fn len(&self) -> usize {
+        self.payload.len()
+    }
+}
+
+#[derive(Clone)]
+enum BatchPayload {
+    Rows(Vec<Value>),
+    Arrow(RecordBatch),
+}
+
+impl BatchPayload {
+    fn len(&self) -> usize {
+        match self {
+            BatchPayload::Rows(rows) => rows.len(),
+            BatchPayload::Arrow(batch) => batch.num_rows(),
+        }
+    }
+
+    fn split_off(&mut self, take_rows: usize) -> Self {
+        match self {
+            BatchPayload::Rows(rows) => BatchPayload::Rows(rows.split_off(take_rows)),
+            BatchPayload::Arrow(batch) => {
+                let rest = batch.slice(take_rows, batch.num_rows() - take_rows);
+                *batch = batch.slice(0, take_rows);
+                BatchPayload::Arrow(rest)
+            }
+        }
+    }
+
+    fn suffix(&self, committed_rows: usize) -> Self {
+        match self {
+            BatchPayload::Rows(rows) => BatchPayload::Rows(rows[committed_rows..].to_vec()),
+            BatchPayload::Arrow(batch) => {
+                BatchPayload::Arrow(batch.slice(committed_rows, batch.num_rows() - committed_rows))
+            }
+        }
+    }
 }
 
 struct PendingBatch {
     signal: Signal,
-    rows: Vec<Value>,
+    payload: BatchPayload,
     source_format: &'static str,
     approx_bytes: usize,
 }
@@ -296,7 +336,14 @@ impl Ingestor {
         for idx in 0..batches.len() {
             let batch = &batches[idx];
             let started = Instant::now();
-            let insert_result = storage.insert_records(signal, &batch.rows, batch.source_format);
+            let insert_result = match &batch.payload {
+                BatchPayload::Rows(records) => {
+                    storage.insert_records(signal, records, batch.source_format)
+                }
+                BatchPayload::Arrow(record_batch) => {
+                    storage.insert_arrow_records(signal, record_batch, batch.source_format)
+                }
+            };
             if let Some(metrics) = metrics {
                 metrics.observe_phase_seconds(
                     signal.as_str(),
@@ -310,9 +357,8 @@ impl Ingestor {
                     rows += committed;
                 }
                 Err(err) => {
-                    let committed_in_batch = insert_committed_rows(&err)
-                        .unwrap_or(0)
-                        .min(batch.rows.len());
+                    let committed_in_batch =
+                        insert_committed_rows(&err).unwrap_or(0).min(batch.len());
                     rows += committed_in_batch;
                     let mut remaining = Vec::new();
                     if let Some(uncommitted) = batch.suffix(committed_in_batch) {
@@ -329,8 +375,7 @@ impl Ingestor {
                             1,
                         );
                     }
-                    let remaining_rows: usize =
-                        remaining.iter().map(|batch| batch.rows.len()).sum();
+                    let remaining_rows: usize = remaining.iter().map(QueuedBatch::len).sum();
                     let committed_str = committed_in_batch.to_string();
                     let remaining_str = remaining_rows.to_string();
                     let err_str = err.to_string();
@@ -375,7 +420,7 @@ impl Ingestor {
             let Some(batch) = queue.batches.pop_front() else {
                 break;
             };
-            let original_rows = batch.rows.len();
+            let original_rows = batch.len();
             if original_rows == 0 {
                 continue;
             }
@@ -390,7 +435,7 @@ impl Ingestor {
                 drained.push(batch);
             } else {
                 let (taken, rest) = batch.split_at(take_rows);
-                queue.rows = queue.rows.saturating_sub(taken.rows.len());
+                queue.rows = queue.rows.saturating_sub(taken.len());
                 queue.bytes = queue.bytes.saturating_sub(taken.approx_bytes);
                 queue.batches.push_front(rest);
                 drained.push(taken);
@@ -463,7 +508,7 @@ impl Ingestor {
         if batches.is_empty() {
             return Ok(0);
         }
-        let accepted = batches.iter().map(|b| b.rows.len()).sum();
+        let accepted = batches.iter().map(|b| b.payload.len()).sum();
         let started = Instant::now();
         let queue_result: ApiResult<Vec<Signal>> = (|| {
             let mut queues = self.queues.lock_or_poisoned();
@@ -520,10 +565,10 @@ impl Ingestor {
             }
             for batch in batches {
                 let queue = queues.get_mut(&batch.signal).unwrap();
-                queue.rows += batch.rows.len();
+                queue.rows += batch.payload.len();
                 queue.bytes += batch.approx_bytes;
                 queue.batches.push_back(QueuedBatch {
-                    rows: batch.rows,
+                    payload: batch.payload,
                     source_format: batch.source_format,
                     accepted_at: Instant::now(),
                     approx_bytes: batch.approx_bytes,
@@ -595,7 +640,7 @@ impl Ingestor {
         let mut queues = self.queues.lock_or_poisoned();
         let queue = queues.get_mut(&signal).unwrap();
         for batch in batches.into_iter().rev() {
-            queue.rows += batch.rows.len();
+            queue.rows += batch.len();
             queue.bytes += batch.approx_bytes;
             queue.batches.push_front(batch);
         }
@@ -613,8 +658,13 @@ impl Ingestor {
     fn validate_skew(&self, transformed: &Transformed) -> ApiResult<()> {
         validation::validate_timestamp_skew(&transformed.logs, Signal::Logs, &self.config)?;
         validation::validate_timestamp_skew(&transformed.spans, Signal::Spans, &self.config)?;
-        validation::validate_timestamp_skew(&transformed.gauge, Signal::MetricGauge, &self.config)?;
-        validation::validate_timestamp_skew(&transformed.sum, Signal::MetricSum, &self.config)
+        if let Some(gauge) = &transformed.gauge {
+            validation::validate_arrow_timestamp_skew(gauge, Signal::MetricGauge, &self.config)?;
+        }
+        if let Some(sum) = &transformed.sum {
+            validation::validate_arrow_timestamp_skew(sum, Signal::MetricSum, &self.config)?;
+        }
+        Ok(())
     }
 }
 
@@ -670,38 +720,36 @@ fn proportional_bytes(total_bytes: usize, rows: usize, total_rows: usize) -> usi
 fn pending_batches(transformed: Transformed, request_bytes: usize) -> Vec<PendingBatch> {
     let source_format = transformed.source_format;
     let mut batches = Vec::new();
-    push_pending(
+    push_pending_rows(
         &mut batches,
         Signal::Logs,
         transformed.logs,
         source_format,
         request_bytes,
     );
-    push_pending(
+    push_pending_rows(
         &mut batches,
         Signal::Spans,
         transformed.spans,
         source_format,
         request_bytes,
     );
-    push_pending(
+    push_pending_arrow(
         &mut batches,
         Signal::MetricGauge,
         transformed.gauge,
         source_format,
-        request_bytes,
     );
-    push_pending(
+    push_pending_arrow(
         &mut batches,
         Signal::MetricSum,
         transformed.sum,
         source_format,
-        request_bytes,
     );
     batches
 }
 
-fn push_pending(
+fn push_pending_rows(
     batches: &mut Vec<PendingBatch>,
     signal: Signal,
     rows: Vec<Value>,
@@ -718,7 +766,28 @@ fn push_pending(
         .max(request_bytes);
     batches.push(PendingBatch {
         signal,
-        rows,
+        payload: BatchPayload::Rows(rows),
+        source_format,
+        approx_bytes,
+    });
+}
+
+fn push_pending_arrow(
+    batches: &mut Vec<PendingBatch>,
+    signal: Signal,
+    batch: Option<RecordBatch>,
+    source_format: &'static str,
+) {
+    let Some(batch) = batch else {
+        return;
+    };
+    if batch.num_rows() == 0 {
+        return;
+    }
+    let approx_bytes = batch.get_array_memory_size().max(batch.num_rows());
+    batches.push(PendingBatch {
+        signal,
+        payload: BatchPayload::Arrow(batch),
         source_format,
         approx_bytes,
     });

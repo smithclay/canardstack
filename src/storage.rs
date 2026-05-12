@@ -4,9 +4,14 @@ use crate::sql::{escape_value, quote as sql_quote};
 use crate::validation::record_timestamp_ms;
 use crate::LockExt;
 use anyhow::{Context, Result};
+use arrow58::array as arrow58_array;
+use arrow58::array::Array as _;
+use arrow58::array::ArrayRef;
+use arrow58::datatypes as arrow58_types;
+use arrow58::record_batch::RecordBatch;
 use chrono::{TimeZone, Utc};
 use duckdb::types::Value as DuckValue;
-use duckdb::{params_from_iter, Connection};
+use duckdb::{params_from_iter, Appender, Connection};
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::fs;
@@ -278,6 +283,42 @@ impl Storage {
         }
         *self.last_error.lock_or_poisoned() = None;
         Ok(committed_rows)
+    }
+
+    pub fn insert_arrow_records(
+        &self,
+        table: Signal,
+        batch: &RecordBatch,
+        source_format: &str,
+    ) -> Result<usize> {
+        if batch.num_rows() == 0 {
+            return Ok(0);
+        }
+        if !matches!(table, Signal::MetricGauge | Signal::MetricSum) {
+            anyhow::bail!("Arrow insert path is only implemented for metric tables");
+        }
+
+        let rows = batch.num_rows();
+        let append_batch = metric_duckdb_batch(table, batch, source_format)?;
+        let conn = self.writer.lock_or_poisoned();
+        configure_write_connection(&conn, &self.write_memory_limit)?;
+        let append_result = (|| -> Result<()> {
+            let mut appender = create_appender(&conn, &self.target_prefix, table.as_str())?;
+            appender.append_record_batch(append_batch)?;
+            appender.flush()?;
+            Ok(())
+        })();
+        if let Err(err) = append_result {
+            *self.last_error.lock_or_poisoned() = Some(err.to_string());
+            return Err(anyhow::Error::new(InsertRecordsError {
+                table,
+                committed_rows: 0,
+                attempted_rows: rows,
+                source: err,
+            }));
+        }
+        *self.last_error.lock_or_poisoned() = None;
+        Ok(rows)
     }
 
     /// Read-side connection access for SELECT-only paths. Do not call into
@@ -577,7 +618,11 @@ fn opt_b(record: &Value, key: &str) -> Option<bool> {
 
 fn promoted(record: &Value, attr_field: &str, attr_key: &str) -> Option<String> {
     let raw = opt_s(record, attr_field)?;
-    let parsed: Value = serde_json::from_str(&raw).ok()?;
+    promoted_from_attr_json(&raw, attr_key)
+}
+
+fn promoted_from_attr_json(raw: &str, attr_key: &str) -> Option<String> {
+    let parsed: Value = serde_json::from_str(raw).ok()?;
     parsed.get(attr_key).map(|v| {
         if let Some(s) = v.as_str() {
             s.to_string()
@@ -741,6 +786,120 @@ fn configure_write_connection(conn: &Connection, memory_limit: &str) -> Result<(
         escape_value(memory_limit)
     ))?;
     Ok(())
+}
+
+fn create_appender<'a>(
+    conn: &'a Connection,
+    target_prefix: &str,
+    table: &str,
+) -> Result<Appender<'a>> {
+    if let Some(catalog) = target_prefix.strip_suffix('.') {
+        conn.appender_to_catalog_and_db(table, catalog, "main")
+            .with_context(|| format!("create appender for {catalog}.main.{table}"))
+    } else {
+        conn.appender(table)
+            .with_context(|| format!("create appender for {table}"))
+    }
+}
+
+fn metric_duckdb_batch(
+    table: Signal,
+    batch: &RecordBatch,
+    source_format: &str,
+) -> Result<RecordBatch> {
+    let timestamp = timestamp_column(batch)?;
+    let rows = batch.num_rows();
+    let ingested_at = Utc::now().timestamp_micros();
+    let mut fields = Vec::with_capacity(table_columns(table).len());
+    let mut arrays = Vec::with_capacity(table_columns(table).len());
+
+    for &(name, _) in table_columns(table) {
+        let (field, array) = match name {
+            "ingested_at" => (
+                arrow58_types::Field::new(
+                    name,
+                    arrow58_types::DataType::Timestamp(arrow58_types::TimeUnit::Microsecond, None),
+                    true,
+                ),
+                Arc::new(arrow58_array::TimestampMicrosecondArray::from(
+                    (0..rows).map(|_| Some(ingested_at)).collect::<Vec<_>>(),
+                )) as ArrayRef,
+            ),
+            "event_date" => (
+                arrow58_types::Field::new(name, arrow58_types::DataType::Date32, true),
+                Arc::new(arrow58_array::Date32Array::from(
+                    (0..rows)
+                        .map(|row| {
+                            (!timestamp.is_null(row))
+                                .then(|| timestamp.value(row).div_euclid(86_400_000_000) as i32)
+                        })
+                        .collect::<Vec<_>>(),
+                )) as ArrayRef,
+            ),
+            "source_format" => (
+                arrow58_types::Field::new(name, arrow58_types::DataType::Utf8, true),
+                string_array_from_options((0..rows).map(|_| Some(source_format.to_string()))),
+            ),
+            "deployment_environment" => (
+                arrow58_types::Field::new(name, arrow58_types::DataType::Utf8, true),
+                deployment_environment_column(batch)?,
+            ),
+            _ => copy_arrow_column(batch, name)?,
+        };
+        fields.push(field);
+        arrays.push(array);
+    }
+
+    RecordBatch::try_new(Arc::new(arrow58_types::Schema::new(fields)), arrays)
+        .context("build DuckDB appender RecordBatch")
+}
+
+fn timestamp_column(batch: &RecordBatch) -> Result<&arrow58_array::TimestampMicrosecondArray> {
+    let idx = batch.schema().index_of("timestamp")?;
+    batch
+        .column(idx)
+        .as_any()
+        .downcast_ref::<arrow58_array::TimestampMicrosecondArray>()
+        .context("timestamp column is not TimestampMicrosecondArray")
+}
+
+fn copy_arrow_column(batch: &RecordBatch, name: &str) -> Result<(arrow58_types::Field, ArrayRef)> {
+    let schema = batch.schema();
+    let idx = schema.index_of(name)?;
+    let field58 = schema.field(idx);
+    let field = arrow58_types::Field::new(name, field58.data_type().clone(), field58.is_nullable());
+    Ok((field, batch.column(idx).clone()))
+}
+
+fn deployment_environment_column(batch: &RecordBatch) -> Result<ArrayRef> {
+    let schema = batch.schema();
+    let idx = schema.index_of("resource_attributes")?;
+    let src = batch
+        .column(idx)
+        .as_any()
+        .downcast_ref::<arrow58_array::StringArray>()
+        .context("resource_attributes column is not StringArray")?;
+    Ok(string_array_from_options((0..src.len()).map(|row| {
+        if src.is_null(row) {
+            None
+        } else {
+            promoted_from_attr_json(src.value(row), "deployment.environment")
+        }
+    })))
+}
+
+fn string_array_from_options(values: impl IntoIterator<Item = Option<String>>) -> ArrayRef {
+    let iter = values.into_iter();
+    let (_, upper) = iter.size_hint();
+    let mut builder = arrow58_array::StringBuilder::with_capacity(upper.unwrap_or(0), 0);
+    for value in iter {
+        if let Some(value) = value {
+            builder.append_value(value);
+        } else {
+            builder.append_null();
+        }
+    }
+    Arc::new(builder.finish())
 }
 
 fn insert_record_chunk(

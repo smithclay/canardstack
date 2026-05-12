@@ -1,5 +1,7 @@
 use crate::config::Config;
 use crate::ingest::Signal;
+use arrow58::array::{Array, TimestampMicrosecondArray};
+use arrow58::record_batch::RecordBatch;
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -227,6 +229,73 @@ pub fn validate_timestamp_skew(
         }
     }
     Ok(())
+}
+
+pub fn validate_arrow_timestamp_skew(
+    batch: &RecordBatch,
+    signal: Signal,
+    config: &Config,
+) -> ApiResult<()> {
+    let now_ms = Utc::now().timestamp_millis();
+    let min_ms = now_ms - config.late_accept_secs * 1000;
+    let max_ms = now_ms + config.future_accept_secs * 1000;
+    let timestamp = arrow_timestamp_micros(batch, signal)?;
+    for row in 0..timestamp.len() {
+        if timestamp.is_null(row) {
+            return Err(ApiError::new(
+                400,
+                "invalid_timestamp",
+                format!("{signal} timestamp is required and must be parseable"),
+            ));
+        }
+        let ts = timestamp.value(row) / 1000;
+        if ts <= 0 {
+            return Err(ApiError::new(
+                400,
+                "invalid_timestamp",
+                format!("{signal} timestamp is required and must be positive"),
+            ));
+        }
+        if ts < min_ms {
+            return Err(ApiError::new(
+                400,
+                "timestamp_too_old",
+                format!("{signal} timestamp is outside late-arrival window"),
+            ));
+        }
+        if ts > max_ms {
+            return Err(ApiError::new(
+                400,
+                "timestamp_in_future",
+                format!("{signal} timestamp is outside future-skew window"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn arrow_timestamp_micros(
+    batch: &RecordBatch,
+    signal: Signal,
+) -> ApiResult<&TimestampMicrosecondArray> {
+    let idx = batch.schema().index_of("timestamp").map_err(|_| {
+        ApiError::new(
+            400,
+            "invalid_timestamp",
+            format!("{signal} timestamp is required and must be parseable"),
+        )
+    })?;
+    batch
+        .column(idx)
+        .as_any()
+        .downcast_ref::<TimestampMicrosecondArray>()
+        .ok_or_else(|| {
+            ApiError::new(
+                400,
+                "invalid_timestamp",
+                format!("{signal} timestamp is required and must be parseable"),
+            )
+        })
 }
 
 pub fn record_timestamp_ms(record: &Value) -> Option<i64> {

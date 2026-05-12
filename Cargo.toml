@@ -7,7 +7,8 @@ license = "Apache-2.0"
 [dependencies]
 anyhow = "1.0.102"
 chrono = { version = "0.4.44", features = ["clock", "serde"] }
-duckdb = { version = "1.4.4", features = ["bundled"] }
+arrow58 = { package = "arrow", version = "58", default-features = false, features = ["ffi", "ipc", "json"] }
+duckdb = { version = "1.10502.0", features = ["bundled", "appender-arrow"] }
 flate2 = "1.1.9"
 otlp2records = "0.4.0"
 opentelemetry-proto = { version = "0.31.0", default-features = false, features = ["gen-tonic-messages", "trace", "logs", "metrics"] }

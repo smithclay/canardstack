@@ -1,9 +1,8 @@
 use crate::ingest::Signal;
 use crate::validation::{ApiError, ApiResult};
+use arrow58::record_batch::RecordBatch;
 use flate2::read::GzDecoder;
-use otlp2records::{
-    transform_logs_json, transform_metrics_json, transform_traces_json, InputFormat,
-};
+use otlp2records::{transform_logs_json, transform_metrics, transform_traces_json, InputFormat};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::io::Read;
@@ -12,8 +11,8 @@ use std::io::Read;
 pub struct Transformed {
     pub logs: Vec<Value>,
     pub spans: Vec<Value>,
-    pub gauge: Vec<Value>,
-    pub sum: Vec<Value>,
+    pub gauge: Option<RecordBatch>,
+    pub sum: Option<RecordBatch>,
     pub source_format: &'static str,
     pub unsupported_histograms: usize,
 }
@@ -71,8 +70,8 @@ pub fn transform(
             .map(|logs| Transformed {
                 logs,
                 spans: vec![],
-                gauge: vec![],
-                sum: vec![],
+                gauge: None,
+                sum: None,
                 source_format,
                 unsupported_histograms: 0,
             })
@@ -81,22 +80,32 @@ pub fn transform(
             .map(|spans| Transformed {
                 logs: vec![],
                 spans,
-                gauge: vec![],
-                sum: vec![],
+                gauge: None,
+                sum: None,
                 source_format,
                 unsupported_histograms: 0,
             })
             .map_err(|e| ApiError::new(400, "invalid_payload", e.to_string())),
         Signal::MetricGauge | Signal::MetricSum => {
-            let batches = transform_metrics_json(body, format)
+            let batches = transform_metrics(body, format)
                 .map_err(|e| ApiError::new(400, "invalid_payload", e.to_string()))?;
+            let unsupported_histograms = batches
+                .histogram
+                .as_ref()
+                .map(RecordBatch::num_rows)
+                .unwrap_or(0)
+                + batches
+                    .exp_histogram
+                    .as_ref()
+                    .map(RecordBatch::num_rows)
+                    .unwrap_or(0);
             Ok(Transformed {
                 logs: vec![],
                 spans: vec![],
                 gauge: batches.gauge,
                 sum: batches.sum,
                 source_format,
-                unsupported_histograms: batches.histogram.len() + batches.exp_histogram.len(),
+                unsupported_histograms,
             })
         }
     }
