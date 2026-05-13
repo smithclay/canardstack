@@ -33,6 +33,10 @@ pub struct Config {
     pub future_accept_secs: i64,
     pub force_dependency_unhealthy: bool,
     pub use_ducklake: bool,
+    pub ducklake_data_inlining_row_limit: usize,
+    pub ducklake_compaction_enabled: bool,
+    pub ducklake_compaction_max_compacted_files: usize,
+    pub ducklake_compaction_cleanup_files: bool,
     pub query_interactive: QueryLane,
     pub query_background: QueryLane,
     pub logs_retention_days: i64,
@@ -92,6 +96,19 @@ impl Config {
             future_accept_secs: env_i64("CANARDSTACK_ACCEPT_FUTURE_SECS", 10 * 60)?,
             force_dependency_unhealthy: false,
             use_ducklake: env_bool("CANARDSTACK_USE_DUCKLAKE", true)?,
+            ducklake_data_inlining_row_limit: env_usize(
+                "CANARDSTACK_DUCKLAKE_DATA_INLINING_ROW_LIMIT",
+                0,
+            )?,
+            ducklake_compaction_enabled: env_bool("CANARDSTACK_DUCKLAKE_COMPACTION_ENABLED", true)?,
+            ducklake_compaction_max_compacted_files: env_usize(
+                "CANARDSTACK_DUCKLAKE_COMPACTION_MAX_COMPACTED_FILES",
+                1_000,
+            )?,
+            ducklake_compaction_cleanup_files: env_bool(
+                "CANARDSTACK_DUCKLAKE_COMPACTION_CLEANUP_FILES",
+                false,
+            )?,
             query_interactive: QueryLane {
                 concurrency: env_usize("CANARDSTACK_QUERY_INTERACTIVE_CONCURRENCY", 4)?,
                 timeout_secs: env_usize("CANARDSTACK_QUERY_INTERACTIVE_TIMEOUT_SECS", 15)? as u64,
@@ -154,6 +171,10 @@ impl Config {
             future_accept_secs: 10 * 60,
             force_dependency_unhealthy: false,
             use_ducklake: false,
+            ducklake_data_inlining_row_limit: 0,
+            ducklake_compaction_enabled: true,
+            ducklake_compaction_max_compacted_files: 1_000,
+            ducklake_compaction_cleanup_files: false,
             query_interactive: QueryLane {
                 concurrency: 4,
                 timeout_secs: 15,
@@ -208,6 +229,9 @@ impl Config {
         }
         if self.duckdb_write_memory_limit.trim().is_empty() {
             anyhow::bail!("CANARDSTACK_DUCKDB_WRITE_MEMORY_LIMIT must not be empty");
+        }
+        if self.ducklake_compaction_max_compacted_files == 0 {
+            anyhow::bail!("CANARDSTACK_DUCKLAKE_COMPACTION_MAX_COMPACTED_FILES must be > 0");
         }
         if self.high_pressure_max_age > self.max_age {
             anyhow::bail!(

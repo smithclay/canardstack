@@ -776,6 +776,25 @@ fn record_operator_gauges(state: &AppState) {
             }
         }
     }
+    if let Some(tables) = storage
+        .ducklake_storage_layout
+        .get("tables")
+        .and_then(Value::as_object)
+    {
+        for (table, value) in tables {
+            for (metric, field) in [
+                ("canardstack_ducklake_parquet_files", "parquet_files"),
+                ("canardstack_ducklake_parquet_rows", "parquet_rows"),
+                ("canardstack_ducklake_inlined_rows", "inlined_rows"),
+            ] {
+                if let Some(count) = value.get(field).and_then(Value::as_i64) {
+                    state
+                        .metrics
+                        .gauge(metric, &[("table", table.as_str())], count as f64);
+                }
+            }
+        }
+    }
     if let Some(watermarks) = storage.freshness_watermarks.as_object() {
         for (table, value) in watermarks {
             if let Some(epoch) = value.get("epoch_seconds").and_then(Value::as_f64) {

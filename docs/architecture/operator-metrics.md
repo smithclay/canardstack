@@ -42,6 +42,9 @@ Do not label metrics by `service_name`, trace id, query text, API key, or arbitr
 | --- | --- | --- | --- |
 | `canardstack_storage_logical_rows` | Gauge | `table` | Row count per table from DuckDB. |
 | `canardstack_storage_physical_bytes` | Gauge | `table=all` | Local storage directory size on disk. |
+| `canardstack_ducklake_parquet_files` | Gauge | `table` | Active DuckLake Parquet data files per table. |
+| `canardstack_ducklake_parquet_rows` | Gauge | `table` | Active rows stored in DuckLake Parquet data files per table. |
+| `canardstack_ducklake_inlined_rows` | Gauge | `table` | Rows currently held in DuckLake inlined-data tables per table. |
 
 ## Query Metrics
 

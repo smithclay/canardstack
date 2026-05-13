@@ -616,6 +616,16 @@ fn print_summary(report: &Report, path: &Path) {
         })
         .collect::<Vec<_>>();
     println!("phase_top={}", top_phases.join("; "));
+    if let Some(storage) = &report.storage {
+        if !storage.ducklake_parquet_files.is_empty() || !storage.ducklake_inlined_rows.is_empty() {
+            println!(
+                "ducklake_layout parquet_files={:?} parquet_rows={:?} inlined_rows={:?}",
+                storage.ducklake_parquet_files,
+                storage.ducklake_parquet_rows,
+                storage.ducklake_inlined_rows
+            );
+        }
+    }
     println!("report={}", path.display());
     if !report.failure_reasons.is_empty() {
         println!("failure_reasons={}", report.failure_reasons.join("; "));
@@ -1355,6 +1365,27 @@ fn scrape_metrics(text: &str) -> ScrapedMetrics {
                         .insert(table.clone(), metric.value as u64);
                 }
             }
+            "canardstack_ducklake_parquet_files" => {
+                if let Some(table) = metric.labels.get("table") {
+                    out.storage
+                        .ducklake_parquet_files
+                        .insert(table.clone(), metric.value as u64);
+                }
+            }
+            "canardstack_ducklake_parquet_rows" => {
+                if let Some(table) = metric.labels.get("table") {
+                    out.storage
+                        .ducklake_parquet_rows
+                        .insert(table.clone(), metric.value as u64);
+                }
+            }
+            "canardstack_ducklake_inlined_rows" => {
+                if let Some(table) = metric.labels.get("table") {
+                    out.storage
+                        .ducklake_inlined_rows
+                        .insert(table.clone(), metric.value as u64);
+                }
+            }
             "canardstack_phase_duration_seconds_count" => {
                 phase_counts.insert(labels_key(&metric.labels), metric.value);
             }
@@ -1560,6 +1591,9 @@ struct QueueReport {
 struct StorageReport {
     physical_bytes: Option<u64>,
     logical_rows: BTreeMap<String, u64>,
+    ducklake_parquet_files: BTreeMap<String, u64>,
+    ducklake_parquet_rows: BTreeMap<String, u64>,
+    ducklake_inlined_rows: BTreeMap<String, u64>,
 }
 
 #[derive(Clone, Serialize)]

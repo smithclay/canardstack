@@ -151,9 +151,20 @@ Initial policy:
 
 - Insert batches into DuckLake tables as soon as flush triggers fire.
 - Let DuckLake inline small inserts below its configured threshold.
+- Configure that threshold with
+  `CANARDSTACK_DUCKLAKE_DATA_INLINING_ROW_LIMIT` (default `0`, which forces
+  direct data files when DuckLake supports direct file writes for the batch).
 - Prefer larger batches that become Parquet directly when sustained throughput
   permits.
-- Track inlined rows, inlined bytes, oldest inlined data age, and flush failure
+- Run `ducklake_merge_adjacent_files` during flush maintenance to compact
+  direct-write small files. Bound each maintenance call with
+  `CANARDSTACK_DUCKLAKE_COMPACTION_MAX_COMPACTED_FILES` (default `1000`) and
+  disable with `CANARDSTACK_DUCKLAKE_COMPACTION_ENABLED=false`.
+- Keep immediate cleanup of compacted files opt-in with
+  `CANARDSTACK_DUCKLAKE_COMPACTION_CLEANUP_FILES=true`; it calls DuckLake file
+  cleanup for files scheduled by compaction and should only be enabled where
+  the maintenance role can rule out long-running readers.
+- Track active Parquet files, Parquet rows, inlined rows, and flush failure
   count per table.
 
 Operator-facing target:

@@ -17,7 +17,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const DUCKDB_THREADS: usize = 1;
 
@@ -33,6 +33,7 @@ pub struct StorageHealth {
     pub capabilities: StorageCapabilities,
     pub freshness_watermarks: Value,
     pub logical_rows: Value,
+    pub ducklake_storage_layout: Value,
     pub physical_bytes: u64,
 }
 
@@ -85,6 +86,9 @@ pub struct Storage {
     local_storage_dir: PathBuf,
     ducklake_required: bool,
     ducklake_managed_maintenance: bool,
+    ducklake_compaction_enabled: bool,
+    ducklake_compaction_max_compacted_files: usize,
+    ducklake_compaction_cleanup_files: bool,
     write_memory_limit: String,
     last_error: Mutex<Option<String>>,
 }
@@ -133,6 +137,31 @@ impl std::fmt::Display for InsertRecordsError {
 
 impl std::error::Error for InsertRecordsError {}
 
+pub struct ArrowBatchInsert<'a> {
+    pub table: Signal,
+    pub batch: &'a RecordBatch,
+    pub source_format: &'a str,
+}
+
+#[derive(Clone, Debug)]
+pub struct ArrowBatchInsertTiming {
+    pub table: Signal,
+    pub rows: usize,
+    pub seconds: f64,
+}
+
+#[derive(Clone, Debug)]
+pub struct ArrowBatchInsertResult {
+    pub rows: usize,
+    pub timings: Vec<ArrowBatchInsertTiming>,
+}
+
+struct PreparedArrowBatch {
+    table: Signal,
+    batch: RecordBatch,
+    rows: usize,
+}
+
 impl Storage {
     pub fn open(config: &Config) -> Result<Self> {
         if let Some(parent) = config.duckdb_path.parent() {
@@ -158,6 +187,7 @@ impl Storage {
                 &config.duckdb_path,
                 &config.local_storage_dir,
                 config.duckdb_extension_dir.as_deref(),
+                config.ducklake_data_inlining_row_limit,
             )
             .context(
                 "DuckLake attach failed. Fix the catalog config (URI, token, network) and \
@@ -191,6 +221,9 @@ impl Storage {
             local_storage_dir: config.local_storage_dir.clone(),
             ducklake_required: config.use_ducklake,
             ducklake_managed_maintenance,
+            ducklake_compaction_enabled: config.ducklake_compaction_enabled,
+            ducklake_compaction_max_compacted_files: config.ducklake_compaction_max_compacted_files,
+            ducklake_compaction_cleanup_files: config.ducklake_compaction_cleanup_files,
             write_memory_limit: config.duckdb_write_memory_limit.clone(),
             last_error: Mutex::new(None),
         })
@@ -237,6 +270,9 @@ impl Storage {
             logical_rows: self
                 .logical_rows()
                 .unwrap_or_else(|err| json!({"error": err.to_string()})),
+            ducklake_storage_layout: self
+                .ducklake_storage_layout()
+                .unwrap_or_else(|err| json!({"error": err.to_string()})),
             physical_bytes: dir_size(&self.local_storage_dir).unwrap_or(0),
         }
     }
@@ -257,31 +293,218 @@ impl Storage {
         batch: &RecordBatch,
         source_format: &str,
     ) -> Result<usize> {
-        if batch.num_rows() == 0 {
-            return Ok(0);
+        let result = self.insert_arrow_batches(&[ArrowBatchInsert {
+            table,
+            batch,
+            source_format,
+        }])?;
+        Ok(result.rows)
+    }
+
+    pub fn insert_arrow_batches(
+        &self,
+        batches: &[ArrowBatchInsert<'_>],
+    ) -> Result<ArrowBatchInsertResult> {
+        let mut prepared = Vec::new();
+        let mut attempted_rows = 0;
+        let mut error_table = None;
+        for batch in batches {
+            if batch.batch.num_rows() == 0 {
+                continue;
+            }
+            error_table.get_or_insert(batch.table);
+            let rows = batch.batch.num_rows();
+            attempted_rows += rows;
+            prepared.push(PreparedArrowBatch {
+                table: batch.table,
+                batch: storage_duckdb_batch(batch.table, batch.batch, batch.source_format)?,
+                rows,
+            });
         }
 
-        let rows = batch.num_rows();
-        let append_batch = storage_duckdb_batch(table, batch, source_format)?;
+        if prepared.is_empty() {
+            return Ok(ArrowBatchInsertResult {
+                rows: 0,
+                timings: Vec::new(),
+            });
+        }
+
         let conn = self.writer.lock_or_poisoned();
         configure_write_connection(&conn, &self.write_memory_limit)?;
-        let append_result = (|| -> Result<()> {
-            let mut appender = create_appender(&conn, &self.target_prefix, table.as_str())?;
-            appender.append_record_batch(append_batch)?;
-            appender.flush()?;
-            Ok(())
+        let append_result = (|| -> Result<Vec<ArrowBatchInsertTiming>> {
+            conn.execute_batch("BEGIN TRANSACTION;")?;
+            let mut timings = Vec::new();
+            for table in unique_tables(&prepared) {
+                let started = Instant::now();
+                let mut rows = 0;
+                {
+                    let mut appender = create_appender(&conn, &self.target_prefix, table.as_str())?;
+                    for prepared in prepared.iter().filter(|batch| batch.table == table) {
+                        rows += prepared.rows;
+                        appender.append_record_batch(prepared.batch.clone())?;
+                    }
+                    appender.flush()?;
+                }
+                timings.push(ArrowBatchInsertTiming {
+                    table,
+                    rows,
+                    seconds: started.elapsed().as_secs_f64(),
+                });
+            }
+            let commit_started = Instant::now();
+            conn.execute_batch("COMMIT;")?;
+            distribute_commit_seconds(&mut timings, commit_started.elapsed().as_secs_f64());
+            Ok(timings)
         })();
-        if let Err(err) = append_result {
-            *self.last_error.lock_or_poisoned() = Some(err.to_string());
-            return Err(anyhow::Error::new(InsertRecordsError {
-                table,
-                committed_rows: 0,
-                attempted_rows: rows,
-                source: err,
-            }));
+        match append_result {
+            Ok(timings) => {
+                *self.last_error.lock_or_poisoned() = None;
+                Ok(ArrowBatchInsertResult {
+                    rows: attempted_rows,
+                    timings,
+                })
+            }
+            Err(err) => {
+                let _ = conn.execute_batch("ROLLBACK;");
+                *self.last_error.lock_or_poisoned() = Some(err.to_string());
+                Err(anyhow::Error::new(InsertRecordsError {
+                    table: error_table.unwrap_or(Signal::Logs),
+                    committed_rows: 0,
+                    attempted_rows,
+                    source: err,
+                }))
+            }
         }
-        *self.last_error.lock_or_poisoned() = None;
-        Ok(rows)
+    }
+
+    pub fn ducklake_storage_layout(&self) -> Result<Value> {
+        if !self.ducklake_available {
+            return Ok(json!({"supported": false, "reason": "ducklake is not attached"}));
+        }
+        self.with_conn(|conn, _| {
+            let tables = self.ducklake_storage_layout_on(conn)?;
+            Ok(json!({"supported": true, "tables": tables}))
+        })
+    }
+
+    fn ducklake_storage_layout_on(&self, conn: &Connection) -> Result<Value> {
+        let metadata_prefix = ducklake_metadata_prefix(&self.catalog_name);
+        let mut tables = serde_json::Map::new();
+        let sql = format!(
+            "\
+            SELECT t.table_id, t.table_name, count(f.data_file_id), coalesce(sum(f.record_count), 0) \
+            FROM {metadata_prefix}ducklake_table t \
+            LEFT JOIN {metadata_prefix}ducklake_data_file f \
+              ON f.table_id = t.table_id AND f.end_snapshot IS NULL \
+            WHERE t.end_snapshot IS NULL \
+            GROUP BY t.table_id, t.table_name"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })?;
+        for row in rows {
+            let (table_id, table_name, parquet_files, parquet_rows) = row?;
+            tables.insert(
+                table_name,
+                json!({
+                    "table_id": table_id,
+                    "parquet_files": parquet_files,
+                    "parquet_rows": parquet_rows,
+                    "inlined_rows": 0
+                }),
+            );
+        }
+
+        let sql = format!(
+            "SELECT table_id, table_name FROM {metadata_prefix}ducklake_inlined_data_tables ORDER BY table_id"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let inlined = stmt.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in inlined {
+            let (table_id, inlined_table) = row?;
+            let count_sql = format!(
+                "SELECT count(*) FROM {metadata_prefix}{} WHERE end_snapshot IS NULL",
+                quote_ident(&inlined_table)
+            );
+            let inlined_rows: i64 = conn.query_row(&count_sql, [], |row| row.get(0))?;
+            for value in tables.values_mut() {
+                if value.get("table_id").and_then(Value::as_i64) == Some(table_id) {
+                    value["inlined_rows"] = json!(inlined_rows);
+                    break;
+                }
+            }
+        }
+        Ok(Value::Object(tables))
+    }
+
+    fn merge_adjacent_files_on(
+        &self,
+        conn: &Connection,
+        table: Option<&str>,
+        with_limits: bool,
+    ) -> Result<i64> {
+        let sql = if with_limits {
+            match table {
+                Some(table) => format!(
+                    "SELECT count(*) FROM ducklake_merge_adjacent_files('{}', '{}', schema => 'main', max_compacted_files => {})",
+                    self.catalog_name,
+                    escape_value(table),
+                    self.ducklake_compaction_max_compacted_files
+                ),
+                None => format!(
+                    "SELECT count(*) FROM ducklake_merge_adjacent_files('{}', max_compacted_files => {})",
+                    self.catalog_name, self.ducklake_compaction_max_compacted_files
+                ),
+            }
+        } else {
+            match table {
+                Some(table) => format!(
+                    "SELECT count(*) FROM ducklake_merge_adjacent_files('{}', '{}', schema => 'main')",
+                    self.catalog_name,
+                    escape_value(table)
+                ),
+                None => format!(
+                    "SELECT count(*) FROM ducklake_merge_adjacent_files('{}')",
+                    self.catalog_name
+                ),
+            }
+        };
+        conn.query_row(&sql, [], |row| row.get(0)).with_context(|| {
+            format!(
+                "run DuckLake merge_adjacent_files for {}",
+                table.unwrap_or("all tables")
+            )
+        })
+    }
+
+    fn cleanup_compacted_files_on(&self, conn: &Connection) -> Result<Value> {
+        let sql = format!(
+            "SELECT count(*) FROM ducklake_cleanup_old_files('{}', cleanup_all => true)",
+            self.catalog_name
+        );
+        let scheduled_deleted_files: i64 = conn
+            .query_row(&sql, [], |row| row.get(0))
+            .context("run DuckLake cleanup_old_files after compaction")?;
+        let sql = format!(
+            "SELECT count(*) FROM ducklake_delete_orphaned_files('{}', cleanup_all => true)",
+            self.catalog_name
+        );
+        let orphan_deleted_files: i64 = conn
+            .query_row(&sql, [], |row| row.get(0))
+            .context("run DuckLake delete_orphaned_files after compaction")?;
+        Ok(json!({
+            "status": "ok",
+            "scheduled_deleted_files": scheduled_deleted_files,
+            "orphan_deleted_files": orphan_deleted_files
+        }))
     }
 
     /// Read-side connection access for SELECT-only paths. Do not call into
@@ -368,6 +591,49 @@ impl Storage {
         };
         conn.execute_batch(&sql)?;
         Ok(json!({"supported": true, "status": "ok"}))
+    }
+
+    pub fn merge_adjacent_files(&self, table: Option<&str>) -> Result<Value> {
+        if !self.ducklake_managed_maintenance {
+            return Ok(
+                json!({"supported": false, "reason": "ducklake maintenance is not managed by this process"}),
+            );
+        }
+        if !self.ducklake_compaction_enabled {
+            return Ok(json!({"supported": true, "status": "disabled"}));
+        }
+
+        let conn = self.writer.lock_or_poisoned();
+        let before = self.ducklake_storage_layout_on(&conn)?;
+        let output_files = match self.merge_adjacent_files_on(&conn, table, true) {
+            Ok(output_files) => output_files,
+            Err(primary) => {
+                let fallback = self.merge_adjacent_files_on(&conn, table, false);
+                match fallback {
+                    Ok(output_files) => output_files,
+                    Err(fallback) => {
+                        return Err(fallback.context(format!(
+                            "ducklake merge_adjacent_files fallback failed after primary error: {primary}"
+                        )));
+                    }
+                }
+            }
+        };
+        let file_cleanup = if self.ducklake_compaction_cleanup_files {
+            self.cleanup_compacted_files_on(&conn)?
+        } else {
+            json!({"status": "skipped", "reason": "disabled"})
+        };
+        let after = self.ducklake_storage_layout_on(&conn)?;
+        Ok(json!({
+            "supported": true,
+            "status": "ok",
+            "table": table,
+            "output_files": output_files,
+            "file_cleanup": file_cleanup,
+            "before": before,
+            "after": after
+        }))
     }
 
     pub fn cleanup_old_files(&self, dry_run: bool) -> Result<Value> {
@@ -553,10 +819,16 @@ fn attach_ducklake_connection(
     duckdb_path: &Path,
     local_storage_dir: &Path,
     extension_dir: Option<&Path>,
+    data_inlining_row_limit: usize,
 ) -> Result<()> {
     configure_extension_directory(conn, extension_dir)?;
-    let plan =
-        build_ducklake_attach_plan(postgres_dsn, attach_uri, duckdb_path, local_storage_dir)?;
+    let plan = build_ducklake_attach_plan(
+        postgres_dsn,
+        attach_uri,
+        duckdb_path,
+        local_storage_dir,
+        data_inlining_row_limit,
+    )?;
 
     if plan.needs_motherduck && conn.execute_batch("LOAD md;").is_err() {
         conn.execute_batch("INSTALL md; LOAD md;")?;
@@ -587,6 +859,7 @@ fn ducklake_attach_plan(config: &Config) -> Result<DuckLakeAttachPlan> {
         config.ducklake_attach_uri.as_deref(),
         &config.duckdb_path,
         &config.local_storage_dir,
+        config.ducklake_data_inlining_row_limit,
     )
 }
 
@@ -595,6 +868,7 @@ fn build_ducklake_attach_plan(
     attach_uri: Option<&str>,
     duckdb_path: &Path,
     local_storage_dir: &Path,
+    data_inlining_row_limit: usize,
 ) -> Result<DuckLakeAttachPlan> {
     if postgres_dsn.is_some() && attach_uri.is_some() {
         anyhow::bail!(
@@ -614,10 +888,16 @@ fn build_ducklake_attach_plan(
         }
         let is_motherduck = uri.starts_with("md:");
         let is_ducklake = uri.starts_with("ducklake:");
+        let attach_options = if is_ducklake {
+            format!(" (DATA_INLINING_ROW_LIMIT {data_inlining_row_limit})")
+        } else {
+            String::new()
+        };
         return Ok(DuckLakeAttachPlan {
             sql: format!(
-                "ATTACH '{}' AS canardlake; USE canardlake;",
-                uri.replace('\'', "''")
+                "ATTACH '{}' AS canardlake{}; USE canardlake;",
+                uri.replace('\'', "''"),
+                attach_options
             ),
             mode: if is_motherduck {
                 "ducklake_motherduck_remote"
@@ -637,9 +917,10 @@ fn build_ducklake_attach_plan(
     if let Some(dsn) = postgres_dsn {
         return Ok(DuckLakeAttachPlan {
             sql: format!(
-                "ATTACH 'ducklake:postgres:{}' AS canardlake (DATA_PATH '{}', DATA_INLINING_ROW_LIMIT 1000); USE canardlake;",
+                "ATTACH 'ducklake:postgres:{}' AS canardlake (DATA_PATH '{}', DATA_INLINING_ROW_LIMIT {}); USE canardlake;",
                 dsn.replace('\'', "''"),
-                data_path
+                data_path,
+                data_inlining_row_limit
             ),
             mode: "ducklake_postgres_catalog",
             needs_ducklake: true,
@@ -655,9 +936,10 @@ fn build_ducklake_attach_plan(
         .join("canardstack.ducklake");
     Ok(DuckLakeAttachPlan {
         sql: format!(
-            "ATTACH 'ducklake:{}' AS canardlake (DATA_PATH '{}', DATA_INLINING_ROW_LIMIT 1000); USE canardlake;",
+            "ATTACH 'ducklake:{}' AS canardlake (DATA_PATH '{}', DATA_INLINING_ROW_LIMIT {}); USE canardlake;",
             sql_path(&metadata),
-            data_path
+            data_path,
+            data_inlining_row_limit
         ),
         mode: "ducklake_duckdb_catalog",
         needs_ducklake: true,
@@ -702,6 +984,44 @@ fn create_appender<'a>(
         conn.appender(table)
             .with_context(|| format!("create appender for {table}"))
     }
+}
+
+fn unique_tables(prepared: &[PreparedArrowBatch]) -> Vec<Signal> {
+    let mut tables = Vec::new();
+    for batch in prepared {
+        if !tables.contains(&batch.table) {
+            tables.push(batch.table);
+        }
+    }
+    tables
+}
+
+fn distribute_commit_seconds(timings: &mut [ArrowBatchInsertTiming], commit_seconds: f64) {
+    if timings.is_empty() || commit_seconds <= 0.0 {
+        return;
+    }
+    let total_rows: usize = timings.iter().map(|timing| timing.rows).sum();
+    if total_rows == 0 {
+        let each = commit_seconds / timings.len() as f64;
+        for timing in timings {
+            timing.seconds += each;
+        }
+        return;
+    }
+    for timing in timings {
+        timing.seconds += commit_seconds * timing.rows as f64 / total_rows as f64;
+    }
+}
+
+fn quote_ident(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
+}
+
+fn ducklake_metadata_prefix(catalog_name: &str) -> String {
+    format!(
+        "{}.",
+        quote_ident(&format!("__ducklake_metadata_{catalog_name}"))
+    )
 }
 
 fn storage_duckdb_batch(
@@ -1054,6 +1374,7 @@ mod tests {
             Some("md:test-ducklake"),
             &dir.path().join("canardstack.duckdb"),
             &dir.path().join("storage"),
+            1_000,
         )
         .unwrap();
 
@@ -1076,12 +1397,28 @@ mod tests {
             Some("md:test-ducklake"),
             &dir.path().join("canardstack.duckdb"),
             &dir.path().join("storage"),
+            1_000,
         )
         .unwrap_err();
 
         assert!(err.to_string().contains(
             "set only one of CANARDSTACK_POSTGRES_DSN or CANARDSTACK_DUCKLAKE_ATTACH_URI"
         ));
+    }
+
+    #[test]
+    fn ducklake_attach_uses_configured_data_inlining_limit() {
+        let dir = tempdir().unwrap();
+        let plan = build_ducklake_attach_plan(
+            None,
+            None,
+            &dir.path().join("canardstack.duckdb"),
+            &dir.path().join("storage"),
+            0,
+        )
+        .unwrap();
+
+        assert!(plan.sql.contains("DATA_INLINING_ROW_LIMIT 0"));
     }
 
     #[test]
@@ -1092,6 +1429,7 @@ mod tests {
             Some("ATTACH 'md:test-ducklake';"),
             &dir.path().join("canardstack.duckdb"),
             &dir.path().join("storage"),
+            1_000,
         )
         .unwrap_err();
 

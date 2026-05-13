@@ -86,7 +86,7 @@ impl Maintenance {
                 "spans": self.retention.spans_days,
                 "metrics": self.retention.metrics_days
             },
-            "priority_order": ["queue_watchdog", "flush_inlined_data", "retention"]
+            "priority_order": ["queue_watchdog", "flush_inlined_data", "merge_adjacent_files", "retention"]
         })
     }
 
@@ -102,11 +102,13 @@ impl Maintenance {
         let started = Instant::now();
         let process_rows = ingestor.flush_all(storage)?;
         let ducklake = storage.flush_inlined_data(table)?;
+        let compaction = storage.merge_adjacent_files(table)?;
         self.record_run("flush");
         Ok(json!({
             "status": "ok",
             "process_rows_flushed": process_rows,
             "ducklake": ducklake,
+            "compaction": compaction,
             "duration_ms": started.elapsed().as_millis()
         }))
     }

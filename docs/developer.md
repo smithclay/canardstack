@@ -53,6 +53,16 @@ file beside `CANARDSTACK_DUCKDB_PATH` and local file storage under
 `CANARDSTACK_STORAGE_DIR`. Postgres catalogs and object storage are later
 deployment modes, not required for the Docker quickstart.
 
+Default v0 writes use DuckLake direct data-file writes
+(`CANARDSTACK_DUCKLAKE_DATA_INLINING_ROW_LIMIT=0`) and scheduled
+`ducklake_merge_adjacent_files` compaction
+(`CANARDSTACK_DUCKLAKE_COMPACTION_ENABLED=true`). This keeps ingest latency low
+without leaving many active small files. Immediate cleanup of compacted files is
+off by default (`CANARDSTACK_DUCKLAKE_COMPACTION_CLEANUP_FILES=false`) because
+operators should only remove files scheduled for deletion when long-running
+readers are understood. Local single-process runs can enable it to reclaim disk
+space aggressively.
+
 The Docker image build runs `canardstack install-ducklake-extension` and stores
 the DuckDB DuckLake extension under `/usr/local/lib/duckdb/extensions`. That
 build step needs network access to the DuckDB extension repository the first
@@ -273,7 +283,7 @@ loop without operator action:
 - A queue watchdog flushes per-signal queues whose oldest batch has exceeded
   `max_age`, so freshness stays bounded even if ingest pauses mid-batch.
 - A periodic flush drains process queues to DuckLake and triggers DuckLake's
-  inlined-data flush.
+  inlined-data flush plus small-file compaction.
 - A retention pass enforces the configured retention days, expires DuckLake
   snapshots, and cleans old files.
 

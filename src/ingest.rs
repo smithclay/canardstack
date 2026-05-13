@@ -1,7 +1,7 @@
 use crate::config::Config;
 use crate::metrics::Metrics;
 use crate::otlp::{self, Transformed};
-use crate::storage::{InsertRecordsError, Storage};
+use crate::storage::{ArrowBatchInsert, Storage};
 use crate::validation::{self, ApiError, ApiResult};
 use crate::LockExt;
 use arrow58::record_batch::RecordBatch;
@@ -28,6 +28,10 @@ impl Signal {
             Signal::MetricGauge => "metric_gauge",
             Signal::MetricSum => "metric_sum",
         }
+    }
+
+    fn is_metric(self) -> bool {
+        matches!(self, Signal::MetricGauge | Signal::MetricSum)
     }
 }
 
@@ -98,22 +102,6 @@ impl QueuedBatch {
             approx_bytes: rest_bytes,
         };
         (taken, rest)
-    }
-
-    fn suffix(&self, committed_rows: usize) -> Option<Self> {
-        if committed_rows >= self.len() {
-            return None;
-        }
-        let batch = self
-            .batch
-            .slice(committed_rows, self.batch.num_rows() - committed_rows);
-        let approx_bytes = proportional_bytes(self.approx_bytes, batch.num_rows(), self.len());
-        Some(Self {
-            batch,
-            source_format: self.source_format,
-            accepted_at: self.accepted_at,
-            approx_bytes,
-        })
     }
 
     fn len(&self) -> usize {
@@ -253,14 +241,13 @@ impl Ingestor {
     pub fn flush_all(&self, storage: &Storage) -> anyhow::Result<usize> {
         let _guard = self.flush_lock.lock_or_poisoned();
         let mut total = 0;
-        for signal in [
-            Signal::Logs,
-            Signal::Spans,
-            Signal::MetricGauge,
-            Signal::MetricSum,
-        ] {
+        for signal in [Signal::Logs, Signal::Spans] {
             total += self.flush_signal_observed(signal, storage, None)?;
         }
+        total += self
+            .flush_metric_pair_observed(storage, None)?
+            .into_values()
+            .sum::<usize>();
         Ok(total)
     }
 
@@ -278,8 +265,7 @@ impl Ingestor {
         };
         let _guard = self.flush_lock.lock_or_poisoned();
         let mut flushed = HashMap::new();
-        for signal in due {
-            let rows = self.flush_signal_observed(signal, storage, None)?;
+        for (signal, rows) in self.flush_due_signals_observed(due, storage, None)? {
             if rows > 0 {
                 flushed.insert(signal, rows);
             }
@@ -299,34 +285,102 @@ impl Ingestor {
         metrics: Option<&Metrics>,
     ) -> anyhow::Result<usize> {
         let batches = self.drain_flush_batches(signal);
+        self.insert_drained_batches_observed(vec![(signal, batches)], storage, metrics)
+            .map(|rows| rows.get(&signal).copied().unwrap_or(0))
+    }
 
-        let mut rows = 0;
-        for idx in 0..batches.len() {
-            let batch = &batches[idx];
-            let started = Instant::now();
-            let insert_result =
-                storage.insert_arrow_records(signal, &batch.batch, batch.source_format);
-            if let Some(metrics) = metrics {
-                metrics.observe_phase_seconds(
-                    signal.as_str(),
-                    "storage_insert",
-                    None,
-                    started.elapsed().as_secs_f64(),
-                );
+    fn flush_metric_pair_observed(
+        &self,
+        storage: &Storage,
+        metrics: Option<&Metrics>,
+    ) -> anyhow::Result<HashMap<Signal, usize>> {
+        let batches = vec![
+            (
+                Signal::MetricGauge,
+                self.drain_flush_batches(Signal::MetricGauge),
+            ),
+            (
+                Signal::MetricSum,
+                self.drain_flush_batches(Signal::MetricSum),
+            ),
+        ];
+        self.insert_drained_batches_observed(batches, storage, metrics)
+    }
+
+    fn flush_due_signals_observed(
+        &self,
+        due: Vec<Signal>,
+        storage: &Storage,
+        metrics: Option<&Metrics>,
+    ) -> anyhow::Result<HashMap<Signal, usize>> {
+        let mut flushed = HashMap::new();
+        let flush_metrics = due.iter().any(|signal| signal.is_metric());
+        for signal in due.into_iter().filter(|signal| !signal.is_metric()) {
+            let rows = self.flush_signal_observed(signal, storage, metrics)?;
+            flushed.insert(signal, rows);
+        }
+        if flush_metrics {
+            flushed.extend(self.flush_metric_pair_observed(storage, metrics)?);
+        }
+        Ok(flushed)
+    }
+
+    fn insert_drained_batches_observed(
+        &self,
+        sets: Vec<(Signal, Vec<QueuedBatch>)>,
+        storage: &Storage,
+        metrics: Option<&Metrics>,
+    ) -> anyhow::Result<HashMap<Signal, usize>> {
+        let mut inserts = Vec::new();
+        for (signal, batches) in &sets {
+            for batch in batches {
+                inserts.push(ArrowBatchInsert {
+                    table: *signal,
+                    batch: &batch.batch,
+                    source_format: batch.source_format,
+                });
             }
-            match insert_result {
-                Ok(committed) => {
-                    rows += committed;
-                }
-                Err(err) => {
-                    let committed_in_batch =
-                        insert_committed_rows(&err).unwrap_or(0).min(batch.len());
-                    rows += committed_in_batch;
-                    let mut remaining = Vec::new();
-                    if let Some(uncommitted) = batch.suffix(committed_in_batch) {
-                        remaining.push(uncommitted);
+        }
+        if inserts.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let insert_result = storage.insert_arrow_batches(&inserts);
+        drop(inserts);
+        match insert_result {
+            Ok(result) => {
+                let mut rows = HashMap::new();
+                for timing in result.timings {
+                    if let Some(metrics) = metrics {
+                        metrics.observe_phase_seconds(
+                            timing.table.as_str(),
+                            "storage_insert",
+                            None,
+                            timing.seconds,
+                        );
                     }
-                    remaining.extend(batches.into_iter().skip(idx + 1));
+                    rows.insert(timing.table, timing.rows);
+                    if let Some(metrics) = metrics {
+                        metrics.inc(
+                            "canardstack_ingest_flush_rows_total",
+                            &[("signal", timing.table.as_str())],
+                            timing.rows as u64,
+                        );
+                    }
+                }
+                Ok(rows)
+            }
+            Err(err) => {
+                let failed_signal = sets
+                    .iter()
+                    .find(|(_, batches)| !batches.is_empty())
+                    .map(|(signal, _)| *signal)
+                    .unwrap_or(Signal::Logs);
+                for (signal, batches) in sets {
+                    let restored_rows: usize = batches.iter().map(QueuedBatch::len).sum();
+                    if restored_rows == 0 {
+                        continue;
+                    }
                     if let Some(metrics) = metrics {
                         metrics.inc(
                             "canardstack_ingest_flush_failures_total",
@@ -337,38 +391,28 @@ impl Ingestor {
                             1,
                         );
                     }
-                    let remaining_rows: usize = remaining.iter().map(QueuedBatch::len).sum();
-                    let committed_str = committed_in_batch.to_string();
-                    let remaining_str = remaining_rows.to_string();
+                    let restored_str = restored_rows.to_string();
                     let err_str = err.to_string();
                     crate::log_event(
                         "error",
                         "ingest_flush_failed",
                         &[
                             ("signal", signal.as_str()),
-                            ("committed_rows", &committed_str),
-                            ("restored_rows", &remaining_str),
+                            ("committed_rows", "0"),
+                            ("restored_rows", &restored_str),
                             ("reason", flush_failure_reason(&err)),
                             ("error", &err_str),
                         ],
                     );
-                    self.restore_batches(signal, remaining);
-                    return Err(anyhow::Error::new(PartialFlushError {
-                        committed_rows: rows,
-                        signal,
-                        source: err,
-                    }));
+                    self.restore_batches(signal, batches);
                 }
+                Err(anyhow::Error::new(PartialFlushError {
+                    committed_rows: 0,
+                    signal: failed_signal,
+                    source: err,
+                }))
             }
         }
-        if let Some(metrics) = metrics {
-            metrics.inc(
-                "canardstack_ingest_flush_rows_total",
-                &[("signal", signal.as_str())],
-                rows as u64,
-            );
-        }
-        Ok(rows)
     }
 
     fn drain_flush_batches(&self, signal: Signal) -> Vec<QueuedBatch> {
@@ -567,23 +611,22 @@ impl Ingestor {
         if !flush_signals.is_empty() {
             match self.flush_lock.try_lock() {
                 Ok(_guard) => {
-                    for signal in flush_signals {
-                        if let Err(err) = self.flush_signal_observed(signal, storage, Some(metrics))
-                        {
-                            if let Some((partial_signal, committed)) = partial_commit_info(&err) {
-                                if committed > 0 {
-                                    metrics.inc(
-                                        "canardstack_ingest_partial_commit_rows_total",
-                                        &[
-                                            ("signal", partial_signal.as_str()),
-                                            ("triggered_by", request_signal.as_str()),
-                                        ],
-                                        committed as u64,
-                                    );
-                                }
+                    if let Err(err) =
+                        self.flush_due_signals_observed(flush_signals, storage, Some(metrics))
+                    {
+                        if let Some((partial_signal, committed)) = partial_commit_info(&err) {
+                            if committed > 0 {
+                                metrics.inc(
+                                    "canardstack_ingest_partial_commit_rows_total",
+                                    &[
+                                        ("signal", partial_signal.as_str()),
+                                        ("triggered_by", request_signal.as_str()),
+                                    ],
+                                    committed as u64,
+                                );
                             }
-                            return Err(flush_error_to_api(err));
                         }
+                        return Err(flush_error_to_api(err));
                     }
                 }
                 Err(_) => {
@@ -646,11 +689,6 @@ fn flush_error_to_api(err: anyhow::Error) -> ApiError {
         );
     }
     ApiError::new(503, "storage_flush_failed", err.to_string())
-}
-
-fn insert_committed_rows(err: &anyhow::Error) -> Option<usize> {
-    err.downcast_ref::<InsertRecordsError>()
-        .map(|insert| insert.committed_rows)
 }
 
 fn flush_failure_reason(err: &anyhow::Error) -> &'static str {
