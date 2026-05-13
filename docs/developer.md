@@ -81,13 +81,12 @@ For a read-write DuckLake hosted in MotherDuck, configure canardstack with a
 MotherDuck attach URI instead of the local or Postgres-catalog DuckLake path:
 
 ```bash
-export motherduck_token='<your-motherduck-token>'
+export MOTHERDUCK_TOKEN='<your-motherduck-token>'
 export CANARDSTACK_DUCKLAKE_ATTACH_URI='md:test-ducklake'
 docker compose up --build
 ```
 
-`MOTHERDUCK_TOKEN` is also accepted by the MotherDuck extension. The attach URI
-must be the URI only, not a full SQL statement. For example, use
+The attach URI must be the URI only, not a full SQL statement. For example, use
 `md:test-ducklake`, not `ATTACH 'md:test-ducklake';`.
 
 Keep `CANARDSTACK_POSTGRES_DSN` unset when

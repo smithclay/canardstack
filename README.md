@@ -9,33 +9,86 @@
 [![DuckLake](https://img.shields.io/badge/storage-DuckLake-fff000.svg?logo=duckdb&logoColor=black)](https://ducklake.select/)
 [![OpenTelemetry](https://img.shields.io/badge/OTLP-HTTP-425cc7.svg?logo=opentelemetry&logoColor=white)](https://opentelemetry.io/)
 
-> OpenTelemetry metrics, logs and traces stored in a ducklake. Query and visualize using Grafana.
+> OpenTelemetry metrics, logs, and traces stored in DuckLake. Inspect them with
+> Grafana or DuckDB-compatible tools.
 
-canardstack is an experimental single-tenant observability backend powered by [DuckLake](https://ducklake.select/), an open Lakehouse format built on top of duckdb, parquet and object storage.
+canardstack is an experimental single-tenant observability backend powered by
+[DuckLake](https://ducklake.select/), an open lakehouse format built on DuckDB,
+Parquet, and object storage.
 
-It accepts OpenTelemetry logs, traces, gauge metrics, and sum metrics over OTLP/HTTP, stores normalized tables in DuckLake, and exposes small compatibility-oriented HTTP query surfaces for local investigation and existing tools such as Grafana.
+It accepts OpenTelemetry logs, traces, gauge metrics, and sum metrics over
+OTLP/HTTP. It stores normalized tables in DuckLake and exposes small
+Prometheus-, Loki-, and Tempo-shaped query surfaces for Grafana and local
+investigation.
+
+It is not a full observability suite. It is a small backend for operators who
+want telemetry in DuckLake/DuckDB-accessible tables, with enough compatibility
+surface to inspect the data through familiar tools.
 
 Builds on prior work from [otlp2parquet](https://github.com/smithclay/otlp2parquet), [otlp2pipeline](https://github.com/smithclay/otlp2pipeline), and [duckdb-otlp](https://github.com/smithclay/duckdb-otlp).
 
 ## Contents
 
-- [Quickstart: MotherDuck-hosted DuckLake](#quickstart-motherduck-hosted-ducklake)
 - [Quickstart: Local DuckLake](#quickstart-local-ducklake)
+- [Quickstart: MotherDuck-hosted DuckLake](#quickstart-motherduck-hosted-ducklake)
+- [Who It Is For](#who-it-is-for)
 - [Architecture](#architecture)
 - [Send Telemetry](#send-telemetry)
 - [Query Data](#query-data)
+- [Operator Contract](#operator-contract)
 - [Caveats](#caveats)
 - [Documentation](#documentation)
 
+## Quickstart: Local DuckLake
+
+Start canardstack and Grafana with local DuckLake storage:
+
+```bash
+docker compose up --build
+```
+
+Docker Compose runs canardstack on `http://localhost:4318` and Grafana on
+`http://localhost:3000`. Local DuckLake metadata and data files live in the
+`canardstack-data` Docker volume.
+
+Open the local investigation UI:
+
+```text
+http://localhost:4318/
+```
+
+Seed representative telemetry through the running service:
+
+```bash
+docker compose run --rm smoke
+```
+
+The smoke command sends one log, one trace, one gauge metric, and one sum metric
+over OTLP/HTTP. It then verifies storage health plus the Prometheus, Loki, and
+Tempo-compatible query paths.
+
+Open the provisioned Grafana dashboard:
+
+```text
+http://localhost:3000/d/canardstack-overview/canardstack-overview
+```
+
+Grafana is provisioned with canardstack datasources for the Prometheus, Loki,
+and Tempo APIs. Use `admin/admin` if you log in directly.
+
 ## Quickstart: MotherDuck-hosted DuckLake
 
-[MotherDuck](https://motherduck.com) has a free-tier hosted DuckLake that's useful for fast experiments and you can get it setup in under 5 minutes. You can also host your own DuckLake on any major cloud platform like [AWS](https://github.com/danielbeach/DuckLakeonS3andPostgres) or [Cloudflare](https://github.com/tobilg/cloudflare-ducklake).
+[MotherDuck](https://motherduck.com) has a hosted DuckLake path that is useful
+for fast remote-storage experiments. You can also host DuckLake yourself on a
+cloud platform such as
+[AWS](https://github.com/danielbeach/DuckLakeonS3andPostgres) or
+[Cloudflare](https://github.com/tobilg/cloudflare-ducklake).
 
 After signing up for MotherDuck:
 
 - Log in to https://app.motherduck.com/, create a new database and under "Advanced" choose "DuckLake"
 - Copy the connection string for your DuckLake database, usually `md:your-database-name`
-- Under Motherduck Account Settings > Access Tokens, create a new Read/Write token
+- Under MotherDuck Account Settings > Access Tokens, create a new Read/Write token
 
 Set your MotherDuck token and the remote DuckLake connection string:
 
@@ -77,35 +130,30 @@ http://localhost:3000/d/canardstack-overview/canardstack-overview
 
 Grafana is provisioned with canardstack datasources based on Prometheus, Loki, and Tempo APIs. Use `admin/admin` for logging on.
 
-## Quickstart: Local DuckLake
+## Who It Is For
 
-Start canardstack with Docker Compose:
+canardstack is for:
 
-```bash
-docker compose up --build
-```
+- Operators curious about DuckLake as an observability storage layer.
+- Teams that want OTLP data in queryable DuckDB/DuckLake tables.
+- Local or single-tenant deployments where bounded loss is acceptable.
 
-Open the local UI:
+canardstack is not for:
 
-```text
-http://localhost:4318/
-```
-
-Seed representative telemetry through the local canardstack service:
-
-```bash
-docker compose run --rm smoke
-```
-
-Open Grafana after running the smoke check:
-
-```text
-http://localhost:3000/d/canardstack-overview/canardstack-overview
-```
+- Production systems that require durable ingest acknowledgement.
+- Multi-tenant observability platforms.
+- Full Prometheus, Loki, Tempo, PromQL, LogQL, or TraceQL compatibility.
+- OTLP/gRPC ingest without an OpenTelemetry Collector translating to
+  OTLP/HTTP.
+- Teams that want a polished all-in-one observability UI, alerting product, or
+  session replay system.
 
 ## Architecture
 
-A single Rust process accepts OTLP over HTTP and normalizes the records into per-signal tables in a DuckLake. Seperately, Prometheus / Loki / Tempo–shaped APIs are available over the same store so Grafana can visualize the data without a custom plugin.
+A single Rust process accepts OTLP over HTTP and normalizes records into
+per-signal tables in DuckLake. Separately, Prometheus-, Loki-, and Tempo-shaped
+APIs are available over the same store so Grafana can visualize the data without
+a custom plugin.
 
 ```mermaid
 flowchart LR
@@ -134,7 +182,13 @@ flowchart LR
 ## Send Telemetry
 
 Configure an OTLP/HTTP exporter to forward data to the canardstack endpoint.
-For example, an OpenTelemetry Collector exporter can point at the same port:
+canardstack accepts the standard OTLP/HTTP paths:
+
+- `POST /v1/logs`
+- `POST /v1/traces`
+- `POST /v1/metrics`
+
+For an OpenTelemetry Collector, point an `otlphttp` exporter at the same port:
 
 ```yaml
 exporters:
@@ -144,7 +198,25 @@ exporters:
       Authorization: Bearer dev-canardstack-key
 ```
 
-Alternately, with Docker Compose send a sample metric, log, and trace"
+Route traces, logs, and metrics through that exporter in the collector's
+pipelines:
+
+```yaml
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      exporters: [otlphttp/canardstack]
+    logs:
+      receivers: [otlp]
+      exporters: [otlphttp/canardstack]
+    metrics:
+      receivers: [otlp]
+      exporters: [otlphttp/canardstack]
+```
+
+For a local proof without changing an app, Docker Compose can send a sample log,
+trace, gauge metric, and sum metric:
 
 ```bash
 docker compose run --rm smoke
@@ -152,15 +224,47 @@ docker compose run --rm smoke
 
 ## Query Data
 
-The v0 query API is a set of compatibility adapters over the internal query engine based on Prometheus, Loki, and Tempo APIs. 
+The v0 query API is a set of compatibility adapters over the internal query
+engine based on Prometheus, Loki, and Tempo APIs.
 
-This makes it possible to use Grafana without custom plugins to visualize and query your metrics, logs and traces stored in duckdb.
+This makes it possible to use Grafana without custom plugins to visualize and
+query metrics, logs, and traces stored in DuckDB/DuckLake.
 
-Power users can query the same DuckLake/DuckDB data directly through DuckDB CLI, MotherDuck, or SQL clients.
+Power users can query the same DuckLake/DuckDB data directly through DuckDB CLI,
+MotherDuck, or SQL clients.
+
+## Operator Contract
+
+| Area | V0 behavior |
+| --- | --- |
+| Process model | One synchronous Rust binary, one DuckDB process, no async runtime. |
+| Ingest | OTLP/HTTP JSON and protobuf for logs, traces, gauge metrics, and sum metrics. |
+| Backpressure | Bounded queues return `429` under pressure. Storage dependency failures surface as `503`. |
+| Durability | A `2xx` ingest response means accepted into bounded process memory. It does not mean committed to DuckLake. |
+| Storage | DuckLake-backed DuckDB tables by default. Local DuckLake is the quickstart path; MotherDuck and Postgres-catalog DuckLake are supported paths. |
+| Query | Prometheus, Loki, and Tempo compatibility subsets with server-side time range, row limit, timeout, memory, and concurrency guards. |
+| SQL | Direct SQL is intentionally outside the HTTP/UI product surface. Use DuckDB CLI, MotherDuck, or another SQL client. |
+| UI | Thin local investigation UI plus provisioned Grafana dashboards. |
+| Retention | Whole-day retention on telemetry tables, followed by DuckLake cleanup hooks when attached. |
 
 ## Caveats
 
-canardstack is experimental and not production-ready. Use with caution, data loss may ocurr.
+canardstack is experimental and not production-ready.
+
+Known v0 limits:
+
+- No durable ingest WAL. A crash can lose accepted but unflushed telemetry.
+- No OTLP/gRPC endpoint. Use an OpenTelemetry Collector if your clients need
+  gRPC.
+- No histograms or exponential histograms.
+- No multi-tenancy.
+- No full PromQL, LogQL, TraceQL, Prometheus, Loki, or Tempo implementation.
+- No arbitrary SQL through the local UI or compatibility APIs.
+- No sub-second freshness target.
+
+## Acknowledgements
+
+@hanorigins, Tyler Hillery, @decalek from the duckdb discord for starting a discussion that lead to this proof-of-concept.
 
 ## Documentation
 
