@@ -280,8 +280,9 @@ scripts/smoke-docker-local.sh
 The `serve` command spawns one background thread that closes the maintenance
 loop without operator action:
 
-- A queue watchdog flushes per-signal queues whose oldest batch has exceeded
-  `max_age`, so freshness stays bounded even if ingest pauses mid-batch.
+- A queue watchdog/flush worker drains due queue partitions when row, byte, or
+  age thresholds fire. Ingest request threads enqueue and signal this worker;
+  they do not perform DuckDB/DuckLake writes inline.
 - A periodic flush drains process queues to DuckLake and triggers DuckLake's
   inlined-data flush plus small-file compaction.
 - A retention pass enforces the configured retention days, expires DuckLake

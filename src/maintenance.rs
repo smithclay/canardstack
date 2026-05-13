@@ -1,6 +1,7 @@
 use crate::app::AppState;
 use crate::config::Config;
 use crate::ingest::Ingestor;
+use crate::metrics::Metrics;
 use crate::storage::{RetentionPolicy, Storage};
 use crate::LockExt;
 use anyhow::Result;
@@ -140,12 +141,17 @@ impl Maintenance {
         }))
     }
 
-    pub fn run_watchdog(&self, ingestor: &Ingestor, storage: &Storage) -> Result<Value> {
+    pub fn run_watchdog(
+        &self,
+        ingestor: &Ingestor,
+        storage: &Storage,
+        metrics: &Metrics,
+    ) -> Result<Value> {
         if self.is_paused() {
             return Ok(json!({"status": "paused"}));
         }
         let started = Instant::now();
-        let flushed = ingestor.flush_aged(storage)?;
+        let flushed = ingestor.flush_due(storage, Some(metrics))?;
         if !flushed.is_empty() {
             self.record_run("watchdog");
         }
@@ -241,15 +247,16 @@ fn scheduler_loop(
         if stop.load(Ordering::SeqCst) {
             return;
         }
-        thread::sleep(tick);
+        let flush_requested = state.ingestor.wait_for_flush_or_timeout(tick, &stop);
         if stop.load(Ordering::SeqCst) {
             return;
         }
         let now = Instant::now();
 
-        if now >= next_watchdog {
+        if flush_requested || now >= next_watchdog {
             let ok = run_job(&state, "watchdog", |s| {
-                s.maintenance.run_watchdog(&s.ingestor, &s.storage)
+                s.maintenance
+                    .run_watchdog(&s.ingestor, &s.storage, &s.metrics)
             });
             next_watchdog = now + next_interval(&state, "watchdog", watchdog_every, ok);
         }

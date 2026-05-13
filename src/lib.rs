@@ -5,6 +5,7 @@ pub mod config;
 pub mod http;
 pub mod ingest;
 pub mod maintenance;
+pub mod memory;
 pub mod metrics;
 pub mod otlp;
 pub mod query;

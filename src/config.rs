@@ -24,6 +24,7 @@ pub struct Config {
     pub max_body_bytes: usize,
     pub per_signal_queue_bytes: usize,
     pub process_ingest_bytes: usize,
+    pub runtime_memory_limit_bytes: Option<usize>,
     pub max_rows_per_flush: usize,
     pub max_bytes_per_flush: usize,
     pub max_age: Duration,
@@ -82,6 +83,9 @@ impl Config {
             process_ingest_bytes: env_usize(
                 "CANARDSTACK_PROCESS_INGEST_BYTES",
                 2 * 1024 * 1024 * 1024,
+            )?,
+            runtime_memory_limit_bytes: env_optional_usize(
+                "CANARDSTACK_RUNTIME_MEMORY_LIMIT_BYTES",
             )?,
             max_rows_per_flush: env_usize("CANARDSTACK_MAX_ROWS_PER_FLUSH", 5_000)?,
             max_bytes_per_flush: env_usize("CANARDSTACK_MAX_BYTES_PER_FLUSH", 4 * 1024 * 1024)?,
@@ -162,6 +166,7 @@ impl Config {
             max_body_bytes: 8 * 1024 * 1024,
             per_signal_queue_bytes: 1024 * 1024,
             process_ingest_bytes: 4 * 1024 * 1024,
+            runtime_memory_limit_bytes: None,
             max_rows_per_flush: 100,
             max_bytes_per_flush: 256 * 1024,
             max_age: Duration::from_millis(50),
@@ -223,6 +228,9 @@ impl Config {
         }
         if self.process_ingest_bytes == 0 || self.per_signal_queue_bytes == 0 {
             anyhow::bail!("ingest memory caps must be > 0");
+        }
+        if matches!(self.runtime_memory_limit_bytes, Some(0)) {
+            anyhow::bail!("CANARDSTACK_RUNTIME_MEMORY_LIMIT_BYTES must be > 0 when set");
         }
         if self.max_rows_per_flush == 0 || self.max_bytes_per_flush == 0 {
             anyhow::bail!("flush thresholds must be > 0");
@@ -296,5 +304,17 @@ fn env_bool(name: &str, default: bool) -> Result<bool> {
         },
         Err(env::VarError::NotPresent) => Ok(default),
         Err(err) => Err(err).with_context(|| format!("read {name}")),
+    }
+}
+
+fn env_optional_usize(name: &str) -> Result<Option<usize>> {
+    match env::var(name) {
+        Ok(value) if !value.trim().is_empty() => value
+            .parse::<usize>()
+            .with_context(|| format!("invalid {name}"))
+            .map(Some),
+        Ok(_) => Ok(None),
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(err) => Err(err).with_context(|| format!("invalid {name}")),
     }
 }

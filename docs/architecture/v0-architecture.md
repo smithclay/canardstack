@@ -88,12 +88,13 @@ flowchart LR
   C --> D["Decode OTLP"]
   D --> E["otlp2records Arrow RecordBatches"]
   E --> F["Group by signal table"]
-  F --> G["Bounded in-memory queue (RecordBatch)"]
-  G --> H["DuckDB/DuckLake Arrow appender insert"]
-  H --> I["Inlined data or Parquet files"]
-  I --> J["DuckDB constrained queries"]
-  J --> K["Prometheus/Loki/Tempo adapter"]
-  K --> L["Grafana, local UI, curl, or another compatible client"]
+  F --> G["Bounded partitioned in-memory queue (RecordBatch)"]
+  G --> H["Scheduler flush worker"]
+  H --> I["DuckDB/DuckLake Arrow appender insert"]
+  I --> J["Inlined data or Parquet files"]
+  J --> K["DuckDB constrained queries"]
+  K --> L["Prometheus/Loki/Tempo adapter"]
+  L --> M["Grafana, local UI, curl, or another compatible client"]
 ```
 
 External SQL path:
@@ -128,20 +129,29 @@ Invalid requests return `400`. Unauthorized requests return `401` or `403`.
 
 ## Batching And Memory Bounds
 
-V0 has three memory guardrails:
+V0 has four memory guardrails:
 
 - Request body limit: default 8 MiB compressed payload, configurable.
 - Per-signal queued bytes: default 512 MiB each for logs, spans, gauge
   metrics, and sum metrics (`CANARDSTACK_PER_SIGNAL_QUEUE_BYTES`).
 - Process ingest memory cap: default 2 GiB
-  (`CANARDSTACK_PROCESS_INGEST_BYTES`). Not auto-scaled to process memory.
+  (`CANARDSTACK_PROCESS_INGEST_BYTES`). This bounds queued Arrow bytes.
+- Optional runtime RSS admission cap (`CANARDSTACK_RUNTIME_MEMORY_LIMIT_BYTES`).
+  When set, ingest returns `429` before decode/enqueue if process RSS is already
+  at or above the configured limit.
 
 Batch flush triggers:
 
-- `max_rows_per_flush`: 200,000 rows.
-- `max_bytes_per_flush`: 128 MiB.
+- `max_rows_per_flush`: 5,000 rows.
+- `max_bytes_per_flush`: 4 MiB.
 - `max_age`: 10 seconds for normal load, 2 seconds when queue pressure is
   above 70%.
+
+Flush work is not performed on the HTTP request thread. A successful request
+only admits decoded Arrow batches into process memory and signals the scheduler
+flush worker. The worker drains due queue partitions by row, byte, or age
+threshold. Queue partitions are intentionally low-cardinality in v0: signal table
+plus source encoding (`json` or `protobuf`).
 
 ## DuckLake Insert And Inlining Policy
 

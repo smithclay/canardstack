@@ -178,6 +178,18 @@ fn metric_gauge_rows(state: &AppState) -> i64 {
         .unwrap()
 }
 
+fn metric_sum_rows(state: &AppState) -> i64 {
+    state.storage.logical_rows().unwrap()["metric_sum"]
+        .as_i64()
+        .unwrap()
+}
+
+fn log_rows(state: &AppState) -> i64 {
+    state.storage.logical_rows().unwrap()["logs"]
+        .as_i64()
+        .unwrap()
+}
+
 fn assert_metric_queue_rows(state: &AppState, expected: usize) {
     let snapshot = state
         .ingestor
@@ -517,6 +529,50 @@ fn queue_pressure_returns_429() {
         &state,
     );
     assert_eq!(response.status(), 429);
+    assert_eq!(
+        state
+            .ingestor
+            .snapshots()
+            .into_iter()
+            .map(|s| s.queued_rows)
+            .sum::<usize>(),
+        0
+    );
+}
+
+#[test]
+fn runtime_memory_pressure_returns_429_before_enqueue() {
+    let dir = tempdir().unwrap();
+    let mut config = Config::test(dir.path().join("canardstack.duckdb"));
+    config.runtime_memory_limit_bytes = Some(1);
+    let state = AppState::new(config).unwrap();
+    let body = log_fixture(Utc::now().timestamp_nanos_opt().unwrap()).to_string();
+    let response = http::route(
+        "POST",
+        "/v1/logs",
+        &HashMap::new(),
+        &headers(&state),
+        body.as_bytes(),
+        &state,
+    );
+    assert_eq!(response.status(), 429);
+    assert_eq!(response.json_body()["error"], "runtime_memory_full");
+    let metrics = state.metrics.render_prometheus();
+    assert!(
+        metrics.contains(
+            "canardstack_ingest_rejections_total{signal=\"logs\",status=\"429\",reason=\"runtime_memory_full\"} 1"
+        ),
+        "{metrics}"
+    );
+    assert_eq!(
+        state
+            .ingestor
+            .snapshots()
+            .into_iter()
+            .map(|s| s.queued_rows)
+            .sum::<usize>(),
+        0
+    );
 }
 
 #[test]
@@ -746,6 +802,13 @@ fn metric_flush_splits_oversized_batch_and_preserves_queue_accounting() {
         &state,
     );
     assert_eq!(response.status(), 202, "{}", response.json_body());
+    assert_eq!(
+        state
+            .ingestor
+            .flush_signal(Signal::MetricGauge, &state.storage)
+            .unwrap(),
+        2
+    );
     assert_eq!(metric_gauge_rows(&state), 2);
     assert_metric_queue_rows(&state, 3);
 
@@ -768,6 +831,46 @@ fn metric_flush_splits_oversized_batch_and_preserves_queue_accounting() {
     );
     assert_eq!(metric_gauge_rows(&state), 5);
     assert_metric_queue_rows(&state, 0);
+}
+
+#[test]
+fn metric_due_flush_preserves_gauge_sum_pairing() {
+    let dir = tempdir().unwrap();
+    let mut config = Config::test(dir.path().join("canardstack.duckdb"));
+    config.local_storage_dir = dir.path().join("storage");
+    config.max_rows_per_flush = 1;
+    config.max_bytes_per_flush = 10_000_000;
+    let state = AppState::new(config).unwrap();
+    let body = metric_fixture(Utc::now().timestamp_nanos_opt().unwrap()).to_string();
+
+    let response = http::route(
+        "POST",
+        "/v1/metrics",
+        &HashMap::new(),
+        &headers(&state),
+        body.as_bytes(),
+        &state,
+    );
+    assert_eq!(response.status(), 202, "{}", response.json_body());
+
+    let flushed = state
+        .ingestor
+        .flush_due(&state.storage, Some(&state.metrics))
+        .unwrap();
+    assert_eq!(flushed.get(&Signal::MetricGauge), Some(&1));
+    assert_eq!(flushed.get(&Signal::MetricSum), Some(&1));
+    assert_eq!(metric_gauge_rows(&state), 1);
+    assert_eq!(metric_sum_rows(&state), 1);
+
+    let metrics = state.metrics.render_prometheus();
+    assert!(
+        metrics.contains("canardstack_ingest_flush_attempts_total{signal=\"metric_gauge\"} 1"),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains("canardstack_ingest_flush_rows_total{signal=\"metric_sum\"} 1"),
+        "{metrics}"
+    );
 }
 
 #[test]
@@ -1480,6 +1583,99 @@ fn scheduler_watchdog_flushes_aged_queue_without_admin_action() {
         last_runs.get("watchdog").is_some(),
         "scheduler should have recorded a watchdog run, got {last_runs}"
     );
+}
+
+#[test]
+fn scheduler_flush_worker_drains_threshold_queue_after_enqueue() {
+    let dir = tempdir().unwrap();
+    let mut config = Config::test(dir.path().join("canardstack.duckdb"));
+    config.local_storage_dir = dir.path().join("storage");
+    config.scheduler_enabled = true;
+    config.scheduler_watchdog_interval = StdDuration::from_millis(200);
+    config.scheduler_flush_interval = StdDuration::from_secs(3_600);
+    config.scheduler_retention_interval = StdDuration::from_secs(3_600);
+    config.max_age = StdDuration::from_secs(60);
+    config.high_pressure_max_age = StdDuration::from_secs(60);
+    config.max_rows_per_flush = 1;
+    config.max_bytes_per_flush = 10_000_000;
+
+    let state = Arc::new(AppState::new(config).unwrap());
+    let scheduler = Scheduler::spawn(state.clone());
+
+    let now = Utc::now();
+    let body = log_fixture(now.timestamp_nanos_opt().unwrap()).to_string();
+    let response = http::route(
+        "POST",
+        "/v1/logs",
+        &HashMap::new(),
+        &headers(&state),
+        body.as_bytes(),
+        &state,
+    );
+    assert_eq!(response.status(), 202);
+
+    let deadline = Instant::now() + StdDuration::from_secs(3);
+    let mut row_count = 0;
+    while Instant::now() < deadline {
+        thread::sleep(StdDuration::from_millis(20));
+        row_count = log_rows(&state);
+        if row_count > 0 {
+            break;
+        }
+    }
+
+    drop(scheduler);
+    assert!(
+        row_count > 0,
+        "flush worker should drain threshold-triggered queue before max_age"
+    );
+    let metrics = state.metrics.render_prometheus();
+    assert!(
+        metrics.contains("canardstack_ingest_flush_requests_total{triggered_by=\"logs\"} 1"),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains("canardstack_ingest_flush_attempts_total{signal=\"logs\"} 1"),
+        "{metrics}"
+    );
+}
+
+#[test]
+fn disabled_scheduler_keeps_threshold_ingest_memory_only_until_manual_flush() {
+    let dir = tempdir().unwrap();
+    let mut config = Config::test(dir.path().join("canardstack.duckdb"));
+    config.local_storage_dir = dir.path().join("storage");
+    config.scheduler_enabled = false;
+    config.max_age = StdDuration::from_secs(60);
+    config.high_pressure_max_age = StdDuration::from_secs(60);
+    config.max_rows_per_flush = 1;
+    config.max_bytes_per_flush = 10_000_000;
+
+    let state = AppState::new(config).unwrap();
+    let body = log_fixture(Utc::now().timestamp_nanos_opt().unwrap()).to_string();
+    let response = http::route(
+        "POST",
+        "/v1/logs",
+        &HashMap::new(),
+        &headers(&state),
+        body.as_bytes(),
+        &state,
+    );
+    assert_eq!(response.status(), 202, "{}", response.json_body());
+    assert_eq!(log_rows(&state), 0, "request thread must not flush storage");
+    assert_eq!(
+        state
+            .ingestor
+            .snapshots()
+            .into_iter()
+            .find(|snapshot| snapshot.signal == "logs")
+            .unwrap()
+            .queued_rows,
+        1
+    );
+
+    assert_eq!(state.ingestor.flush_all(&state.storage).unwrap(), 1);
+    assert_eq!(log_rows(&state), 1);
 }
 
 #[test]
