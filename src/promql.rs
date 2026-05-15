@@ -26,15 +26,7 @@ pub fn parse_prom_query(raw: &str) -> ApiResult<PromQuery> {
         explicit_grouping = expr.explicit_grouping;
         query = expr.inner;
     } else if let Some((func, inner)) = unwrap_func(query) {
-        aggregation = match func {
-            "avg" => "avg",
-            "min" => "min",
-            "max" => "max",
-            "sum" => "sum",
-            "count" => "count",
-            "rate" => "rate",
-            _ => return Err(unsupported_promql()),
-        };
+        aggregation = aggregation_keyword(func).ok_or_else(unsupported_promql)?;
         query = inner;
     }
 
@@ -87,13 +79,9 @@ fn parse_aggregation(query: &str) -> ApiResult<Option<AggregationExpr<'_>>> {
     let Some((func, rest)) = split_ident(query) else {
         return Ok(None);
     };
-    let aggregation = match func {
-        "avg" => "avg",
-        "min" => "min",
-        "max" => "max",
-        "sum" => "sum",
-        "count" => "count",
-        _ => return Ok(None),
+    let aggregation = match aggregation_keyword(func) {
+        Some("rate") | None => return Ok(None),
+        Some(agg) => agg,
     };
     let rest = rest.trim_start();
     let Some(rest) = rest
@@ -124,6 +112,18 @@ fn parse_aggregation(query: &str) -> ApiResult<Option<AggregationExpr<'_>>> {
         explicit_grouping: true,
         inner,
     }))
+}
+
+fn aggregation_keyword(func: &str) -> Option<&'static str> {
+    Some(match func {
+        "avg" => "avg",
+        "min" => "min",
+        "max" => "max",
+        "sum" => "sum",
+        "count" => "count",
+        "rate" => "rate",
+        _ => return None,
+    })
 }
 
 fn split_ident(raw: &str) -> Option<(&str, &str)> {

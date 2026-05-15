@@ -1,6 +1,6 @@
 use crate::query_plan::{
-    matchers_from_labels, normalize_labels, parse_selector, unquote, LogPlan, QueryLane,
-    SelectorPlan, SignalKind, SortDirection, TextFilter, TimeBounds,
+    matchers_from_labels, normalize_labels, parse_selector, unquote, LogPlan, SelectorPlan,
+    SortDirection, TextFilter, TimeBounds,
 };
 use crate::validation::ApiResult;
 
@@ -45,7 +45,6 @@ pub fn parse_loki_query(
     }
     Ok(LogPlan {
         selector: SelectorPlan {
-            signal: SignalKind::Logs,
             resource: None,
             matchers: matchers_from_labels(labels),
             text_filters,
@@ -53,7 +52,6 @@ pub fn parse_loki_query(
         time_bounds,
         limit,
         direction: SortDirection::from_loki(direction),
-        lane: QueryLane::Interactive,
         stream_labels: LOKI_STREAM_LABELS
             .iter()
             .map(|label| (*label).to_string())
@@ -67,14 +65,10 @@ mod tests {
     use chrono::{TimeZone, Utc};
 
     fn bounds() -> TimeBounds {
-        TimeBounds::new(
-            Utc.with_ymd_and_hms(1970, 1, 1, 0, 0, 0).unwrap(),
-            Utc.with_ymd_and_hms(1970, 1, 1, 1, 0, 0).unwrap(),
-            24 * 60 * 60,
-            None,
-            false,
-        )
-        .unwrap()
+        TimeBounds {
+            from: Utc.with_ymd_and_hms(1970, 1, 1, 0, 0, 0).unwrap(),
+            to: Utc.with_ymd_and_hms(1970, 1, 1, 1, 0, 0).unwrap(),
+        }
     }
 
     #[test]

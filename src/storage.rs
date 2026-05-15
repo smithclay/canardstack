@@ -593,6 +593,55 @@ impl Storage {
         Ok(json!({"supported": true, "status": "ok"}))
     }
 
+    pub fn compaction_decision(&self, table: Option<&str>, min_files: usize) -> Result<Value> {
+        if !self.ducklake_managed_maintenance {
+            return Ok(
+                json!({"supported": false, "reason": "ducklake maintenance is not managed by this process"}),
+            );
+        }
+        if !self.ducklake_compaction_enabled {
+            return Ok(json!({
+                "supported": true,
+                "status": "disabled",
+                "should_compact": false
+            }));
+        }
+
+        let layout = self.with_conn(|conn, _| self.ducklake_storage_layout_on(conn))?;
+        let mut candidates = serde_json::Map::new();
+        if let Some(tables) = layout.as_object() {
+            for (table_name, value) in tables {
+                if table.is_some_and(|requested| requested != table_name) {
+                    continue;
+                }
+                let parquet_files = value
+                    .get("parquet_files")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0);
+                if parquet_files >= min_files as i64 {
+                    candidates.insert(
+                        table_name.clone(),
+                        json!({
+                            "parquet_files": parquet_files,
+                            "threshold": min_files
+                        }),
+                    );
+                }
+            }
+        }
+
+        let should_compact = !candidates.is_empty();
+        Ok(json!({
+            "supported": true,
+            "status": if should_compact { "ready" } else { "below_file_threshold" },
+            "should_compact": should_compact,
+            "threshold": min_files,
+            "table": table,
+            "candidates": candidates,
+            "layout": layout
+        }))
+    }
+
     pub fn merge_adjacent_files(&self, table: Option<&str>) -> Result<Value> {
         if !self.ducklake_managed_maintenance {
             return Ok(

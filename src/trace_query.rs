@@ -1,6 +1,5 @@
 use crate::query_plan::{
-    matchers_from_labels, normalize_labels, QueryLane, SelectorPlan, SignalKind, TimeBounds,
-    TracePlan, TraceSort,
+    matchers_from_labels, normalize_labels, SelectorPlan, TimeBounds, TracePlan, TraceSort,
 };
 use crate::validation::ApiResult;
 use std::collections::{BTreeMap, HashMap};
@@ -50,9 +49,8 @@ pub fn plan_tempo_search(
         extract_traceql_labels(tags, &mut labels);
     }
     let labels = normalize_labels(labels, TEMPO_ALIASES, "unsupported_selector")?;
-    Ok(TracePlan::Search {
+    Ok(TracePlan {
         selector: SelectorPlan {
-            signal: SignalKind::Traces,
             resource: None,
             matchers: matchers_from_labels(labels),
             text_filters: Vec::new(),
@@ -60,7 +58,6 @@ pub fn plan_tempo_search(
         time_bounds,
         limit,
         sort: TraceSort::TimestampDesc,
-        lane: QueryLane::Interactive,
     })
 }
 
@@ -104,14 +101,10 @@ mod tests {
     use chrono::{TimeZone, Utc};
 
     fn bounds() -> TimeBounds {
-        TimeBounds::new(
-            Utc.with_ymd_and_hms(1970, 1, 1, 0, 0, 0).unwrap(),
-            Utc.with_ymd_and_hms(1970, 1, 1, 1, 0, 0).unwrap(),
-            24 * 60 * 60,
-            None,
-            false,
-        )
-        .unwrap()
+        TimeBounds {
+            from: Utc.with_ymd_and_hms(1970, 1, 1, 0, 0, 0).unwrap(),
+            to: Utc.with_ymd_and_hms(1970, 1, 1, 1, 0, 0).unwrap(),
+        }
     }
 
     #[test]
@@ -124,7 +117,7 @@ mod tests {
             ),
         ]);
         let plan = plan_tempo_search(&params, bounds(), 20).unwrap();
-        let TracePlan::Search { selector, .. } = plan;
+        let TracePlan { selector, .. } = plan;
 
         assert_eq!(selector.matcher_value("service_name"), Some("checkout"));
         assert_eq!(selector.matcher_value("span_name"), Some("GET /smoke"));

@@ -125,6 +125,7 @@ The remaining HTTP endpoints are operational or ingest endpoints:
 - `POST /api/admin/maintenance/pause`
 - `POST /api/admin/maintenance/resume`
 - `POST /api/admin/maintenance/flush`
+- `POST /api/admin/maintenance/compaction/run`
 - `POST /api/admin/maintenance/retention/dry-run`
 - `POST /api/admin/maintenance/retention/run`
 

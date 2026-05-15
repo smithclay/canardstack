@@ -166,8 +166,12 @@ Initial policy:
   direct data files when DuckLake supports direct file writes for the batch).
 - Prefer larger batches that become Parquet directly when sustained throughput
   permits.
-- Run `ducklake_merge_adjacent_files` during flush maintenance to compact
-  direct-write small files. Bound each maintenance call with
+- Run `ducklake_flush_inlined_data` during flush maintenance to keep DuckLake
+  inlined rows fresh.
+- Run `ducklake_merge_adjacent_files` on a separate compaction cadence to
+  compact direct-write small files only after active Parquet file fanout reaches
+  `CANARDSTACK_DUCKLAKE_COMPACTION_MIN_FILES` (default `8`). Bound each
+  maintenance call with
   `CANARDSTACK_DUCKLAKE_COMPACTION_MAX_COMPACTED_FILES` (default `1000`) and
   disable with `CANARDSTACK_DUCKLAKE_COMPACTION_ENABLED=false`.
 - Keep immediate cleanup of compacted files opt-in with

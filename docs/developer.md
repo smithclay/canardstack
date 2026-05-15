@@ -283,11 +283,13 @@ loop without operator action:
   age thresholds fire. Ingest request threads enqueue and signal this worker;
   they do not perform DuckDB/DuckLake writes inline.
 - A periodic flush drains process queues to DuckLake and triggers DuckLake's
-  inlined-data flush plus small-file compaction.
+  inlined-data flush.
+- A separate compaction pass runs DuckLake adjacent-file compaction only when
+  active Parquet file fanout reaches the configured threshold.
 - A retention pass enforces the configured retention days, expires DuckLake
   snapshots, and cleans old files.
 
-All three respect `POST /api/admin/maintenance/pause`. Cadences are configurable
+All four respect `POST /api/admin/maintenance/pause`. Cadences are configurable
 via `CANARDSTACK_SCHEDULER_*` env vars. Set
 `CANARDSTACK_SCHEDULER_ENABLED=false` to fall back to operator-triggered
 maintenance only. The scheduler shuts down cleanly when `serve` exits.

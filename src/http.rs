@@ -392,6 +392,19 @@ pub fn route(
             record_maintenance_metrics(state, "flush", &result, started);
             result
         }),
+        ("POST", "/api/admin/maintenance/compaction/run") => admin(headers, state, || {
+            let started = Instant::now();
+            let result = state
+                .maintenance
+                .run_compaction(
+                    &state.storage,
+                    query.get("table").map(String::as_str),
+                    Some(&state.metrics),
+                )
+                .map_err(storage_error);
+            record_maintenance_metrics(state, "compaction", &result, started);
+            result
+        }),
         ("POST", "/api/admin/maintenance/retention/dry-run") => admin(headers, state, || {
             let started = Instant::now();
             let result = state

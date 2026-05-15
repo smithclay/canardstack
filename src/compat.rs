@@ -392,17 +392,7 @@ struct TempoTraceByIdResponse {
 pub fn tempo_search(state: &AppState, params: &HashMap<String, String>) -> ApiResult<Value> {
     let (from, to) = optional_range(params, INTERACTIVE_RANGE_SECS)?;
     let limit = parse_usize(params.get("limit"), 20, 1000)?;
-    let plan = plan_tempo_search(
-        params,
-        TimeBounds {
-            from,
-            to,
-            max_range_secs: INTERACTIVE_RANGE_SECS,
-            default_lookback: Some(chrono::Duration::hours(1)),
-            instant: false,
-        },
-        limit,
-    )?;
+    let plan = plan_tempo_search(params, TimeBounds { from, to }, limit)?;
     let rows = state.queries.execute_trace_search(&state.storage, &plan)?;
     let traces = result_rows(&rows)
         .into_iter()
@@ -496,9 +486,6 @@ fn loki_query_inner(
         } else {
             end + chrono::Duration::seconds(1)
         },
-        max_range_secs: INTERACTIVE_RANGE_SECS,
-        default_lookback: Some(chrono::Duration::hours(1)),
-        instant: !range,
     };
     let plan = parse_loki_query(query, time_bounds, limit, direction)?;
     let result = state.queries.execute_logs(&state.storage, &plan)?;

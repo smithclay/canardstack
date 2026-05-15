@@ -1966,6 +1966,7 @@ fn admin_endpoints_reject_data_key_and_unauthenticated_requests() {
         ("POST", "/api/admin/maintenance/pause"),
         ("POST", "/api/admin/maintenance/resume"),
         ("POST", "/api/admin/maintenance/flush"),
+        ("POST", "/api/admin/maintenance/compaction/run"),
         ("POST", "/api/admin/maintenance/retention/dry-run"),
         ("POST", "/api/admin/maintenance/retention/run"),
     ];
@@ -2021,7 +2022,7 @@ fn admin_endpoints_reject_data_key_and_unauthenticated_requests() {
 }
 
 #[test]
-fn admin_flush_records_ducklake_maintenance_phase_metrics() {
+fn admin_flush_records_ducklake_inlined_flush_metrics() {
     let (_dir, state) = app();
     let response = http::route(
         "POST",
@@ -2040,7 +2041,31 @@ fn admin_flush_records_ducklake_maintenance_phase_metrics() {
         "{metrics}"
     );
     assert!(
-        metrics.contains("canardstack_ducklake_compaction_duration_seconds_count{table=\"all\"} 1"),
+        !metrics.contains("canardstack_ducklake_compaction_duration_seconds_count"),
+        "{metrics}"
+    );
+}
+
+#[test]
+fn admin_compaction_is_a_separate_maintenance_job() {
+    let (_dir, state) = app();
+    let response = http::route(
+        "POST",
+        "/api/admin/maintenance/compaction/run",
+        &HashMap::new(),
+        &admin_headers(&state),
+        &[],
+        &state,
+    );
+    assert_eq!(response.status(), 200, "{}", response.json_body());
+    assert_eq!(response.json_body()["status"], "skipped");
+    assert_eq!(response.json_body()["decision"]["supported"], false);
+
+    let metrics = state.metrics.render_prometheus();
+    assert!(
+        metrics.contains(
+            "canardstack_maintenance_runs_total{job=\"compaction\",status=\"ok\",reason=\"ok\"} 1"
+        ),
         "{metrics}"
     );
 }

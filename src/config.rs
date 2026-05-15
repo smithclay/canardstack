@@ -37,6 +37,7 @@ pub struct Config {
     pub ducklake_data_inlining_row_limit: usize,
     pub ducklake_compaction_enabled: bool,
     pub ducklake_compaction_max_compacted_files: usize,
+    pub ducklake_compaction_min_files: usize,
     pub ducklake_compaction_cleanup_files: bool,
     pub query_interactive: QueryLane,
     pub query_background: QueryLane,
@@ -46,6 +47,7 @@ pub struct Config {
     pub scheduler_enabled: bool,
     pub scheduler_watchdog_interval: Duration,
     pub scheduler_flush_interval: Duration,
+    pub scheduler_compaction_interval: Duration,
     pub scheduler_retention_interval: Duration,
     pub max_concurrent_connections: usize,
     pub socket_read_timeout: Duration,
@@ -109,6 +111,10 @@ impl Config {
                 "CANARDSTACK_DUCKLAKE_COMPACTION_MAX_COMPACTED_FILES",
                 1_000,
             )?,
+            ducklake_compaction_min_files: env_usize(
+                "CANARDSTACK_DUCKLAKE_COMPACTION_MIN_FILES",
+                8,
+            )?,
             ducklake_compaction_cleanup_files: env_bool(
                 "CANARDSTACK_DUCKLAKE_COMPACTION_CLEANUP_FILES",
                 false,
@@ -136,6 +142,10 @@ impl Config {
             scheduler_flush_interval: Duration::from_secs(env_usize(
                 "CANARDSTACK_SCHEDULER_FLUSH_SECS",
                 30,
+            )? as u64),
+            scheduler_compaction_interval: Duration::from_secs(env_usize(
+                "CANARDSTACK_SCHEDULER_COMPACTION_SECS",
+                300,
             )? as u64),
             scheduler_retention_interval: Duration::from_secs(env_usize(
                 "CANARDSTACK_SCHEDULER_RETENTION_SECS",
@@ -179,6 +189,7 @@ impl Config {
             ducklake_data_inlining_row_limit: 0,
             ducklake_compaction_enabled: true,
             ducklake_compaction_max_compacted_files: 1_000,
+            ducklake_compaction_min_files: 8,
             ducklake_compaction_cleanup_files: false,
             query_interactive: QueryLane {
                 concurrency: 4,
@@ -196,6 +207,7 @@ impl Config {
             scheduler_enabled: false,
             scheduler_watchdog_interval: Duration::from_millis(50),
             scheduler_flush_interval: Duration::from_millis(200),
+            scheduler_compaction_interval: Duration::from_secs(300),
             scheduler_retention_interval: Duration::from_secs(3_600),
             max_concurrent_connections: 64,
             socket_read_timeout: Duration::from_secs(5),
@@ -240,6 +252,9 @@ impl Config {
         }
         if self.ducklake_compaction_max_compacted_files == 0 {
             anyhow::bail!("CANARDSTACK_DUCKLAKE_COMPACTION_MAX_COMPACTED_FILES must be > 0");
+        }
+        if self.ducklake_compaction_min_files == 0 {
+            anyhow::bail!("CANARDSTACK_DUCKLAKE_COMPACTION_MIN_FILES must be > 0");
         }
         if self.high_pressure_max_age > self.max_age {
             anyhow::bail!(

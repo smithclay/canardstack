@@ -1,8 +1,8 @@
 use crate::config::Config;
 use crate::metrics::Timer;
 use crate::query_plan::{
-    FieldMatcher, LogPlan, MetricAggregation, MetricPlan, MetricSignal, QueryLane, SelectorPlan,
-    SignalKind, SortDirection, TextFilter, TimeBounds, TracePlan, TraceSort,
+    FieldMatcher, LogPlan, MetricAggregation, MetricPlan, MetricSignal, SelectorPlan,
+    SortDirection, TextFilter, TimeBounds, TracePlan, TraceSort,
 };
 use crate::sql::{push_eq, quote as sql_quote, span_row, time_predicate};
 use crate::storage::{QueryTimeoutError, Storage};
@@ -92,8 +92,7 @@ impl QueryEngine {
     }
 
     pub fn execute_logs(&self, storage: &Storage, plan: &LogPlan) -> ApiResult<Value> {
-        let background = plan.lane.is_background();
-        let _guard = self.acquire(background)?;
+        let _guard = self.acquire(false)?;
         let timer = Timer::start();
         let mut where_sql = vec![time_predicate(plan.time_bounds.from, plan.time_bounds.to)];
         for matcher in &plan.selector.matchers {
@@ -112,8 +111,8 @@ impl QueryEngine {
         );
         let rows = storage
             .with_query_conn(
-                self.memory_limit(background),
-                self.timeout(background),
+                self.memory_limit(false),
+                self.timeout(false),
                 |conn, prefix| {
                     let mut stmt = conn.prepare(&sql.replace("{prefix}", prefix))?;
                     let mapped = stmt.query_map([], log_row)?;
@@ -127,62 +126,6 @@ impl QueryEngine {
             timer.elapsed_ms(),
             freshness(storage).unwrap_or(Value::Null),
         ))
-    }
-
-    pub fn log_search(&self, storage: &Storage, req: &Value) -> ApiResult<Value> {
-        let (from, to) = parse_range(req, INTERACTIVE_RANGE_SECS)?;
-        let limit = validation::parse_limit(req.get("limit"), 200, 1000)?;
-        let mut matchers = Vec::new();
-        push_req_matcher(&mut matchers, "service_name", req.get("service_name"));
-        push_req_matcher(
-            &mut matchers,
-            "deployment_environment",
-            req.get("deployment_environment"),
-        );
-        push_req_matcher(&mut matchers, "trace_id", req.get("trace_id"));
-        push_req_matcher(&mut matchers, "span_id", req.get("span_id"));
-        push_req_matcher(&mut matchers, "http_route", req.get("http_route"));
-        push_req_matcher(&mut matchers, "http_method", req.get("http_method"));
-        if let Some(sev) = req.get("severity").and_then(Value::as_array) {
-            if let Some(value) = sev.iter().filter_map(Value::as_str).next() {
-                matchers.push(FieldMatcher {
-                    field: "severity_text".to_string(),
-                    value: value.to_string(),
-                });
-            }
-        }
-        let mut text_filters = Vec::new();
-        if let Some(q) = req
-            .get("query")
-            .and_then(Value::as_str)
-            .filter(|s| !s.trim().is_empty())
-        {
-            text_filters.push(TextFilter::BodyContains(q.to_string()));
-        }
-        let plan = LogPlan {
-            selector: SelectorPlan {
-                signal: SignalKind::Logs,
-                resource: None,
-                matchers,
-                text_filters,
-            },
-            time_bounds: TimeBounds {
-                from,
-                to,
-                max_range_secs: INTERACTIVE_RANGE_SECS,
-                default_lookback: None,
-                instant: false,
-            },
-            limit,
-            direction: SortDirection::from_loki(
-                req.get("direction")
-                    .and_then(Value::as_str)
-                    .unwrap_or("backward"),
-            ),
-            lane: QueryLane::Interactive,
-            stream_labels: Vec::new(),
-        };
-        self.execute_logs(storage, &plan)
     }
 
     pub fn span_search(&self, storage: &Storage, req: &Value) -> ApiResult<Value> {
@@ -240,15 +183,13 @@ impl QueryEngine {
     }
 
     pub fn execute_trace_search(&self, storage: &Storage, plan: &TracePlan) -> ApiResult<Value> {
-        let TracePlan::Search {
+        let TracePlan {
             selector,
             time_bounds,
             limit,
             sort,
-            lane,
         } = plan;
-        let background = lane.is_background();
-        let _guard = self.acquire(background)?;
+        let _guard = self.acquire(false)?;
         let timer = Timer::start();
         let mut where_sql = vec![time_predicate(time_bounds.from, time_bounds.to)];
         for matcher in &selector.matchers {
@@ -270,8 +211,8 @@ impl QueryEngine {
         );
         let rows = storage
             .with_query_conn(
-                self.memory_limit(background),
-                self.timeout(background),
+                self.memory_limit(false),
+                self.timeout(false),
                 |conn, prefix| {
                     let mut stmt = conn.prepare(&sql.replace("{prefix}", prefix))?;
                     let rows = stmt.query_map([], |row| {
@@ -298,8 +239,7 @@ impl QueryEngine {
     }
 
     pub fn execute_metric(&self, storage: &Storage, plan: &MetricPlan) -> ApiResult<Value> {
-        let background = plan.lane.is_background();
-        let _guard = self.acquire(background)?;
+        let _guard = self.acquire(false)?;
         let timer = Timer::start();
         let table = plan.signal.table();
         let agg_sql = match plan.aggregation {
@@ -336,32 +276,22 @@ impl QueryEngine {
                 "unsupported_promql",
             )?;
         }
-        let group_by = plan
-            .group_by
-            .iter()
-            .filter(|name| matches!(name.as_str(), "service_name" | "deployment_environment"))
-            .cloned()
-            .collect::<Vec<_>>();
-        let select_group = if group_by.is_empty() {
-            String::new()
-        } else {
-            format!(", {}", group_by.join(", "))
-        };
-        let group_sql = if group_by.is_empty() {
+        let group_by = &plan.group_by;
+        let group_clause = if group_by.is_empty() {
             String::new()
         } else {
             format!(", {}", group_by.join(", "))
         };
         let sql = format!(
-            "SELECT to_timestamp(floor(epoch(timestamp)/{step})*{step})::VARCHAR AS bucket{select_group}, {agg_sql} AS value FROM {{prefix}}{table} WHERE {} GROUP BY bucket{group_sql} ORDER BY bucket {} LIMIT {}",
+            "SELECT to_timestamp(floor(epoch(timestamp)/{step})*{step})::VARCHAR AS bucket{group_clause}, {agg_sql} AS value FROM {{prefix}}{table} WHERE {} GROUP BY bucket{group_clause} ORDER BY bucket {} LIMIT {}",
             where_sql.join(" AND "),
             plan.order.sql(),
             plan.limit + 1
         );
         let rows = storage
             .with_query_conn(
-                self.memory_limit(background),
-                self.timeout(background),
+                self.memory_limit(false),
+                self.timeout(false),
                 |conn, prefix| {
                     let mut stmt = conn.prepare(&sql.replace("{prefix}", prefix))?;
                     let mapped = stmt.query_map([], |row| {
@@ -433,25 +363,17 @@ impl QueryEngine {
             .unwrap_or_default();
         let plan = MetricPlan {
             selector: SelectorPlan {
-                signal: SignalKind::Metrics,
                 resource: Some(metric_name.to_string()),
                 matchers,
                 text_filters: Vec::new(),
             },
-            time_bounds: TimeBounds {
-                from,
-                to,
-                max_range_secs: METRIC_RANGE_SECS,
-                default_lookback: None,
-                instant: false,
-            },
+            time_bounds: TimeBounds { from, to },
             signal,
             aggregation,
             group_by,
             step_seconds: step,
             limit,
             order: SortDirection::from_order(req.get("order").and_then(Value::as_str)),
-            lane: QueryLane::Interactive,
         };
         self.execute_metric(storage, &plan)
     }

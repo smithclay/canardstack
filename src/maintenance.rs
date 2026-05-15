@@ -24,6 +24,7 @@ pub struct Maintenance {
     last_runs: Mutex<BTreeMap<String, String>>,
     last_failures: Mutex<BTreeMap<String, FailureRecord>>,
     retention: RetentionPolicy,
+    compaction_min_files: usize,
 }
 
 impl Maintenance {
@@ -37,6 +38,7 @@ impl Maintenance {
                 spans_days: config.spans_retention_days,
                 metrics_days: config.metrics_retention_days,
             },
+            compaction_min_files: config.ducklake_compaction_min_files,
         }
     }
 
@@ -87,6 +89,7 @@ impl Maintenance {
                 "spans": self.retention.spans_days,
                 "metrics": self.retention.metrics_days
             },
+            "compaction_min_files": self.compaction_min_files,
             "priority_order": ["queue_watchdog", "flush_inlined_data", "merge_adjacent_files", "retention"]
         })
     }
@@ -112,6 +115,40 @@ impl Maintenance {
                 ducklake_started.elapsed().as_secs_f64(),
             );
         }
+        self.record_run("flush");
+        Ok(json!({
+            "status": "ok",
+            "process_rows_flushed": process_rows,
+            "ducklake": ducklake,
+            "duration_ms": started.elapsed().as_millis()
+        }))
+    }
+
+    pub fn run_compaction(
+        &self,
+        storage: &Storage,
+        table: Option<&str>,
+        metrics: Option<&Metrics>,
+    ) -> Result<Value> {
+        if self.is_paused() {
+            return Ok(json!({"status": "paused"}));
+        }
+        let started = Instant::now();
+        let decision = storage.compaction_decision(table, self.compaction_min_files)?;
+        if !decision
+            .get("should_compact")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            self.record_run("compaction");
+            return Ok(json!({
+                "status": "skipped",
+                "reason": decision.get("status").and_then(Value::as_str).unwrap_or("not_needed"),
+                "decision": decision,
+                "duration_ms": started.elapsed().as_millis()
+            }));
+        }
+
         let compaction_started = Instant::now();
         let compaction = storage.merge_adjacent_files(table)?;
         if let Some(metrics) = metrics {
@@ -121,11 +158,10 @@ impl Maintenance {
                 compaction_started.elapsed().as_secs_f64(),
             );
         }
-        self.record_run("flush");
+        self.record_run("compaction");
         Ok(json!({
             "status": "ok",
-            "process_rows_flushed": process_rows,
-            "ducklake": ducklake,
+            "decision": decision,
             "compaction": compaction,
             "duration_ms": started.elapsed().as_millis()
         }))
@@ -225,10 +261,20 @@ impl Scheduler {
         let stop_for_thread = stop.clone();
         let watchdog = state.config.scheduler_watchdog_interval;
         let flush = state.config.scheduler_flush_interval;
+        let compaction = state.config.scheduler_compaction_interval;
         let retention = state.config.scheduler_retention_interval;
         let handle = thread::Builder::new()
             .name("canardstack-scheduler".to_string())
-            .spawn(move || scheduler_loop(state, stop_for_thread, watchdog, flush, retention))
+            .spawn(move || {
+                scheduler_loop(
+                    state,
+                    stop_for_thread,
+                    watchdog,
+                    flush,
+                    compaction,
+                    retention,
+                )
+            })
             .expect("spawn scheduler thread");
         Self {
             stop,
@@ -251,6 +297,7 @@ fn scheduler_loop(
     stop: Arc<AtomicBool>,
     watchdog_every: Duration,
     flush_every: Duration,
+    compaction_every: Duration,
     retention_every: Duration,
 ) {
     let tick = watchdog_every
@@ -258,6 +305,7 @@ fn scheduler_loop(
         .max(Duration::from_millis(10));
     let mut next_watchdog = Instant::now();
     let mut next_flush = Instant::now();
+    let mut next_compaction = Instant::now() + compaction_every;
     let mut next_retention = Instant::now() + retention_every;
 
     loop {
@@ -284,6 +332,14 @@ fn scheduler_loop(
                     .run_flush(&s.ingestor, &s.storage, None, Some(&s.metrics))
             });
             next_flush = now + next_interval(&state, "flush", flush_every, ok);
+        }
+
+        if now >= next_compaction {
+            let ok = run_job(&state, "compaction", |s| {
+                s.maintenance
+                    .run_compaction(&s.storage, None, Some(&s.metrics))
+            });
+            next_compaction = now + next_interval(&state, "compaction", compaction_every, ok);
         }
 
         if now >= next_retention {
@@ -371,6 +427,7 @@ fn classify_job_error(err: &anyhow::Error, job: &str) -> &'static str {
     }
     match job {
         "flush" | "watchdog" => "flush_failed",
+        "compaction" => "compaction_failed",
         "retention" | "retention_dry_run" => "retention_failed",
         _ => "scheduler_job_failed",
     }

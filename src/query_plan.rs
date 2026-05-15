@@ -1,39 +1,6 @@
-use crate::validation::{self, ApiError, ApiResult};
-use chrono::{DateTime, Duration, Utc};
+use crate::validation::{ApiError, ApiResult};
+use chrono::{DateTime, Utc};
 use std::collections::BTreeMap;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum QuerySurface {
-    PrometheusInstant,
-    PrometheusRange,
-    PrometheusMetadata,
-    LokiInstant,
-    LokiRange,
-    LokiMetadata,
-    TempoTraceById,
-    TempoSearch,
-    TempoTags,
-    TempoTagValues,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SignalKind {
-    Metrics,
-    Logs,
-    Traces,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum QueryLane {
-    Interactive,
-    Background,
-}
-
-impl QueryLane {
-    pub fn is_background(self) -> bool {
-        matches!(self, Self::Background)
-    }
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SortDirection {
@@ -83,7 +50,6 @@ pub enum TextFilter {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SelectorPlan {
-    pub signal: SignalKind,
     pub resource: Option<String>,
     pub matchers: Vec<FieldMatcher>,
     pub text_filters: Vec<TextFilter>,
@@ -98,49 +64,10 @@ impl SelectorPlan {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct TimeBounds {
     pub from: DateTime<Utc>,
     pub to: DateTime<Utc>,
-    pub max_range_secs: i64,
-    pub default_lookback: Option<Duration>,
-    pub instant: bool,
-}
-
-impl TimeBounds {
-    pub fn new(
-        from: DateTime<Utc>,
-        to: DateTime<Utc>,
-        max_range_secs: i64,
-        default_lookback: Option<Duration>,
-        instant: bool,
-    ) -> ApiResult<Self> {
-        validation::validate_range(from, to, max_range_secs)?;
-        Ok(Self {
-            from,
-            to,
-            max_range_secs,
-            default_lookback,
-            instant,
-        })
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct QueryLimitPlan {
-    pub limit: usize,
-    pub max_limit: usize,
-    pub max_groups: Option<usize>,
-    pub query_text_len: usize,
-    pub lane: QueryLane,
-}
-
-#[derive(Clone, Debug)]
-pub enum SignalQueryPlan {
-    Metric(MetricPlan),
-    Logs(LogPlan),
-    Traces(TracePlan),
-    Metadata(MetadataPlan),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -166,13 +93,6 @@ impl MetricSignal {
         match self {
             Self::Gauge => "metric_gauge",
             Self::Sum => "metric_sum",
-        }
-    }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Gauge => "gauge",
-            Self::Sum => "sum",
         }
     }
 }
@@ -203,17 +123,6 @@ impl MetricAggregation {
             )),
         }
     }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Avg => "avg",
-            Self::Min => "min",
-            Self::Max => "max",
-            Self::Sum => "sum",
-            Self::Count => "count",
-            Self::Rate => "rate",
-        }
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -226,7 +135,6 @@ pub struct MetricPlan {
     pub step_seconds: i64,
     pub limit: usize,
     pub order: SortDirection,
-    pub lane: QueryLane,
 }
 
 #[derive(Clone, Debug)]
@@ -235,33 +143,21 @@ pub struct LogPlan {
     pub time_bounds: TimeBounds,
     pub limit: usize,
     pub direction: SortDirection,
-    pub lane: QueryLane,
     pub stream_labels: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
-pub enum TracePlan {
-    Search {
-        selector: SelectorPlan,
-        time_bounds: TimeBounds,
-        limit: usize,
-        sort: TraceSort,
-        lane: QueryLane,
-    },
+pub struct TracePlan {
+    pub selector: SelectorPlan,
+    pub time_bounds: TimeBounds,
+    pub limit: usize,
+    pub sort: TraceSort,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TraceSort {
     TimestampDesc,
     DurationDesc,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MetadataPlan {
-    pub surface: QuerySurface,
-    pub selector: Option<SelectorPlan>,
-    pub limit: usize,
-    pub lane: QueryLane,
 }
 
 pub fn parse_selector(
