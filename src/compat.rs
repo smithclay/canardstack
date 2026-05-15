@@ -1,4 +1,8 @@
+use crate::log_query::parse_loki_query;
+use crate::promql::parse_prom_query;
+use crate::query_plan::TimeBounds;
 use crate::sql::{quote as sql_quote, time_predicate};
+use crate::trace_query::plan_tempo_search;
 use crate::validation::{self, ApiError, ApiResult};
 use crate::AppState;
 use chrono::{DateTime, TimeZone, Utc};
@@ -36,6 +40,7 @@ pub fn prometheus_query(state: &AppState, params: &HashMap<String, String>) -> A
         "aggregation": prom.aggregation,
         "step_seconds": 300,
         "filters": prom.filters,
+        "group_by": prom.group_by.clone(),
         "order": "desc",
         "limit": 1
     });
@@ -75,27 +80,38 @@ pub fn prometheus_query_range(
         "aggregation": prom.aggregation,
         "step_seconds": step,
         "filters": prom.filters,
-        "group_by": ["service_name"],
+        "group_by": if prom.explicit_grouping { json!(prom.group_by.clone()) } else { json!(["service_name"]) },
         "limit": 5000
     });
     let result = state.queries.metric_query(&state.storage, &req)?;
-    let mut series: BTreeMap<String, Vec<Value>> = BTreeMap::new();
+    let group_by = req
+        .get("group_by")
+        .and_then(Value::as_array)
+        .map(|values| values.iter().filter_map(Value::as_str).collect::<Vec<_>>())
+        .unwrap_or_default();
+    let mut series: BTreeMap<String, (Map<String, Value>, Vec<Value>)> = BTreeMap::new();
     for row in result_rows(&result) {
-        let service = row
-            .get("service_name")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        series.entry(service).or_default().push(row.clone());
+        let mut labels = Map::new();
+        labels.insert("__name__".to_string(), json!(prom.metric_name));
+        for label in &group_by {
+            if let Some(value) = row
+                .get(*label)
+                .and_then(Value::as_str)
+                .filter(|v| !v.is_empty())
+            {
+                labels.insert((*label).to_string(), json!(value));
+            }
+        }
+        let key = serde_json::to_string(&labels).unwrap_or_default();
+        series
+            .entry(key)
+            .or_insert_with(|| (labels, Vec::new()))
+            .1
+            .push(row.clone());
     }
     let result = series
         .into_iter()
-        .map(|(service, rows)| {
-            let mut labels = Map::new();
-            labels.insert("__name__".to_string(), json!(prom.metric_name));
-            if !service.is_empty() {
-                labels.insert("service_name".to_string(), json!(service));
-            }
+        .map(|(_, (labels, rows))| {
             json!({
                 "metric": labels,
                 "values": rows.into_iter().filter_map(|row| {
@@ -376,87 +392,43 @@ struct TempoTraceByIdResponse {
 pub fn tempo_search(state: &AppState, params: &HashMap<String, String>) -> ApiResult<Value> {
     let (from, to) = optional_range(params, INTERACTIVE_RANGE_SECS)?;
     let limit = parse_usize(params.get("limit"), 20, 1000)?;
-    let mut where_sql = vec![time_predicate(from, to)];
-    for (param, column) in [
-        ("service.name", "service_name"),
-        ("service_name", "service_name"),
-        ("serviceName", "service_name"),
-        ("service-name", "service_name"),
-        ("name", "span_name"),
-        ("span_name", "span_name"),
-        ("span.name", "span_name"),
-        ("span-name", "span_name"),
-        ("http.route", "http_route"),
-        ("http-route", "http_route"),
-        ("status.code", "status_code"),
-        ("status_code", "status_code"),
-        ("status", "status_code"),
-    ] {
-        if let Some(value) = params.get(param).filter(|v| !v.is_empty()) {
-            where_sql.push(format!("{column} = {}", sql_quote(value)));
-        }
-    }
-    if let Some(q) = params.get("q").or_else(|| params.get("query")) {
-        for (tag, column) in [
-            ("resource.service.name", "service_name"),
-            ("service.name", "service_name"),
-            ("span.name", "span_name"),
-            ("name", "span_name"),
-            ("http.route", "http_route"),
-            ("status.code", "status_code"),
-            ("status", "status_code"),
-        ] {
-            if let Some(value) = extract_quoted_tag(q, tag) {
-                where_sql.push(format!("{column} = {}", sql_quote(&value)));
-            }
-        }
-    }
-    if let Some(tags) = params.get("tags") {
-        for (tag, column) in [
-            ("service.name", "service_name"),
-            ("span.name", "span_name"),
-            ("name", "span_name"),
-            ("http.route", "http_route"),
-            ("status.code", "status_code"),
-            ("status", "status_code"),
-        ] {
-            if let Some(value) = extract_quoted_tag(tags, tag) {
-                where_sql.push(format!("{column} = {}", sql_quote(&value)));
-            }
-        }
-    }
-    let mut traces = Vec::new();
-    state.queries.run_interactive(&state.storage, |conn, prefix| {
-        let sql = format!(
-            "SELECT trace_id, min(timestamp)::VARCHAR, max(timestamp)::VARCHAR, max(service_name), max(span_name), count(*), max(duration) FROM {prefix}spans WHERE {} GROUP BY trace_id ORDER BY 3 DESC LIMIT {}",
-            where_sql.join(" AND "),
-            limit + 1
-        );
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map([], |row| {
-            let start_time = row.get::<_, Option<String>>(1)?;
-            let start_time_unix_nano = start_time
-                .as_deref()
+    let plan = plan_tempo_search(
+        params,
+        TimeBounds {
+            from,
+            to,
+            max_range_secs: INTERACTIVE_RANGE_SECS,
+            default_lookback: Some(chrono::Duration::hours(1)),
+            instant: false,
+        },
+        limit,
+    )?;
+    let rows = state.queries.execute_trace_search(&state.storage, &plan)?;
+    let traces = result_rows(&rows)
+        .into_iter()
+        .map(|row| {
+            let start_time_unix_nano = row
+                .get("start_time")
+                .and_then(Value::as_str)
                 .and_then(parse_any_time_to_utc)
                 .and_then(|time| time.timestamp_nanos_opt())
                 .map(|nanos| nanos.to_string())
                 .unwrap_or_default();
-            Ok(json!({
-                "traceID": row.get::<_, Option<String>>(0)?.unwrap_or_default(),
+            let matched = row
+                .get("matched_spans")
+                .and_then(Value::as_i64)
+                .unwrap_or_default();
+            json!({
+                "traceID": row.get("trace_id").and_then(Value::as_str).unwrap_or_default(),
                 "startTimeUnixNano": start_time_unix_nano,
-                "rootServiceName": row.get::<_, Option<String>>(3)?,
-                "rootTraceName": row.get::<_, Option<String>>(4)?,
-                "spanSet": {"spans": [], "matched": row.get::<_, i64>(5)?},
-                "spanSets": [{"spans": [], "matched": row.get::<_, i64>(5)?}],
-                "durationMs": row.get::<_, Option<i64>>(6)?.unwrap_or(0)
-            }))
-        })?;
-        for row in rows {
-            traces.push(row?);
-        }
-        Ok(())
-    })?;
-    traces.truncate(limit);
+                "rootServiceName": row.get("service_name").and_then(Value::as_str),
+                "rootTraceName": row.get("span_name").and_then(Value::as_str),
+                "spanSet": {"spans": [], "matched": matched},
+                "spanSets": [{"spans": [], "matched": matched}],
+                "durationMs": row.get("duration").and_then(Value::as_i64).unwrap_or_default()
+            })
+        })
+        .collect::<Vec<_>>();
     Ok(json!({"traces": traces, "metrics": {"inspectedTraces": traces.len(), "completedJobs": 1}}))
 }
 
@@ -509,7 +481,6 @@ fn loki_query_inner(
     range: bool,
 ) -> ApiResult<Value> {
     let query = required_param(params, "query")?;
-    let selector = parse_log_selector(query)?;
     let end = optional_time(params, "end")?.unwrap_or_else(Utc::now);
     let start = optional_time(params, "start")?.unwrap_or(end - chrono::Duration::hours(1));
     validate_range(start, end, INTERACTIVE_RANGE_SECS)?;
@@ -518,66 +489,25 @@ fn loki_query_inner(
         .get("direction")
         .map(String::as_str)
         .unwrap_or("backward");
-    let mut req = json!({
-        "from": start.to_rfc3339(),
-        "to": if range { end.to_rfc3339() } else { (end + chrono::Duration::seconds(1)).to_rfc3339() },
-        "limit": limit
-    });
-    if let Some(text) = selector.contains {
-        req["query"] = json!(text);
-    }
-    req["service_name"] = selector
-        .labels
-        .get("service_name")
-        .or_else(|| selector.labels.get("service.name"))
-        .map(|s| json!(s))
-        .unwrap_or(Value::Null);
-    req["deployment_environment"] = selector
-        .labels
-        .get("deployment_environment")
-        .or_else(|| selector.labels.get("deployment.environment"))
-        .map(|s| json!(s))
-        .unwrap_or(Value::Null);
-    req["trace_id"] = selector
-        .labels
-        .get("trace_id")
-        .map(|s| json!(s))
-        .unwrap_or(Value::Null);
-    req["span_id"] = selector
-        .labels
-        .get("span_id")
-        .map(|s| json!(s))
-        .unwrap_or(Value::Null);
-    req["http_route"] = selector
-        .labels
-        .get("http_route")
-        .or_else(|| selector.labels.get("http.route"))
-        .map(|s| json!(s))
-        .unwrap_or(Value::Null);
-    req["http_method"] = selector
-        .labels
-        .get("http_method")
-        .or_else(|| selector.labels.get("http.method"))
-        .map(|s| json!(s))
-        .unwrap_or(Value::Null);
-    if let Some(sev) = selector.labels.get("severity_text") {
-        req["severity"] = json!([sev]);
-    }
-    req["direction"] = json!(direction);
-    let result = state.queries.log_search(&state.storage, &req)?;
+    let time_bounds = TimeBounds {
+        from: start,
+        to: if range {
+            end
+        } else {
+            end + chrono::Duration::seconds(1)
+        },
+        max_range_secs: INTERACTIVE_RANGE_SECS,
+        default_lookback: Some(chrono::Duration::hours(1)),
+        instant: !range,
+    };
+    let plan = parse_loki_query(query, time_bounds, limit, direction)?;
+    let result = state.queries.execute_logs(&state.storage, &plan)?;
     let mut streams: BTreeMap<String, (Map<String, Value>, Vec<Value>)> = BTreeMap::new();
     for row in result_rows(&result) {
         let mut labels = Map::new();
-        for label in [
-            "service_name",
-            "deployment_environment",
-            "severity_text",
-            "trace_id",
-            "span_id",
-            "http_route",
-        ] {
+        for label in &plan.stream_labels {
             if let Some(value) = row
-                .get(label)
+                .get(label.as_str())
                 .and_then(Value::as_str)
                 .filter(|v| !v.is_empty())
             {
@@ -607,227 +537,12 @@ fn loki_query_inner(
         .into_values()
         .map(|(stream, values)| json!({"stream": stream, "values": values}))
         .collect::<Vec<_>>();
-    if direction == "forward" {
+    if plan.direction.is_forward() {
         result.reverse();
     }
     Ok(loki_success(
         json!({"resultType": "streams", "result": result}),
     ))
-}
-
-#[derive(Debug)]
-struct PromQuery {
-    metric_name: String,
-    signal: &'static str,
-    aggregation: &'static str,
-    filters: Value,
-}
-
-fn parse_prom_query(raw: &str) -> ApiResult<PromQuery> {
-    let mut query = raw.trim();
-    let mut aggregation = "avg";
-    if let Some((func, inner)) = unwrap_func(query) {
-        aggregation = match func {
-            "avg" => "avg",
-            "min" => "min",
-            "max" => "max",
-            "sum" => "sum",
-            "count" => "count",
-            "rate" => "rate",
-            _ => {
-                return Err(ApiError::new(
-                    400,
-                    "unsupported_promql",
-                    "supported PromQL subset is metric selectors plus avg/min/max/sum/count/rate(metric)",
-                ))
-            }
-        };
-        query = inner;
-    }
-    let (mut metric_name, mut filters) = parse_selector(query)?;
-    if metric_name.is_empty() {
-        metric_name = filters.remove("__name__").ok_or_else(|| {
-            ApiError::new(
-                400,
-                "unsupported_promql",
-                "metric queries require a metric name or __name__ label",
-            )
-        })?;
-    }
-    let filters = normalize_labels(
-        filters,
-        &[
-            ("service_name", "service_name"),
-            ("service.name", "service_name"),
-            ("deployment_environment", "deployment_environment"),
-            ("deployment.environment", "deployment_environment"),
-        ],
-        "unsupported_promql",
-    )?;
-    let signal = if aggregation == "rate"
-        || metric_name.ends_with(".sum")
-        || metric_name.ends_with("_total")
-    {
-        "sum"
-    } else {
-        "gauge"
-    };
-    Ok(PromQuery {
-        metric_name,
-        signal,
-        aggregation,
-        filters: json!(filters),
-    })
-}
-
-#[derive(Debug)]
-struct LogSelector {
-    labels: BTreeMap<String, String>,
-    contains: Option<String>,
-}
-
-fn parse_log_selector(raw: &str) -> ApiResult<LogSelector> {
-    let (selector, contains) = raw
-        .split_once("|=")
-        .map(|(left, right)| (left.trim(), Some(unquote(right.trim()).to_string())))
-        .unwrap_or((raw.trim(), None));
-    let (_, labels) = parse_selector(selector)?;
-    let labels = normalize_labels(
-        labels,
-        &[
-            ("service_name", "service_name"),
-            ("service.name", "service_name"),
-            ("deployment_environment", "deployment_environment"),
-            ("deployment.environment", "deployment_environment"),
-            ("severity_text", "severity_text"),
-            ("trace_id", "trace_id"),
-            ("span_id", "span_id"),
-            ("http_route", "http_route"),
-            ("http.route", "http_route"),
-            ("http_method", "http_method"),
-            ("http.method", "http_method"),
-        ],
-        "unsupported_selector",
-    )?;
-    Ok(LogSelector { labels, contains })
-}
-
-fn parse_selector(raw: &str) -> ApiResult<(String, BTreeMap<String, String>)> {
-    let raw = raw.trim();
-    if let Some((name, rest)) = raw.split_once('{') {
-        let label_part = rest
-            .strip_suffix('}')
-            .ok_or_else(|| ApiError::new(400, "invalid_selector", "selector must end with }"))?;
-        let labels = parse_labels(label_part)?;
-        let metric_name = name.trim();
-        Ok((metric_name.to_string(), labels))
-    } else if raw.starts_with('{') {
-        let label_part = raw
-            .strip_prefix('{')
-            .and_then(|s| s.strip_suffix('}'))
-            .ok_or_else(|| ApiError::new(400, "invalid_selector", "selector must be {...}"))?;
-        Ok(("".to_string(), parse_labels(label_part)?))
-    } else if !raw.is_empty()
-        && raw
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | ':' | '.'))
-    {
-        Ok((raw.to_string(), BTreeMap::new()))
-    } else {
-        Err(ApiError::new(
-            400,
-            "unsupported_selector",
-            "supported selector subset is name, name{label=\"value\"}, or {label=\"value\"}",
-        ))
-    }
-}
-
-fn parse_labels(raw: &str) -> ApiResult<BTreeMap<String, String>> {
-    let mut labels = BTreeMap::new();
-    for part in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-        let (key, value) = part.split_once('=').ok_or_else(|| {
-            ApiError::new(
-                400,
-                "unsupported_selector",
-                "only equality label filters are supported",
-            )
-        })?;
-        if key.ends_with('!') || key.ends_with('~') || part.contains("=~") || part.contains("!=") {
-            return Err(ApiError::new(
-                400,
-                "unsupported_selector",
-                "regex and negative label filters are not supported",
-            ));
-        }
-        labels.insert(key.trim().to_string(), unquote(value.trim()).to_string());
-    }
-    Ok(labels)
-}
-
-fn unwrap_func(query: &str) -> Option<(&str, &str)> {
-    let open = query.find('(')?;
-    let close = query.rfind(')')?;
-    if close == query.len() - 1 {
-        Some((query[..open].trim(), query[open + 1..close].trim()))
-    } else {
-        None
-    }
-}
-
-fn unquote(value: &str) -> &str {
-    value.trim().trim_matches('"')
-}
-
-fn normalize_labels(
-    labels: BTreeMap<String, String>,
-    supported: &[(&str, &str)],
-    reason: &'static str,
-) -> ApiResult<BTreeMap<String, String>> {
-    let mut normalized = BTreeMap::new();
-    for (key, value) in labels {
-        let Some((_, canonical)) = supported.iter().find(|(raw, _)| *raw == key) else {
-            return Err(ApiError::new(
-                400,
-                reason,
-                format!("unsupported label {key} in v0 selector"),
-            ));
-        };
-        if let Some(existing) = normalized.get(*canonical) {
-            if existing != &value {
-                return Err(ApiError::new(
-                    400,
-                    reason,
-                    format!("conflicting values for label {canonical}"),
-                ));
-            }
-        }
-        normalized.insert((*canonical).to_string(), value);
-    }
-    Ok(normalized)
-}
-
-fn extract_quoted_tag(raw: &str, tag: &str) -> Option<String> {
-    let marker = format!("{tag}=");
-    let marker_start = raw.match_indices(&marker).find_map(|(index, _)| {
-        let is_tag_boundary = raw[..index]
-            .chars()
-            .next_back()
-            .map(|c| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')))
-            .unwrap_or(true);
-        is_tag_boundary.then_some(index)
-    })?;
-    let start = marker_start + marker.len();
-    let rest = raw[start..].trim_start();
-    if let Some(rest) = rest.strip_prefix('"') {
-        let end = rest.find('"')?;
-        Some(rest[..end].to_string())
-    } else {
-        let end = rest
-            .find(|c: char| c.is_whitespace() || c == ',' || c == '}')
-            .unwrap_or(rest.len());
-        let value = &rest[..end];
-        (!value.is_empty()).then(|| value.to_string())
-    }
 }
 
 fn required_param<'a>(

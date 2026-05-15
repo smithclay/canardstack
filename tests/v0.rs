@@ -727,6 +727,29 @@ fn compatibility_routes_reject_unsupported_query_subsets() {
     assert_eq!(response.status(), 400);
     assert_eq!(response.json_body()["status"], "error");
     assert_eq!(response.json_body()["errorType"], "unsupported_promql");
+
+    let response = http::route(
+        "GET",
+        "/api/v1/query_range",
+        &HashMap::from([
+            (
+                "query".to_string(),
+                "sum by (pod) (smoke.gauge)".to_string(),
+            ),
+            (
+                "start".to_string(),
+                (now - Duration::minutes(5)).to_rfc3339(),
+            ),
+            ("end".to_string(), now.to_rfc3339()),
+            ("step".to_string(), "60".to_string()),
+        ]),
+        &headers(&state),
+        &[],
+        &state,
+    );
+    assert_eq!(response.status(), 400);
+    assert_eq!(response.json_body()["status"], "error");
+    assert_eq!(response.json_body()["errorType"], "unsupported_promql");
 }
 
 #[test]
@@ -781,6 +804,109 @@ fn prometheus_instant_query_returns_latest_bucket_in_lookback() {
     );
     assert_eq!(response.status(), 200, "{}", response.json_body());
     assert_eq!(response.json_body()["data"]["result"][0]["value"][1], "2");
+}
+
+#[test]
+fn prometheus_query_range_supports_explicit_grouping_over_promoted_labels() {
+    let (_dir, state) = app();
+    let at = Utc.with_ymd_and_hms(1970, 1, 1, 0, 10, 0).unwrap();
+    append_gauge_rows(
+        &state,
+        &[
+            (at.timestamp_millis(), "smoke.gauge", 2.0, "checkout"),
+            (at.timestamp_millis(), "smoke.gauge", 3.0, "checkout"),
+            (at.timestamp_millis(), "smoke.gauge", 5.0, "payments"),
+        ],
+        "test",
+    );
+
+    let response = http::route(
+        "GET",
+        "/api/v1/query_range",
+        &HashMap::from([
+            (
+                "query".to_string(),
+                "sum by (service_name) (smoke.gauge)".to_string(),
+            ),
+            (
+                "start".to_string(),
+                (at - Duration::minutes(1)).timestamp().to_string(),
+            ),
+            (
+                "end".to_string(),
+                (at + Duration::minutes(1)).timestamp().to_string(),
+            ),
+            ("step".to_string(), "60".to_string()),
+        ]),
+        &headers(&state),
+        &[],
+        &state,
+    );
+    assert_eq!(response.status(), 200, "{}", response.json_body());
+    let result = response.json_body()["data"]["result"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert!(
+        result.iter().any(|series| {
+            series["metric"]["service_name"] == "checkout"
+                && series["values"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|sample| sample[1] == "5")
+        }),
+        "checkout grouped sum missing: {}",
+        response.json_body()
+    );
+    assert!(
+        result.iter().any(|series| {
+            series["metric"]["service_name"] == "payments"
+                && series["values"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|sample| sample[1] == "5")
+        }),
+        "payments grouped sum missing: {}",
+        response.json_body()
+    );
+
+    let response = http::route(
+        "GET",
+        "/api/v1/query_range",
+        &HashMap::from([
+            (
+                "query".to_string(),
+                "sum without (service_name, deployment_environment) (smoke.gauge)".to_string(),
+            ),
+            (
+                "start".to_string(),
+                (at - Duration::minutes(1)).timestamp().to_string(),
+            ),
+            (
+                "end".to_string(),
+                (at + Duration::minutes(1)).timestamp().to_string(),
+            ),
+            ("step".to_string(), "60".to_string()),
+        ]),
+        &headers(&state),
+        &[],
+        &state,
+    );
+    assert_eq!(response.status(), 200, "{}", response.json_body());
+    let body = response.json_body();
+    let result = body["data"]["result"].as_array().unwrap();
+    assert_eq!(result.len(), 1, "{body}");
+    assert!(result[0]["metric"].get("service_name").is_none());
+    assert!(
+        result[0]["values"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|sample| sample[1] == "10"),
+        "ungrouped without sum missing: {body}"
+    );
 }
 
 #[test]

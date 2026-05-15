@@ -42,6 +42,9 @@ Supported PromQL subset:
 - Equality filters over promoted labels such as `service_name` and
   `deployment_environment`.
 - `avg`, `min`, `max`, `sum`, `count`, and `rate` around a single selector.
+- `avg`, `min`, `max`, `sum`, and `count` with explicit `by(...)` or
+  `without(...)` grouping over promoted labels such as `service_name` and
+  `deployment_environment`.
 
 Not implemented: full PromQL expression evaluation, joins, binary operators,
 subqueries, histograms, exemplars, rule evaluation, staleness semantics, and
