@@ -155,6 +155,8 @@ Each benchmark run must produce:
 - Storage physical/logical byte chart.
 - Recommendation: pass, fail, or retry with changed config.
 
+Record completed evidence in [benchmark-results.md](benchmark-results.md).
+
 ## v0 Iteration Benchmark
 
 The first Rust-native iteration benchmark is intentionally smaller than this
@@ -167,5 +169,81 @@ dominant server phases that correlate with failed gates.
 cargo bench --bench v0_iteration -- --duration 30s --warmup 5s
 ```
 
-Useful local knobs are `--target-gb-day`, `--query-interval`, `--no-queries`,
-and `--report-dir`.
+Useful local knobs:
+
+- Volume: `--target-gb-day 25`, `--target-gb-day 100`, `--target-gb-day 250`.
+- Run shape: `--profile ingest-only` for a clean ingest baseline, or
+  `--profile mixed-query` for ingest plus compatibility-query interference.
+- Query pressure: `--query-pressure low|medium|high`, or explicit
+  `--query-interval` plus `--query-concurrency`.
+- Workload dimensions: `--services`, `--log-body-bytes`, `--trace-spans`,
+  and `--metric-series`.
+- Output: `--report-dir`, which preserves `report.json`.
+
+The JSON report includes the workload profile, query profile, configured or
+detected resource envelope, `/api/admin/health/storage` storage mode/config
+snapshot, storage layout gauges, freshness and queue trends, phase timing, and
+explicit pass/fail criteria for the single-tenant claim under test.
+
+## Practical Evidence Ladder
+
+Run each volume first without queries, then with queries:
+
+```sh
+# Sentinel: catches obvious regressions quickly.
+cargo bench --bench v0_iteration -- \
+  --warmup 30s --duration 5m --target-gb-day 25 --profile ingest-only
+cargo bench --bench v0_iteration -- \
+  --warmup 30s --duration 5m --target-gb-day 25 --profile mixed-query --query-pressure medium
+
+# Two-hour proof run at the candidate volume.
+cargo bench --bench v0_iteration -- \
+  --warmup 5m --duration 2h --target-gb-day 100 --profile ingest-only
+cargo bench --bench v0_iteration -- \
+  --warmup 5m --duration 2h --target-gb-day 100 --profile mixed-query --query-pressure high
+
+# Overnight run before claiming sustained operation.
+cargo bench --bench v0_iteration -- \
+  --warmup 10m --duration 12h --target-gb-day 250 --profile mixed-query --query-pressure high
+```
+
+Treat 25 GB/day, 100 GB/day, and 250 GB/day as separate claims. A passing
+25 GB/day sentinel is not evidence for 100 GB/day, and a clean ingest-only run
+is not evidence that queries cannot starve ingest.
+
+## Capped Docker Desktop Runs
+
+The `bench` Compose profile starts a separate capped `canardstack-bench`
+container on host port `4319`. Defaults are intentionally modest:
+2 CPUs, 4 GB memory, 1 GiB DuckDB write memory, 1 GiB total ingest queue budget,
+and 256 MiB per-signal queue budget.
+
+```sh
+docker compose --profile bench up --build -d canardstack-bench
+
+docker inspect "$(docker compose ps -q canardstack-bench)" \
+  --format 'NanoCpus={{.HostConfig.NanoCpus}} Memory={{.HostConfig.Memory}} MemorySwap={{.HostConfig.MemorySwap}}'
+
+CANARDSTACK_BENCHMARK_CPU_LIMIT=2.0 \
+CANARDSTACK_BENCHMARK_MEMORY_LIMIT=4g \
+CANARDSTACK_BENCHMARK_RESOURCE_NOTE='Docker Desktop VM capped to 2 CPU / 4 GB memory; not cloud-equivalent Linux hardware' \
+cargo bench --bench v0_iteration -- \
+  --base-url http://127.0.0.1:4319 \
+  --warmup 30s --duration 5m \
+  --target-gb-day 25 \
+  --profile mixed-query --query-pressure medium \
+  --report-dir target/canardstack-bench/docker-desktop
+```
+
+Override limits per run:
+
+```sh
+CANARDSTACK_BENCH_CPUS=4.0 CANARDSTACK_BENCH_MEMORY=8g \
+docker compose --profile bench up --build -d canardstack-bench
+```
+
+On macOS, report the result as "Docker Desktop VM capped to X CPU / Y memory."
+That is useful regression evidence for this repository, but it is not equivalent
+to a Linux VM or bare-metal claim. Cloud or production-facing claims require a
+real Linux VM with documented instance type, disk/object-store configuration,
+kernel/cgroup limits, and the same benchmark report artifacts.

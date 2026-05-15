@@ -149,6 +149,7 @@ impl Ingestor {
         if let Some(metrics) = metrics {
             for (key, batches) in &sets {
                 let attempted_rows: usize = batches.iter().map(QueuedBatch::len).sum();
+                let attempted_bytes: usize = batches.iter().map(|batch| batch.approx_bytes).sum();
                 if attempted_rows == 0 {
                     continue;
                 }
@@ -161,6 +162,11 @@ impl Ingestor {
                     "canardstack_ingest_flush_attempted_rows_total",
                     &[("signal", key.signal.as_str())],
                     attempted_rows as u64,
+                );
+                metrics.inc(
+                    "canardstack_ingest_flush_attempted_bytes_total",
+                    &[("signal", key.signal.as_str())],
+                    attempted_bytes as u64,
                 );
             }
         }

@@ -868,6 +868,10 @@ fn metric_due_flush_preserves_gauge_sum_pairing() {
         "{metrics}"
     );
     assert!(
+        metrics.contains("canardstack_ingest_flush_attempted_bytes_total{signal=\"metric_gauge\"}"),
+        "{metrics}"
+    );
+    assert!(
         metrics.contains("canardstack_ingest_flush_rows_total{signal=\"metric_sum\"} 1"),
         "{metrics}"
     );
@@ -1888,6 +1892,31 @@ fn admin_endpoints_reject_data_key_and_unauthenticated_requests() {
             admin.json_body()
         );
     }
+}
+
+#[test]
+fn admin_flush_records_ducklake_maintenance_phase_metrics() {
+    let (_dir, state) = app();
+    let response = http::route(
+        "POST",
+        "/api/admin/maintenance/flush",
+        &HashMap::new(),
+        &admin_headers(&state),
+        &[],
+        &state,
+    );
+    assert_eq!(response.status(), 200, "{}", response.json_body());
+
+    let metrics = state.metrics.render_prometheus();
+    assert!(
+        metrics
+            .contains("canardstack_ducklake_flush_inlined_duration_seconds_count{table=\"all\"} 1"),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains("canardstack_ducklake_compaction_duration_seconds_count{table=\"all\"} 1"),
+        "{metrics}"
+    );
 }
 
 #[test]

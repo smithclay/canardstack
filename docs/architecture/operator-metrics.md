@@ -28,6 +28,7 @@ Do not label metrics by `service_name`, trace id, query text, API key, or arbitr
 | `canardstack_ingest_queue_bytes` | Gauge | `signal` | Current queued bytes (approximate). |
 | `canardstack_ingest_queue_oldest_age_seconds` | Gauge | `signal` | Oldest queued record age. |
 | `canardstack_ingest_rejections_total` | Counter | `signal`, `status`, `reason` | Admission-control rejections (subset of `_ingest_requests_total`). |
+| `canardstack_ingest_flush_attempted_bytes_total` | Counter | `signal` | Approximate queued Arrow bytes selected for flush attempts. |
 | `canardstack_ingest_partial_commit_rows_total` | Counter | `signal`, `triggered_by` | Rows durably committed before a mid-batch flush failure; surfaces best-effort durability. |
 
 ## HTTP Metrics
@@ -45,6 +46,8 @@ Do not label metrics by `service_name`, trace id, query text, API key, or arbitr
 | `canardstack_ducklake_parquet_files` | Gauge | `table` | Active DuckLake Parquet data files per table. |
 | `canardstack_ducklake_parquet_rows` | Gauge | `table` | Active rows stored in DuckLake Parquet data files per table. |
 | `canardstack_ducklake_inlined_rows` | Gauge | `table` | Rows currently held in DuckLake inlined-data tables per table. |
+| `canardstack_ducklake_flush_inlined_duration_seconds` | Histogram (`_count` / `_sum`) | `table` | Time spent in DuckLake inlined-data flush during maintenance. |
+| `canardstack_ducklake_compaction_duration_seconds` | Histogram (`_count` / `_sum`) | `table` | Time spent in DuckLake adjacent-file compaction during maintenance. |
 
 ## Query Metrics
 
@@ -88,7 +91,7 @@ Do not label metrics by `service_name`, trace id, query text, API key, or arbitr
 The following metrics from earlier design drafts are **not** emitted by the current implementation. They are listed here so dashboards and runbooks don't silently depend on them:
 
 - `canardstack_ingest_decode_seconds`
-- `canardstack_ducklake_insert_seconds`, `_commit_seconds`, `_inlined_bytes`, `_inlined_rows`, `_oldest_inlined_age_seconds`, `_snapshot_count`, `_flush_failures_total`
+- `canardstack_ducklake_insert_seconds`, `_commit_seconds`, `_inlined_bytes`, `_oldest_inlined_age_seconds`, `_snapshot_count`, `_flush_failures_total`
 - `canardstack_storage_logical_bytes` (the implementation emits `_logical_rows` instead)
 - `canardstack_object_store_errors_total`, `_request_seconds`
 - `canardstack_query_active`, `_memory_high_water_bytes`, `_oom_total`

@@ -96,14 +96,31 @@ impl Maintenance {
         ingestor: &Ingestor,
         storage: &Storage,
         table: Option<&str>,
+        metrics: Option<&Metrics>,
     ) -> Result<Value> {
         if self.is_paused() {
             return Ok(json!({"status": "paused"}));
         }
         let started = Instant::now();
         let process_rows = ingestor.flush_all(storage)?;
+        let ducklake_started = Instant::now();
         let ducklake = storage.flush_inlined_data(table)?;
+        if let Some(metrics) = metrics {
+            metrics.observe_seconds(
+                "canardstack_ducklake_flush_inlined_duration_seconds",
+                &[("table", table.unwrap_or("all"))],
+                ducklake_started.elapsed().as_secs_f64(),
+            );
+        }
+        let compaction_started = Instant::now();
         let compaction = storage.merge_adjacent_files(table)?;
+        if let Some(metrics) = metrics {
+            metrics.observe_seconds(
+                "canardstack_ducklake_compaction_duration_seconds",
+                &[("table", table.unwrap_or("all"))],
+                compaction_started.elapsed().as_secs_f64(),
+            );
+        }
         self.record_run("flush");
         Ok(json!({
             "status": "ok",
@@ -263,7 +280,8 @@ fn scheduler_loop(
 
         if now >= next_flush {
             let ok = run_job(&state, "flush", |s| {
-                s.maintenance.run_flush(&s.ingestor, &s.storage, None)
+                s.maintenance
+                    .run_flush(&s.ingestor, &s.storage, None, Some(&s.metrics))
             });
             next_flush = now + next_interval(&state, "flush", flush_every, ok);
         }

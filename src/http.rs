@@ -370,6 +370,7 @@ pub fn route(
                     &state.ingestor,
                     &state.storage,
                     query.get("table").map(String::as_str),
+                    Some(&state.metrics),
                 )
                 .map_err(|err| {
                     if let Some((partial_signal, committed)) =

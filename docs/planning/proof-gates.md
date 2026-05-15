@@ -4,6 +4,8 @@
 
 - Docker/local quickstart starts in local DuckLake mode with one documented command.
 - Docker/local smoke ingests representative OTLP fixtures through port `4318` and verifies Prometheus/Loki/Tempo compatibility results.
+- Capped Docker Desktop sentinel benchmark records the configured CPU/memory envelope and passes at 25 GB/day ingest-only and mixed-query profiles.
+- A real Linux VM 2-hour benchmark records instance/disk/object-store details and passes at the claimed GB/day volume, both ingest-only and with query interference.
 - Local Docker volume persistence survives container restart and reset behavior is documented.
 - OTLP/HTTP protobuf and JSON decode pass compatibility fixtures.
 - `otlp2records` schemas are mapped without lossy column renames.
@@ -15,7 +17,8 @@
 
 ## Required Before Claiming 100-500 GB/day
 
-- 24-hour mixed workload benchmark at 500 GB/day equivalent.
+- 2-hour and overnight mixed workload benchmarks at each claimed ladder step: 100 GB/day, then 250 GB/day, then 500 GB/day equivalent.
+- Each claimed ladder step has both clean ingest-only evidence and ingest-plus-query-interference evidence under a documented CPU/memory envelope.
 - Object storage mode benchmark, not local-only.
 - DuckLake inlined data is bounded under sustained load.
 - Inlined data reliably becomes Parquet through maintenance.
