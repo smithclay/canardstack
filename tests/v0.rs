@@ -87,6 +87,7 @@ fn seeded_app() -> SeededApp {
         assert_eq!(response.status(), 202, "{path}: {}", response.json_body());
     }
     state.ingestor.flush_all(&state.storage).unwrap();
+    state.storage.refresh_metadata().unwrap();
 
     let from = now - Duration::minutes(5);
     let to = now + Duration::minutes(5);
@@ -326,6 +327,7 @@ fn append_log_rows(state: &AppState, rows: &[(i64, &str, &str)], source_format: 
         .storage
         .insert_arrow_records(Signal::Logs, &batch, source_format)
         .unwrap();
+    state.storage.refresh_metadata().unwrap();
 }
 
 #[test]
@@ -357,9 +359,10 @@ fn auth_rejects_missing_and_bad_keys() {
 }
 
 #[test]
-fn removed_dashboard_alert_and_rest_query_routes_are_not_available() {
+fn removed_ui_dashboard_alert_and_rest_query_routes_are_not_available() {
     let (_dir, state) = app();
     for (method, path) in [
+        ("GET", "/"),
         ("POST", "/api/logs/search"),
         ("POST", "/api/spans/search"),
         ("POST", "/api/metrics/query"),
@@ -381,6 +384,60 @@ fn removed_dashboard_alert_and_rest_query_routes_are_not_available() {
         );
         assert_eq!(response.status(), 404, "{method} {path}");
     }
+}
+
+#[test]
+fn operator_metrics_snapshot_is_written_to_metric_store() {
+    let (_dir, state) = app();
+    state.metrics.ingest_request(Signal::Logs, 202, "accepted");
+    state.metrics.ingest_request(Signal::Logs, 202, "accepted");
+    state
+        .metrics
+        .query_request("/api/v1/query_range", 200, "ok", 0.125);
+
+    let rows = state
+        .metrics
+        .write_snapshot_to_storage(&state.storage)
+        .unwrap();
+    assert!(rows >= 3, "expected operator metric rows, got {rows}");
+
+    let now = Utc::now();
+    let response = http::route(
+        "GET",
+        "/api/v1/query_range",
+        &HashMap::from([
+            (
+                "query".to_string(),
+                "sum({__name__=\"canardstack_ingest_requests_total\",service_name=\"canardstack\"})"
+                    .to_string(),
+            ),
+            (
+                "start".to_string(),
+                (now - Duration::minutes(5)).to_rfc3339(),
+            ),
+            (
+                "end".to_string(),
+                (now + Duration::minutes(5)).to_rfc3339(),
+            ),
+            ("step".to_string(), "60".to_string()),
+        ]),
+        &headers(&state),
+        &[],
+        &state,
+    );
+    assert_eq!(response.status(), 200, "{}", response.json_body());
+    let series = response.json_body()["data"]["result"]
+        .as_array()
+        .unwrap()
+        .first()
+        .cloned()
+        .unwrap_or_else(|| panic!("operator metric query returned no series"));
+    assert_eq!(
+        series["metric"]["__name__"],
+        "canardstack_ingest_requests_total"
+    );
+    assert_eq!(series["metric"]["service_name"], "canardstack");
+    assert_eq!(series["values"][0][1], "2");
 }
 
 #[test]
@@ -1176,6 +1233,239 @@ fn grafana_loki_contract_accepts_unix_ranges_and_label_aliases() {
 }
 
 #[test]
+fn metadata_spine_serves_discovery_endpoints_and_cache_repeats() {
+    let app = seeded_app();
+
+    let summary_rows = app
+        .state
+        .storage
+        .with_conn(|conn, prefix| {
+            let sql = format!("SELECT count(*) FROM {prefix}metadata_summary");
+            let count: i64 = conn.query_row(&sql, [], |row| row.get(0))?;
+            Ok(count)
+        })
+        .unwrap();
+    assert!(summary_rows > 0, "flush should populate metadata summaries");
+    assert!(
+        app.state.storage.metadata_generation() > 0,
+        "metadata refresh should advance cache generation"
+    );
+
+    let metric_names = assert_success(
+        &compat_get(
+            &app,
+            "/api/v1/label/__name__/values",
+            HashMap::from(unix_range_params(&app)),
+        ),
+        "prometheus metric name values",
+    );
+    let metric_names = metric_names["data"].as_array().unwrap();
+    assert!(metric_names.iter().any(|value| value == "smoke.gauge"));
+    assert!(metric_names.iter().any(|value| value == "smoke.sum"));
+
+    let before_cache = app.state.metadata.cache_entries();
+    let first_loki_values = assert_success(
+        &compat_get(
+            &app,
+            "/loki/api/v1/label/http_route/values",
+            HashMap::from(unix_range_params(&app)),
+        ),
+        "first Loki label values",
+    );
+    assert_eq!(first_loki_values["status"], "success");
+    assert!(
+        first_loki_values["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value == "/smoke"),
+        "Loki label values should come from metadata summaries: {first_loki_values}"
+    );
+    assert!(
+        app.state.metadata.cache_entries() > before_cache,
+        "first lookup should populate metadata discovery cache"
+    );
+    let second_loki_values = assert_success(
+        &compat_get(
+            &app,
+            "/loki/api/v1/label/http_route/values",
+            HashMap::from(unix_range_params(&app)),
+        ),
+        "second Loki label values",
+    );
+    assert_eq!(first_loki_values, second_loki_values);
+
+    let prom_series = assert_success(
+        &compat_get(
+            &app,
+            "/api/v1/series",
+            HashMap::from(unix_range_params(&app)),
+        ),
+        "prometheus series",
+    );
+    assert!(prom_series["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|series| series["__name__"] == "smoke.gauge"));
+
+    let metadata = assert_success(
+        &compat_get(&app, "/api/v1/metadata", HashMap::new()),
+        "prometheus metadata",
+    );
+    assert_eq!(metadata["data"]["smoke.gauge"][0]["type"], "gauge");
+    assert_eq!(metadata["data"]["smoke.sum"][0]["type"], "counter");
+
+    let tempo_values = assert_success(
+        &compat_get(
+            &app,
+            "/api/v2/search/tag/span-name/values",
+            HashMap::from(unix_range_params(&app)),
+        ),
+        "tempo tag values",
+    );
+    assert_tag_values_include(&tempo_values, "GET /smoke", "tempo tag values");
+
+    let unsupported = assert_success(
+        &compat_get(
+            &app,
+            "/api/v1/label/pod/values",
+            HashMap::from(unix_range_params(&app)),
+        ),
+        "unsupported Prometheus label",
+    );
+    assert_eq!(unsupported["data"].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn metadata_cache_key_distinguishes_same_day_ranges() {
+    let (_dir, state) = app();
+    let day = Utc.with_ymd_and_hms(2025, 1, 10, 0, 0, 0).unwrap();
+    append_log_rows(
+        &state,
+        &[
+            (day.timestamp_millis(), "early same-day log", "checkout"),
+            (
+                (day + Duration::hours(12)).timestamp_millis(),
+                "late same-day log",
+                "payments",
+            ),
+        ],
+        "otlp_json",
+    );
+
+    let first = http::route(
+        "GET",
+        "/loki/api/v1/label/service_name/values",
+        &HashMap::from([
+            (
+                "start".to_string(),
+                (day - Duration::minutes(1)).to_rfc3339(),
+            ),
+            ("end".to_string(), (day + Duration::minutes(1)).to_rfc3339()),
+        ]),
+        &headers(&state),
+        &[],
+        &state,
+    );
+    assert_eq!(first.status(), 200, "{}", first.json_body());
+    assert_eq!(first.json_body()["data"], json!(["checkout"]));
+
+    let second = http::route(
+        "GET",
+        "/loki/api/v1/label/service_name/values",
+        &HashMap::from([
+            (
+                "start".to_string(),
+                (day + Duration::hours(12) - Duration::minutes(1)).to_rfc3339(),
+            ),
+            (
+                "end".to_string(),
+                (day + Duration::hours(12) + Duration::minutes(1)).to_rfc3339(),
+            ),
+        ]),
+        &headers(&state),
+        &[],
+        &state,
+    );
+    assert_eq!(second.status(), 200, "{}", second.json_body());
+    assert_eq!(second.json_body()["data"], json!(["payments"]));
+}
+
+#[test]
+fn metadata_cache_invalidates_after_new_flush_bumps_generation() {
+    let app = seeded_app();
+
+    let before = assert_success(
+        &compat_get(
+            &app,
+            "/loki/api/v1/label/service_name/values",
+            HashMap::from(unix_range_params(&app)),
+        ),
+        "initial Loki service_name values",
+    );
+    assert!(
+        !before["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value == "cache-probe-svc"),
+        "new service must not exist before it is ingested: {before}"
+    );
+    let generation_before = app.state.storage.metadata_generation();
+
+    let now_nanos = Utc::now().timestamp_nanos_opt().unwrap();
+    let body = json!({
+        "resourceLogs": [{
+            "resource": {"attributes": [
+                {"key": "service.name", "value": {"stringValue": "cache-probe-svc"}}
+            ]},
+            "scopeLogs": [{
+                "scope": {"name": "smoke", "version": "1"},
+                "logRecords": [{
+                    "timeUnixNano": now_nanos.to_string(),
+                    "severityNumber": 9,
+                    "severityText": "INFO",
+                    "body": {"stringValue": "cache probe"}
+                }]
+            }]
+        }]
+    });
+    let ingest = http::route(
+        "POST",
+        "/v1/logs",
+        &HashMap::new(),
+        &app.headers,
+        body.to_string().as_bytes(),
+        &app.state,
+    );
+    assert_eq!(ingest.status(), 202, "{}", ingest.json_body());
+    app.state.ingestor.flush_all(&app.state.storage).unwrap();
+    app.state.storage.refresh_metadata().unwrap();
+    assert!(
+        app.state.storage.metadata_generation() > generation_before,
+        "refreshing dirtied buckets must advance the metadata generation"
+    );
+
+    let after = assert_success(
+        &compat_get(
+            &app,
+            "/loki/api/v1/label/service_name/values",
+            HashMap::from(unix_range_params(&app)),
+        ),
+        "Loki service_name values after a new flush",
+    );
+    assert!(
+        after["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value == "cache-probe-svc"),
+        "generation bump must drop the stale cache entry so discovery reflects the new service: {after}"
+    );
+}
+
+#[test]
 fn grafana_tempo_contract_supports_probe_search_tags_and_trace_lookup() {
     let app = seeded_app();
 
@@ -1306,27 +1596,17 @@ fn grafana_tempo_contract_supports_probe_search_tags_and_trace_lookup() {
 #[test]
 fn provisioned_grafana_dashboard_uses_supported_compat_queries() {
     let datasources = include_str!("../config/grafana/provisioning/datasources/canardstack.yaml");
-    assert!(
-        datasources.contains("uid: canardstack-tempo"),
-        "Tempo datasource should be provisioned"
-    );
-    assert!(
-        datasources.contains("streamingEnabled:")
-            && datasources.contains("search: false")
-            && datasources.contains("metrics: false"),
-        "Tempo streaming must stay disabled because canardstack exposes HTTP compatibility APIs, not Tempo gRPC streaming"
-    );
+    assert!(datasources.contains("url: http://canardstack:4318"));
+    assert!(datasources.contains("uid: canardstack-prometheus"));
 
     let dashboard: Value = serde_json::from_str(include_str!(
         "../config/grafana/dashboards/canardstack-overview.json"
     ))
     .unwrap();
-    let links = dashboard["links"].as_array().unwrap();
+    assert_eq!(dashboard["title"], "Canardstack");
     let panels = dashboard["panels"].as_array().unwrap();
 
     let mut prom_exprs = Vec::new();
-    let mut loki_exprs = Vec::new();
-    let mut tempo_searches = Vec::new();
     for panel in panels {
         if let Some(targets) = panel["targets"].as_array() {
             for target in targets {
@@ -1334,13 +1614,9 @@ fn provisioned_grafana_dashboard_uses_supported_compat_queries() {
                     Some("canardstack-prometheus") => {
                         prom_exprs.push(target["expr"].as_str().unwrap_or_default().to_string());
                     }
-                    Some("canardstack-loki") => {
-                        loki_exprs.push(target["expr"].as_str().unwrap_or_default().to_string());
-                    }
-                    Some("canardstack-tempo") => {
-                        tempo_searches.push(target.clone());
-                    }
-                    _ => {}
+                    other => panic!(
+                        "dashboard should only query stored canardstack metrics, got {other:?}"
+                    ),
                 }
             }
         }
@@ -1349,35 +1625,20 @@ fn provisioned_grafana_dashboard_uses_supported_compat_queries() {
     assert!(
         prom_exprs
             .iter()
-            .any(|expr| expr == "avg({__name__=\"smoke.gauge\",service_name=\"checkout\"})"),
-        "dashboard should use the __name__ selector Grafana accepts: {prom_exprs:?}"
+            .any(|expr| expr.contains("__name__=\"canardstack_ingest_requests_total\"")),
+        "dashboard should show canardstack ingest metrics: {prom_exprs:?}"
     );
     assert!(
-        !prom_exprs.iter().any(|expr| expr.contains("smoke.gauge{")),
-        "dotted metric names inside bare PromQL selectors are not Grafana-safe: {prom_exprs:?}"
-    );
-    assert!(
-        loki_exprs
+        prom_exprs
             .iter()
-            .any(|expr| expr == "{service_name=\"checkout\"} |= \"smoke\""),
-        "dashboard should include the smoke log query: {loki_exprs:?}"
+            .all(|expr| expr.contains("service_name=\"canardstack\"")),
+        "dashboard should query stored self-metrics for the canardstack service: {prom_exprs:?}"
     );
     assert!(
-        tempo_searches.iter().any(|target| {
-            target["queryType"] == "traceqlSearch"
-                && target["query"] == "{resource.service.name=\"checkout\"}"
-                && target["tableType"] == "traces"
-        }),
-        "dashboard should provision a dashboard-compatible Tempo TraceQL search target: {tempo_searches:?}"
-    );
-    assert!(
-        links.iter().any(|link| {
-            link["title"] == "Explore traces"
-                && link["url"]
-                    .as_str()
-                    .is_some_and(|url| url.contains("traceqlSearch"))
-        }),
-        "dashboard Explore link should use the same Tempo TraceQL search shape: {links:?}"
+        !prom_exprs
+            .iter()
+            .any(|expr| expr.contains("canardstack_ingest_requests_total{")),
+        "dotted metric names inside bare PromQL selectors are not Grafana-safe: {prom_exprs:?}"
     );
 }
 
@@ -1404,6 +1665,7 @@ fn ingest_flush_and_query_vertical_slice() {
         assert_eq!(response.status(), 202, "{path}: {}", response.json_body());
     }
     state.ingestor.flush_all(&state.storage).unwrap();
+    state.storage.refresh_metadata().unwrap();
 
     let from = (now - Duration::minutes(5)).to_rfc3339();
     let to = (now + Duration::minutes(5)).to_rfc3339();
@@ -1820,7 +2082,7 @@ fn retention_run_deletes_whole_day_eligible_rows() {
     append_log_rows(
         &state,
         &[
-            (old_ms, "old retained log", "checkout"),
+            (old_ms, "old retained log", "legacy"),
             (fresh_ms, "fresh retained log", "checkout"),
         ],
         "otlp_json",
@@ -1845,6 +2107,38 @@ fn retention_run_deletes_whole_day_eligible_rows() {
         })
         .unwrap();
     assert_eq!(remaining, 1);
+
+    let stale_summary = state
+        .storage
+        .with_conn(|conn, prefix| {
+            let sql = format!(
+                "SELECT count(*) FROM {prefix}metadata_summary WHERE signal = 'logs' AND value = 'legacy'"
+            );
+            let count: i64 = conn.query_row(&sql, [], |row| row.get(0))?;
+            Ok(count)
+        })
+        .unwrap();
+    assert_eq!(stale_summary, 0);
+
+    let values = http::route(
+        "GET",
+        "/loki/api/v1/label/service_name/values",
+        &HashMap::from([
+            (
+                "start".to_string(),
+                (Utc::now() - Duration::minutes(5)).to_rfc3339(),
+            ),
+            (
+                "end".to_string(),
+                (Utc::now() + Duration::minutes(5)).to_rfc3339(),
+            ),
+        ]),
+        &headers(&state),
+        &[],
+        &state,
+    );
+    assert_eq!(values.status(), 200, "{}", values.json_body());
+    assert_eq!(values.json_body()["data"], json!(["checkout"]));
 }
 
 #[test]
@@ -2122,4 +2416,31 @@ fn config_validate_rejects_empty_keys_and_collisions() {
         config.validate().is_err(),
         "zero query concurrency must fail"
     );
+}
+
+#[test]
+fn config_validate_rejects_zero_scheduler_intervals() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("canardstack.duckdb");
+    assert!(
+        Config::test(path.clone()).validate().is_ok(),
+        "baseline test config must validate"
+    );
+
+    let mutations: [fn(&mut Config); 6] = [
+        |c| c.scheduler_watchdog_interval = std::time::Duration::ZERO,
+        |c| c.scheduler_flush_interval = std::time::Duration::ZERO,
+        |c| c.scheduler_metadata_interval = std::time::Duration::ZERO,
+        |c| c.scheduler_metrics_interval = std::time::Duration::ZERO,
+        |c| c.scheduler_compaction_interval = std::time::Duration::ZERO,
+        |c| c.scheduler_retention_interval = std::time::Duration::ZERO,
+    ];
+    for mutate in mutations {
+        let mut config = Config::test(path.clone());
+        mutate(&mut config);
+        assert!(
+            config.validate().is_err(),
+            "a zero scheduler interval must fail validation"
+        );
+    }
 }

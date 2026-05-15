@@ -141,6 +141,36 @@ Derived promoted fields:
 | `aggregation_temporality` | `INTEGER` | `1 = delta`, `2 = cumulative`. |
 | `is_monotonic` | `BOOLEAN` | OTel monotonic flag. |
 
+## Metadata Summary
+
+Discovery endpoints use one shared `metadata_summary` table instead of scanning
+raw telemetry for every Grafana label, series, metric metadata, and Tempo tag
+lookup. The table is durable in both local DuckDB and DuckLake modes.
+
+| Column | Type | Purpose |
+| --- | --- | --- |
+| `signal` | `VARCHAR` | `logs`, `spans`, `metric_gauge`, or `metric_sum`. |
+| `event_date` | `DATE` | Daily summary bucket derived from telemetry event time. |
+| `kind` | `VARCHAR` | `label_value`, `series`, `metric_metadata`, or `tag_value`. |
+| `name` | `VARCHAR` | Label, tag, metric, or series name. |
+| `value` | `VARCHAR` | Label/tag value when applicable. |
+| `metric_type` | `VARCHAR` | Prometheus metadata type (`gauge` or `counter`). |
+| `metric_unit` | `VARCHAR` | Representative metric unit. |
+| `metric_description` | `VARCHAR` | Representative metric help text. |
+| `service_name` | `VARCHAR` | Promoted series dimension. |
+| `deployment_environment` | `VARCHAR` | Promoted series dimension. |
+| `severity_text` | `VARCHAR` | Promoted Loki stream dimension. |
+| `row_count` | `BIGINT` | Rows represented by this summary entry. |
+| `first_seen` | `TIMESTAMP` | Earliest event timestamp in the summary entry. |
+| `last_seen` | `TIMESTAMP` | Latest event timestamp in the summary entry. |
+
+Committed inserts record their affected `(signal, event_date)` buckets as dirty.
+The `metadata_refresh` scheduler job drains that set, rebuilding each bucket's
+summary rows from promoted columns; a failed refresh re-queues the buckets for
+the next tick. Keeping the day-partition scan off the commit path stops it from
+blocking the writer on every flush. An in-process generation counter, bumped
+after each committed refresh, lets bounded discovery caches invalidate.
+
 ## Partitioning
 
 Default:
@@ -157,4 +187,3 @@ If DuckLake partition-drop behavior is not cheap enough, switch to physical day 
 - Renaming or removing canonical `otlp2records` columns is not allowed in v0.
 - Attribute JSON fields remain strings; extraction happens at insert time for the small promoted set.
 - Store unknown fields only inside the existing JSON attribute columns.
-

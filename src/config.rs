@@ -47,6 +47,8 @@ pub struct Config {
     pub scheduler_enabled: bool,
     pub scheduler_watchdog_interval: Duration,
     pub scheduler_flush_interval: Duration,
+    pub scheduler_metadata_interval: Duration,
+    pub scheduler_metrics_interval: Duration,
     pub scheduler_compaction_interval: Duration,
     pub scheduler_retention_interval: Duration,
     pub max_concurrent_connections: usize,
@@ -143,6 +145,14 @@ impl Config {
                 "CANARDSTACK_SCHEDULER_FLUSH_SECS",
                 30,
             )? as u64),
+            scheduler_metadata_interval: Duration::from_secs(env_usize(
+                "CANARDSTACK_SCHEDULER_METADATA_SECS",
+                30,
+            )? as u64),
+            scheduler_metrics_interval: Duration::from_secs(env_usize(
+                "CANARDSTACK_SCHEDULER_METRICS_SECS",
+                60,
+            )? as u64),
             scheduler_compaction_interval: Duration::from_secs(env_usize(
                 "CANARDSTACK_SCHEDULER_COMPACTION_SECS",
                 300,
@@ -207,6 +217,8 @@ impl Config {
             scheduler_enabled: false,
             scheduler_watchdog_interval: Duration::from_millis(50),
             scheduler_flush_interval: Duration::from_millis(200),
+            scheduler_metadata_interval: Duration::from_millis(200),
+            scheduler_metrics_interval: Duration::from_millis(200),
             scheduler_compaction_interval: Duration::from_secs(300),
             scheduler_retention_interval: Duration::from_secs(3_600),
             max_concurrent_connections: 64,
@@ -278,6 +290,15 @@ impl Config {
         }
         if self.socket_read_timeout.is_zero() || self.socket_write_timeout.is_zero() {
             anyhow::bail!("socket timeouts must be > 0");
+        }
+        if self.scheduler_watchdog_interval.is_zero()
+            || self.scheduler_flush_interval.is_zero()
+            || self.scheduler_metadata_interval.is_zero()
+            || self.scheduler_metrics_interval.is_zero()
+            || self.scheduler_compaction_interval.is_zero()
+            || self.scheduler_retention_interval.is_zero()
+        {
+            anyhow::bail!("scheduler intervals must be > 0");
         }
         Ok(())
     }

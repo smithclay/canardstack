@@ -22,15 +22,17 @@ canardstack is currently shaped as:
   `CANARDSTACK_USE_DUCKLAKE=true`. Set `CANARDSTACK_USE_DUCKLAKE=false` for a
   local-DuckDB-only mode (dev / smoke / single-host demos).
 - Prometheus, Loki, and Tempo compatibility adapters over bounded query helpers.
-- HTTP routes for ingest, smoke checks, compatibility queries, and browser viewing.
+- HTTP routes for ingest, smoke checks, and compatibility queries.
 - Query execution with time range, limit, timeout, memory, and concurrency
   enforcement.
+- Grafana is the only bundled UI; canardstack itself does not serve a custom
+  browser interface.
 - Whole-day retention execution for telemetry tables, followed by DuckLake
   snapshot expiration and cleanup hooks when DuckLake is attached.
 - Storage health with freshness watermarks, logical row counts, and local
   physical bytes.
-- Thin local investigation UI at `/`.
-- Prometheus-style operator metrics at `/metrics`.
+- Prometheus-style operator metrics at `/metrics`, also snapshotted into the
+  metric store for Grafana dashboards.
 
 ## Local DuckLake Mode
 
@@ -176,7 +178,7 @@ representative compatibility query endpoints, and prints health.
 ## Query Surface
 
 The primary v0 query surface is a set of compatibility adapters. They use the
-same bounded query engine as the local UI and smoke tests, with time ranges,
+same bounded query engine as smoke tests and Grafana, with time ranges,
 limits, server-owned timeouts, DuckDB memory limits, and query concurrency
 guards.
 
@@ -207,7 +209,7 @@ Tempo-compatible trace routes:
 
 These are subset adapters, not full protocol implementations. Prometheus and
 Loki errors use `{"status":"error","errorType":"...","error":"..."}`. The
-normal UI/API does not expose arbitrary SQL.
+normal HTTP API does not expose arbitrary SQL.
 
 Supported ingest response behavior:
 
@@ -300,14 +302,14 @@ maintenance only. The scheduler shuts down cleanly when `serve` exits.
 - OTLP/gRPC is intentionally not implemented.
 - Histograms and exponential histograms are decoded as unsupported for v0 and
   not stored.
-- Dashboard and alert scaffolds have been removed from the v0 path.
+- Custom dashboard and alert APIs have been removed from the v0 path; Grafana
+  provisioning is the supported dashboard surface.
 - Canardstack no longer presents a bespoke query protocol as a v0 product/API
   surface. Use the Grafana-compatible Prometheus, Loki, and Tempo subsets for
-  HTTP/UI workflows, or external DuckDB/MotherDuck/SQL clients for direct SQL.
-- Arrow IPC artifacts and embedded Perspective are not implemented yet; the
-  current viewer consumes compatibility JSON responses.
-- Attribute introspection scans bounded raw JSON rows in v1. Daily metadata
-  tables are still a proof-gate follow-up for production volume.
+  HTTP workflows, or external DuckDB/MotherDuck/SQL clients for direct SQL.
+- Arrow IPC artifacts and embedded Perspective are not implemented.
+- Grafana discovery endpoints use daily metadata summaries over promoted
+  columns; full raw-attribute introspection remains outside the v0 HTTP API.
 - Retention is row-level `DELETE` against single tables as a documented v0
   fallback; the day-tables-behind-views migration is the next storage-layout
   proof gate.
@@ -321,7 +323,6 @@ maintenance only. The scheduler shuts down cleanly when `serve` exits.
 - [V0 architecture](architecture/v0-architecture.md)
 - [Storage schema](architecture/storage-schema.md)
 - [Query API](architecture/query-api.md)
-- [UI workflows](architecture/ui-workflows.md)
 - [Operator metrics](architecture/operator-metrics.md)
 - [Benchmark plan](planning/benchmark-plan.md)
 - [Proof gates](planning/proof-gates.md)

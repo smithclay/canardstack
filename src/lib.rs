@@ -7,6 +7,7 @@ pub mod ingest;
 pub mod log_query;
 pub mod maintenance;
 pub mod memory;
+pub mod metadata;
 pub mod metrics;
 pub mod otlp;
 pub mod promql;
@@ -15,7 +16,6 @@ pub mod query_plan;
 pub mod sql;
 pub mod storage;
 pub mod trace_query;
-pub mod ui;
 pub mod validation;
 
 pub use app::AppState;

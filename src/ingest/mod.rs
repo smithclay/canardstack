@@ -19,7 +19,7 @@ mod queue;
 pub use flush::{partial_commit_info, PartialFlushError};
 pub use queue::IngestSnapshot;
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Serialize)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize)]
 pub enum Signal {
     Logs,
     Spans,

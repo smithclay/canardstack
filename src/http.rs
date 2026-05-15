@@ -1,6 +1,5 @@
 use crate::compat;
 use crate::ingest::Signal;
-use crate::ui;
 use crate::validation::{self, ApiError};
 use crate::AppState;
 use serde_json::{json, Value};
@@ -47,7 +46,7 @@ pub fn serve_until(state: Arc<AppState>, shutdown: &AtomicBool) -> anyhow::Resul
     listener.set_nonblocking(true)?;
     let addr = listener.local_addr()?;
     let probe = state.storage.probe();
-    eprintln!("canardstack listening on http://{addr}/  (viewer at http://{addr}/)");
+    eprintln!("canardstack listening on http://{addr}/");
     log_startup_storage_mode(&probe);
     eprintln!(
         "canardstack ingest acknowledgement is best-effort: 2xx means accepted into process memory, not durably committed"
@@ -304,7 +303,6 @@ pub fn route(
     }
 
     let result = match (method, path) {
-        ("GET", "/") => return HttpResponse::html(200, ui::index_html()),
         ("GET", "/healthz") => {
             let probe = state.storage.probe();
             let ok = probe.is_ready();
@@ -771,7 +769,7 @@ fn record_maintenance_metrics(
         .maintenance_run(job, status, reason, started.elapsed().as_secs_f64());
 }
 
-fn record_operator_gauges(state: &AppState) {
+pub(crate) fn record_operator_gauges(state: &AppState) {
     state.ingestor.record_queue_metrics(&state.metrics);
     let storage = state.storage.health();
     state.metrics.gauge(

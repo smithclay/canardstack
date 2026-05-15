@@ -1,6 +1,17 @@
 use crate::ingest::Signal;
+use crate::storage::Storage;
 use crate::LockExt;
+use anyhow::{Context, Result};
+use arrow58::array::{
+    ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, StringArray,
+    TimestampMicrosecondArray,
+};
+use arrow58::datatypes::{DataType, Field, Schema, TimeUnit};
+use arrow58::record_batch::RecordBatch;
+use chrono::Utc;
+use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Instant;
 
@@ -13,6 +24,47 @@ pub struct Metrics {
 struct MetricsInner {
     counters: BTreeMap<String, u64>,
     gauges: BTreeMap<String, f64>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MetricSample {
+    pub name: String,
+    pub labels: BTreeMap<String, String>,
+    pub value: f64,
+    kind: MetricKind,
+}
+
+impl MetricSample {
+    fn counter(name: String, labels: BTreeMap<String, String>, value: f64) -> Self {
+        Self {
+            name,
+            labels,
+            value,
+            kind: MetricKind::Counter,
+        }
+    }
+
+    fn gauge(name: String, labels: BTreeMap<String, String>, value: f64) -> Self {
+        Self {
+            name,
+            labels,
+            value,
+            kind: MetricKind::Gauge,
+        }
+    }
+
+    /// Discriminates how `value` is interpreted: a `Counter` is cumulative and
+    /// routes to `metric_sum`, a `Gauge` is instantaneous and routes to
+    /// `metric_gauge`.
+    pub fn kind(&self) -> MetricKind {
+        self.kind
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MetricKind {
+    Counter,
+    Gauge,
 }
 
 impl Metrics {
@@ -149,6 +201,57 @@ impl Metrics {
         }
         out
     }
+
+    pub fn snapshot(&self) -> Vec<MetricSample> {
+        let inner = self.inner.lock_or_poisoned();
+        inner
+            .counters
+            .iter()
+            .map(|(k, v)| {
+                let (name, labels) = split_metric_key(k);
+                MetricSample::counter(name, labels, *v as f64)
+            })
+            .chain(inner.gauges.iter().map(|(k, v)| {
+                let (name, labels) = split_metric_key(k);
+                MetricSample::gauge(name, labels, *v)
+            }))
+            .collect()
+    }
+
+    pub fn write_snapshot_to_storage(&self, storage: &Storage) -> Result<usize> {
+        let samples = self.snapshot();
+        if samples.is_empty() {
+            return Ok(0);
+        }
+        let counters = samples
+            .iter()
+            .filter(|sample| sample.kind() == MetricKind::Counter)
+            .cloned()
+            .collect::<Vec<_>>();
+        let gauges = samples
+            .iter()
+            .filter(|sample| sample.kind() == MetricKind::Gauge)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut rows = 0;
+        if !counters.is_empty() {
+            let batch = metric_samples_batch(&counters, Signal::MetricSum)?;
+            rows += storage.insert_arrow_records(
+                Signal::MetricSum,
+                &batch,
+                "canardstack_operator_metrics",
+            )?;
+        }
+        if !gauges.is_empty() {
+            let batch = metric_samples_batch(&gauges, Signal::MetricGauge)?;
+            rows += storage.insert_arrow_records(
+                Signal::MetricGauge,
+                &batch,
+                "canardstack_operator_metrics",
+            )?;
+        }
+        Ok(rows)
+    }
 }
 
 pub struct Timer {
@@ -173,8 +276,153 @@ fn key(name: &str, labels: &[(&str, &str)]) -> String {
     }
     let rendered = labels
         .iter()
-        .map(|(k, v)| format!("{k}=\"{}\"", v.replace('"', "\\\"")))
+        .map(|(k, v)| format!("{k}=\"{}\"", escape_label_value(v)))
         .collect::<Vec<_>>()
         .join(",");
     format!("{name}{{{rendered}}}")
+}
+
+/// Escape a label value for the `name{k="v"}` key format. Both `\` and `"` are
+/// escaped so `split_metric_key` can round-trip values containing either.
+fn escape_label_value(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn split_metric_key(key: &str) -> (String, BTreeMap<String, String>) {
+    let Some((name, rest)) = key.split_once('{') else {
+        return (key.to_string(), BTreeMap::new());
+    };
+    let Some(labels) = rest.strip_suffix('}') else {
+        return (key.to_string(), BTreeMap::new());
+    };
+    (name.to_string(), parse_labels(labels))
+}
+
+/// Parse the `k1="v1",k2="v2"` body produced by `key`. Quote-aware so a `,` or
+/// escaped `"` inside a value does not split or terminate it early.
+fn parse_labels(input: &str) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    let mut chars = input.chars().peekable();
+    loop {
+        let mut name = String::new();
+        while let Some(&ch) = chars.peek() {
+            if ch == '=' {
+                break;
+            }
+            name.push(ch);
+            chars.next();
+        }
+        if chars.next() != Some('=') || chars.next() != Some('"') {
+            break;
+        }
+        let mut value = String::new();
+        let mut closed = false;
+        while let Some(ch) = chars.next() {
+            match ch {
+                '\\' => {
+                    if let Some(escaped) = chars.next() {
+                        value.push(escaped);
+                    }
+                }
+                '"' => {
+                    closed = true;
+                    break;
+                }
+                _ => value.push(ch),
+            }
+        }
+        if !closed {
+            break;
+        }
+        if !name.is_empty() {
+            out.insert(name, value);
+        }
+        if chars.next() != Some(',') {
+            break;
+        }
+    }
+    out
+}
+
+fn metric_samples_batch(samples: &[MetricSample], signal: Signal) -> Result<RecordBatch> {
+    let rows = samples.len();
+    let timestamp = Utc::now().timestamp_micros();
+    let resource_attributes = json!({"service.name": "canardstack"}).to_string();
+    let mut fields = vec![
+        Field::new(
+            "timestamp",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            true,
+        ),
+        Field::new("start_timestamp", DataType::Int64, true),
+        Field::new("metric_name", DataType::Utf8, true),
+        Field::new("metric_description", DataType::Utf8, true),
+        Field::new("metric_unit", DataType::Utf8, true),
+        Field::new("value", DataType::Float64, true),
+        Field::new("service_name", DataType::Utf8, true),
+        Field::new("service_namespace", DataType::Utf8, true),
+        Field::new("service_instance_id", DataType::Utf8, true),
+        Field::new("resource_attributes", DataType::Utf8, true),
+        Field::new("scope_name", DataType::Utf8, true),
+        Field::new("scope_version", DataType::Utf8, true),
+        Field::new("scope_attributes", DataType::Utf8, true),
+        Field::new("metric_attributes", DataType::Utf8, true),
+        Field::new("flags", DataType::Int32, true),
+        Field::new("exemplars_json", DataType::Utf8, true),
+    ];
+    let mut arrays: Vec<ArrayRef> = vec![
+        Arc::new(TimestampMicrosecondArray::from(vec![Some(timestamp); rows])),
+        Arc::new(Int64Array::from(vec![None; rows])),
+        Arc::new(StringArray::from(
+            samples
+                .iter()
+                .map(|sample| Some(sample.name.clone()))
+                .collect::<Vec<_>>(),
+        )),
+        Arc::new(StringArray::from(vec![None::<String>; rows])),
+        Arc::new(StringArray::from(vec![None::<String>; rows])),
+        Arc::new(Float64Array::from(
+            samples
+                .iter()
+                .map(|sample| Some(sample.value))
+                .collect::<Vec<_>>(),
+        )),
+        Arc::new(StringArray::from(vec![
+            Some("canardstack".to_string());
+            rows
+        ])),
+        Arc::new(StringArray::from(vec![None::<String>; rows])),
+        Arc::new(StringArray::from(vec![None::<String>; rows])),
+        Arc::new(StringArray::from(vec![Some(resource_attributes); rows])),
+        Arc::new(StringArray::from(vec![
+            Some("canardstack".to_string());
+            rows
+        ])),
+        Arc::new(StringArray::from(vec![None::<String>; rows])),
+        Arc::new(StringArray::from(vec![Some("{}".to_string()); rows])),
+        Arc::new(StringArray::from(
+            samples
+                .iter()
+                .map(|sample| Some(labels_json(&sample.labels).to_string()))
+                .collect::<Vec<_>>(),
+        )),
+        Arc::new(Int32Array::from(vec![None; rows])),
+        Arc::new(StringArray::from(vec![None::<String>; rows])),
+    ];
+    if signal == Signal::MetricSum {
+        fields.push(Field::new("aggregation_temporality", DataType::Int32, true));
+        fields.push(Field::new("is_monotonic", DataType::Boolean, true));
+        arrays.push(Arc::new(Int32Array::from(vec![Some(2); rows])));
+        arrays.push(Arc::new(BooleanArray::from(vec![Some(true); rows])));
+    }
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
+        .context("build operator metrics RecordBatch")
+}
+
+fn labels_json(labels: &BTreeMap<String, String>) -> Value {
+    let mut map = Map::new();
+    for (k, v) in labels {
+        map.insert(k.clone(), Value::String(v.clone()));
+    }
+    Value::Object(map)
 }

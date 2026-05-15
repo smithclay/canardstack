@@ -2,7 +2,7 @@
 
 Canardstack v0 exposes bounded compatibility adapters for existing
 observability clients. It does not define a Canardstack-specific product query
-protocol and does not expose arbitrary SQL through the normal UI/API.
+protocol and does not expose arbitrary SQL through the normal HTTP API.
 
 All telemetry query paths use the internal query engine protections:
 
@@ -11,6 +11,24 @@ All telemetry query paths use the internal query engine protections:
 - Server-owned timeouts.
 - DuckDB memory limits.
 - Query concurrency guards.
+
+## Discovery Metadata Spine
+
+Prometheus label values, Prometheus series, Prometheus metric metadata, Loki
+label values, Loki series, and Tempo tag values read from the shared
+`metadata_summary` table. The `metadata_refresh` scheduler job re-aggregates the
+daily `(signal, event_date)` buckets dirtied by committed inserts, keeping the
+day-partition scan off the ingest commit path, using only
+promoted columns such as `service_name`, `deployment_environment`,
+`severity_text`, `http_route`, `http_method`, `trace_id`, `span_id`,
+`span_name`, `status_code`, `metric_name`, `metric_unit`, and
+`metric_description`.
+
+These reads still run through the bounded `QueryEngine` path with normal
+concurrency, timeout, memory, range, and result-limit controls. An in-process
+cache stores only bounded discovery responses, keyed by API family, metadata
+kind, label/tag name, and exact normalized time range. Successful metadata refreshes
+advance a generation counter, invalidating stale cache entries.
 
 ## Prometheus Metrics Subset
 
@@ -131,4 +149,4 @@ The remaining HTTP endpoints are operational or ingest endpoints:
 
 Direct DuckDB/DuckLake SQL access is available outside Canardstack through
 DuckDB CLI, MotherDuck, or SQL clients. That path is intentionally separate from
-the normal HTTP/UI product surface.
+the normal HTTP product surface.

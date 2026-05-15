@@ -8,13 +8,15 @@ use arrow58::array::Array as _;
 use arrow58::array::ArrayRef;
 use arrow58::datatypes as arrow58_types;
 use arrow58::record_batch::RecordBatch;
-use chrono::Utc;
+use chrono::{NaiveDate, Utc};
 use duckdb::{Appender, Connection};
 use serde::Serialize;
 use serde_json::{json, Value};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -91,6 +93,14 @@ pub struct Storage {
     ducklake_compaction_cleanup_files: bool,
     write_memory_limit: String,
     last_error: Mutex<Option<String>>,
+    /// Cache-invalidation token for discovery metadata. Bumped only after a
+    /// committed `metadata_summary` change (refresh or retention); discovery
+    /// caches in `Metadata` key entries on this value and drop them on a bump.
+    metadata_generation: AtomicU64,
+    /// Signal/event-date buckets whose `metadata_summary` rows are stale after
+    /// a committed insert. Drained by the `metadata_refresh` scheduler job so
+    /// the day-partition re-aggregation stays off the ingest commit path.
+    dirty_metadata: Mutex<BTreeMap<Signal, BTreeSet<String>>>,
 }
 
 pub struct RetentionPolicy {
@@ -160,6 +170,7 @@ struct PreparedArrowBatch {
     table: Signal,
     batch: RecordBatch,
     rows: usize,
+    event_dates: Vec<String>,
 }
 
 impl Storage {
@@ -226,6 +237,8 @@ impl Storage {
             ducklake_compaction_cleanup_files: config.ducklake_compaction_cleanup_files,
             write_memory_limit: config.duckdb_write_memory_limit.clone(),
             last_error: Mutex::new(None),
+            metadata_generation: AtomicU64::new(0),
+            dirty_metadata: Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -287,6 +300,38 @@ impl Storage {
         }
     }
 
+    pub fn metadata_generation(&self) -> u64 {
+        self.metadata_generation.load(Ordering::SeqCst)
+    }
+
+    fn mark_metadata_dirty(&self, affected: BTreeMap<Signal, BTreeSet<String>>) {
+        merge_dirty_metadata(&mut self.dirty_metadata.lock_or_poisoned(), affected);
+    }
+
+    /// Re-aggregate `metadata_summary` for every signal/date bucket dirtied by
+    /// a committed insert. Runs on the `metadata_refresh` scheduler job so the
+    /// full day-partition scan stays off the ingest commit path. On failure the
+    /// drained buckets are re-queued so the next tick retries them — committed
+    /// telemetry must not stay invisible to the discovery APIs.
+    pub fn refresh_metadata(&self) -> Result<usize> {
+        let affected = std::mem::take(&mut *self.dirty_metadata.lock_or_poisoned());
+        if affected.is_empty() {
+            return Ok(0);
+        }
+        let conn = self.writer.lock_or_poisoned();
+        configure_write_connection(&conn, &self.write_memory_limit)?;
+        match refresh_metadata_summaries_on(&conn, &self.target_prefix, &affected) {
+            Ok(buckets) => {
+                self.metadata_generation.fetch_add(1, Ordering::SeqCst);
+                Ok(buckets)
+            }
+            Err(err) => {
+                self.mark_metadata_dirty(affected);
+                Err(err)
+            }
+        }
+    }
+
     pub fn insert_arrow_records(
         &self,
         table: Signal,
@@ -314,11 +359,15 @@ impl Storage {
             }
             error_table.get_or_insert(batch.table);
             let rows = batch.batch.num_rows();
+            let prepared_batch =
+                storage_duckdb_batch(batch.table, batch.batch, batch.source_format)?;
+            let event_dates = batch_event_dates(&prepared_batch)?;
             attempted_rows += rows;
             prepared.push(PreparedArrowBatch {
                 table: batch.table,
-                batch: storage_duckdb_batch(batch.table, batch.batch, batch.source_format)?,
+                batch: prepared_batch,
                 rows,
+                event_dates,
             });
         }
 
@@ -359,6 +408,9 @@ impl Storage {
         match append_result {
             Ok(timings) => {
                 *self.last_error.lock_or_poisoned() = None;
+                // Record affected buckets for the metadata_refresh job; the
+                // day-partition re-aggregation must not block the writer here.
+                self.mark_metadata_dirty(affected_metadata_buckets(&prepared));
                 Ok(ArrowBatchInsertResult {
                     rows: attempted_rows,
                     timings,
@@ -716,6 +768,7 @@ impl Storage {
     pub fn enforce_retention(&self, policy: &RetentionPolicy, dry_run: bool) -> Result<Value> {
         let conn = self.writer.lock_or_poisoned();
         let mut results = Vec::new();
+        let mut metadata_deleted_total = 0_i64;
         for target in [
             ("logs", policy.logs_days, "event_date"),
             ("spans", policy.spans_days, "event_date"),
@@ -743,13 +796,39 @@ impl Storage {
                 let delete_sql = format!("DELETE FROM {full_table} WHERE {predicate}");
                 conn.execute(&delete_sql, [])? as i64
             };
+            let metadata_predicate = format!(
+                "signal = {} AND event_date < DATE {}",
+                sql_quote(table),
+                sql_quote(&cutoff)
+            );
+            let metadata_count_sql = format!(
+                "SELECT count(*) FROM {prefix}metadata_summary WHERE {metadata_predicate}",
+                prefix = self.target_prefix
+            );
+            let matching_metadata_rows: i64 =
+                conn.query_row(&metadata_count_sql, [], |row| row.get(0))?;
+            let deleted_metadata_rows = if dry_run || matching_metadata_rows == 0 {
+                0
+            } else {
+                let delete_sql = format!(
+                    "DELETE FROM {prefix}metadata_summary WHERE {metadata_predicate}",
+                    prefix = self.target_prefix
+                );
+                conn.execute(&delete_sql, [])? as i64
+            };
+            metadata_deleted_total += deleted_metadata_rows;
             results.push(json!({
                 "table": table,
                 "retention_days": retention_days,
                 "cutoff_date": cutoff,
                 "matching_rows": matching_rows,
-                "deleted_rows": deleted_rows
+                "deleted_rows": deleted_rows,
+                "matching_metadata_rows": matching_metadata_rows,
+                "deleted_metadata_rows": deleted_metadata_rows
             }));
+        }
+        if metadata_deleted_total > 0 {
+            self.metadata_generation.fetch_add(1, Ordering::SeqCst);
         }
         Ok(json!({"dry_run": dry_run, "tables": results}))
     }
@@ -827,6 +906,12 @@ fn create_tables_on(conn: &Connection, prefix: &str) -> Result<()> {
         ));
         ddl.push('\n');
     }
+    ddl.push_str(&create_table_sql(
+        prefix,
+        "metadata_summary",
+        METADATA_SUMMARY_COLUMNS,
+    ));
+    ddl.push('\n');
     conn.execute_batch(&ddl)?;
     Ok(())
 }
@@ -1045,6 +1130,222 @@ fn unique_tables(prepared: &[PreparedArrowBatch]) -> Vec<Signal> {
     tables
 }
 
+fn affected_metadata_buckets(
+    prepared: &[PreparedArrowBatch],
+) -> BTreeMap<Signal, BTreeSet<String>> {
+    let mut affected = BTreeMap::new();
+    for batch in prepared {
+        let dates: &mut BTreeSet<String> = affected.entry(batch.table).or_default();
+        for date in &batch.event_dates {
+            dates.insert(date.clone());
+        }
+    }
+    affected
+}
+
+fn merge_dirty_metadata(
+    dst: &mut BTreeMap<Signal, BTreeSet<String>>,
+    src: BTreeMap<Signal, BTreeSet<String>>,
+) {
+    for (signal, dates) in src {
+        dst.entry(signal).or_default().extend(dates);
+    }
+}
+
+fn refresh_metadata_summaries_on(
+    conn: &Connection,
+    prefix: &str,
+    affected: &BTreeMap<Signal, BTreeSet<String>>,
+) -> Result<usize> {
+    if affected.is_empty() {
+        return Ok(0);
+    }
+
+    let result = (|| -> Result<usize> {
+        conn.execute_batch("BEGIN TRANSACTION;")?;
+        let mut buckets = 0;
+        for (signal, dates) in affected {
+            for date in dates {
+                buckets += 1;
+                conn.execute_batch(&format!(
+                    "DELETE FROM {prefix}metadata_summary \
+                     WHERE signal = {} AND event_date = DATE {}",
+                    sql_quote(signal.as_str()),
+                    sql_quote(date)
+                ))?;
+                for sql in metadata_refresh_sql(prefix, *signal, date) {
+                    conn.execute_batch(&sql)?;
+                }
+            }
+        }
+        conn.execute_batch("COMMIT;")?;
+        Ok(buckets)
+    })();
+
+    if result.is_err() {
+        if let Err(rollback_err) = conn.execute_batch("ROLLBACK;") {
+            // A failed ROLLBACK can leave the shared writer connection with a
+            // dangling transaction; surface it so a wedged refresh path is
+            // observable instead of silently cascading into later appends.
+            crate::log_event(
+                "error",
+                "metadata_refresh_rollback_failed",
+                &[("error", &rollback_err.to_string())],
+            );
+        }
+    }
+    result
+}
+
+fn metadata_refresh_sql(prefix: &str, signal: Signal, date: &str) -> Vec<String> {
+    match signal {
+        Signal::Logs => logs_metadata_sql(prefix, date),
+        Signal::Spans => spans_metadata_sql(prefix, date),
+        Signal::MetricGauge => metric_metadata_sql(prefix, Signal::MetricGauge, date, "gauge"),
+        Signal::MetricSum => metric_metadata_sql(prefix, Signal::MetricSum, date, "counter"),
+    }
+}
+
+fn logs_metadata_sql(prefix: &str, date: &str) -> Vec<String> {
+    let mut sql = Vec::new();
+    for (name, column) in [
+        ("service_name", "service_name"),
+        ("deployment_environment", "deployment_environment"),
+        ("severity_text", "severity_text"),
+        ("trace_id", "trace_id"),
+        ("span_id", "span_id"),
+        ("http_route", "http_route"),
+        ("http_method", "http_method"),
+    ] {
+        sql.push(label_value_insert_sql(
+            prefix,
+            "logs",
+            "logs",
+            date,
+            "label_value",
+            name,
+            column,
+        ));
+    }
+    sql.push(format!(
+        "\
+        INSERT INTO {prefix}metadata_summary ({}) \
+        SELECT 'logs', event_date, 'series', 'stream', NULL, NULL, NULL, NULL, \
+               service_name, deployment_environment, severity_text, \
+               count(*), min(timestamp), max(timestamp) \
+        FROM {prefix}logs \
+        WHERE event_date = DATE {} \
+        GROUP BY event_date, service_name, deployment_environment, severity_text",
+        metadata_summary_columns(),
+        sql_quote(date)
+    ));
+    sql
+}
+
+fn spans_metadata_sql(prefix: &str, date: &str) -> Vec<String> {
+    let mut sql = Vec::new();
+    for (name, column) in [
+        ("service.name", "service_name"),
+        ("span.name", "span_name"),
+        ("http.route", "http_route"),
+        ("status", "status_code"),
+        ("status.code", "status_code"),
+        ("traceID", "trace_id"),
+    ] {
+        sql.push(label_value_insert_sql(
+            prefix,
+            "spans",
+            "spans",
+            date,
+            "tag_value",
+            name,
+            column,
+        ));
+    }
+    sql
+}
+
+fn metric_metadata_sql(prefix: &str, signal: Signal, date: &str, metric_type: &str) -> Vec<String> {
+    let table = signal.as_str();
+    let signal = signal.as_str();
+    let mut sql = Vec::new();
+    for (name, column) in [
+        ("__name__", "metric_name"),
+        ("service_name", "service_name"),
+        ("deployment_environment", "deployment_environment"),
+    ] {
+        sql.push(label_value_insert_sql(
+            prefix,
+            signal,
+            table,
+            date,
+            "label_value",
+            name,
+            column,
+        ));
+    }
+    sql.push(format!(
+        "\
+        INSERT INTO {prefix}metadata_summary ({}) \
+        SELECT {}, event_date, 'series', metric_name, NULL, {}, NULL, NULL, \
+               service_name, deployment_environment, NULL, \
+               count(*), min(timestamp), max(timestamp) \
+        FROM {prefix}{table} \
+        WHERE event_date = DATE {} AND metric_name IS NOT NULL AND metric_name <> '' \
+        GROUP BY event_date, metric_name, service_name, deployment_environment",
+        metadata_summary_columns(),
+        sql_quote(signal),
+        sql_quote(metric_type),
+        sql_quote(date)
+    ));
+    sql.push(format!(
+        "\
+        INSERT INTO {prefix}metadata_summary ({}) \
+        SELECT {}, event_date, 'metric_metadata', metric_name, NULL, {}, \
+               max(coalesce(metric_unit, '')), max(coalesce(metric_description, '')), \
+               NULL, NULL, NULL, count(*), min(timestamp), max(timestamp) \
+        FROM {prefix}{table} \
+        WHERE event_date = DATE {} AND metric_name IS NOT NULL AND metric_name <> '' \
+        GROUP BY event_date, metric_name",
+        metadata_summary_columns(),
+        sql_quote(signal),
+        sql_quote(metric_type),
+        sql_quote(date)
+    ));
+    sql
+}
+
+fn label_value_insert_sql(
+    prefix: &str,
+    signal: &str,
+    table: &str,
+    date: &str,
+    kind: &str,
+    name: &str,
+    column: &str,
+) -> String {
+    format!(
+        "\
+        INSERT INTO {prefix}metadata_summary ({}) \
+        SELECT {}, event_date, {}, {}, {column}::VARCHAR, NULL, NULL, NULL, \
+               NULL, NULL, NULL, count(*), min(timestamp), max(timestamp) \
+        FROM {prefix}{table} \
+        WHERE event_date = DATE {} AND {column} IS NOT NULL AND {column}::VARCHAR <> '' \
+        GROUP BY event_date, {column}",
+        metadata_summary_columns(),
+        sql_quote(signal),
+        sql_quote(kind),
+        sql_quote(name),
+        sql_quote(date)
+    )
+}
+
+fn metadata_summary_columns() -> &'static str {
+    "signal, event_date, kind, name, value, metric_type, metric_unit, \
+     metric_description, service_name, deployment_environment, severity_text, \
+     row_count, first_seen, last_seen"
+}
+
 fn distribute_commit_seconds(timings: &mut [ArrowBatchInsertTiming], commit_seconds: f64) {
     if timings.is_empty() || commit_seconds <= 0.0 {
         return;
@@ -1175,6 +1476,25 @@ fn storage_duckdb_batch(
 
     RecordBatch::try_new(Arc::new(arrow58_types::Schema::new(fields)), arrays)
         .context("build DuckDB appender RecordBatch")
+}
+
+fn batch_event_dates(batch: &RecordBatch) -> Result<Vec<String>> {
+    let idx = batch.schema().index_of("event_date")?;
+    let dates = batch
+        .column(idx)
+        .as_any()
+        .downcast_ref::<arrow58_array::Date32Array>()
+        .context("event_date column is not Date32Array")?;
+    let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).expect("valid Unix epoch date");
+    let mut out = BTreeSet::new();
+    for row in 0..dates.len() {
+        if dates.is_null(row) {
+            continue;
+        }
+        let date = epoch + chrono::Duration::days(dates.value(row) as i64);
+        out.insert(date.to_string());
+    }
+    Ok(out.into_iter().collect())
 }
 
 fn timestamp_column(batch: &RecordBatch) -> Result<&arrow58_array::TimestampMicrosecondArray> {
@@ -1390,6 +1710,23 @@ const METRIC_SUM_COLUMNS: &[(&str, &str)] = &[
     ("deployment_environment", "VARCHAR"),
     ("aggregation_temporality", "INTEGER"),
     ("is_monotonic", "BOOLEAN"),
+];
+
+const METADATA_SUMMARY_COLUMNS: &[(&str, &str)] = &[
+    ("signal", "VARCHAR"),
+    ("event_date", "DATE"),
+    ("kind", "VARCHAR"),
+    ("name", "VARCHAR"),
+    ("value", "VARCHAR"),
+    ("metric_type", "VARCHAR"),
+    ("metric_unit", "VARCHAR"),
+    ("metric_description", "VARCHAR"),
+    ("service_name", "VARCHAR"),
+    ("deployment_environment", "VARCHAR"),
+    ("severity_text", "VARCHAR"),
+    ("row_count", "BIGINT"),
+    ("first_seen", "TIMESTAMP"),
+    ("last_seen", "TIMESTAMP"),
 ];
 
 fn table_columns(table: Signal) -> &'static [(&'static str, &'static str)] {

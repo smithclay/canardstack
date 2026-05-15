@@ -259,22 +259,9 @@ impl Scheduler {
     pub fn spawn(state: Arc<AppState>) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_for_thread = stop.clone();
-        let watchdog = state.config.scheduler_watchdog_interval;
-        let flush = state.config.scheduler_flush_interval;
-        let compaction = state.config.scheduler_compaction_interval;
-        let retention = state.config.scheduler_retention_interval;
         let handle = thread::Builder::new()
             .name("canardstack-scheduler".to_string())
-            .spawn(move || {
-                scheduler_loop(
-                    state,
-                    stop_for_thread,
-                    watchdog,
-                    flush,
-                    compaction,
-                    retention,
-                )
-            })
+            .spawn(move || scheduler_loop(state, stop_for_thread))
             .expect("spawn scheduler thread");
         Self {
             stop,
@@ -292,19 +279,20 @@ impl Drop for Scheduler {
     }
 }
 
-fn scheduler_loop(
-    state: Arc<AppState>,
-    stop: Arc<AtomicBool>,
-    watchdog_every: Duration,
-    flush_every: Duration,
-    compaction_every: Duration,
-    retention_every: Duration,
-) {
+fn scheduler_loop(state: Arc<AppState>, stop: Arc<AtomicBool>) {
+    let watchdog_every = state.config.scheduler_watchdog_interval;
+    let flush_every = state.config.scheduler_flush_interval;
+    let metadata_every = state.config.scheduler_metadata_interval;
+    let metrics_every = state.config.scheduler_metrics_interval;
+    let compaction_every = state.config.scheduler_compaction_interval;
+    let retention_every = state.config.scheduler_retention_interval;
     let tick = watchdog_every
         .min(Duration::from_millis(500))
         .max(Duration::from_millis(10));
     let mut next_watchdog = Instant::now();
     let mut next_flush = Instant::now();
+    let mut next_metadata = Instant::now() + metadata_every;
+    let mut next_metrics = Instant::now() + metrics_every;
     let mut next_compaction = Instant::now() + compaction_every;
     let mut next_retention = Instant::now() + retention_every;
 
@@ -332,6 +320,26 @@ fn scheduler_loop(
                     .run_flush(&s.ingestor, &s.storage, None, Some(&s.metrics))
             });
             next_flush = now + next_interval(&state, "flush", flush_every, ok);
+        }
+
+        if now >= next_metadata {
+            let ok = run_job(&state, "metadata_refresh", |s| {
+                if s.maintenance.is_paused() {
+                    return Ok(json!({"status": "paused"}));
+                }
+                let buckets = s.storage.refresh_metadata()?;
+                Ok(json!({"status": "ok", "buckets": buckets}))
+            });
+            next_metadata = now + next_interval(&state, "metadata_refresh", metadata_every, ok);
+        }
+
+        if now >= next_metrics {
+            let ok = run_job(&state, "metrics_snapshot", |s| {
+                crate::http::record_operator_gauges(s);
+                let rows = s.metrics.write_snapshot_to_storage(&s.storage)?;
+                Ok(json!({"status": "ok", "rows": rows}))
+            });
+            next_metrics = now + next_interval(&state, "metrics_snapshot", metrics_every, ok);
         }
 
         if now >= next_compaction {
@@ -427,6 +435,8 @@ fn classify_job_error(err: &anyhow::Error, job: &str) -> &'static str {
     }
     match job {
         "flush" | "watchdog" => "flush_failed",
+        "metadata_refresh" => "metadata_refresh_failed",
+        "metrics_snapshot" => "metrics_snapshot_failed",
         "compaction" => "compaction_failed",
         "retention" | "retention_dry_run" => "retention_failed",
         _ => "scheduler_job_failed",

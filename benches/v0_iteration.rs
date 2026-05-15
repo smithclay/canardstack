@@ -31,7 +31,7 @@ const DEFAULT_LOG_BODY_BYTES: usize = 120_000;
 const DEFAULT_TRACE_SPAN_COUNT: usize = 16;
 const DEFAULT_TRACE_ATTRIBUTE_BYTES: usize = 48_000;
 const DEFAULT_METRIC_SERIES_COUNT: usize = 40;
-const DEFAULT_METRIC_DESCRIPTION_BYTES: usize = 280_000;
+const DEFAULT_METRIC_DESCRIPTION_BYTES: usize = 192;
 
 fn main() {
     match run() {
@@ -765,11 +765,12 @@ fn print_summary(report: &Report, path: &Path) {
         report.query_profile.concurrency
     );
     println!(
-        "workload services={} log_body_bytes={} trace_spans={} metric_series={}",
+        "workload services={} log_body_bytes={} trace_spans={} metric_series={} metric_description_bytes={}",
         report.workload_profile.service_count,
         report.workload_profile.log_body_bytes,
         report.workload_profile.trace_span_count,
-        report.workload_profile.metric_series_count
+        report.workload_profile.metric_series_count,
+        report.workload_profile.metric_description_bytes
     );
     println!(
         "resource_envelope cpu_limit={} memory_limit={} note={}",
@@ -950,6 +951,13 @@ impl Args {
                         .parse()
                         .context("invalid --metric-series")?;
                 }
+                "--metric-description-bytes" => {
+                    parsed.workload.metric_description_bytes = args
+                        .next()
+                        .context("--metric-description-bytes requires a value")?
+                        .parse()
+                        .context("invalid --metric-description-bytes")?;
+                }
                 "--progress-interval" => {
                     parsed.progress_interval = parse_duration(
                         &args
@@ -974,7 +982,7 @@ impl Args {
                 "--bench" => {}
                 "--help" | "-h" => {
                     println!(
-                        "cargo bench --bench v0_iteration -- [--base-url URL] [--warmup 2m] [--duration 20m] [--target-gb-day 100] [--profile ingest-only|mixed-query] [--query-pressure off|low|medium|high] [--query-interval 5s] [--query-concurrency 1] [--services 1] [--log-body-bytes 120000] [--trace-spans 16] [--metric-series 40] [--progress-interval 30s] [--max-runtime 27m] [--no-queries] [--report-dir DIR]"
+                        "cargo bench --bench v0_iteration -- [--base-url URL] [--warmup 2m] [--duration 20m] [--target-gb-day 100] [--profile ingest-only|mixed-query] [--query-pressure off|low|medium|high] [--query-interval 5s] [--query-concurrency 1] [--services 1] [--log-body-bytes 120000] [--trace-spans 16] [--metric-series 40] [--metric-description-bytes 192] [--progress-interval 30s] [--max-runtime 27m] [--no-queries] [--report-dir DIR]"
                     );
                     std::process::exit(0);
                 }

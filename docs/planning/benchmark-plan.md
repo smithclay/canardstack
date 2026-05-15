@@ -177,7 +177,7 @@ Useful local knobs:
 - Query pressure: `--query-pressure low|medium|high`, or explicit
   `--query-interval` plus `--query-concurrency`.
 - Workload dimensions: `--services`, `--log-body-bytes`, `--trace-spans`,
-  and `--metric-series`.
+  `--metric-series`, and `--metric-description-bytes`.
 - Output: `--report-dir`, which preserves `report.json`.
 
 The JSON report includes the workload profile, query profile, configured or

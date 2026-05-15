@@ -2,7 +2,14 @@
 
 ## Metric Naming
 
-The canardstack process exposes Prometheus-text metrics at `GET /metrics`. The names below are the implemented contract — only metrics that are actually emitted are listed here. Histograms are rendered as a counter pair (`*_count` / `*_sum`) rather than full HDR-style buckets.
+The canardstack process exposes Prometheus-text metrics at `GET /metrics`. The
+scheduler also writes a snapshot of those same samples every
+`CANARDSTACK_SCHEDULER_METRICS_SECS` seconds with `service_name="canardstack"`:
+counters land in `metric_sum`, and gauges land in `metric_gauge`. Grafana can
+query canardstack's own monitoring data through the normal Prometheus-compatible
+datastore path. The names below are the implemented contract: only metrics that
+are actually emitted are listed here. Histograms are rendered as a counter pair
+(`*_count` / `*_sum`) rather than full HDR-style buckets.
 
 Labels stay low-cardinality:
 
@@ -10,7 +17,7 @@ Labels stay low-cardinality:
 - `table`: `logs`, `spans`, `metric_gauge`, `metric_sum`, or `all`.
 - `status`: HTTP status code or grouped class.
 - `reason`: bounded rejection or failure reason.
-- `job`: maintenance job name (`watchdog`, `flush`, `retention`).
+- `job`: maintenance job name (`watchdog`, `flush`, `metadata_refresh`, `metrics_snapshot`, `compaction`, `retention`).
 - `query_class`: route path (e.g. `/api/v1/query_range`).
 - `encoding`: `identity`, `gzip`.
 - `triggered_by`: who initiated a partial-commit flush.
@@ -64,7 +71,7 @@ Do not label metrics by `service_name`, trace id, query text, API key, or arbitr
 | --- | --- | --- | --- |
 | `canardstack_maintenance_runs_total` | Counter | `job`, `status`, `reason` | Job outcomes (`status=ok` or `status=error`). |
 | `canardstack_maintenance_duration_seconds` | Histogram (`_count` / `_sum`) | `job`, `table=all` | Job runtime. |
-| `canardstack_maintenance_failures_total` | Counter | `job`, `reason` | Failures only, broken out by classified reason. Bounded reason set: `disk_full`, `flush_failed`, `compaction_failed`, `retention_failed`, `scheduler_job_failed`. Reasons derive from the job name where possible (so dependency wording changes do not silently re-route alerts); only `disk_full` substring-matches OS / DuckDB errors. |
+| `canardstack_maintenance_failures_total` | Counter | `job`, `reason` | Failures only, broken out by classified reason. Bounded reason set: `disk_full`, `flush_failed`, `metadata_refresh_failed`, `metrics_snapshot_failed`, `compaction_failed`, `retention_failed`, `scheduler_job_failed`. Reasons derive from the job name where possible (so dependency wording changes do not silently re-route alerts); only `disk_full` substring-matches OS / DuckDB errors. |
 | `canardstack_maintenance_consecutive_failures` | Gauge | `job` | Consecutive failure count; resets to 0 on success. Drives exponential backoff. |
 | `canardstack_maintenance_paused` | Gauge | none | `1` when paused. |
 

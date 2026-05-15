@@ -65,7 +65,7 @@ status is the HTTP code, not just the body.
 ### Symptoms
 
 - Query role restarts.
-- In-flight UI queries fail with `503`.
+- In-flight Grafana or compatibility queries fail with `503`.
 - System logs show DuckDB allocation failure or process OOM kill.
 - Ingest may remain healthy if process roles are isolated; otherwise all service endpoints restart.
 
@@ -86,7 +86,7 @@ endpoint. Steps 2 and 3 require an operator-driven restart.
    (e.g. `256MiB`) and restart.
 3. Lower global query concurrency: set
    `CANARDSTACK_QUERY_INTERACTIVE_CONCURRENCY=1` and restart.
-4. Reduce compatibility query traffic from Grafana or the local UI.
+4. Reduce compatibility query traffic from Grafana or other clients.
 
 ### Safe Degradation
 
@@ -130,7 +130,7 @@ endpoint. Steps 2 and 3 require an operator-driven restart.
 ### Safe Degradation
 
 - Serve queries from already committed data.
-- Surface stale freshness watermarks in the UI.
+- Surface stale freshness watermarks in Grafana.
 - Prioritize flush recovery; compaction and orphan cleanup are not implemented v0 controls.
 
 ### Escalation
@@ -210,4 +210,3 @@ endpoint. Steps 2 and 3 require an operator-driven restart.
 - Add storage capacity.
 - Investigate whether partition deletes are producing delete files instead of reclaiming physical files.
 - If needed, migrate to physical day tables behind stable views.
-

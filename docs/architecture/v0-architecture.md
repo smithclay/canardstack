@@ -31,8 +31,8 @@ V0 exposes:
 - Prometheus-compatible metric query subset.
 - Loki-compatible log query subset.
 - Tempo-compatible trace lookup/search subset.
-- Thin local browser UI over those compatibility endpoints.
-- Direct DuckLake/DuckDB access outside the HTTP/UI product surface.
+- Provisioned Grafana dashboards over those compatibility endpoints.
+- Direct DuckLake/DuckDB access outside the HTTP product surface.
 
 V0 rejects or defers:
 
@@ -41,7 +41,7 @@ V0 rejects or defers:
 - Durable ingest WAL.
 - Kafka, ClickHouse, or separate hot store.
 - Multi-tenancy.
-- Arbitrary user SQL through normal UI/API routes.
+- Arbitrary user SQL through normal HTTP API routes.
 - Sub-second freshness.
 - Histograms and exponential histograms.
 - Full Prometheus, Loki, Tempo, PromQL, LogQL, or TraceQL semantics.
@@ -53,7 +53,7 @@ V0 rejects or defers:
 ### HTTP API Role
 
 The binary owns OTLP/HTTP ingestion, auth, bounded in-memory buffering,
-compatibility query adapters, admin endpoints, operator metrics, and UI serving.
+compatibility query adapters, admin endpoints, and operator metrics.
 In dev it may also run maintenance. In production, maintenance should be moved
 to a singleton maintenance role.
 
@@ -77,7 +77,7 @@ deployments or object storage for production.
 
 DuckDB is the only query engine. User-facing investigation access goes through
 compatibility adapters that impose time range, row limit, timeout, memory limit,
-and concurrency controls. The local browser UI calls those adapters directly.
+and concurrency controls. Grafana calls those adapters directly.
 
 ## Request Flow
 
@@ -94,7 +94,7 @@ flowchart LR
   I --> J["Inlined data or Parquet files"]
   J --> K["DuckDB constrained queries"]
   K --> L["Prometheus/Loki/Tempo adapter"]
-  L --> M["Grafana, local UI, curl, or another compatible client"]
+  L --> M["Grafana, curl, or another compatible client"]
 ```
 
 External SQL path:
@@ -211,6 +211,8 @@ Responsibilities:
 
 - Queue watchdog.
 - Flush inlined data.
+- Refresh discovery metadata summaries.
+- Snapshot operator metrics.
 - Expire snapshots.
 - Clean old files.
 - Enforce day retention.
@@ -281,4 +283,4 @@ Default limits:
 
 Admin SQL is acceptable for diagnostics only if separately authenticated,
 audited, timeout-bound, and memory-bound. It is not exposed through the normal
-browser or compatibility APIs.
+HTTP compatibility APIs.

@@ -78,9 +78,9 @@ The crate is intentionally flat; each module maps to a pipeline stage or boundar
 - `src/storage.rs` - DuckDB lifecycle, DuckLake `ATTACH`, extension install, Arrow appender writes, `StorageProbe`, retention, and compaction SQL.
 - `src/query.rs` - bounded query helpers with interactive and background lanes.
 - `src/compat.rs` - Prometheus/Loki/Tempo route adapters and the v0 public query surface.
-- `src/maintenance.rs` - `Scheduler` background thread for flush, DuckLake inlined-data flush, compaction, retention, and maintenance pause.
+- `src/metadata.rs` - bounded discovery-metadata adapters over `metadata_summary`, with a generation-keyed in-process cache.
+- `src/maintenance.rs` - `Scheduler` background thread for flush, metadata refresh, operator-metrics snapshot, compaction, retention, and maintenance pause.
 - `src/metrics.rs` - Prometheus-style operator metrics at `/metrics`.
-- `src/ui.rs` - thin investigation UI at `/`.
 - `src/sql.rs` - shared SQL fragment helpers used by `storage` and `compat`.
 - `src/cli/` - subcommand implementations.
 
@@ -91,7 +91,7 @@ The crate is intentionally flat; each module maps to a pipeline stage or boundar
 - Treat ingest as best-effort: a 2xx response means "accepted into a bounded in-memory queue," not "durably committed." There is no WAL.
 - Preserve pressure behavior: queues return 429 under pressure, and storage/dependency failures surface as 503 where appropriate.
 - Keep query routes bounded by time range, row limit, timeout, DuckDB memory limit, and concurrency caps through `QueryEngine`.
-- Do not expose arbitrary SQL through the UI or compatibility APIs. Direct SQL is intentionally an external DuckDB CLI / MotherDuck path.
+- Do not expose arbitrary SQL through the compatibility APIs. Direct SQL is intentionally an external DuckDB CLI / MotherDuck path.
 - Preserve the Prometheus/Loki error envelope shape: `{"status":"error","errorType":"...","error":"..."}`.
 - Assume one in-process scheduler and single writer. There is no Postgres-backed maintenance lease yet.
 

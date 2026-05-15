@@ -143,67 +143,26 @@ pub fn prometheus_label_values(
     params: &HashMap<String, String>,
 ) -> ApiResult<Value> {
     let (from, to) = optional_range(params, METRIC_RANGE_SECS)?;
-    let values = metric_label_values(state, name, from, to)?;
+    let values =
+        state
+            .metadata
+            .prometheus_label_values(&state.queries, &state.storage, name, from, to)?;
     Ok(prom_success(json!(values)))
 }
 
 pub fn prometheus_series(state: &AppState, params: &HashMap<String, String>) -> ApiResult<Value> {
     let (from, to) = optional_range(params, METRIC_RANGE_SECS)?;
-    let mut out = Vec::new();
-    state.queries.run_interactive(&state.storage, |conn, prefix| {
-        for table in ["metric_gauge", "metric_sum"] {
-            let sql = format!(
-                "SELECT metric_name, service_name, deployment_environment, count(*) FROM {prefix}{table} WHERE {} GROUP BY 1,2,3 ORDER BY 4 DESC LIMIT 1000",
-                time_predicate(from, to)
-            );
-            let mut stmt = conn.prepare(&sql)?;
-            let rows = stmt.query_map([], |row| {
-                let mut labels = Map::new();
-                labels.insert("__name__".to_string(), json!(row.get::<_, String>(0)?));
-                if let Some(v) = row.get::<_, Option<String>>(1)? {
-                    labels.insert("service_name".to_string(), json!(v));
-                }
-                if let Some(v) = row.get::<_, Option<String>>(2)? {
-                    labels.insert("deployment_environment".to_string(), json!(v));
-                }
-                Ok(Value::Object(labels))
-            })?;
-            for row in rows {
-                out.push(row?);
-            }
-        }
-        Ok(())
-    })?;
-    Ok(prom_success(json!(out)))
+    let out = state
+        .metadata
+        .prometheus_series(&state.queries, &state.storage, from, to)?;
+    Ok(prom_success(out))
 }
 
 pub fn prometheus_metadata(state: &AppState) -> ApiResult<Value> {
-    let mut metadata = Map::new();
-    state.queries.run_interactive(&state.storage, |conn, prefix| {
-        for table in ["metric_gauge", "metric_sum"] {
-            let signal_type = if table == "metric_sum" { "counter" } else { "gauge" };
-            let sql = format!(
-                "SELECT metric_name, max(metric_unit), max(metric_description) FROM {prefix}{table} GROUP BY 1 LIMIT 1000"
-            );
-            let mut stmt = conn.prepare(&sql)?;
-            let rows = stmt.query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, Option<String>>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                ))
-            })?;
-            for row in rows {
-                let (name, unit, help) = row?;
-                metadata.insert(
-                    name,
-                    json!([{"type": signal_type, "unit": unit.unwrap_or_default(), "help": help.unwrap_or_default()}]),
-                );
-            }
-        }
-        Ok(())
-    })?;
-    Ok(prom_success(Value::Object(metadata)))
+    let metadata = state
+        .metadata
+        .prometheus_metric_metadata(&state.queries, &state.storage)?;
+    Ok(prom_success(metadata))
 }
 
 pub fn loki_query(state: &AppState, params: &HashMap<String, String>) -> ApiResult<Value> {
@@ -234,36 +193,19 @@ pub fn loki_label_values(
     params: &HashMap<String, String>,
 ) -> ApiResult<Value> {
     let (from, to) = optional_range(params, INTERACTIVE_RANGE_SECS)?;
-    let values = log_label_values(state, name, from, to)?;
+    let values =
+        state
+            .metadata
+            .loki_label_values(&state.queries, &state.storage, name, from, to)?;
     Ok(loki_success(json!(values)))
 }
 
 pub fn loki_series(state: &AppState, params: &HashMap<String, String>) -> ApiResult<Value> {
     let (from, to) = optional_range(params, INTERACTIVE_RANGE_SECS)?;
-    let mut out = Vec::new();
-    state.queries.run_interactive(&state.storage, |conn, prefix| {
-        let sql = format!(
-            "SELECT service_name, deployment_environment, severity_text, count(*) FROM {prefix}logs WHERE {} GROUP BY 1,2,3 ORDER BY 4 DESC LIMIT 1000",
-            time_predicate(from, to)
-        );
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map([], |row| {
-            let mut labels = Map::new();
-            insert_opt(&mut labels, "service_name", row.get::<_, Option<String>>(0)?);
-            insert_opt(
-                &mut labels,
-                "deployment_environment",
-                row.get::<_, Option<String>>(1)?,
-            );
-            insert_opt(&mut labels, "severity_text", row.get::<_, Option<String>>(2)?);
-            Ok(Value::Object(labels))
-        })?;
-        for row in rows {
-            out.push(row?);
-        }
-        Ok(())
-    })?;
-    Ok(loki_success(json!(out)))
+    let out = state
+        .metadata
+        .loki_series(&state.queries, &state.storage, from, to)?;
+    Ok(loki_success(out))
 }
 
 pub fn tempo_trace(state: &AppState, trace_id: &str) -> ApiResult<Value> {
@@ -439,29 +381,9 @@ pub fn tempo_tag_values(
     }
 
     let (from, to) = optional_range(params, INTERACTIVE_RANGE_SECS)?;
-    let column = match tag {
-        "service.name" | "service_name" | "service-name" => "service_name",
-        "name" | "span.name" | "span_name" | "span-name" => "span_name",
-        "http.route" | "http_route" | "http-route" => "http_route",
-        "status" | "status.code" | "status_code" | "status-code" => "status_code",
-        "traceID" | "trace_id" => "trace_id",
-        _ => return Ok(json!({"tagValues": []})),
-    };
-    let mut values = Vec::new();
-    state.queries.run_interactive(&state.storage, |conn, prefix| {
-        let sql = format!(
-            "SELECT DISTINCT {column}::VARCHAR FROM {prefix}spans WHERE {} AND {column} IS NOT NULL ORDER BY 1 LIMIT 1000",
-            time_predicate(from, to)
-        );
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map([], |row| row.get::<_, Option<String>>(0))?;
-        for row in rows {
-            if let Some(value) = row? {
-                values.push(value);
-            }
-        }
-        Ok(())
-    })?;
+    let values = state
+        .metadata
+        .tempo_tag_values(&state.queries, &state.storage, tag, from, to)?;
     Ok(json!({"tagValues": values}))
 }
 
@@ -652,95 +574,6 @@ fn parse_usize(value: Option<&String>, default: usize, max: usize) -> ApiResult<
     validation::parse_limit(Some(&json!(parsed)), default, max)
 }
 
-fn metric_label_values(
-    state: &AppState,
-    name: &str,
-    from: DateTime<Utc>,
-    to: DateTime<Utc>,
-) -> ApiResult<Vec<String>> {
-    if name == "__name__" {
-        return distinct_union(state, "metric_name", "metric_gauge", "metric_sum", from, to);
-    }
-    if !matches!(name, "service_name" | "deployment_environment") {
-        return Ok(Vec::new());
-    }
-    distinct_union(state, name, "metric_gauge", "metric_sum", from, to)
-}
-
-fn log_label_values(
-    state: &AppState,
-    name: &str,
-    from: DateTime<Utc>,
-    to: DateTime<Utc>,
-) -> ApiResult<Vec<String>> {
-    if !matches!(
-        name,
-        "service_name"
-            | "deployment_environment"
-            | "severity_text"
-            | "trace_id"
-            | "span_id"
-            | "http_route"
-            | "http_method"
-    ) {
-        return Ok(Vec::new());
-    }
-    distinct_one(state, name, "logs", from, to)
-}
-
-fn distinct_union(
-    state: &AppState,
-    column: &str,
-    table_a: &str,
-    table_b: &str,
-    from: DateTime<Utc>,
-    to: DateTime<Utc>,
-) -> ApiResult<Vec<String>> {
-    let mut values = BTreeSet::new();
-    state.queries.run_interactive(&state.storage, |conn, prefix| {
-        for table in [table_a, table_b] {
-            let sql = format!(
-                "SELECT DISTINCT {column}::VARCHAR FROM {prefix}{table} WHERE {} AND {column} IS NOT NULL ORDER BY 1 LIMIT 1000",
-                time_predicate(from, to)
-            );
-            let mut stmt = conn.prepare(&sql)?;
-            let rows = stmt.query_map([], |row| row.get::<_, Option<String>>(0))?;
-            for row in rows {
-                if let Some(value) = row? {
-                    values.insert(value);
-                }
-            }
-        }
-        Ok(())
-    })?;
-    Ok(values.into_iter().collect())
-}
-
-fn distinct_one(
-    state: &AppState,
-    column: &str,
-    table: &str,
-    from: DateTime<Utc>,
-    to: DateTime<Utc>,
-) -> ApiResult<Vec<String>> {
-    let mut values = BTreeSet::new();
-    state.queries.run_interactive(&state.storage, |conn, prefix| {
-        let sql = format!(
-            "SELECT DISTINCT {column}::VARCHAR FROM {prefix}{table} WHERE {} AND {column} IS NOT NULL ORDER BY 1 LIMIT 1000",
-            time_predicate(from, to)
-        );
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map([], |row| row.get::<_, Option<String>>(0))?;
-        for row in rows {
-            if let Some(value) = row? {
-                values.insert(value);
-            }
-        }
-        Ok(())
-    })?;
-    Ok(values.into_iter().collect())
-}
-
 fn result_rows(result: &Value) -> Vec<Value> {
     result
         .get("rows")
@@ -767,12 +600,6 @@ fn prom_value(value: f64) -> String {
         value.to_string()
     } else {
         "NaN".to_string()
-    }
-}
-
-fn insert_opt(labels: &mut Map<String, Value>, name: &str, value: Option<String>) {
-    if let Some(value) = value.filter(|v| !v.is_empty()) {
-        labels.insert(name.to_string(), json!(value));
     }
 }
 
