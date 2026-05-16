@@ -20,7 +20,7 @@ cargo build --all-targets --locked
 # Tests (offline; does not touch MotherDuck)
 cargo test
 cargo test <test_name>
-cargo test remote_motherduck_ducklake_smoke -- --ignored --nocapture  # live MotherDuck smoke; requires MOTHERDUCK_TOKEN
+cargo test remote_ducklake_attach_uri_smoke -- --ignored --nocapture  # live remote DuckLake smoke; requires credentials
 
 # Lint and formatting (CI treats warnings as errors)
 cargo fmt --all -- --check
@@ -46,7 +46,7 @@ scripts/smoke-docker-local.sh
 cargo bench --bench v0_iteration
 ```
 
-`CANARDSTACK_USE_DUCKLAKE=true` is the default and requires the DuckLake DuckDB extension; startup should fail loudly if it is not loadable. Use `CANARDSTACK_USE_DUCKLAKE=false` for a pure local-DuckDB run when iterating without the lake.
+DuckLake is the only ingest storage mode and requires the DuckLake DuckDB extension; startup should fail loudly if it is not loadable. With no remote catalog configuration, canardstack uses a local DuckLake catalog and local data files.
 
 ## Architecture
 
@@ -57,7 +57,7 @@ OTLP/HTTP (JSON or protobuf, optional gzip)
   -> validation (auth, content type, size, timestamp skew)
   -> otlp2records -> Arrow RecordBatch grouped by Signal
   -> bounded per-signal in-memory queue
-  -> DuckDB Arrow appender into DuckLake tables, or local DuckDB when USE_DUCKLAKE=false
+  -> immutable Parquet segment files registered with DuckLake
   -> bounded compat query adapters for Prometheus / Loki / Tempo subsets
 ```
 
@@ -75,7 +75,7 @@ The crate is intentionally flat; each module maps to a pipeline stage or boundar
 - `src/validation.rs` - auth, content-type, size, compression, timestamp-skew checks, `ApiError`, and error envelopes.
 - `src/otlp.rs` - OTLP JSON/protobuf decode and `Transformed` payload construction.
 - `src/ingest/` - request flow, admission, queue accounting, flush orchestration, and `PartialFlushError`.
-- `src/storage.rs` - DuckDB lifecycle, DuckLake `ATTACH`, extension install, Arrow appender writes, `StorageProbe`, retention, and compaction SQL.
+- `src/storage.rs` - DuckDB lifecycle, DuckLake `ATTACH`, extension install, immutable segment writes, `StorageProbe`, retention, and maintenance SQL.
 - `src/query.rs` - bounded query helpers with interactive and background lanes.
 - `src/compat.rs` - Prometheus/Loki/Tempo route adapters and the v0 public query surface.
 - `src/metadata.rs` - bounded discovery-metadata adapters over `metadata_summary`, with a generation-keyed in-process cache.
@@ -99,7 +99,7 @@ The crate is intentionally flat; each module maps to a pipeline stage or boundar
 
 - Add or update tests for behavior changes when practical.
 - End-to-end tests usually belong in `tests/v0.rs` with shared fixtures under `tests/common/`; do not create a new test crate without a clear reason.
-- For storage-mode changes, cover the relevant `CANARDSTACK_USE_DUCKLAKE`, `CANARDSTACK_POSTGRES_DSN`, and `CANARDSTACK_DUCKLAKE_ATTACH_URI` combinations or explain why a live smoke is required.
+- For storage-mode changes, cover local DuckLake plus relevant `CANARDSTACK_POSTGRES_DSN` and `CANARDSTACK_DUCKLAKE_ATTACH_URI` combinations, or explain why a live smoke is required.
 - For compatibility API changes, verify both success payloads and protocol-specific error envelopes.
 - If a check cannot be run locally, say exactly which command was skipped and why.
 

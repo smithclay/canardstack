@@ -20,21 +20,10 @@ const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 static NEVER_SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
 fn log_startup_storage_mode(probe: &crate::storage::StorageProbe) {
-    if probe.ducklake_required {
-        eprintln!(
-            "canardstack storage mode=ducklake ({}); telemetry lands in the configured DuckLake. \
-             To run local-only for development, set CANARDSTACK_USE_DUCKLAKE=false.",
-            probe.mode
-        );
-    } else {
-        eprintln!(
-            "canardstack storage mode=local-duckdb; telemetry is stored ONLY in this process's \
-             DuckDB file. Suitable for dev / smoke / one-host demos — data is not visible to \
-             other readers (MotherDuck, second canardstack instance). For DuckLake, set \
-             CANARDSTACK_USE_DUCKLAKE=true and configure CANARDSTACK_DUCKLAKE_ATTACH_URI \
-             or CANARDSTACK_POSTGRES_DSN."
-        );
-    }
+    eprintln!(
+        "canardstack storage mode=ducklake ({}); telemetry lands in immutable DuckLake data files.",
+        probe.mode
+    );
 }
 
 pub fn serve(state: Arc<AppState>) -> anyhow::Result<()> {

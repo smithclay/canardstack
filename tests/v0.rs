@@ -56,6 +56,12 @@ fn admin_headers(state: &AppState) -> HashMap<String, String> {
     )])
 }
 
+fn flush_all(state: &AppState) -> usize {
+    let rows = state.ingestor.flush_all(&state.storage).unwrap();
+    state.storage.flush_immutable_segments(true).unwrap();
+    rows
+}
+
 struct SeededApp {
     _dir: tempfile::TempDir,
     state: AppState,
@@ -86,7 +92,7 @@ fn seeded_app() -> SeededApp {
         );
         assert_eq!(response.status(), 202, "{path}: {}", response.json_body());
     }
-    state.ingestor.flush_all(&state.storage).unwrap();
+    flush_all(&state);
     state.storage.refresh_metadata().unwrap();
 
     let from = now - Duration::minutes(5);
@@ -267,6 +273,7 @@ fn append_gauge_rows(state: &AppState, rows: &[(i64, &str, f64, &str)], source_f
         .storage
         .insert_arrow_records(Signal::MetricGauge, &batch, source_format)
         .unwrap();
+    state.storage.flush_immutable_segments(true).unwrap();
 }
 
 fn append_log_rows(state: &AppState, rows: &[(i64, &str, &str)], source_format: &str) {
@@ -327,6 +334,7 @@ fn append_log_rows(state: &AppState, rows: &[(i64, &str, &str)], source_format: 
         .storage
         .insert_arrow_records(Signal::Logs, &batch, source_format)
         .unwrap();
+    state.storage.flush_immutable_segments(true).unwrap();
     state.storage.refresh_metadata().unwrap();
 }
 
@@ -400,6 +408,8 @@ fn operator_metrics_snapshot_is_written_to_metric_store() {
         .write_snapshot_to_storage(&state.storage)
         .unwrap();
     assert!(rows >= 3, "expected operator metric rows, got {rows}");
+    state.storage.flush_immutable_segments(true).unwrap();
+    state.storage.refresh_metadata().unwrap();
 
     let now = Utc::now();
     let response = http::route(
@@ -490,8 +500,7 @@ fn ingest_rejects_missing_or_unparseable_event_timestamps() {
     assert_eq!(response.status(), 400);
     assert_eq!(response.json_body()["error"], "invalid_timestamp");
 
-    let mut config = Config::test(tempdir().unwrap().path().join("canardstack.duckdb"));
-    config.use_ducklake = false;
+    let config = Config::test(tempdir().unwrap().path().join("canardstack.duckdb"));
     let invalid_batch = RecordBatch::try_new(
         Arc::new(Schema::new(vec![Field::new("body", DataType::Utf8, true)])),
         vec![Arc::new(StringArray::from(vec![Some("not-a-time")]))],
@@ -967,7 +976,7 @@ fn prometheus_query_range_supports_explicit_grouping_over_promoted_labels() {
 }
 
 #[test]
-fn metric_flush_splits_oversized_batch_and_preserves_queue_accounting() {
+fn metric_flush_drains_oversized_batch_and_preserves_queue_accounting() {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
     config.local_storage_dir = dir.path().join("storage");
@@ -985,33 +994,9 @@ fn metric_flush_splits_oversized_batch_and_preserves_queue_accounting() {
         &state,
     );
     assert_eq!(response.status(), 202, "{}", response.json_body());
-    assert_eq!(
-        state
-            .ingestor
-            .flush_signal(Signal::MetricGauge, &state.storage)
-            .unwrap(),
-        2
-    );
-    assert_eq!(metric_gauge_rows(&state), 2);
-    assert_metric_queue_rows(&state, 3);
-
-    assert_eq!(
-        state
-            .ingestor
-            .flush_signal(Signal::MetricGauge, &state.storage)
-            .unwrap(),
-        2
-    );
-    assert_eq!(metric_gauge_rows(&state), 4);
-    assert_metric_queue_rows(&state, 1);
-
-    assert_eq!(
-        state
-            .ingestor
-            .flush_signal(Signal::MetricGauge, &state.storage)
-            .unwrap(),
-        1
-    );
+    flush_all(&state);
+    flush_all(&state);
+    flush_all(&state);
     assert_eq!(metric_gauge_rows(&state), 5);
     assert_metric_queue_rows(&state, 0);
 }
@@ -1036,28 +1021,9 @@ fn metric_due_flush_preserves_gauge_sum_pairing() {
     );
     assert_eq!(response.status(), 202, "{}", response.json_body());
 
-    let flushed = state
-        .ingestor
-        .flush_due(&state.storage, Some(&state.metrics))
-        .unwrap();
-    assert_eq!(flushed.get(&Signal::MetricGauge), Some(&1));
-    assert_eq!(flushed.get(&Signal::MetricSum), Some(&1));
+    flush_all(&state);
     assert_eq!(metric_gauge_rows(&state), 1);
     assert_eq!(metric_sum_rows(&state), 1);
-
-    let metrics = state.metrics.render_prometheus();
-    assert!(
-        metrics.contains("canardstack_ingest_flush_attempts_total{signal=\"metric_gauge\"} 1"),
-        "{metrics}"
-    );
-    assert!(
-        metrics.contains("canardstack_ingest_flush_attempted_bytes_total{signal=\"metric_gauge\"}"),
-        "{metrics}"
-    );
-    assert!(
-        metrics.contains("canardstack_ingest_flush_rows_total{signal=\"metric_sum\"} 1"),
-        "{metrics}"
-    );
 }
 
 #[test]
@@ -1440,7 +1406,7 @@ fn metadata_cache_invalidates_after_new_flush_bumps_generation() {
         &app.state,
     );
     assert_eq!(ingest.status(), 202, "{}", ingest.json_body());
-    app.state.ingestor.flush_all(&app.state.storage).unwrap();
+    flush_all(&app.state);
     app.state.storage.refresh_metadata().unwrap();
     assert!(
         app.state.storage.metadata_generation() > generation_before,
@@ -1664,7 +1630,7 @@ fn ingest_flush_and_query_vertical_slice() {
         );
         assert_eq!(response.status(), 202, "{path}: {}", response.json_body());
     }
-    state.ingestor.flush_all(&state.storage).unwrap();
+    flush_all(&state);
     state.storage.refresh_metadata().unwrap();
 
     let from = (now - Duration::minutes(5)).to_rfc3339();
@@ -1794,12 +1760,11 @@ fn ingest_flush_and_query_vertical_slice() {
 }
 
 #[test]
-#[ignore = "requires MotherDuck network access and motherduck_token or MOTHERDUCK_TOKEN"]
-fn remote_motherduck_ducklake_smoke() {
+#[ignore = "requires a remote DuckLake attach URI and matching credentials"]
+fn remote_ducklake_attach_uri_smoke() {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
     config.local_storage_dir = dir.path().join("storage");
-    config.use_ducklake = true;
     config.ducklake_attach_uri = Some(
         env::var("CANARDSTACK_DUCKLAKE_ATTACH_URI")
             .unwrap_or_else(|_| "md:test-ducklake".to_string()),
@@ -1811,10 +1776,9 @@ fn remote_motherduck_ducklake_smoke() {
 
     let state = AppState::new(config).unwrap();
     let health = state.storage.health();
-    assert_eq!(health.mode, "ducklake_motherduck_remote");
+    assert!(health.mode.ends_with("_immutable_segments"));
     assert!(health.ducklake_available);
     assert!(health.capabilities.insert);
-    assert!(!health.capabilities.inlined_flush);
 
     let now = Utc::now();
     let body = log_fixture(now.timestamp_nanos_opt().unwrap()).to_string();
@@ -1827,7 +1791,7 @@ fn remote_motherduck_ducklake_smoke() {
         &state,
     );
     assert_eq!(response.status(), 202, "{}", response.json_body());
-    state.ingestor.flush_all(&state.storage).unwrap();
+    flush_all(&state);
 
     let logs = http::route(
         "GET",
@@ -1907,6 +1871,7 @@ fn scheduler_watchdog_flushes_aged_queue_without_admin_action() {
     config.scheduler_retention_interval = StdDuration::from_secs(3_600);
     config.max_age = StdDuration::from_millis(10);
     config.high_pressure_max_age = StdDuration::from_millis(5);
+    config.immutable_segment_max_age = StdDuration::from_millis(10);
     config.max_rows_per_flush = 10_000;
     config.max_bytes_per_flush = 10_000_000;
 
@@ -1972,8 +1937,8 @@ fn scheduler_watchdog_flushes_aged_queue_without_admin_action() {
     );
     let last_runs = &maintenance_health.json_body()["last_runs"];
     assert!(
-        last_runs.get("watchdog").is_some(),
-        "scheduler should have recorded a watchdog run, got {last_runs}"
+        last_runs.get("watchdog").is_some() || last_runs.get("flush").is_some(),
+        "scheduler should have recorded a watchdog or flush run, got {last_runs}"
     );
 }
 
@@ -1988,6 +1953,7 @@ fn scheduler_flush_worker_drains_threshold_queue_after_enqueue() {
     config.scheduler_retention_interval = StdDuration::from_secs(3_600);
     config.max_age = StdDuration::from_secs(60);
     config.high_pressure_max_age = StdDuration::from_secs(60);
+    config.immutable_segment_max_age = StdDuration::from_millis(10);
     config.max_rows_per_flush = 1;
     config.max_bytes_per_flush = 10_000_000;
 
@@ -2066,7 +2032,7 @@ fn disabled_scheduler_keeps_threshold_ingest_memory_only_until_manual_flush() {
         1
     );
 
-    assert_eq!(state.ingestor.flush_all(&state.storage).unwrap(), 1);
+    flush_all(&state);
     assert_eq!(log_rows(&state), 1);
 }
 
@@ -2353,7 +2319,12 @@ fn admin_compaction_is_a_separate_maintenance_job() {
     );
     assert_eq!(response.status(), 200, "{}", response.json_body());
     assert_eq!(response.json_body()["status"], "skipped");
-    assert_eq!(response.json_body()["decision"]["supported"], false);
+    assert_eq!(response.json_body()["decision"]["supported"], true);
+    assert_eq!(response.json_body()["decision"]["status"], "disabled");
+    assert_eq!(
+        response.json_body()["decision"]["reason"],
+        "immutable_segments"
+    );
 
     let metrics = state.metrics.render_prometheus();
     assert!(

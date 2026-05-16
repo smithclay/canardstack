@@ -33,15 +33,10 @@ pub struct Config {
     pub late_accept_secs: i64,
     pub future_accept_secs: i64,
     pub force_dependency_unhealthy: bool,
-    pub use_ducklake: bool,
-    pub experimental_immutable_segments: bool,
     pub immutable_segment_target_bytes: usize,
     pub immutable_segment_max_age: Duration,
     pub ducklake_data_inlining_row_limit: usize,
-    pub ducklake_compaction_enabled: bool,
-    pub ducklake_compaction_max_compacted_files: usize,
     pub ducklake_compaction_min_files: usize,
-    pub ducklake_compaction_cleanup_files: bool,
     pub query_interactive: QueryLane,
     pub query_background: QueryLane,
     pub logs_retention_days: i64,
@@ -106,35 +101,21 @@ impl Config {
             late_accept_secs: env_i64("CANARDSTACK_ACCEPT_LATE_SECS", 24 * 60 * 60)?,
             future_accept_secs: env_i64("CANARDSTACK_ACCEPT_FUTURE_SECS", 10 * 60)?,
             force_dependency_unhealthy: false,
-            use_ducklake: env_bool("CANARDSTACK_USE_DUCKLAKE", true)?,
-            experimental_immutable_segments: env_bool(
-                "CANARDSTACK_EXPERIMENTAL_IMMUTABLE_SEGMENTS",
-                false,
-            )?,
             immutable_segment_target_bytes: env_usize(
                 "CANARDSTACK_IMMUTABLE_SEGMENT_TARGET_BYTES",
                 64 * 1024 * 1024,
             )?,
             immutable_segment_max_age: Duration::from_secs(env_usize(
                 "CANARDSTACK_IMMUTABLE_SEGMENT_MAX_AGE_SECS",
-                15,
+                10,
             )? as u64),
             ducklake_data_inlining_row_limit: env_usize(
                 "CANARDSTACK_DUCKLAKE_DATA_INLINING_ROW_LIMIT",
                 0,
             )?,
-            ducklake_compaction_enabled: env_bool("CANARDSTACK_DUCKLAKE_COMPACTION_ENABLED", true)?,
-            ducklake_compaction_max_compacted_files: env_usize(
-                "CANARDSTACK_DUCKLAKE_COMPACTION_MAX_COMPACTED_FILES",
-                1_000,
-            )?,
             ducklake_compaction_min_files: env_usize(
                 "CANARDSTACK_DUCKLAKE_COMPACTION_MIN_FILES",
                 8,
-            )?,
-            ducklake_compaction_cleanup_files: env_bool(
-                "CANARDSTACK_DUCKLAKE_COMPACTION_CLEANUP_FILES",
-                false,
             )?,
             query_interactive: QueryLane {
                 concurrency: env_usize("CANARDSTACK_QUERY_INTERACTIVE_CONCURRENCY", 4)?,
@@ -189,12 +170,16 @@ impl Config {
     }
 
     pub fn test(duckdb_path: PathBuf) -> Self {
+        let local_storage_dir = duckdb_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("storage");
         Self {
             bind: "127.0.0.1:0".to_string(),
             api_key: "test-key".to_string(),
             admin_api_key: "test-admin-key".to_string(),
             duckdb_path,
-            local_storage_dir: PathBuf::from(".canardstack-test-storage"),
+            local_storage_dir,
             duckdb_extension_dir: None,
             postgres_dsn: None,
             ducklake_attach_uri: None,
@@ -210,15 +195,10 @@ impl Config {
             late_accept_secs: 24 * 60 * 60,
             future_accept_secs: 10 * 60,
             force_dependency_unhealthy: false,
-            use_ducklake: false,
-            experimental_immutable_segments: false,
             immutable_segment_target_bytes: 64 * 1024 * 1024,
-            immutable_segment_max_age: Duration::from_secs(15),
+            immutable_segment_max_age: Duration::from_secs(10),
             ducklake_data_inlining_row_limit: 0,
-            ducklake_compaction_enabled: true,
-            ducklake_compaction_max_compacted_files: 1_000,
             ducklake_compaction_min_files: 8,
-            ducklake_compaction_cleanup_files: false,
             query_interactive: QueryLane {
                 concurrency: 4,
                 timeout_secs: 15,
@@ -280,19 +260,11 @@ impl Config {
         if self.duckdb_write_memory_limit.trim().is_empty() {
             anyhow::bail!("CANARDSTACK_DUCKDB_WRITE_MEMORY_LIMIT must not be empty");
         }
-        if self.experimental_immutable_segments && !self.use_ducklake {
-            anyhow::bail!(
-                "CANARDSTACK_EXPERIMENTAL_IMMUTABLE_SEGMENTS requires CANARDSTACK_USE_DUCKLAKE=true"
-            );
-        }
         if self.immutable_segment_target_bytes == 0 {
             anyhow::bail!("CANARDSTACK_IMMUTABLE_SEGMENT_TARGET_BYTES must be > 0");
         }
         if self.immutable_segment_max_age.is_zero() {
             anyhow::bail!("CANARDSTACK_IMMUTABLE_SEGMENT_MAX_AGE_SECS must be > 0");
-        }
-        if self.ducklake_compaction_max_compacted_files == 0 {
-            anyhow::bail!("CANARDSTACK_DUCKLAKE_COMPACTION_MAX_COMPACTED_FILES must be > 0");
         }
         if self.ducklake_compaction_min_files == 0 {
             anyhow::bail!("CANARDSTACK_DUCKLAKE_COMPACTION_MIN_FILES must be > 0");

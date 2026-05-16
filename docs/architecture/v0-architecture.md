@@ -69,9 +69,9 @@ MotherDuck-hosted DuckLake is a supported path for fast experiments.
 
 ### Data Store
 
-Data lands in DuckLake-managed tables over Parquet files, with DuckLake inlining
-absorbing small writes. Storage may be local filesystem for dev/small
-deployments or object storage for production.
+Data lands in DuckLake-managed tables as immutable Parquet segment files.
+Storage may be local filesystem for dev/small deployments or object storage for
+production.
 
 ### Query Engine
 
@@ -90,8 +90,8 @@ flowchart LR
   E --> F["Group by signal table"]
   F --> G["Bounded partitioned in-memory queue (RecordBatch)"]
   G --> H["Scheduler flush worker"]
-  H --> I["DuckDB/DuckLake Arrow appender insert"]
-  I --> J["Inlined data or Parquet files"]
+  H --> I["Immutable Parquet segment seal"]
+  I --> J["ducklake_add_data_files registration"]
   J --> K["DuckDB constrained queries"]
   K --> L["Prometheus/Loki/Tempo adapter"]
   L --> M["Grafana, curl, or another compatible client"]
@@ -159,33 +159,24 @@ DuckLake inlining is used as the small-write absorber, not a hot tier.
 
 Initial policy:
 
-- Insert batches into DuckLake tables as soon as flush triggers fire.
-- Let DuckLake inline small inserts below its configured threshold.
-- Configure that threshold with
-  `CANARDSTACK_DUCKLAKE_DATA_INLINING_ROW_LIMIT` (default `0`, which forces
-  direct data files when DuckLake supports direct file writes for the batch).
-- Prefer larger batches that become Parquet directly when sustained throughput
-  permits.
-- Run `ducklake_flush_inlined_data` during flush maintenance to keep DuckLake
-  inlined rows fresh.
-- Run `ducklake_merge_adjacent_files` on a separate compaction cadence to
-  compact direct-write small files only after active Parquet file fanout reaches
-  `CANARDSTACK_DUCKLAKE_COMPACTION_MIN_FILES` (default `8`). Bound each
-  maintenance call with
-  `CANARDSTACK_DUCKLAKE_COMPACTION_MAX_COMPACTED_FILES` (default `1000`) and
-  disable with `CANARDSTACK_DUCKLAKE_COMPACTION_ENABLED=false`.
-- Keep immediate cleanup of compacted files opt-in with
-  `CANARDSTACK_DUCKLAKE_COMPACTION_CLEANUP_FILES=true`; it calls DuckLake file
-  cleanup for files scheduled by compaction and should only be enabled where
-  the maintenance role can rule out long-running readers.
+- Flush drains process queues into immutable segment buffers.
+- Segment sealing writes Parquet with `otlp2records` and registers files with
+  DuckLake through `ducklake_add_data_files`.
+- `CANARDSTACK_IMMUTABLE_SEGMENT_TARGET_BYTES` defaults to 64 MiB and
+  `CANARDSTACK_IMMUTABLE_SEGMENT_MAX_AGE_SECS` defaults to 10 seconds.
+- `ducklake_flush_inlined_data` remains harmless maintenance, but normal
+  telemetry ingest should produce zero inlined rows.
+- DuckLake adjacent-file compaction is disabled for immutable telemetry
+  segments because earlier query/compaction coexistence testing hit fatal
+  DuckDB invalidation.
 - Track active Parquet files, Parquet rows, inlined rows, and flush failure
   count per table.
 
 Operator-facing target:
 
 - P50 freshness under 30 seconds during healthy load.
-- P95 freshness under 2 minutes during healthy load.
-- Oldest inlined data age under 10 minutes.
+- P95 freshness under 30 seconds during healthy load.
+- Zero inlined telemetry rows during normal ingest.
 
 ## Retention
 

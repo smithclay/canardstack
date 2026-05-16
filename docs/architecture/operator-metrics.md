@@ -54,7 +54,7 @@ Do not label metrics by `service_name`, trace id, query text, API key, or arbitr
 | `canardstack_ducklake_parquet_rows` | Gauge | `table` | Active rows stored in DuckLake Parquet data files per table. |
 | `canardstack_ducklake_inlined_rows` | Gauge | `table` | Rows currently held in DuckLake inlined-data tables per table. |
 | `canardstack_ducklake_flush_inlined_duration_seconds` | Histogram (`_count` / `_sum`) | `table` | Time spent in DuckLake inlined-data flush during maintenance. |
-| `canardstack_ducklake_compaction_duration_seconds` | Histogram (`_count` / `_sum`) | `table` | Time spent in DuckLake adjacent-file compaction during maintenance. |
+| `canardstack_ducklake_compaction_duration_seconds` | Histogram (`_count` / `_sum`) | `table` | Time spent in DuckLake adjacent-file compaction during maintenance. Immutable telemetry disables this path, so this should normally remain flat. |
 
 ## Query Metrics
 

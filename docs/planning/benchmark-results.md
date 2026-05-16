@@ -4,6 +4,113 @@ This is a running factual log of benchmark evidence. Keep entries narrow: record
 the exact claim tested, environment, command shape, report path, result, and
 known caveats. Do not generalize one run into a broader product claim.
 
+## 2026-05-16 - Immutable Segment Max-Age Validation, otlp2records 0.5.1
+
+### Claim Tested
+
+Validate whether immutable DuckLake segments should become the default/only
+ingest storage path after the partition-split fix, and whether increasing
+segment max age from 10s to 30s or 60s improves file shape without violating
+freshness.
+
+All runs used:
+
+- `otlp2records` `0.5.1`
+- local DuckLake with DuckDB catalog
+- immutable segment target bytes `67108864`
+- 100 GB/day target
+- benchmark `--ingest-concurrency 3`
+- `--profile mixed-query`
+- `--query-pressure medium`
+- 2m warmup, 30m measured duration
+
+### Result
+
+Partially validated, with a code decision:
+
+```text
+Make immutable DuckLake segments the only ingest storage path and drop the
+legacy DuckDB Arrow appender/local-DuckDB fallback. Keep 10s as the default
+immutable segment max age. Do not choose 30s or 60s as defaults because they
+miss the freshness target.
+```
+
+10s passed all acceptance criteria available in the report/progress output:
+throughput sustained, zero 429/503s, zero query failures, bounded queue oldest
+age, freshness samples under 30s, no DuckDB invalidation.
+
+30s passed the benchmark harness and materially reduced file count, but progress
+freshness samples repeatedly exceeded 30s. 60s was interrupted after it already
+showed repeated 40-60s freshness samples with bounded queue age, which is enough
+to reject it for the current freshness target.
+
+### Reports
+
+```text
+target/canardstack-bench/immutable-v051-64m-10s-100gpd-medium-conc3/20260516T155946Z/report.json
+target/canardstack-bench/immutable-v051-64m-30s-100gpd-medium-conc3/20260516T163242Z/report.json
+```
+
+The 60s run was intentionally stopped before a final report because it had
+already disproved the freshness claim during progress sampling.
+
+### Key Numbers
+
+10s max age:
+
+- Pass: `true`.
+- Actual throughput: `1154881 decoded B/s` vs target `1157407`.
+- HTTP status counts: `202=51600`, `200=720`; no `429`, no `503`.
+- Query failures: `0` of `720`.
+- Ingest latency: p50 `104.4ms`, p95 `111.1ms`, p99 `123.0ms`.
+- Query latency: p50 `395.1ms`, p95 `799.9ms`, p99 `912.7ms`.
+- Queue oldest-age trend: start `5.5s`, end `2.7s`.
+- Freshness lag trend: start `11.6s`, end `10.3s`; progress samples stayed
+  below 30s.
+- Top phases: metric gauge transform `327.714s` (`18%` wall), Prometheus
+  query_range `115.961s` (`6%` wall).
+- Active DuckLake telemetry files: logs `153`, spans `128`, metric_gauge
+  `148`, metric_sum `148`; metadata_summary `577`.
+- Local storage bytes from report: `264412762`.
+- Parquet byte shape: logs avg `970305`, spans avg `784271`, metric_gauge avg
+  `43726`, metric_sum avg `47675`.
+
+30s max age:
+
+- Pass: `true`.
+- Actual throughput: `1144902 decoded B/s` vs target `1157407`.
+- HTTP status counts: `202=50625`, `200=720`; no `429`, no `503`.
+- Query failures: `0` of `720`.
+- Ingest latency: p50 `107.1ms`, p95 `113.7ms`, p99 `128.8ms`.
+- Query latency: p50 `373.5ms`, p95 `740.7ms`, p99 `832.9ms`.
+- Queue oldest-age trend: start `4.2s`, end `3.3s`.
+- Freshness lag trend: start `17.5s`, end `27.9s`; progress samples repeatedly
+  exceeded 30s, including about `33-38s`.
+- Top phases: metric gauge transform `332.656s` (`18%` wall), Prometheus
+  query_range `108.073s` (`6%` wall).
+- Active DuckLake telemetry files: logs `58`, spans `56`, metric_gauge `58`,
+  metric_sum `58`; metadata_summary `230`.
+- Local storage bytes from report: `112738679`.
+- Parquet byte shape: logs avg `970536`, spans avg `784599`, metric_gauge avg
+  `97044`, metric_sum avg `104878`.
+
+60s max age:
+
+- No final report; run was stopped after enough negative evidence.
+- Progress samples showed bounded queue oldest age and zero errors, but
+  freshness repeatedly exceeded target, including roughly `40-60s`.
+- Partial file shape at interruption: logs `16`, spans `16`, metric_gauge `16`,
+  metric_sum `16`, metadata_summary `64`.
+
+### Caveats
+
+- The benchmark report stores start/end/final metric snapshots, not all progress
+  samples, so p95 freshness is inferred from progress output rather than a
+  first-class report field.
+- This is still local macOS evidence, not object-store, Linux VM, or overnight
+  proof.
+- The chosen default is backed by a 30-minute run, not the ideal 2-hour run.
+
 ## 2026-05-16 - 100 GB/day Immutable DuckLake, Ingest Concurrency 3
 
 ### Claim Tested

@@ -10,7 +10,7 @@ use arrow58::compute::{concat_batches, take};
 use arrow58::datatypes as arrow58_types;
 use arrow58::record_batch::RecordBatch;
 use chrono::{DateTime, NaiveDate, Timelike, Utc};
-use duckdb::{Appender, Connection};
+use duckdb::Connection;
 use otlp2records::output::write_parquet;
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -88,14 +88,10 @@ pub struct Storage {
     mode: String,
     catalog_name: String,
     ducklake_available: bool,
-    experimental_immutable_segments: bool,
     postgres_catalog_configured: bool,
     local_storage_dir: PathBuf,
     ducklake_required: bool,
     ducklake_managed_maintenance: bool,
-    ducklake_compaction_enabled: bool,
-    ducklake_compaction_max_compacted_files: usize,
-    ducklake_compaction_cleanup_files: bool,
     immutable_segment_target_bytes: usize,
     immutable_segment_max_age: Duration,
     immutable_buffers: Mutex<BTreeMap<Signal, ImmutableSegmentBuffer>>,
@@ -257,32 +253,22 @@ impl Storage {
         configure_base_connection(&writer)?;
         configure_write_connection(&writer, &config.duckdb_write_memory_limit)?;
 
-        let mut target_prefix = String::new();
-        let mut mode = "duckdb_local".to_string();
-        let mut ducklake_available = false;
-        let mut ducklake_managed_maintenance = false;
-
-        if config.use_ducklake {
-            attach_ducklake_connection(
-                &writer,
-                config.postgres_dsn.as_deref(),
-                config.ducklake_attach_uri.as_deref(),
-                &config.duckdb_path,
-                &config.local_storage_dir,
-                config.duckdb_extension_dir.as_deref(),
-                config.ducklake_data_inlining_row_limit,
-            )
-            .context(
-                "DuckLake attach failed. Fix the catalog config (URI, token, network) and \
-                 restart, or set CANARDSTACK_USE_DUCKLAKE=false to run in local-only mode \
-                 (development/testing — telemetry stays in a local DuckDB file).",
-            )?;
-            target_prefix = "canardlake.".to_string();
-            let plan = ducklake_attach_plan(config)?;
-            mode = plan.mode.to_string();
-            ducklake_managed_maintenance = plan.managed_maintenance;
-            ducklake_available = true;
-        }
+        attach_ducklake_connection(
+            &writer,
+            config.postgres_dsn.as_deref(),
+            config.ducklake_attach_uri.as_deref(),
+            &config.duckdb_path,
+            &config.local_storage_dir,
+            config.duckdb_extension_dir.as_deref(),
+            config.ducklake_data_inlining_row_limit,
+        )
+        .context(
+            "DuckLake attach failed. Fix the catalog config (URI, token, network, or extension path) and restart.",
+        )?;
+        let target_prefix = "canardlake.".to_string();
+        let plan = ducklake_attach_plan(config)?;
+        let mode = format!("{}_immutable_segments", plan.mode);
+        let ducklake_managed_maintenance = plan.managed_maintenance;
 
         create_tables_on(&writer, &target_prefix)?;
 
@@ -297,21 +283,13 @@ impl Storage {
             writer: Mutex::new(writer),
             reader: Mutex::new(reader),
             target_prefix,
-            mode: if config.experimental_immutable_segments {
-                format!("{mode}_immutable_segments")
-            } else {
-                mode
-            },
+            mode,
             catalog_name: "canardlake".to_string(),
-            ducklake_available,
-            experimental_immutable_segments: config.experimental_immutable_segments,
+            ducklake_available: true,
             postgres_catalog_configured: config.postgres_dsn.is_some(),
             local_storage_dir: config.local_storage_dir.clone(),
-            ducklake_required: config.use_ducklake,
+            ducklake_required: true,
             ducklake_managed_maintenance,
-            ducklake_compaction_enabled: config.ducklake_compaction_enabled,
-            ducklake_compaction_max_compacted_files: config.ducklake_compaction_max_compacted_files,
-            ducklake_compaction_cleanup_files: config.ducklake_compaction_cleanup_files,
             immutable_segment_target_bytes: config.immutable_segment_target_bytes,
             immutable_segment_max_age: config.immutable_segment_max_age,
             immutable_buffers: Mutex::new(BTreeMap::new()),
@@ -336,7 +314,7 @@ impl Storage {
     }
 
     pub fn accepts_memory_ingest(&self) -> bool {
-        !self.ducklake_required || self.ducklake_available
+        self.ducklake_available
     }
 
     pub fn health(&self) -> StorageHealth {
@@ -354,7 +332,7 @@ impl Storage {
                 inlined_flush: self.ducklake_managed_maintenance,
                 snapshot_expiration: self.ducklake_managed_maintenance,
                 cleanup_old_files: self.ducklake_managed_maintenance,
-                merge_adjacent_files: self.ducklake_managed_maintenance,
+                merge_adjacent_files: false,
                 whole_day_retention: true,
             },
             freshness_watermarks: self
@@ -433,12 +411,10 @@ impl Storage {
         let mut prepared = Vec::new();
         let mut prepare_timings = Vec::new();
         let mut attempted_rows = 0;
-        let mut error_table = None;
         for batch in batches {
             if batch.batch.num_rows() == 0 {
                 continue;
             }
-            error_table.get_or_insert(batch.table);
             let rows = batch.batch.num_rows();
             let prepare_started = Instant::now();
             let prepared_batch =
@@ -467,60 +443,7 @@ impl Storage {
             });
         }
 
-        if self.experimental_immutable_segments {
-            return self.insert_immutable_segments(prepared, prepare_timings, attempted_rows);
-        }
-
-        let conn = self.writer.lock_or_poisoned();
-        configure_write_connection(&conn, &self.write_memory_limit)?;
-        let append_result = (|| -> Result<Vec<ArrowBatchInsertTiming>> {
-            conn.execute_batch("BEGIN TRANSACTION;")?;
-            let mut timings = prepare_timings;
-            for table in unique_tables(&prepared) {
-                let started = Instant::now();
-                let mut rows = 0;
-                {
-                    let mut appender = create_appender(&conn, &self.target_prefix, table.as_str())?;
-                    for prepared in prepared.iter().filter(|batch| batch.table == table) {
-                        rows += prepared.rows;
-                        appender.append_record_batch(prepared.batch.clone())?;
-                    }
-                    appender.flush()?;
-                }
-                timings.push(ArrowBatchInsertTiming {
-                    table,
-                    phase: "storage_insert",
-                    rows,
-                    seconds: started.elapsed().as_secs_f64(),
-                });
-            }
-            let commit_started = Instant::now();
-            conn.execute_batch("COMMIT;")?;
-            distribute_commit_seconds(&mut timings, commit_started.elapsed().as_secs_f64());
-            Ok(timings)
-        })();
-        match append_result {
-            Ok(timings) => {
-                *self.last_error.lock_or_poisoned() = None;
-                // Record affected buckets for the metadata_refresh job; the
-                // day-partition re-aggregation must not block the writer here.
-                self.mark_metadata_dirty(affected_metadata_buckets(&prepared));
-                Ok(ArrowBatchInsertResult {
-                    rows: attempted_rows,
-                    timings,
-                })
-            }
-            Err(err) => {
-                let _ = conn.execute_batch("ROLLBACK;");
-                *self.last_error.lock_or_poisoned() = Some(err.to_string());
-                Err(anyhow::Error::new(InsertRecordsError {
-                    table: error_table.unwrap_or(Signal::Logs),
-                    committed_rows: 0,
-                    attempted_rows,
-                    source: err,
-                }))
-            }
-        }
+        self.insert_immutable_segments(prepared, prepare_timings, attempted_rows)
     }
 
     fn insert_immutable_segments(
@@ -529,8 +452,8 @@ impl Storage {
         prepare_timings: Vec<ArrowBatchInsertTiming>,
         attempted_rows: usize,
     ) -> Result<ArrowBatchInsertResult> {
-        if !self.ducklake_available || !self.ducklake_required {
-            anyhow::bail!("CANARDSTACK_EXPERIMENTAL_IMMUTABLE_SEGMENTS requires DuckLake storage");
+        if !self.ducklake_available {
+            anyhow::bail!("immutable segment ingest requires DuckLake storage");
         }
 
         let error_table = prepared
@@ -563,10 +486,6 @@ impl Storage {
     }
 
     pub fn flush_immutable_segments(&self, force: bool) -> Result<Value> {
-        if !self.experimental_immutable_segments {
-            return Ok(json!({"supported": false, "reason": "immutable segments are disabled"}));
-        }
-
         let mut to_seal = BTreeMap::new();
         let no_seal_snapshot;
         {
@@ -767,68 +686,6 @@ impl Storage {
         Ok(Value::Object(tables))
     }
 
-    fn merge_adjacent_files_on(
-        &self,
-        conn: &Connection,
-        table: Option<&str>,
-        with_limits: bool,
-    ) -> Result<i64> {
-        let sql = if with_limits {
-            match table {
-                Some(table) => format!(
-                    "SELECT count(*) FROM ducklake_merge_adjacent_files('{}', '{}', schema => 'main', max_compacted_files => {})",
-                    self.catalog_name,
-                    escape_value(table),
-                    self.ducklake_compaction_max_compacted_files
-                ),
-                None => format!(
-                    "SELECT count(*) FROM ducklake_merge_adjacent_files('{}', max_compacted_files => {})",
-                    self.catalog_name, self.ducklake_compaction_max_compacted_files
-                ),
-            }
-        } else {
-            match table {
-                Some(table) => format!(
-                    "SELECT count(*) FROM ducklake_merge_adjacent_files('{}', '{}', schema => 'main')",
-                    self.catalog_name,
-                    escape_value(table)
-                ),
-                None => format!(
-                    "SELECT count(*) FROM ducklake_merge_adjacent_files('{}')",
-                    self.catalog_name
-                ),
-            }
-        };
-        conn.query_row(&sql, [], |row| row.get(0)).with_context(|| {
-            format!(
-                "run DuckLake merge_adjacent_files for {}",
-                table.unwrap_or("all tables")
-            )
-        })
-    }
-
-    fn cleanup_compacted_files_on(&self, conn: &Connection) -> Result<Value> {
-        let sql = format!(
-            "SELECT count(*) FROM ducklake_cleanup_old_files('{}', cleanup_all => true)",
-            self.catalog_name
-        );
-        let scheduled_deleted_files: i64 = conn
-            .query_row(&sql, [], |row| row.get(0))
-            .context("run DuckLake cleanup_old_files after compaction")?;
-        let sql = format!(
-            "SELECT count(*) FROM ducklake_delete_orphaned_files('{}', cleanup_all => true)",
-            self.catalog_name
-        );
-        let orphan_deleted_files: i64 = conn
-            .query_row(&sql, [], |row| row.get(0))
-            .context("run DuckLake delete_orphaned_files after compaction")?;
-        Ok(json!({
-            "status": "ok",
-            "scheduled_deleted_files": scheduled_deleted_files,
-            "orphan_deleted_files": orphan_deleted_files
-        }))
-    }
-
     /// Read-side connection access for SELECT-only paths. Do not call into
     /// write paths from inside the closure.
     pub fn with_conn<T>(&self, f: impl FnOnce(&Connection, &str) -> Result<T>) -> Result<T> {
@@ -915,59 +772,18 @@ impl Storage {
         Ok(json!({"supported": true, "status": "ok"}))
     }
 
-    pub fn compaction_decision(&self, table: Option<&str>, min_files: usize) -> Result<Value> {
+    pub fn compaction_decision(&self, table: Option<&str>, _min_files: usize) -> Result<Value> {
         if !self.ducklake_managed_maintenance {
             return Ok(
                 json!({"supported": false, "reason": "ducklake maintenance is not managed by this process"}),
             );
         }
-        if self.experimental_immutable_segments {
-            return Ok(json!({
-                "supported": true,
-                "status": "disabled",
-                "reason": "immutable_segments"
-            }));
-        }
-        if !self.ducklake_compaction_enabled {
-            return Ok(json!({
-                "supported": true,
-                "status": "disabled",
-                "should_compact": false
-            }));
-        }
-
-        let layout = self.with_conn(|conn, _| self.ducklake_storage_layout_on(conn))?;
-        let mut candidates = serde_json::Map::new();
-        if let Some(tables) = layout.as_object() {
-            for (table_name, value) in tables {
-                if table.is_some_and(|requested| requested != table_name) {
-                    continue;
-                }
-                let parquet_files = value
-                    .get("parquet_files")
-                    .and_then(Value::as_i64)
-                    .unwrap_or(0);
-                if parquet_files >= min_files as i64 {
-                    candidates.insert(
-                        table_name.clone(),
-                        json!({
-                            "parquet_files": parquet_files,
-                            "threshold": min_files
-                        }),
-                    );
-                }
-            }
-        }
-
-        let should_compact = !candidates.is_empty();
         Ok(json!({
             "supported": true,
-            "status": if should_compact { "ready" } else { "below_file_threshold" },
-            "should_compact": should_compact,
-            "threshold": min_files,
+            "status": "disabled",
+            "should_compact": false,
             "table": table,
-            "candidates": candidates,
-            "layout": layout
+            "reason": "immutable_segments"
         }))
     }
 
@@ -977,47 +793,11 @@ impl Storage {
                 json!({"supported": false, "reason": "ducklake maintenance is not managed by this process"}),
             );
         }
-        if self.experimental_immutable_segments {
-            return Ok(json!({
-                "supported": true,
-                "status": "disabled",
-                "reason": "immutable_segments"
-            }));
-        }
-        if !self.ducklake_compaction_enabled {
-            return Ok(json!({"supported": true, "status": "disabled"}));
-        }
-
-        let conn = self.writer.lock_or_poisoned();
-        let before = self.ducklake_storage_layout_on(&conn)?;
-        let output_files = match self.merge_adjacent_files_on(&conn, table, true) {
-            Ok(output_files) => output_files,
-            Err(primary) => {
-                let fallback = self.merge_adjacent_files_on(&conn, table, false);
-                match fallback {
-                    Ok(output_files) => output_files,
-                    Err(fallback) => {
-                        return Err(fallback.context(format!(
-                            "ducklake merge_adjacent_files fallback failed after primary error: {primary}"
-                        )));
-                    }
-                }
-            }
-        };
-        let file_cleanup = if self.ducklake_compaction_cleanup_files {
-            self.cleanup_compacted_files_on(&conn)?
-        } else {
-            json!({"status": "skipped", "reason": "disabled"})
-        };
-        let after = self.ducklake_storage_layout_on(&conn)?;
         Ok(json!({
             "supported": true,
-            "status": "ok",
+            "status": "disabled",
             "table": table,
-            "output_files": output_files,
-            "file_cleanup": file_cleanup,
-            "before": before,
-            "after": after
+            "reason": "immutable_segments"
         }))
     }
 
@@ -1306,6 +1086,11 @@ fn build_ducklake_attach_plan(
         }
         let is_motherduck = uri.starts_with("md:");
         let is_ducklake = uri.starts_with("ducklake:");
+        if !is_motherduck && !is_ducklake {
+            anyhow::bail!(
+                "CANARDSTACK_DUCKLAKE_ATTACH_URI must be an md: or ducklake: URI because immutable ingest registers data files with DuckLake"
+            );
+        }
         let attach_options = if is_ducklake {
             format!(" (DATA_INLINING_ROW_LIMIT {data_inlining_row_limit})")
         } else {
@@ -1319,10 +1104,8 @@ fn build_ducklake_attach_plan(
             ),
             mode: if is_motherduck {
                 "ducklake_motherduck_remote"
-            } else if is_ducklake {
-                "ducklake_custom_uri"
             } else {
-                "duckdb_custom_attach_uri"
+                "ducklake_custom_uri"
             },
             needs_ducklake: is_ducklake,
             needs_motherduck: is_motherduck,
@@ -1388,43 +1171,6 @@ fn configure_write_connection(conn: &Connection, memory_limit: &str) -> Result<(
         escape_value(memory_limit)
     ))?;
     Ok(())
-}
-
-fn create_appender<'a>(
-    conn: &'a Connection,
-    target_prefix: &str,
-    table: &str,
-) -> Result<Appender<'a>> {
-    if let Some(catalog) = target_prefix.strip_suffix('.') {
-        conn.appender_to_catalog_and_db(table, catalog, "main")
-            .with_context(|| format!("create appender for {catalog}.main.{table}"))
-    } else {
-        conn.appender(table)
-            .with_context(|| format!("create appender for {table}"))
-    }
-}
-
-fn unique_tables(prepared: &[PreparedArrowBatch]) -> Vec<Signal> {
-    let mut tables = Vec::new();
-    for batch in prepared {
-        if !tables.contains(&batch.table) {
-            tables.push(batch.table);
-        }
-    }
-    tables
-}
-
-fn affected_metadata_buckets(
-    prepared: &[PreparedArrowBatch],
-) -> BTreeMap<Signal, BTreeSet<String>> {
-    let mut affected = BTreeMap::new();
-    for batch in prepared {
-        let dates: &mut BTreeSet<String> = affected.entry(batch.table).or_default();
-        for date in &batch.event_dates {
-            dates.insert(date.clone());
-        }
-    }
-    affected
 }
 
 fn merge_dirty_metadata(
@@ -1954,7 +1700,7 @@ fn storage_duckdb_batch(
     }
 
     RecordBatch::try_new(Arc::new(arrow58_types::Schema::new(fields)), arrays)
-        .context("build DuckDB appender RecordBatch")
+        .context("build storage RecordBatch")
 }
 
 fn batch_event_dates(batch: &RecordBatch) -> Result<Vec<String>> {
@@ -2233,6 +1979,28 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn custom_ducklake_attach_uri_uses_ducklake_extension_and_canardlake_alias() {
+        let dir = tempdir().unwrap();
+        let plan = build_ducklake_attach_plan(
+            None,
+            Some("ducklake:md:test-ducklake"),
+            &dir.path().join("canardstack.duckdb"),
+            &dir.path().join("storage"),
+            1_000,
+        )
+        .unwrap();
+
+        assert_eq!(
+            plan.sql,
+            "ATTACH 'ducklake:md:test-ducklake' AS canardlake (DATA_INLINING_ROW_LIMIT 1000); USE canardlake;"
+        );
+        assert_eq!(plan.mode, "ducklake_custom_uri");
+        assert!(plan.needs_ducklake);
+        assert!(!plan.needs_postgres);
+        assert!(plan.managed_maintenance);
+    }
+
+    #[test]
     fn motherduck_attach_uri_uses_md_extension_and_canardlake_alias() {
         let dir = tempdir().unwrap();
         let plan = build_ducklake_attach_plan(
@@ -2260,7 +2028,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let err = build_ducklake_attach_plan(
             Some("dbname=ducklake_catalog host=localhost"),
-            Some("md:test-ducklake"),
+            Some("ducklake:md:test-ducklake"),
             &dir.path().join("canardstack.duckdb"),
             &dir.path().join("storage"),
             1_000,
@@ -2302,6 +2070,21 @@ mod tests {
         assert!(err
             .to_string()
             .contains("must be the URI only, not an ATTACH statement"));
+    }
+
+    #[test]
+    fn custom_attach_uri_must_be_md_or_ducklake_uri() {
+        let dir = tempdir().unwrap();
+        let err = build_ducklake_attach_plan(
+            None,
+            Some("sqlite:/tmp/not-ducklake.db"),
+            &dir.path().join("canardstack.duckdb"),
+            &dir.path().join("storage"),
+            1_000,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("must be an md: or ducklake: URI"));
     }
 
     #[test]

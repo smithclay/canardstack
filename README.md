@@ -166,8 +166,7 @@ flowchart LR
     Collector -->|OTLP| Ingest
     Grafana -->|PromQL · LogQL · trace lookup| Compat
 
-    Storage -->|USE_DUCKLAKE=true| Lake[("DuckLake catalog<br/>")]
-    Storage -.->|USE_DUCKLAKE=false| Local[("Local DuckDB file")]
+    Storage -->|immutable Parquet files| Lake[("DuckLake catalog<br/>")]
 ```
 
 ## Send Telemetry
