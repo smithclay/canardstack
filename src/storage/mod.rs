@@ -1,6 +1,6 @@
 use crate::config::Config;
+use crate::db::sql::{escape_value, quote as sql_quote};
 use crate::ingest::Signal;
-use crate::sql::{escape_value, quote as sql_quote};
 use crate::LockExt;
 use anyhow::{Context, Result};
 use arrow58::array as arrow58_array;

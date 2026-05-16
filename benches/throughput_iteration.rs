@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-const BENCH_NAME: &str = "v0_iteration";
+const BENCH_NAME: &str = "throughput_iteration";
 const BENCH_VERSION: &str = "0.1.0";
 const SCENARIO_NAME: &str = "v0-local-100gpd";
 const DETERMINISTIC_SEED: u64 = 0xCA4A_D57A_C5AC;
@@ -43,7 +43,7 @@ fn main() {
             }
         }
         Err(err) => {
-            eprintln!("v0_iteration failed before completing a reportable run: {err:#}");
+            eprintln!("throughput_iteration failed before completing a reportable run: {err:#}");
             std::process::exit(1);
         }
     }
@@ -66,7 +66,7 @@ fn run() -> Result<(Report, PathBuf)> {
     let guard_deadline = Instant::now() + args.max_runtime();
 
     eprintln!(
-        "v0_iteration: warmup={} measured={} target={:.0} decoded B/s base_url={} profile={} ingest_concurrency={} query_concurrency={} progress={} max_runtime={}",
+        "throughput_iteration: warmup={} measured={} target={:.0} decoded B/s base_url={} profile={} ingest_concurrency={} query_concurrency={} progress={} max_runtime={}",
         fmt_duration(args.warmup),
         fmt_duration(args.duration),
         target_bytes_per_sec,
@@ -429,7 +429,7 @@ fn print_progress(
         .map(|lag| format!(" freshness_lag={lag:.1}s"))
         .unwrap_or_default();
     eprintln!(
-        "v0_iteration progress phase={} elapsed={}/{} accepted={:.0}B/s status_counts={} queries={}/{} transport_errors={}{}{}",
+        "throughput_iteration progress phase={} elapsed={}/{} accepted={:.0}B/s status_counts={} queries={}/{} transport_errors={}{}{}",
         phase,
         fmt_duration(elapsed.min(duration)),
         fmt_duration(duration),
@@ -558,7 +558,7 @@ fn send_ingest_payload(
                 payload.body.len(),
                 format_error_chain(&err)
             );
-            eprintln!("v0_iteration {detail}");
+            eprintln!("throughput_iteration {detail}");
             IngestOutcome {
                 status: None,
                 elapsed_ms,
@@ -927,7 +927,7 @@ fn write_report(report: &Report, report_dir: Option<&Path>) -> Result<PathBuf> {
 
 fn print_summary(report: &Report, path: &Path) {
     println!(
-        "v0_iteration scenario={} pass={} actual={:.0}B/s target={:.0}B/s profile={} query_concurrency={}",
+        "throughput_iteration scenario={} pass={} actual={:.0}B/s target={:.0}B/s profile={} query_concurrency={}",
         report.scenario.name,
         report.pass,
         report.actual_decoded_bytes_per_sec,
@@ -1162,7 +1162,7 @@ impl Args {
                 "--bench" => {}
                 "--help" | "-h" => {
                     println!(
-                        "cargo bench --bench v0_iteration -- [--base-url URL] [--warmup 2m] [--duration 20m] [--target-gb-day 100] [--profile ingest-only|mixed-query] [--ingest-concurrency 1] [--query-pressure off|low|medium|high] [--query-interval 5s] [--query-concurrency 1] [--services 1] [--log-body-bytes 120000] [--trace-spans 16] [--metric-series 40] [--metric-description-bytes 192] [--progress-interval 30s] [--max-runtime 27m] [--no-queries] [--report-dir DIR]"
+                        "cargo bench --bench throughput_iteration -- [--base-url URL] [--warmup 2m] [--duration 20m] [--target-gb-day 100] [--profile ingest-only|mixed-query] [--ingest-concurrency 1] [--query-pressure off|low|medium|high] [--query-interval 5s] [--query-concurrency 1] [--services 1] [--log-body-bytes 120000] [--trace-spans 16] [--metric-series 40] [--metric-description-bytes 192] [--progress-interval 30s] [--max-runtime 27m] [--no-queries] [--report-dir DIR]"
                     );
                     std::process::exit(0);
                 }
@@ -1746,7 +1746,7 @@ mod otlp_fixture {
 
     pub fn scope() -> InstrumentationScope {
         InstrumentationScope {
-            name: "v0_iteration".to_string(),
+            name: "throughput_iteration".to_string(),
             version: BENCH_VERSION.to_string(),
             attributes: vec![],
             dropped_attributes_count: 0,

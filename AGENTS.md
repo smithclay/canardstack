@@ -43,7 +43,7 @@ docker compose run --rm smoke
 scripts/smoke-docker-local.sh
 
 # Bench
-cargo bench --bench v0_iteration
+cargo bench --bench throughput_iteration
 ```
 
 DuckLake is the only ingest storage mode and requires the DuckLake DuckDB extension; startup should fail loudly if it is not loadable. With no remote catalog configuration, canardstack uses a local DuckLake catalog and local data files.
@@ -65,7 +65,7 @@ Signals are `Logs`, `Spans`, `MetricGauge`, and `MetricSum`. Histograms and expo
 
 ## Source Map
 
-The crate is intentionally flat; each module maps to a pipeline stage or boundary.
+Top-level modules map to pipeline stages or boundaries. Subdirectories group helper code by ownership while preserving the public root module shims where they already exist.
 
 - `src/main.rs` - argv dispatch for `serve`, `smoke`, `smoke-http`, `healthcheck`, and `install-ducklake-extension`; installs SIGINT/SIGTERM handlers.
 - `src/lib.rs` - re-exports `AppState`, `Config`, and `Scheduler`; defines `log_event` and `LockExt::lock_or_poisoned`.
@@ -75,13 +75,14 @@ The crate is intentionally flat; each module maps to a pipeline stage or boundar
 - `src/validation.rs` - auth, content-type, size, compression, timestamp-skew checks, `ApiError`, and error envelopes.
 - `src/otlp.rs` - OTLP JSON/protobuf decode and `Transformed` payload construction.
 - `src/ingest/` - request flow, admission, queue accounting, flush orchestration, and `PartialFlushError`.
-- `src/storage.rs` - DuckDB lifecycle, DuckLake `ATTACH`, extension install, immutable segment writes, `StorageProbe`, retention, and maintenance SQL.
-- `src/query.rs` - bounded query helpers with interactive and background lanes.
-- `src/compat.rs` - Prometheus/Loki/Tempo route adapters and the v0 public query surface.
+- `src/storage/` - DuckDB lifecycle, DuckLake `ATTACH`, extension install, immutable segment writes, `StorageProbe`, retention, and maintenance SQL.
+- `src/query/` - bounded query helpers, shared query plans, and Prometheus/Loki/Tempo selector parsing.
+- `src/compat/` - Prometheus/Loki/Tempo route adapters and the v0 public query surface.
 - `src/metadata.rs` - bounded discovery-metadata adapters over `metadata_summary`, with a generation-keyed in-process cache.
 - `src/maintenance.rs` - `Scheduler` background thread for flush, metadata refresh, operator-metrics snapshot, compaction, retention, and maintenance pause.
 - `src/metrics.rs` - Prometheus-style operator metrics at `/metrics`.
-- `src/sql.rs` - shared SQL fragment helpers used by `storage` and `compat`.
+- `src/db/sql.rs` - shared SQL fragment helpers used by `storage`, `query`, and `compat`.
+- `src/runtime/memory.rs` - runtime memory-pressure probing.
 - `src/cli/` - subcommand implementations.
 
 ## Load-Bearing Constraints
@@ -98,7 +99,7 @@ The crate is intentionally flat; each module maps to a pipeline stage or boundar
 ## Testing Expectations
 
 - Add or update tests for behavior changes when practical.
-- End-to-end tests usually belong in `tests/v0.rs` with shared fixtures under `tests/common/`; do not create a new test crate without a clear reason.
+- End-to-end tests usually belong in `tests/integration.rs` with shared fixtures under `tests/common/`; do not create a new test crate without a clear reason.
 - For storage-mode changes, cover local DuckLake plus relevant `CANARDSTACK_POSTGRES_DSN` and `CANARDSTACK_DUCKLAKE_ATTACH_URI` combinations, or explain why a live smoke is required.
 - For compatibility API changes, verify both success payloads and protocol-specific error envelopes.
 - If a check cannot be run locally, say exactly which command was skipped and why.

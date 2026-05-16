@@ -166,7 +166,7 @@ or freshness lag, query interference with ingest, unstable tail latency, and
 dominant server phases that correlate with failed gates.
 
 ```sh
-cargo bench --bench v0_iteration -- --duration 30s --warmup 5s
+cargo bench --bench throughput_iteration -- --duration 30s --warmup 5s
 ```
 
 Useful local knobs:
@@ -191,19 +191,19 @@ Run each volume first without queries, then with queries:
 
 ```sh
 # Sentinel: catches obvious regressions quickly.
-cargo bench --bench v0_iteration -- \
+cargo bench --bench throughput_iteration -- \
   --warmup 30s --duration 5m --target-gb-day 25 --profile ingest-only
-cargo bench --bench v0_iteration -- \
+cargo bench --bench throughput_iteration -- \
   --warmup 30s --duration 5m --target-gb-day 25 --profile mixed-query --query-pressure medium
 
 # Two-hour proof run at the candidate volume.
-cargo bench --bench v0_iteration -- \
+cargo bench --bench throughput_iteration -- \
   --warmup 5m --duration 2h --target-gb-day 100 --profile ingest-only
-cargo bench --bench v0_iteration -- \
+cargo bench --bench throughput_iteration -- \
   --warmup 5m --duration 2h --target-gb-day 100 --profile mixed-query --query-pressure high
 
 # Overnight run before claiming sustained operation.
-cargo bench --bench v0_iteration -- \
+cargo bench --bench throughput_iteration -- \
   --warmup 10m --duration 12h --target-gb-day 250 --profile mixed-query --query-pressure high
 ```
 
@@ -227,7 +227,7 @@ docker inspect "$(docker compose ps -q canardstack-bench)" \
 CANARDSTACK_BENCHMARK_CPU_LIMIT=2.0 \
 CANARDSTACK_BENCHMARK_MEMORY_LIMIT=4g \
 CANARDSTACK_BENCHMARK_RESOURCE_NOTE='Docker Desktop VM capped to 2 CPU / 4 GB memory; not cloud-equivalent Linux hardware' \
-cargo bench --bench v0_iteration -- \
+cargo bench --bench throughput_iteration -- \
   --base-url http://127.0.0.1:4319 \
   --warmup 30s --duration 5m \
   --target-gb-day 25 \

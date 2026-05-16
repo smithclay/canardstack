@@ -1,5 +1,5 @@
+use crate::db::sql::quote as sql_quote;
 use crate::query::QueryEngine;
-use crate::sql::quote as sql_quote;
 use crate::storage::Storage;
 use crate::validation::ApiResult;
 use crate::LockExt;

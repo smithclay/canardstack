@@ -1,8 +1,8 @@
-use crate::log_query::parse_loki_query;
-use crate::promql::parse_prom_query;
-use crate::query_plan::TimeBounds;
-use crate::sql::{quote as sql_quote, time_predicate};
-use crate::trace_query::plan_tempo_search;
+use crate::db::sql::{quote as sql_quote, span_row, time_predicate};
+use crate::query::log::parse_loki_query;
+use crate::query::plan::TimeBounds;
+use crate::query::prometheus::parse_prom_query;
+use crate::query::trace::plan_tempo_search;
 use crate::validation::{self, ApiError, ApiResult};
 use crate::AppState;
 use chrono::{DateTime, TimeZone, Utc};
@@ -220,7 +220,7 @@ pub fn tempo_trace(state: &AppState, trace_id: &str) -> ApiResult<Value> {
             time_predicate(from, to)
         );
         let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map([], crate::sql::span_row)?;
+        let rows = stmt.query_map([], span_row)?;
         for row in rows {
             spans.push(row?);
         }

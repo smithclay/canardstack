@@ -1,10 +1,15 @@
+pub mod log;
+pub mod plan;
+pub mod prometheus;
+pub mod trace;
+
 use crate::config::Config;
+use crate::db::sql::{push_eq, quote as sql_quote, span_row, time_predicate};
 use crate::metrics::Timer;
-use crate::query_plan::{
+use crate::query::plan::{
     FieldMatcher, LogPlan, MetricAggregation, MetricPlan, MetricSignal, SelectorPlan,
     SortDirection, TextFilter, TimeBounds, TracePlan, TraceSort,
 };
-use crate::sql::{push_eq, quote as sql_quote, span_row, time_predicate};
 use crate::storage::{QueryTimeoutError, Storage};
 use crate::validation::{self, ApiError, ApiResult};
 use chrono::{DateTime, Utc};
