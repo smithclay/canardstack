@@ -369,6 +369,7 @@ pub fn route(
                     &state.storage,
                     query.get("table").map(String::as_str),
                     Some(&state.metrics),
+                    true,
                 )
                 .map_err(|err| {
                     if let Some((partial_signal, committed)) =

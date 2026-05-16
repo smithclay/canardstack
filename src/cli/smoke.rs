@@ -49,6 +49,7 @@ pub fn run() -> anyhow::Result<()> {
         &state,
     );
     state.ingestor.flush_all(&state.storage)?;
+    state.storage.flush_immutable_segments(true)?;
 
     let mut admin_headers = HashMap::new();
     admin_headers.insert(

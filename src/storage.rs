@@ -6,14 +6,17 @@ use anyhow::{Context, Result};
 use arrow58::array as arrow58_array;
 use arrow58::array::Array as _;
 use arrow58::array::ArrayRef;
+use arrow58::compute::{concat_batches, take};
 use arrow58::datatypes as arrow58_types;
 use arrow58::record_batch::RecordBatch;
-use chrono::{NaiveDate, Utc};
+use chrono::{DateTime, NaiveDate, Timelike, Utc};
 use duckdb::{Appender, Connection};
+use otlp2records::output::write_parquet;
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
+use std::fs::{self, File};
+use std::io::BufWriter;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -22,6 +25,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const DUCKDB_THREADS: usize = 1;
+static IMMUTABLE_SEGMENT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, Serialize)]
 pub struct StorageHealth {
@@ -84,6 +88,7 @@ pub struct Storage {
     mode: String,
     catalog_name: String,
     ducklake_available: bool,
+    experimental_immutable_segments: bool,
     postgres_catalog_configured: bool,
     local_storage_dir: PathBuf,
     ducklake_required: bool,
@@ -91,6 +96,9 @@ pub struct Storage {
     ducklake_compaction_enabled: bool,
     ducklake_compaction_max_compacted_files: usize,
     ducklake_compaction_cleanup_files: bool,
+    immutable_segment_target_bytes: usize,
+    immutable_segment_max_age: Duration,
+    immutable_buffers: Mutex<BTreeMap<Signal, ImmutableSegmentBuffer>>,
     write_memory_limit: String,
     last_error: Mutex<Option<String>>,
     /// Cache-invalidation token for discovery metadata. Bumped only after a
@@ -156,6 +164,7 @@ pub struct ArrowBatchInsert<'a> {
 #[derive(Clone, Debug)]
 pub struct ArrowBatchInsertTiming {
     pub table: Signal,
+    pub phase: &'static str,
     pub rows: usize,
     pub seconds: f64,
 }
@@ -171,6 +180,69 @@ struct PreparedArrowBatch {
     batch: RecordBatch,
     rows: usize,
     event_dates: Vec<String>,
+}
+
+#[derive(Clone)]
+struct ImmutableSegmentBuffer {
+    batches: Vec<RecordBatch>,
+    rows: usize,
+    bytes: usize,
+    event_dates: BTreeSet<String>,
+    opened_at: Instant,
+}
+
+struct ImmutableSealResult {
+    rows: usize,
+    files: usize,
+    timings: Vec<ArrowBatchInsertTiming>,
+    affected: BTreeMap<Signal, BTreeSet<String>>,
+}
+
+impl ImmutableSegmentBuffer {
+    fn new(now: Instant) -> Self {
+        Self {
+            batches: Vec::new(),
+            rows: 0,
+            bytes: 0,
+            event_dates: BTreeSet::new(),
+            opened_at: now,
+        }
+    }
+
+    fn push(&mut self, prepared: PreparedArrowBatch) {
+        self.rows += prepared.rows;
+        self.bytes += prepared.batch.get_array_memory_size().max(prepared.rows);
+        self.event_dates.extend(prepared.event_dates);
+        self.batches.push(prepared.batch);
+    }
+
+    fn append_buffer(&mut self, mut other: ImmutableSegmentBuffer) {
+        self.rows += other.rows;
+        self.bytes += other.bytes;
+        self.event_dates.append(&mut other.event_dates);
+        if other.opened_at < self.opened_at {
+            self.opened_at = other.opened_at;
+        }
+        self.batches.append(&mut other.batches);
+    }
+
+    fn should_seal(&self, target_bytes: usize, max_age: Duration, now: Instant) -> bool {
+        self.rows > 0
+            && (self.bytes >= target_bytes || now.duration_since(self.opened_at) >= max_age)
+    }
+
+    fn record_batch(&self, table: Signal) -> Result<RecordBatch> {
+        match self.batches.as_slice() {
+            [] => anyhow::bail!("immutable {table} buffer is empty"),
+            [batch] => Ok(batch.clone()),
+            batches => {
+                let schema = batches[0].schema();
+                let refs = batches.iter().collect::<Vec<_>>();
+                concat_batches(&schema, refs)
+                    .with_context(|| format!("coalesce immutable {table} segment buffer"))
+            }
+        }
+    }
 }
 
 impl Storage {
@@ -225,9 +297,14 @@ impl Storage {
             writer: Mutex::new(writer),
             reader: Mutex::new(reader),
             target_prefix,
-            mode,
+            mode: if config.experimental_immutable_segments {
+                format!("{mode}_immutable_segments")
+            } else {
+                mode
+            },
             catalog_name: "canardlake".to_string(),
             ducklake_available,
+            experimental_immutable_segments: config.experimental_immutable_segments,
             postgres_catalog_configured: config.postgres_dsn.is_some(),
             local_storage_dir: config.local_storage_dir.clone(),
             ducklake_required: config.use_ducklake,
@@ -235,6 +312,9 @@ impl Storage {
             ducklake_compaction_enabled: config.ducklake_compaction_enabled,
             ducklake_compaction_max_compacted_files: config.ducklake_compaction_max_compacted_files,
             ducklake_compaction_cleanup_files: config.ducklake_compaction_cleanup_files,
+            immutable_segment_target_bytes: config.immutable_segment_target_bytes,
+            immutable_segment_max_age: config.immutable_segment_max_age,
+            immutable_buffers: Mutex::new(BTreeMap::new()),
             write_memory_limit: config.duckdb_write_memory_limit.clone(),
             last_error: Mutex::new(None),
             metadata_generation: AtomicU64::new(0),
@@ -351,6 +431,7 @@ impl Storage {
         batches: &[ArrowBatchInsert<'_>],
     ) -> Result<ArrowBatchInsertResult> {
         let mut prepared = Vec::new();
+        let mut prepare_timings = Vec::new();
         let mut attempted_rows = 0;
         let mut error_table = None;
         for batch in batches {
@@ -359,15 +440,23 @@ impl Storage {
             }
             error_table.get_or_insert(batch.table);
             let rows = batch.batch.num_rows();
+            let prepare_started = Instant::now();
             let prepared_batch =
                 storage_duckdb_batch(batch.table, batch.batch, batch.source_format)?;
             let event_dates = batch_event_dates(&prepared_batch)?;
+            let prepare_seconds = prepare_started.elapsed().as_secs_f64();
             attempted_rows += rows;
             prepared.push(PreparedArrowBatch {
                 table: batch.table,
                 batch: prepared_batch,
                 rows,
                 event_dates,
+            });
+            prepare_timings.push(ArrowBatchInsertTiming {
+                table: batch.table,
+                phase: "storage_prepare",
+                rows,
+                seconds: prepare_seconds,
             });
         }
 
@@ -378,11 +467,15 @@ impl Storage {
             });
         }
 
+        if self.experimental_immutable_segments {
+            return self.insert_immutable_segments(prepared, prepare_timings, attempted_rows);
+        }
+
         let conn = self.writer.lock_or_poisoned();
         configure_write_connection(&conn, &self.write_memory_limit)?;
         let append_result = (|| -> Result<Vec<ArrowBatchInsertTiming>> {
             conn.execute_batch("BEGIN TRANSACTION;")?;
-            let mut timings = Vec::new();
+            let mut timings = prepare_timings;
             for table in unique_tables(&prepared) {
                 let started = Instant::now();
                 let mut rows = 0;
@@ -396,6 +489,7 @@ impl Storage {
                 }
                 timings.push(ArrowBatchInsertTiming {
                     table,
+                    phase: "storage_insert",
                     rows,
                     seconds: started.elapsed().as_secs_f64(),
                 });
@@ -426,6 +520,182 @@ impl Storage {
                     source: err,
                 }))
             }
+        }
+    }
+
+    fn insert_immutable_segments(
+        &self,
+        prepared: Vec<PreparedArrowBatch>,
+        prepare_timings: Vec<ArrowBatchInsertTiming>,
+        attempted_rows: usize,
+    ) -> Result<ArrowBatchInsertResult> {
+        if !self.ducklake_available || !self.ducklake_required {
+            anyhow::bail!("CANARDSTACK_EXPERIMENTAL_IMMUTABLE_SEGMENTS requires DuckLake storage");
+        }
+
+        let error_table = prepared
+            .first()
+            .map(|batch| batch.table)
+            .unwrap_or(Signal::Logs);
+        let mut timings = prepare_timings;
+
+        {
+            let mut buffers = self.immutable_buffers.lock_or_poisoned();
+            let started = Instant::now();
+            for batch in prepared {
+                buffers
+                    .entry(batch.table)
+                    .or_insert_with(|| ImmutableSegmentBuffer::new(started))
+                    .push(batch);
+            }
+            timings.push(ArrowBatchInsertTiming {
+                table: error_table,
+                phase: "storage_buffer",
+                rows: attempted_rows,
+                seconds: started.elapsed().as_secs_f64(),
+            });
+        }
+        *self.last_error.lock_or_poisoned() = None;
+        Ok(ArrowBatchInsertResult {
+            rows: attempted_rows,
+            timings,
+        })
+    }
+
+    pub fn flush_immutable_segments(&self, force: bool) -> Result<Value> {
+        if !self.experimental_immutable_segments {
+            return Ok(json!({"supported": false, "reason": "immutable segments are disabled"}));
+        }
+
+        let mut to_seal = BTreeMap::new();
+        let no_seal_snapshot;
+        {
+            let mut buffers = self.immutable_buffers.lock_or_poisoned();
+            let now = Instant::now();
+            let tables_to_seal = buffers
+                .iter()
+                .filter_map(|(table, buffer)| {
+                    (force
+                        || buffer.should_seal(
+                            self.immutable_segment_target_bytes,
+                            self.immutable_segment_max_age,
+                            now,
+                        ))
+                    .then_some(*table)
+                })
+                .collect::<Vec<_>>();
+
+            if tables_to_seal.is_empty() {
+                no_seal_snapshot = immutable_buffer_snapshot(&buffers);
+                return Ok(json!({
+                    "supported": true,
+                    "force": force,
+                    "sealed_files": 0,
+                    "sealed_rows": 0,
+                    "timings": [],
+                    "active_buffers": no_seal_snapshot,
+                }));
+            }
+
+            for table in tables_to_seal {
+                if let Some(buffer) = buffers.remove(&table) {
+                    to_seal.insert(table, buffer);
+                }
+            }
+        }
+        let seal_result = match self.seal_immutable_buffers(&to_seal) {
+            Ok(result) => result,
+            Err(err) => {
+                self.restore_immutable_buffers(to_seal);
+                return Err(err);
+            }
+        };
+        let active_buffers = immutable_buffer_snapshot(&self.immutable_buffers.lock_or_poisoned());
+        *self.last_error.lock_or_poisoned() = None;
+        self.mark_metadata_dirty(seal_result.affected);
+
+        Ok(json!({
+            "supported": true,
+            "force": force,
+            "sealed_files": seal_result.files,
+            "sealed_rows": seal_result.rows,
+            "timings": immutable_timing_snapshot(&seal_result.timings),
+            "active_buffers": active_buffers,
+        }))
+    }
+
+    fn seal_immutable_buffers(
+        &self,
+        buffers: &BTreeMap<Signal, ImmutableSegmentBuffer>,
+    ) -> Result<ImmutableSealResult> {
+        let mut timings = Vec::new();
+        let mut sealed = Vec::with_capacity(buffers.len());
+        let mut affected = BTreeMap::new();
+
+        for (&table, buffer) in buffers {
+            let batch = buffer.record_batch(table)?;
+            let started = Instant::now();
+            let segments = split_batch_by_immutable_partition(&batch)?
+                .into_iter()
+                .map(|(partition, batch)| {
+                    write_immutable_segment(&self.local_storage_dir, table, partition, &batch)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            sealed.extend(segments);
+            timings.push(ArrowBatchInsertTiming {
+                table,
+                phase: "storage_parquet_write",
+                rows: buffer.rows,
+                seconds: started.elapsed().as_secs_f64(),
+            });
+            affected.insert(table, buffer.event_dates.clone());
+        }
+
+        let conn = self.writer.lock_or_poisoned();
+        configure_write_connection(&conn, &self.write_memory_limit)?;
+        let register_result = (|| -> Result<()> {
+            conn.execute_batch("BEGIN TRANSACTION;")?;
+            for segment in &sealed {
+                let started = Instant::now();
+                register_ducklake_data_file(
+                    &conn,
+                    &self.catalog_name,
+                    segment.table,
+                    &segment.path,
+                )?;
+                timings.push(ArrowBatchInsertTiming {
+                    table: segment.table,
+                    phase: "storage_insert",
+                    rows: segment.rows,
+                    seconds: started.elapsed().as_secs_f64(),
+                });
+            }
+            let commit_started = Instant::now();
+            conn.execute_batch("COMMIT;")?;
+            distribute_commit_seconds(&mut timings, commit_started.elapsed().as_secs_f64());
+            Ok(())
+        })();
+
+        if let Err(err) = register_result {
+            let _ = conn.execute_batch("ROLLBACK;");
+            return Err(err);
+        }
+
+        Ok(ImmutableSealResult {
+            rows: sealed.iter().map(|segment| segment.rows).sum(),
+            files: sealed.len(),
+            timings,
+            affected,
+        })
+    }
+
+    fn restore_immutable_buffers(&self, detached: BTreeMap<Signal, ImmutableSegmentBuffer>) {
+        let mut buffers = self.immutable_buffers.lock_or_poisoned();
+        for (table, mut detached_buffer) in detached {
+            if let Some(current) = buffers.remove(&table) {
+                detached_buffer.append_buffer(current);
+            }
+            buffers.insert(table, detached_buffer);
         }
     }
 
@@ -651,6 +921,13 @@ impl Storage {
                 json!({"supported": false, "reason": "ducklake maintenance is not managed by this process"}),
             );
         }
+        if self.experimental_immutable_segments {
+            return Ok(json!({
+                "supported": true,
+                "status": "disabled",
+                "reason": "immutable_segments"
+            }));
+        }
         if !self.ducklake_compaction_enabled {
             return Ok(json!({
                 "supported": true,
@@ -699,6 +976,13 @@ impl Storage {
             return Ok(
                 json!({"supported": false, "reason": "ducklake maintenance is not managed by this process"}),
             );
+        }
+        if self.experimental_immutable_segments {
+            return Ok(json!({
+                "supported": true,
+                "status": "disabled",
+                "reason": "immutable_segments"
+            }));
         }
         if !self.ducklake_compaction_enabled {
             return Ok(json!({"supported": true, "status": "disabled"}));
@@ -1173,9 +1457,7 @@ fn refresh_metadata_summaries_on(
                     sql_quote(signal.as_str()),
                     sql_quote(date)
                 ))?;
-                for sql in metadata_refresh_sql(prefix, *signal, date) {
-                    conn.execute_batch(&sql)?;
-                }
+                conn.execute_batch(&metadata_refresh_sql(prefix, *signal, date)?)?;
             }
         }
         conn.execute_batch("COMMIT;")?;
@@ -1197,13 +1479,21 @@ fn refresh_metadata_summaries_on(
     result
 }
 
-fn metadata_refresh_sql(prefix: &str, signal: Signal, date: &str) -> Vec<String> {
-    match signal {
+fn metadata_refresh_sql(prefix: &str, signal: Signal, date: &str) -> Result<String> {
+    let selects = match signal {
         Signal::Logs => logs_metadata_sql(prefix, date),
         Signal::Spans => spans_metadata_sql(prefix, date),
         Signal::MetricGauge => metric_metadata_sql(prefix, Signal::MetricGauge, date, "gauge"),
         Signal::MetricSum => metric_metadata_sql(prefix, Signal::MetricSum, date, "counter"),
+    };
+    if selects.is_empty() {
+        anyhow::bail!("metadata refresh for {signal} produced no SELECT statements");
     }
+    Ok(format!(
+        "INSERT INTO {prefix}metadata_summary ({}) {}",
+        metadata_summary_columns(),
+        selects.join("\nUNION ALL\n")
+    ))
 }
 
 fn logs_metadata_sql(prefix: &str, date: &str) -> Vec<String> {
@@ -1229,14 +1519,12 @@ fn logs_metadata_sql(prefix: &str, date: &str) -> Vec<String> {
     }
     sql.push(format!(
         "\
-        INSERT INTO {prefix}metadata_summary ({}) \
         SELECT 'logs', event_date, 'series', 'stream', NULL, NULL, NULL, NULL, \
                service_name, deployment_environment, severity_text, \
                count(*), min(timestamp), max(timestamp) \
         FROM {prefix}logs \
         WHERE event_date = DATE {} \
         GROUP BY event_date, service_name, deployment_environment, severity_text",
-        metadata_summary_columns(),
         sql_quote(date)
     ));
     sql
@@ -1286,28 +1574,24 @@ fn metric_metadata_sql(prefix: &str, signal: Signal, date: &str, metric_type: &s
     }
     sql.push(format!(
         "\
-        INSERT INTO {prefix}metadata_summary ({}) \
         SELECT {}, event_date, 'series', metric_name, NULL, {}, NULL, NULL, \
                service_name, deployment_environment, NULL, \
                count(*), min(timestamp), max(timestamp) \
         FROM {prefix}{table} \
         WHERE event_date = DATE {} AND metric_name IS NOT NULL AND metric_name <> '' \
         GROUP BY event_date, metric_name, service_name, deployment_environment",
-        metadata_summary_columns(),
         sql_quote(signal),
         sql_quote(metric_type),
         sql_quote(date)
     ));
     sql.push(format!(
         "\
-        INSERT INTO {prefix}metadata_summary ({}) \
         SELECT {}, event_date, 'metric_metadata', metric_name, NULL, {}, \
                max(coalesce(metric_unit, '')), max(coalesce(metric_description, '')), \
                NULL, NULL, NULL, count(*), min(timestamp), max(timestamp) \
         FROM {prefix}{table} \
         WHERE event_date = DATE {} AND metric_name IS NOT NULL AND metric_name <> '' \
         GROUP BY event_date, metric_name",
-        metadata_summary_columns(),
         sql_quote(signal),
         sql_quote(metric_type),
         sql_quote(date)
@@ -1326,13 +1610,11 @@ fn label_value_insert_sql(
 ) -> String {
     format!(
         "\
-        INSERT INTO {prefix}metadata_summary ({}) \
         SELECT {}, event_date, {}, {}, {column}::VARCHAR, NULL, NULL, NULL, \
                NULL, NULL, NULL, count(*), min(timestamp), max(timestamp) \
         FROM {prefix}{table} \
         WHERE event_date = DATE {} AND {column} IS NOT NULL AND {column}::VARCHAR <> '' \
         GROUP BY event_date, {column}",
-        metadata_summary_columns(),
         sql_quote(signal),
         sql_quote(kind),
         sql_quote(name),
@@ -1350,15 +1632,22 @@ fn distribute_commit_seconds(timings: &mut [ArrowBatchInsertTiming], commit_seco
     if timings.is_empty() || commit_seconds <= 0.0 {
         return;
     }
-    let total_rows: usize = timings.iter().map(|timing| timing.rows).sum();
+    let insert_timings = timings
+        .iter_mut()
+        .filter(|timing| timing.phase == "storage_insert")
+        .collect::<Vec<_>>();
+    if insert_timings.is_empty() {
+        return;
+    }
+    let total_rows: usize = insert_timings.iter().map(|timing| timing.rows).sum();
     if total_rows == 0 {
-        let each = commit_seconds / timings.len() as f64;
-        for timing in timings {
+        let each = commit_seconds / insert_timings.len() as f64;
+        for timing in insert_timings {
             timing.seconds += each;
         }
         return;
     }
-    for timing in timings {
+    for timing in insert_timings {
         timing.seconds += commit_seconds * timing.rows as f64 / total_rows as f64;
     }
 }
@@ -1371,6 +1660,196 @@ fn ducklake_metadata_prefix(catalog_name: &str) -> String {
     format!(
         "{}.",
         quote_ident(&format!("__ducklake_metadata_{catalog_name}"))
+    )
+}
+
+struct SealedSegment {
+    table: Signal,
+    path: PathBuf,
+    rows: usize,
+}
+
+fn write_immutable_segment(
+    storage_dir: &Path,
+    table: Signal,
+    partition: ImmutableSegmentPartition,
+    batch: &RecordBatch,
+) -> Result<SealedSegment> {
+    let final_path = immutable_segment_path(storage_dir, table, partition)?;
+    let parent = final_path
+        .parent()
+        .context("immutable segment path has no parent")?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("create immutable segment directory {}", parent.display()))?;
+
+    let tmp_path = final_path.with_extension("parquet.tmp");
+    let mut file = BufWriter::new(
+        File::create(&tmp_path)
+            .with_context(|| format!("create immutable segment {}", tmp_path.display()))?,
+    );
+    write_parquet(batch, &mut file, None).context("encode immutable segment parquet")?;
+    let file = file
+        .into_inner()
+        .context("flush immutable segment writer before seal")?;
+    file.sync_all()
+        .with_context(|| format!("fsync immutable segment {}", tmp_path.display()))?;
+    drop(file);
+    fs::rename(&tmp_path, &final_path).with_context(|| {
+        format!(
+            "seal immutable segment {} -> {}",
+            tmp_path.display(),
+            final_path.display()
+        )
+    })?;
+
+    Ok(SealedSegment {
+        table,
+        path: final_path,
+        rows: batch.num_rows(),
+    })
+}
+
+fn immutable_segment_path(
+    storage_dir: &Path,
+    table: Signal,
+    partition: ImmutableSegmentPartition,
+) -> Result<PathBuf> {
+    let sequence = IMMUTABLE_SEGMENT_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let suffix = format!("{}-{sequence}.parquet", Utc::now().timestamp_micros());
+    Ok(storage_dir
+        .join("main")
+        .join(table.as_str())
+        .join(format!("event_date={}", partition.event_date))
+        .join(format!("hour={:02}", partition.hour))
+        .join(suffix))
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ImmutableSegmentPartition {
+    event_date: String,
+    hour: u32,
+}
+
+fn split_batch_by_immutable_partition(
+    batch: &RecordBatch,
+) -> Result<Vec<(ImmutableSegmentPartition, RecordBatch)>> {
+    if batch.num_rows() == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut rows_by_partition: BTreeMap<ImmutableSegmentPartition, Vec<u32>> = BTreeMap::new();
+    let dates = event_date_column(batch)?;
+    let timestamps = timestamp_column(batch)?;
+    for row in 0..batch.num_rows() {
+        rows_by_partition
+            .entry(immutable_row_partition(dates, timestamps, row))
+            .or_default()
+            .push(row as u32);
+    }
+
+    if rows_by_partition.len() == 1 {
+        let partition = rows_by_partition
+            .into_keys()
+            .next()
+            .expect("partition exists for non-empty batch");
+        return Ok(vec![(partition, batch.clone())]);
+    }
+
+    let schema = batch.schema();
+    rows_by_partition
+        .into_iter()
+        .map(|(partition, rows)| {
+            let indices = arrow58_array::UInt32Array::from(rows);
+            let columns = batch
+                .columns()
+                .iter()
+                .map(|column| take(column.as_ref(), &indices, None))
+                .collect::<arrow58::error::Result<Vec<_>>>()?;
+            let batch = RecordBatch::try_new(schema.clone(), columns)
+                .context("build immutable partition RecordBatch")?;
+            Ok((partition, batch))
+        })
+        .collect()
+}
+
+fn immutable_row_partition(
+    dates: &arrow58_array::Date32Array,
+    timestamps: &arrow58_array::TimestampMicrosecondArray,
+    row: usize,
+) -> ImmutableSegmentPartition {
+    let now = Utc::now();
+    ImmutableSegmentPartition {
+        event_date: date32_value(dates, row).unwrap_or_else(|| now.date_naive().to_string()),
+        hour: timestamp_hour(timestamps, row).unwrap_or_else(|| now.hour()),
+    }
+}
+
+fn date32_value(dates: &arrow58_array::Date32Array, row: usize) -> Option<String> {
+    if dates.is_null(row) {
+        return None;
+    }
+    let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).expect("valid Unix epoch date");
+    Some((epoch + chrono::Duration::days(dates.value(row) as i64)).to_string())
+}
+
+fn timestamp_hour(
+    timestamps: &arrow58_array::TimestampMicrosecondArray,
+    row: usize,
+) -> Option<u32> {
+    if timestamps.is_null(row) {
+        return None;
+    }
+    let micros = timestamps.value(row);
+    let secs = micros.div_euclid(1_000_000);
+    let nanos = micros.rem_euclid(1_000_000) as u32 * 1_000;
+    DateTime::<Utc>::from_timestamp(secs, nanos).map(|timestamp| timestamp.hour())
+}
+
+fn register_ducklake_data_file(
+    conn: &Connection,
+    catalog_name: &str,
+    table: Signal,
+    path: &Path,
+) -> Result<()> {
+    let sql = format!(
+        "CALL ducklake_add_data_files({}, {}, {}, schema = 'main')",
+        sql_quote(catalog_name),
+        sql_quote(table.as_str()),
+        sql_quote(&path.to_string_lossy())
+    );
+    conn.execute_batch(&sql)
+        .with_context(|| format!("register immutable segment {}", path.display()))?;
+    Ok(())
+}
+
+fn immutable_buffer_snapshot(buffers: &BTreeMap<Signal, ImmutableSegmentBuffer>) -> Value {
+    let mut map = serde_json::Map::new();
+    for (table, buffer) in buffers {
+        map.insert(
+            table.as_str().to_string(),
+            json!({
+                "rows": buffer.rows,
+                "bytes": buffer.bytes,
+                "age_seconds": buffer.opened_at.elapsed().as_secs_f64(),
+            }),
+        );
+    }
+    Value::Object(map)
+}
+
+fn immutable_timing_snapshot(timings: &[ArrowBatchInsertTiming]) -> Value {
+    Value::Array(
+        timings
+            .iter()
+            .map(|timing| {
+                json!({
+                    "table": timing.table.as_str(),
+                    "phase": timing.phase,
+                    "rows": timing.rows,
+                    "seconds": timing.seconds,
+                })
+            })
+            .collect(),
     )
 }
 
@@ -1479,22 +1958,23 @@ fn storage_duckdb_batch(
 }
 
 fn batch_event_dates(batch: &RecordBatch) -> Result<Vec<String>> {
+    let dates = event_date_column(batch)?;
+    let mut out = BTreeSet::new();
+    for row in 0..dates.len() {
+        if let Some(date) = date32_value(dates, row) {
+            out.insert(date);
+        }
+    }
+    Ok(out.into_iter().collect())
+}
+
+fn event_date_column(batch: &RecordBatch) -> Result<&arrow58_array::Date32Array> {
     let idx = batch.schema().index_of("event_date")?;
-    let dates = batch
+    batch
         .column(idx)
         .as_any()
         .downcast_ref::<arrow58_array::Date32Array>()
-        .context("event_date column is not Date32Array")?;
-    let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).expect("valid Unix epoch date");
-    let mut out = BTreeSet::new();
-    for row in 0..dates.len() {
-        if dates.is_null(row) {
-            continue;
-        }
-        let date = epoch + chrono::Duration::days(dates.value(row) as i64);
-        out.insert(date.to_string());
-    }
-    Ok(out.into_iter().collect())
+        .context("event_date column is not Date32Array")
 }
 
 fn timestamp_column(batch: &RecordBatch) -> Result<&arrow58_array::TimestampMicrosecondArray> {
@@ -1822,5 +2302,83 @@ mod tests {
         assert!(err
             .to_string()
             .contains("must be the URI only, not an ATTACH statement"));
+    }
+
+    #[test]
+    fn metadata_refresh_uses_one_insert_per_signal_bucket() {
+        for (signal, select_count) in [
+            (Signal::Logs, 8),
+            (Signal::Spans, 6),
+            (Signal::MetricGauge, 5),
+            (Signal::MetricSum, 5),
+        ] {
+            let sql = metadata_refresh_sql("canardlake.", signal, "2026-05-16").unwrap();
+            assert_eq!(
+                sql.matches("INSERT INTO canardlake.metadata_summary")
+                    .count(),
+                1
+            );
+            assert_eq!(sql.matches("UNION ALL").count(), select_count - 1);
+        }
+    }
+
+    #[test]
+    fn immutable_segment_split_preserves_event_date_hour_partitions() {
+        fn date32(year: i32, month: u32, day: u32) -> i32 {
+            let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+            let date = NaiveDate::from_ymd_opt(year, month, day).unwrap();
+            (date - epoch).num_days() as i32
+        }
+
+        fn timestamp_micros(year: i32, month: u32, day: u32, hour: u32) -> i64 {
+            DateTime::<Utc>::from_naive_utc_and_offset(
+                NaiveDate::from_ymd_opt(year, month, day)
+                    .unwrap()
+                    .and_hms_opt(hour, 0, 0)
+                    .unwrap(),
+                Utc,
+            )
+            .timestamp_micros()
+        }
+
+        let schema = Arc::new(arrow58_types::Schema::new(vec![
+            arrow58_types::Field::new(
+                "timestamp",
+                arrow58_types::DataType::Timestamp(arrow58_types::TimeUnit::Microsecond, None),
+                true,
+            ),
+            arrow58_types::Field::new("event_date", arrow58_types::DataType::Date32, true),
+            arrow58_types::Field::new("value", arrow58_types::DataType::Int64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(arrow58_array::TimestampMicrosecondArray::from(vec![
+                    Some(timestamp_micros(2026, 5, 16, 0)),
+                    Some(timestamp_micros(2026, 5, 16, 1)),
+                    Some(timestamp_micros(2026, 5, 17, 0)),
+                ])),
+                Arc::new(arrow58_array::Date32Array::from(vec![
+                    Some(date32(2026, 5, 16)),
+                    Some(date32(2026, 5, 16)),
+                    Some(date32(2026, 5, 17)),
+                ])),
+                Arc::new(arrow58_array::Int64Array::from(vec![1, 2, 3])),
+            ],
+        )
+        .unwrap();
+
+        let splits = split_batch_by_immutable_partition(&batch).unwrap();
+
+        assert_eq!(splits.len(), 3);
+        assert_eq!(splits[0].0.event_date, "2026-05-16");
+        assert_eq!(splits[0].0.hour, 0);
+        assert_eq!(splits[0].1.num_rows(), 1);
+        assert_eq!(splits[1].0.event_date, "2026-05-16");
+        assert_eq!(splits[1].0.hour, 1);
+        assert_eq!(splits[1].1.num_rows(), 1);
+        assert_eq!(splits[2].0.event_date, "2026-05-17");
+        assert_eq!(splits[2].0.hour, 0);
+        assert_eq!(splits[2].1.num_rows(), 1);
     }
 }

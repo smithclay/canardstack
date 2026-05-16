@@ -3,6 +3,9 @@ use super::{Ingestor, Signal};
 use crate::metrics::Metrics;
 use crate::storage::{ArrowBatchInsert, Storage};
 use crate::LockExt;
+use anyhow::Context;
+use arrow58::compute::concat_batches;
+use arrow58::record_batch::RecordBatch;
 use std::collections::{HashMap, HashSet};
 
 /// Flush failed mid-batch. `committed_rows` were accepted by the catalog
@@ -133,16 +136,15 @@ impl Ingestor {
         storage: &Storage,
         metrics: Option<&Metrics>,
     ) -> anyhow::Result<HashMap<Signal, usize>> {
-        let mut inserts = Vec::new();
-        for (key, batches) in &sets {
-            for batch in batches {
-                inserts.push(ArrowBatchInsert {
-                    table: key.signal,
-                    batch: &batch.batch,
-                    source_format: batch.source_format,
-                });
-            }
-        }
+        let coalesced = coalesce_drained_batches(&sets)?;
+        let inserts: Vec<_> = coalesced
+            .iter()
+            .map(|batch| ArrowBatchInsert {
+                table: batch.table,
+                batch: &batch.batch,
+                source_format: batch.source_format,
+            })
+            .collect();
         if inserts.is_empty() {
             return Ok(HashMap::new());
         }
@@ -180,18 +182,20 @@ impl Ingestor {
                     if let Some(metrics) = metrics {
                         metrics.observe_phase_seconds(
                             timing.table.as_str(),
-                            "storage_insert",
+                            timing.phase,
                             None,
                             timing.seconds,
                         );
                     }
-                    rows.insert(timing.table, timing.rows);
-                    if let Some(metrics) = metrics {
-                        metrics.inc(
-                            "canardstack_ingest_flush_rows_total",
-                            &[("signal", timing.table.as_str())],
-                            timing.rows as u64,
-                        );
+                    if timing.phase == "storage_insert" {
+                        rows.insert(timing.table, timing.rows);
+                        if let Some(metrics) = metrics {
+                            metrics.inc(
+                                "canardstack_ingest_flush_rows_total",
+                                &[("signal", timing.table.as_str())],
+                                timing.rows as u64,
+                            );
+                        }
                     }
                 }
                 Ok(rows)
@@ -270,6 +274,40 @@ impl Ingestor {
         let mut queues = self.queues.lock_or_poisoned();
         queue::restore_batches(&mut queues, key, batches);
     }
+}
+
+struct CoalescedInsert {
+    table: Signal,
+    batch: RecordBatch,
+    source_format: &'static str,
+}
+
+fn coalesce_drained_batches(
+    sets: &[(QueueKey, Vec<QueuedBatch>)],
+) -> anyhow::Result<Vec<CoalescedInsert>> {
+    let mut inserts = Vec::new();
+    for (key, batches) in sets {
+        match batches.as_slice() {
+            [] => {}
+            [batch] => inserts.push(CoalescedInsert {
+                table: key.signal,
+                batch: batch.batch.clone(),
+                source_format: batch.source_format,
+            }),
+            batches => {
+                let schema = batches[0].batch.schema();
+                let refs: Vec<_> = batches.iter().map(|batch| &batch.batch).collect();
+                let batch = concat_batches(&schema, refs)
+                    .with_context(|| format!("coalesce drained {} batches", key.signal))?;
+                inserts.push(CoalescedInsert {
+                    table: key.signal,
+                    batch,
+                    source_format: batches[0].source_format,
+                });
+            }
+        }
+    }
+    Ok(inserts)
 }
 
 fn flush_failure_reason(err: &anyhow::Error) -> &'static str {

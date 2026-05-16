@@ -9,6 +9,7 @@ use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -65,12 +66,13 @@ fn run() -> Result<(Report, PathBuf)> {
     let guard_deadline = Instant::now() + args.max_runtime();
 
     eprintln!(
-        "v0_iteration: warmup={} measured={} target={:.0} decoded B/s base_url={} profile={} query_concurrency={} progress={} max_runtime={}",
+        "v0_iteration: warmup={} measured={} target={:.0} decoded B/s base_url={} profile={} ingest_concurrency={} query_concurrency={} progress={} max_runtime={}",
         fmt_duration(args.warmup),
         fmt_duration(args.duration),
         target_bytes_per_sec,
         args.base_url,
         args.profile.as_str(),
+        args.ingest_concurrency,
         args.query_concurrency,
         fmt_duration(args.progress_interval),
         fmt_duration(args.max_runtime())
@@ -86,6 +88,7 @@ fn run() -> Result<(Report, PathBuf)> {
             phase: "warmup",
             duration: args.warmup,
             target_bytes_per_sec,
+            ingest_concurrency: args.ingest_concurrency,
             query_interval: args.query_interval,
             query_concurrency: args.query_concurrency,
             no_queries: args.no_queries(),
@@ -118,6 +121,7 @@ fn run() -> Result<(Report, PathBuf)> {
             phase: "measured",
             duration: args.duration,
             target_bytes_per_sec,
+            ingest_concurrency: args.ingest_concurrency,
             query_interval: args.query_interval,
             query_concurrency: args.query_concurrency,
             no_queries: args.no_queries(),
@@ -192,6 +196,9 @@ fn run_phase(
     if config.duration.is_zero() {
         return stats;
     }
+    if config.ingest_concurrency > 1 {
+        return run_phase_concurrent_ingest(client, api_key, workload, query_plan, config);
+    }
 
     let started = Instant::now();
     let deadline = started + config.duration;
@@ -243,57 +250,158 @@ fn run_phase(
             continue;
         };
         *sent_by_signal.entry(payload.signal).or_default() += payload.decoded_bytes;
-        stats.request_bytes_sent += payload.body.len() as u64;
 
-        let started_request = Instant::now();
-        match client.post_body(
-            payload.path,
-            Some(api_key),
-            payload.content_type,
-            &payload.body,
-        ) {
-            Ok(response) => {
-                let elapsed_ms = started_request.elapsed().as_secs_f64() * 1000.0;
-                stats.status_counts_inc(response.status);
-                if config.measured {
-                    stats.ingest_latency_ms.push(elapsed_ms);
-                }
-                if response.status == 202 {
-                    stats.accepted_decoded_bytes += payload.decoded_bytes as u64;
-                    stats.accepted_request_bytes += payload.body.len() as u64;
-                    let records = serde_json::from_str::<Value>(&response.body)
-                        .ok()
-                        .and_then(|body| body.get("records").and_then(Value::as_u64))
-                        .unwrap_or(payload.records_per_request);
-                    *stats
-                        .accepted_records_by_signal
-                        .entry(payload.signal.to_string())
-                        .or_default() += records;
-                }
-            }
-            Err(err) => {
-                stats.transport_errors += 1;
-                let elapsed_ms = started_request.elapsed().as_secs_f64() * 1000.0;
-                let detail = format!(
-                    "ingest transport error signal={} path={} decoded_bytes={} request_bytes={} elapsed_ms={elapsed_ms:.1}: {}",
-                    payload.signal,
-                    payload.path,
-                    payload.decoded_bytes,
-                    payload.body.len(),
-                    format_error_chain(&err)
-                );
-                eprintln!("v0_iteration {detail}");
-                if config.measured {
-                    stats.errors.push(detail);
-                }
-                thread::sleep(Duration::from_millis(100));
-            }
-        }
+        let outcome = send_ingest_payload(client, api_key, payload, config.measured);
+        stats.record_ingest_outcome(payload, outcome, config.measured);
     }
 
     stats.elapsed = started.elapsed();
     print_progress(config.phase, started, config.duration, &stats, client);
     stats
+}
+
+fn run_phase_concurrent_ingest(
+    client: &Client,
+    api_key: &str,
+    workload: &Workload,
+    query_plan: &mut QueryPlan,
+    config: PhaseConfig,
+) -> RunStats {
+    let stats = Arc::new(Mutex::new(RunStats::default()));
+    let sent_by_signal = Arc::new(Mutex::new(BTreeMap::new()));
+    let workload = Arc::new(workload.clone());
+    let started = Instant::now();
+    let deadline = started + config.duration;
+    let mut handles = Vec::new();
+
+    for _ in 0..config.ingest_concurrency {
+        let worker = IngestWorker {
+            client: client.clone(),
+            api_key: api_key.to_string(),
+            workload: workload.clone(),
+            sent_by_signal: sent_by_signal.clone(),
+            stats: stats.clone(),
+            started,
+            deadline,
+            config,
+        };
+        handles.push(thread::spawn(move || ingest_worker(worker)));
+    }
+
+    let mut next_query = Instant::now() + config.query_interval.min(Duration::from_secs(1));
+    let mut next_progress = started + config.progress_interval;
+    while Instant::now() < deadline {
+        let now = Instant::now();
+        if now >= config.guard_deadline {
+            let mut stats = stats.lock().expect("lock benchmark stats");
+            stats.guard_exceeded = true;
+            stats.errors.push(format!(
+                "{} phase exceeded benchmark max-runtime guard",
+                config.phase
+            ));
+            break;
+        }
+        if now >= next_progress {
+            let stats_snapshot = stats.lock().expect("lock benchmark stats").clone();
+            print_progress(
+                config.phase,
+                started,
+                config.duration,
+                &stats_snapshot,
+                client,
+            );
+            while next_progress <= now {
+                next_progress += config.progress_interval;
+            }
+        }
+        if !config.no_queries && now >= next_query {
+            let mut query_stats = RunStats::default();
+            run_query_pressure(
+                client,
+                api_key,
+                query_plan,
+                config.query_concurrency,
+                &mut query_stats,
+            );
+            stats
+                .lock()
+                .expect("lock benchmark stats")
+                .merge(query_stats);
+            next_query += config.query_interval.max(Duration::from_millis(1));
+            continue;
+        }
+        sleep_until_next_tick(deadline);
+    }
+
+    for handle in handles {
+        if handle.join().is_err() {
+            let mut stats = stats.lock().expect("lock benchmark stats");
+            stats.transport_errors += 1;
+            stats
+                .errors
+                .push("ingest worker thread panicked".to_string());
+        }
+    }
+
+    let mut stats = Arc::try_unwrap(stats)
+        .map_err(|_| ())
+        .expect("benchmark stats still referenced")
+        .into_inner()
+        .expect("lock benchmark stats");
+    stats.elapsed = started.elapsed();
+    print_progress(config.phase, started, config.duration, &stats, client);
+    stats
+}
+
+struct IngestWorker {
+    client: Client,
+    api_key: String,
+    workload: Arc<Workload>,
+    sent_by_signal: Arc<Mutex<BTreeMap<&'static str, usize>>>,
+    stats: Arc<Mutex<RunStats>>,
+    started: Instant,
+    deadline: Instant,
+    config: PhaseConfig,
+}
+
+fn ingest_worker(worker: IngestWorker) {
+    while Instant::now() < worker.deadline {
+        let now = Instant::now();
+        if now >= worker.config.guard_deadline {
+            return;
+        }
+        let elapsed = now.duration_since(worker.started).as_secs_f64();
+        let payload_idx = {
+            let mut sent_by_signal = worker
+                .sent_by_signal
+                .lock()
+                .expect("lock sent bytes by signal");
+            let Some(payload_idx) = worker.workload.next_payload_index(
+                elapsed,
+                worker.config.target_bytes_per_sec,
+                &sent_by_signal,
+            ) else {
+                drop(sent_by_signal);
+                sleep_until_next_tick(worker.deadline);
+                continue;
+            };
+            let payload = &worker.workload.payloads[payload_idx];
+            *sent_by_signal.entry(payload.signal).or_default() += payload.decoded_bytes;
+            payload_idx
+        };
+        let payload = &worker.workload.payloads[payload_idx];
+        let outcome = send_ingest_payload(
+            &worker.client,
+            &worker.api_key,
+            payload,
+            worker.config.measured,
+        );
+        worker
+            .stats
+            .lock()
+            .expect("lock benchmark stats")
+            .record_ingest_outcome(payload, outcome, worker.config.measured);
+    }
 }
 
 fn print_progress(
@@ -372,8 +480,14 @@ fn run_query(client: Client, api_key: String, path: String) -> QueryOutcome {
             QueryOutcome {
                 status: Some(response.status),
                 elapsed_ms,
-                error: (response.status != 200)
-                    .then(|| format!("query returned HTTP {}", response.status)),
+                error: (response.status != 200).then(|| {
+                    format!(
+                        "query returned HTTP {} path={} elapsed_ms={elapsed_ms:.1} body={}",
+                        response.status,
+                        path,
+                        response.body.trim()
+                    )
+                }),
                 transport_error: false,
             }
         }
@@ -408,6 +522,62 @@ fn record_query_outcome(outcome: QueryOutcome, stats: &mut RunStats) {
     }
 }
 
+fn send_ingest_payload(
+    client: &Client,
+    api_key: &str,
+    payload: &WorkloadPayload,
+    measured: bool,
+) -> IngestOutcome {
+    let started_request = Instant::now();
+    match client.post_body(
+        payload.path,
+        Some(api_key),
+        payload.content_type,
+        &payload.body,
+    ) {
+        Ok(response) => IngestOutcome {
+            status: Some(response.status),
+            elapsed_ms: started_request.elapsed().as_secs_f64() * 1000.0,
+            records: (response.status == 202).then(|| {
+                serde_json::from_str::<Value>(&response.body)
+                    .ok()
+                    .and_then(|body| body.get("records").and_then(Value::as_u64))
+                    .unwrap_or(payload.records_per_request)
+            }),
+            error: None,
+            transport_error: false,
+        },
+        Err(err) => {
+            thread::sleep(Duration::from_millis(100));
+            let elapsed_ms = started_request.elapsed().as_secs_f64() * 1000.0;
+            let detail = format!(
+                "ingest transport error signal={} path={} decoded_bytes={} request_bytes={} elapsed_ms={elapsed_ms:.1}: {}",
+                payload.signal,
+                payload.path,
+                payload.decoded_bytes,
+                payload.body.len(),
+                format_error_chain(&err)
+            );
+            eprintln!("v0_iteration {detail}");
+            IngestOutcome {
+                status: None,
+                elapsed_ms,
+                records: None,
+                error: measured.then_some(detail),
+                transport_error: true,
+            }
+        }
+    }
+}
+
+struct IngestOutcome {
+    status: Option<u16>,
+    elapsed_ms: f64,
+    records: Option<u64>,
+    error: Option<String>,
+    transport_error: bool,
+}
+
 struct QueryOutcome {
     status: Option<u16>,
     elapsed_ms: f64,
@@ -435,6 +605,7 @@ struct PhaseConfig {
     phase: &'static str,
     duration: Duration,
     target_bytes_per_sec: f64,
+    ingest_concurrency: usize,
     query_interval: Duration,
     query_concurrency: usize,
     no_queries: bool,
@@ -849,6 +1020,7 @@ struct Args {
     warmup: Duration,
     duration: Duration,
     target_gb_per_day: f64,
+    ingest_concurrency: usize,
     query_interval: Duration,
     query_concurrency: usize,
     query_pressure: QueryPressure,
@@ -867,6 +1039,7 @@ impl Args {
             warmup: DEFAULT_WARMUP,
             duration: DEFAULT_DURATION,
             target_gb_per_day: DEFAULT_TARGET_GB_PER_DAY,
+            ingest_concurrency: 1,
             query_interval: DEFAULT_QUERY_INTERVAL,
             query_concurrency: DEFAULT_QUERY_CONCURRENCY,
             query_pressure: QueryPressure::Medium,
@@ -904,6 +1077,13 @@ impl Args {
                     parsed.query_interval =
                         parse_duration(&args.next().context("--query-interval requires a value")?)?;
                     explicit_query_interval = true;
+                }
+                "--ingest-concurrency" => {
+                    parsed.ingest_concurrency = args
+                        .next()
+                        .context("--ingest-concurrency requires a value")?
+                        .parse()
+                        .context("invalid --ingest-concurrency")?;
                 }
                 "--query-concurrency" => {
                     parsed.query_concurrency = args
@@ -982,7 +1162,7 @@ impl Args {
                 "--bench" => {}
                 "--help" | "-h" => {
                     println!(
-                        "cargo bench --bench v0_iteration -- [--base-url URL] [--warmup 2m] [--duration 20m] [--target-gb-day 100] [--profile ingest-only|mixed-query] [--query-pressure off|low|medium|high] [--query-interval 5s] [--query-concurrency 1] [--services 1] [--log-body-bytes 120000] [--trace-spans 16] [--metric-series 40] [--metric-description-bytes 192] [--progress-interval 30s] [--max-runtime 27m] [--no-queries] [--report-dir DIR]"
+                        "cargo bench --bench v0_iteration -- [--base-url URL] [--warmup 2m] [--duration 20m] [--target-gb-day 100] [--profile ingest-only|mixed-query] [--ingest-concurrency 1] [--query-pressure off|low|medium|high] [--query-interval 5s] [--query-concurrency 1] [--services 1] [--log-body-bytes 120000] [--trace-spans 16] [--metric-series 40] [--metric-description-bytes 192] [--progress-interval 30s] [--max-runtime 27m] [--no-queries] [--report-dir DIR]"
                     );
                     std::process::exit(0);
                 }
@@ -994,6 +1174,9 @@ impl Args {
         }
         if parsed.target_gb_per_day <= 0.0 {
             bail!("--target-gb-day must be positive");
+        }
+        if parsed.ingest_concurrency == 0 {
+            bail!("--ingest-concurrency must be > 0");
         }
         if !explicit_query_interval {
             parsed.query_interval = parsed.query_pressure.default_interval();
@@ -1250,16 +1433,28 @@ impl Workload {
         target_bytes_per_sec: f64,
         sent_by_signal: &BTreeMap<&'static str, usize>,
     ) -> Option<&WorkloadPayload> {
+        self.next_payload_index(elapsed_seconds, target_bytes_per_sec, sent_by_signal)
+            .map(|idx| &self.payloads[idx])
+    }
+
+    fn next_payload_index(
+        &self,
+        elapsed_seconds: f64,
+        target_bytes_per_sec: f64,
+        sent_by_signal: &BTreeMap<&'static str, usize>,
+    ) -> Option<usize> {
         self.payloads
             .iter()
+            .enumerate()
             .map(|payload| {
+                let (idx, payload) = payload;
                 let desired = elapsed_seconds * target_bytes_per_sec * payload.ratio;
                 let sent = sent_by_signal.get(payload.signal).copied().unwrap_or(0) as f64;
-                (desired - sent, payload)
+                (desired - sent, idx)
             })
             .filter(|(deficit, _)| *deficit > 0.0)
             .max_by(|(left, _), (right, _)| left.total_cmp(right))
-            .map(|(_, payload)| payload)
+            .map(|(_, idx)| idx)
     }
 }
 
@@ -1645,7 +1840,7 @@ impl QueryPlan {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct RunStats {
     elapsed: Duration,
     accepted_decoded_bytes: u64,
@@ -1665,6 +1860,54 @@ struct RunStats {
 impl RunStats {
     fn status_counts_inc(&mut self, status: u16) {
         *self.status_counts.entry(status).or_default() += 1;
+    }
+
+    fn record_ingest_outcome(
+        &mut self,
+        payload: &WorkloadPayload,
+        outcome: IngestOutcome,
+        measured: bool,
+    ) {
+        self.request_bytes_sent += payload.body.len() as u64;
+        if let Some(status) = outcome.status {
+            self.status_counts_inc(status);
+            if measured {
+                self.ingest_latency_ms.push(outcome.elapsed_ms);
+            }
+            if status == 202 {
+                self.accepted_decoded_bytes += payload.decoded_bytes as u64;
+                self.accepted_request_bytes += payload.body.len() as u64;
+                *self
+                    .accepted_records_by_signal
+                    .entry(payload.signal.to_string())
+                    .or_default() += outcome.records.unwrap_or(payload.records_per_request);
+            }
+        }
+        if let Some(error) = outcome.error {
+            self.errors.push(error);
+        }
+        if outcome.transport_error {
+            self.transport_errors += 1;
+        }
+    }
+
+    fn merge(&mut self, other: RunStats) {
+        self.accepted_decoded_bytes += other.accepted_decoded_bytes;
+        self.accepted_request_bytes += other.accepted_request_bytes;
+        self.request_bytes_sent += other.request_bytes_sent;
+        for (signal, records) in other.accepted_records_by_signal {
+            *self.accepted_records_by_signal.entry(signal).or_default() += records;
+        }
+        for (status, count) in other.status_counts {
+            *self.status_counts.entry(status).or_default() += count;
+        }
+        self.ingest_latency_ms.extend(other.ingest_latency_ms);
+        self.query_latency_ms.extend(other.query_latency_ms);
+        self.query_requests += other.query_requests;
+        self.query_failures += other.query_failures;
+        self.transport_errors += other.transport_errors;
+        self.errors.extend(other.errors);
+        self.guard_exceeded |= other.guard_exceeded;
     }
 }
 

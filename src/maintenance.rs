@@ -100,12 +100,17 @@ impl Maintenance {
         storage: &Storage,
         table: Option<&str>,
         metrics: Option<&Metrics>,
+        force_immutable_segments: bool,
     ) -> Result<Value> {
         if self.is_paused() {
             return Ok(json!({"status": "paused"}));
         }
         let started = Instant::now();
         let process_rows = ingestor.flush_all(storage)?;
+        let immutable_segments = storage.flush_immutable_segments(force_immutable_segments)?;
+        if let Some(metrics) = metrics {
+            observe_immutable_segment_timings(metrics, &immutable_segments);
+        }
         let ducklake_started = Instant::now();
         let ducklake = storage.flush_inlined_data(table)?;
         if let Some(metrics) = metrics {
@@ -119,6 +124,7 @@ impl Maintenance {
         Ok(json!({
             "status": "ok",
             "process_rows_flushed": process_rows,
+            "immutable_segments": immutable_segments,
             "ducklake": ducklake,
             "duration_ms": started.elapsed().as_millis()
         }))
@@ -205,6 +211,8 @@ impl Maintenance {
         }
         let started = Instant::now();
         let flushed = ingestor.flush_due(storage, Some(metrics))?;
+        let immutable_segments = storage.flush_immutable_segments(false)?;
+        observe_immutable_segment_timings(metrics, &immutable_segments);
         if !flushed.is_empty() {
             self.record_run("watchdog");
         }
@@ -215,6 +223,7 @@ impl Maintenance {
         Ok(json!({
             "status": "ok",
             "flushed": by_signal,
+            "immutable_segments": immutable_segments,
             "duration_ms": started.elapsed().as_millis()
         }))
     }
@@ -247,6 +256,24 @@ impl Maintenance {
             .get(job)
             .map(|r| r.consecutive)
             .unwrap_or(0)
+    }
+}
+
+fn observe_immutable_segment_timings(metrics: &Metrics, result: &Value) {
+    let Some(timings) = result.get("timings").and_then(Value::as_array) else {
+        return;
+    };
+    for timing in timings {
+        let Some(table) = timing.get("table").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(phase) = timing.get("phase").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(seconds) = timing.get("seconds").and_then(Value::as_f64) else {
+            continue;
+        };
+        metrics.observe_phase_seconds(table, phase, None, seconds);
     }
 }
 
@@ -317,7 +344,7 @@ fn scheduler_loop(state: Arc<AppState>, stop: Arc<AtomicBool>) {
         if now >= next_flush {
             let ok = run_job(&state, "flush", |s| {
                 s.maintenance
-                    .run_flush(&s.ingestor, &s.storage, None, Some(&s.metrics))
+                    .run_flush(&s.ingestor, &s.storage, None, Some(&s.metrics), false)
             });
             next_flush = now + next_interval(&state, "flush", flush_every, ok);
         }
