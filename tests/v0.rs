@@ -62,6 +62,50 @@ fn flush_all(state: &AppState) -> usize {
     rows
 }
 
+#[test]
+fn telemetry_tables_are_timestamp_partitioned_without_event_date_column() {
+    let (_dir, state) = app();
+    state
+        .storage
+        .with_conn(|conn, _| {
+            for table in ["logs", "spans", "metric_gauge", "metric_sum"] {
+                let event_date_columns: i64 = conn.query_row(
+                    &format!(
+                        "SELECT count(*) FROM information_schema.columns \
+                         WHERE table_name = {} AND column_name = 'event_date'",
+                        sql_quote_for_test(table)
+                    ),
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(event_date_columns, 0, "{table} should not store event_date");
+
+                let mut stmt = conn.prepare(&format!(
+                    "\
+                    SELECT pc.transform \
+                    FROM __ducklake_metadata_canardlake.ducklake_table t \
+                    JOIN __ducklake_metadata_canardlake.ducklake_partition_info p \
+                      ON p.table_id = t.table_id AND p.end_snapshot IS NULL \
+                    JOIN __ducklake_metadata_canardlake.ducklake_partition_column pc \
+                      ON pc.table_id = p.table_id AND pc.partition_id = p.partition_id \
+                    WHERE t.table_name = {} AND t.end_snapshot IS NULL \
+                    ORDER BY pc.partition_key_index",
+                    sql_quote_for_test(table)
+                ))?;
+                let transforms = stmt
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                assert_eq!(transforms, ["year", "month", "day"], "{table}");
+            }
+            Ok(())
+        })
+        .unwrap();
+}
+
+fn sql_quote_for_test(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
 struct SeededApp {
     _dir: tempfile::TempDir,
     state: AppState,

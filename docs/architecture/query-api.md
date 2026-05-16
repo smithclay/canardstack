@@ -17,8 +17,8 @@ All telemetry query paths use the internal query engine protections:
 Prometheus label values, Prometheus series, Prometheus metric metadata, Loki
 label values, Loki series, and Tempo tag values read from the shared
 `metadata_summary` table. The `metadata_refresh` scheduler job re-aggregates the
-daily `(signal, event_date)` buckets dirtied by committed inserts, keeping the
-day-partition scan off the ingest commit path, using only
+daily `(signal, event_date)` summary buckets derived from committed telemetry
+timestamps, keeping the timestamp-day scan off the ingest commit path, using only
 promoted columns such as `service_name`, `deployment_environment`,
 `severity_text`, `http_route`, `http_method`, `trace_id`, `span_id`,
 `span_name`, `status_code`, `metric_name`, `metric_unit`, and

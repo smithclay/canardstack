@@ -24,11 +24,11 @@ Each table should add a small number of storage-management columns around the ca
 
 | Column | Type | Purpose |
 | --- | --- | --- |
-| `event_date` | `DATE` | Day partition/retention key derived from `timestamp`. |
 | `ingested_at` | `TIMESTAMP` | Server receive/commit time for freshness diagnostics. |
 | `source_format` | `VARCHAR` | `otlp_proto` or `otlp_json`. |
 
-`event_date` must be derived from event time, not ingest time.
+Raw telemetry tables are partitioned from event time using the canonical
+`timestamp` column. Do not add a separate day column to the raw tables.
 
 ## Logs
 
@@ -175,9 +175,12 @@ after each committed refresh, lets bounded discovery caches invalidate.
 
 Default:
 
-- Partition by `event_date`.
+- Partition telemetry tables in DuckLake by
+  `year(timestamp), month(timestamp), day(timestamp)`.
 - Do not partition by `service_name` in v0.
-- Consider hourly physical layout only after benchmark evidence shows day files are too broad.
+- Immutable segment files may be pre-split by timestamp day/hour before
+  registration, but DuckLake partition pruning should use the configured
+  timestamp transforms, not a duplicated raw-table date column.
 
 If DuckLake partition-drop behavior is not cheap enough, switch to physical day tables behind stable views.
 

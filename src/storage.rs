@@ -9,7 +9,7 @@ use arrow58::array::ArrayRef;
 use arrow58::compute::{concat_batches, take};
 use arrow58::datatypes as arrow58_types;
 use arrow58::record_batch::RecordBatch;
-use chrono::{DateTime, NaiveDate, Timelike, Utc};
+use chrono::{DateTime, Datelike, NaiveDate, Timelike, Utc};
 use duckdb::Connection;
 use otlp2records::output::write_parquet;
 use serde::Serialize;
@@ -175,7 +175,7 @@ struct PreparedArrowBatch {
     table: Signal,
     batch: RecordBatch,
     rows: usize,
-    event_dates: Vec<String>,
+    timestamp_days: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -183,7 +183,7 @@ struct ImmutableSegmentBuffer {
     batches: Vec<RecordBatch>,
     rows: usize,
     bytes: usize,
-    event_dates: BTreeSet<String>,
+    timestamp_days: BTreeSet<String>,
     opened_at: Instant,
 }
 
@@ -200,7 +200,7 @@ impl ImmutableSegmentBuffer {
             batches: Vec::new(),
             rows: 0,
             bytes: 0,
-            event_dates: BTreeSet::new(),
+            timestamp_days: BTreeSet::new(),
             opened_at: now,
         }
     }
@@ -208,14 +208,14 @@ impl ImmutableSegmentBuffer {
     fn push(&mut self, prepared: PreparedArrowBatch) {
         self.rows += prepared.rows;
         self.bytes += prepared.batch.get_array_memory_size().max(prepared.rows);
-        self.event_dates.extend(prepared.event_dates);
+        self.timestamp_days.extend(prepared.timestamp_days);
         self.batches.push(prepared.batch);
     }
 
     fn append_buffer(&mut self, mut other: ImmutableSegmentBuffer) {
         self.rows += other.rows;
         self.bytes += other.bytes;
-        self.event_dates.append(&mut other.event_dates);
+        self.timestamp_days.append(&mut other.timestamp_days);
         if other.opened_at < self.opened_at {
             self.opened_at = other.opened_at;
         }
@@ -419,14 +419,14 @@ impl Storage {
             let prepare_started = Instant::now();
             let prepared_batch =
                 storage_duckdb_batch(batch.table, batch.batch, batch.source_format)?;
-            let event_dates = batch_event_dates(&prepared_batch)?;
+            let timestamp_days = batch_timestamp_days(&prepared_batch)?;
             let prepare_seconds = prepare_started.elapsed().as_secs_f64();
             attempted_rows += rows;
             prepared.push(PreparedArrowBatch {
                 table: batch.table,
                 batch: prepared_batch,
                 rows,
-                event_dates,
+                timestamp_days,
             });
             prepare_timings.push(ArrowBatchInsertTiming {
                 table: batch.table,
@@ -567,7 +567,7 @@ impl Storage {
                 rows: buffer.rows,
                 seconds: started.elapsed().as_secs_f64(),
             });
-            affected.insert(table, buffer.event_dates.clone());
+            affected.insert(table, buffer.timestamp_days.clone());
         }
 
         let conn = self.writer.lock_or_poisoned();
@@ -834,24 +834,20 @@ impl Storage {
         let mut results = Vec::new();
         let mut metadata_deleted_total = 0_i64;
         for target in [
-            ("logs", policy.logs_days, "event_date"),
-            ("spans", policy.spans_days, "event_date"),
-            ("metric_gauge", policy.metrics_days, "event_date"),
-            ("metric_sum", policy.metrics_days, "event_date"),
+            ("logs", policy.logs_days),
+            ("spans", policy.spans_days),
+            ("metric_gauge", policy.metrics_days),
+            ("metric_sum", policy.metrics_days),
         ] {
-            let (table, retention_days, date_column) = target;
+            let (table, retention_days) = target;
             let cutoff = (Utc::now() - chrono::Duration::days(retention_days))
                 .format("%Y-%m-%d")
                 .to_string();
             let full_table = format!("{}{}", self.target_prefix, table);
-            let predicate = if date_column == "event_date" {
-                format!("{date_column} < DATE {}", sql_quote(&cutoff))
-            } else {
-                format!(
-                    "{date_column} < TIMESTAMP {}",
-                    sql_quote(&format!("{cutoff} 00:00:00"))
-                )
-            };
+            let predicate = format!(
+                "timestamp < TIMESTAMP {}",
+                sql_quote(&format!("{cutoff} 00:00:00"))
+            );
             let count_sql = format!("SELECT count(*) FROM {full_table} WHERE {predicate}");
             let matching_rows: i64 = conn.query_row(&count_sql, [], |row| row.get(0))?;
             let deleted_rows = if dry_run || matching_rows == 0 {
@@ -977,6 +973,23 @@ fn create_tables_on(conn: &Connection, prefix: &str) -> Result<()> {
     ));
     ddl.push('\n');
     conn.execute_batch(&ddl)?;
+    configure_telemetry_partitioning_on(conn, prefix)?;
+    Ok(())
+}
+
+fn configure_telemetry_partitioning_on(conn: &Connection, prefix: &str) -> Result<()> {
+    for table in [
+        Signal::Logs,
+        Signal::Spans,
+        Signal::MetricGauge,
+        Signal::MetricSum,
+    ] {
+        conn.execute_batch(&format!(
+            "ALTER TABLE {prefix}{} SET PARTITIONED BY (year(timestamp), month(timestamp), day(timestamp));",
+            table.as_str()
+        ))
+        .with_context(|| format!("configure DuckLake timestamp partitioning for {table}"))?;
+    }
     Ok(())
 }
 
@@ -1226,11 +1239,12 @@ fn refresh_metadata_summaries_on(
 }
 
 fn metadata_refresh_sql(prefix: &str, signal: Signal, date: &str) -> Result<String> {
+    let day = MetadataRefreshDay::new(date)?;
     let selects = match signal {
-        Signal::Logs => logs_metadata_sql(prefix, date),
-        Signal::Spans => spans_metadata_sql(prefix, date),
-        Signal::MetricGauge => metric_metadata_sql(prefix, Signal::MetricGauge, date, "gauge"),
-        Signal::MetricSum => metric_metadata_sql(prefix, Signal::MetricSum, date, "counter"),
+        Signal::Logs => logs_metadata_sql(prefix, &day),
+        Signal::Spans => spans_metadata_sql(prefix, &day),
+        Signal::MetricGauge => metric_metadata_sql(prefix, Signal::MetricGauge, &day, "gauge"),
+        Signal::MetricSum => metric_metadata_sql(prefix, Signal::MetricSum, &day, "counter"),
     };
     if selects.is_empty() {
         anyhow::bail!("metadata refresh for {signal} produced no SELECT statements");
@@ -1242,7 +1256,36 @@ fn metadata_refresh_sql(prefix: &str, signal: Signal, date: &str) -> Result<Stri
     ))
 }
 
-fn logs_metadata_sql(prefix: &str, date: &str) -> Vec<String> {
+struct MetadataRefreshDay<'a> {
+    date: &'a str,
+    start: String,
+    end: String,
+}
+
+impl<'a> MetadataRefreshDay<'a> {
+    fn new(date: &'a str) -> Result<Self> {
+        let start = NaiveDate::parse_from_str(date, "%Y-%m-%d")
+            .with_context(|| format!("parse metadata refresh date {date}"))?;
+        let end = start
+            .succ_opt()
+            .with_context(|| format!("metadata refresh date {date} has no successor"))?;
+        Ok(Self {
+            date,
+            start: format!("{start} 00:00:00"),
+            end: format!("{end} 00:00:00"),
+        })
+    }
+
+    fn predicate(&self) -> String {
+        format!(
+            "timestamp >= TIMESTAMP {} AND timestamp < TIMESTAMP {}",
+            sql_quote(&self.start),
+            sql_quote(&self.end)
+        )
+    }
+}
+
+fn logs_metadata_sql(prefix: &str, day: &MetadataRefreshDay<'_>) -> Vec<String> {
     let mut sql = Vec::new();
     for (name, column) in [
         ("service_name", "service_name"),
@@ -1257,7 +1300,7 @@ fn logs_metadata_sql(prefix: &str, date: &str) -> Vec<String> {
             prefix,
             "logs",
             "logs",
-            date,
+            day,
             "label_value",
             name,
             column,
@@ -1265,18 +1308,19 @@ fn logs_metadata_sql(prefix: &str, date: &str) -> Vec<String> {
     }
     sql.push(format!(
         "\
-        SELECT 'logs', event_date, 'series', 'stream', NULL, NULL, NULL, NULL, \
+        SELECT 'logs', DATE {}, 'series', 'stream', NULL, NULL, NULL, NULL, \
                service_name, deployment_environment, severity_text, \
                count(*), min(timestamp), max(timestamp) \
         FROM {prefix}logs \
-        WHERE event_date = DATE {} \
-        GROUP BY event_date, service_name, deployment_environment, severity_text",
-        sql_quote(date)
+        WHERE {} \
+        GROUP BY service_name, deployment_environment, severity_text",
+        sql_quote(day.date),
+        day.predicate()
     ));
     sql
 }
 
-fn spans_metadata_sql(prefix: &str, date: &str) -> Vec<String> {
+fn spans_metadata_sql(prefix: &str, day: &MetadataRefreshDay<'_>) -> Vec<String> {
     let mut sql = Vec::new();
     for (name, column) in [
         ("service.name", "service_name"),
@@ -1290,7 +1334,7 @@ fn spans_metadata_sql(prefix: &str, date: &str) -> Vec<String> {
             prefix,
             "spans",
             "spans",
-            date,
+            day,
             "tag_value",
             name,
             column,
@@ -1299,7 +1343,12 @@ fn spans_metadata_sql(prefix: &str, date: &str) -> Vec<String> {
     sql
 }
 
-fn metric_metadata_sql(prefix: &str, signal: Signal, date: &str, metric_type: &str) -> Vec<String> {
+fn metric_metadata_sql(
+    prefix: &str,
+    signal: Signal,
+    day: &MetadataRefreshDay<'_>,
+    metric_type: &str,
+) -> Vec<String> {
     let table = signal.as_str();
     let signal = signal.as_str();
     let mut sql = Vec::new();
@@ -1312,7 +1361,7 @@ fn metric_metadata_sql(prefix: &str, signal: Signal, date: &str, metric_type: &s
             prefix,
             signal,
             table,
-            date,
+            day,
             "label_value",
             name,
             column,
@@ -1320,27 +1369,29 @@ fn metric_metadata_sql(prefix: &str, signal: Signal, date: &str, metric_type: &s
     }
     sql.push(format!(
         "\
-        SELECT {}, event_date, 'series', metric_name, NULL, {}, NULL, NULL, \
+        SELECT {}, DATE {}, 'series', metric_name, NULL, {}, NULL, NULL, \
                service_name, deployment_environment, NULL, \
                count(*), min(timestamp), max(timestamp) \
         FROM {prefix}{table} \
-        WHERE event_date = DATE {} AND metric_name IS NOT NULL AND metric_name <> '' \
-        GROUP BY event_date, metric_name, service_name, deployment_environment",
+        WHERE {} AND metric_name IS NOT NULL AND metric_name <> '' \
+        GROUP BY metric_name, service_name, deployment_environment",
         sql_quote(signal),
+        sql_quote(day.date),
         sql_quote(metric_type),
-        sql_quote(date)
+        day.predicate()
     ));
     sql.push(format!(
         "\
-        SELECT {}, event_date, 'metric_metadata', metric_name, NULL, {}, \
+        SELECT {}, DATE {}, 'metric_metadata', metric_name, NULL, {}, \
                max(coalesce(metric_unit, '')), max(coalesce(metric_description, '')), \
                NULL, NULL, NULL, count(*), min(timestamp), max(timestamp) \
         FROM {prefix}{table} \
-        WHERE event_date = DATE {} AND metric_name IS NOT NULL AND metric_name <> '' \
-        GROUP BY event_date, metric_name",
+        WHERE {} AND metric_name IS NOT NULL AND metric_name <> '' \
+        GROUP BY metric_name",
         sql_quote(signal),
+        sql_quote(day.date),
         sql_quote(metric_type),
-        sql_quote(date)
+        day.predicate()
     ));
     sql
 }
@@ -1349,22 +1400,23 @@ fn label_value_insert_sql(
     prefix: &str,
     signal: &str,
     table: &str,
-    date: &str,
+    day: &MetadataRefreshDay<'_>,
     kind: &str,
     name: &str,
     column: &str,
 ) -> String {
     format!(
         "\
-        SELECT {}, event_date, {}, {}, {column}::VARCHAR, NULL, NULL, NULL, \
+        SELECT {}, DATE {}, {}, {}, {column}::VARCHAR, NULL, NULL, NULL, \
                NULL, NULL, NULL, count(*), min(timestamp), max(timestamp) \
         FROM {prefix}{table} \
-        WHERE event_date = DATE {} AND {column} IS NOT NULL AND {column}::VARCHAR <> '' \
-        GROUP BY event_date, {column}",
+        WHERE {} AND {column} IS NOT NULL AND {column}::VARCHAR <> '' \
+        GROUP BY {column}",
         sql_quote(signal),
+        sql_quote(day.date),
         sql_quote(kind),
         sql_quote(name),
-        sql_quote(date)
+        day.predicate()
     )
 }
 
@@ -1462,17 +1514,25 @@ fn immutable_segment_path(
 ) -> Result<PathBuf> {
     let sequence = IMMUTABLE_SEGMENT_COUNTER.fetch_add(1, Ordering::SeqCst);
     let suffix = format!("{}-{sequence}.parquet", Utc::now().timestamp_micros());
+    let day =
+        NaiveDate::parse_from_str(&partition.timestamp_day, "%Y-%m-%d").with_context(|| {
+            format!(
+                "parse immutable segment timestamp day {}",
+                partition.timestamp_day
+            )
+        })?;
     Ok(storage_dir
         .join("main")
         .join(table.as_str())
-        .join(format!("event_date={}", partition.event_date))
-        .join(format!("hour={:02}", partition.hour))
+        .join(format!("year={}", day.format("%Y")))
+        .join(format!("month={}", day.month()))
+        .join(format!("day={}", day.day()))
         .join(suffix))
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct ImmutableSegmentPartition {
-    event_date: String,
+    timestamp_day: String,
     hour: u32,
 }
 
@@ -1484,11 +1544,10 @@ fn split_batch_by_immutable_partition(
     }
 
     let mut rows_by_partition: BTreeMap<ImmutableSegmentPartition, Vec<u32>> = BTreeMap::new();
-    let dates = event_date_column(batch)?;
     let timestamps = timestamp_column(batch)?;
     for row in 0..batch.num_rows() {
         rows_by_partition
-            .entry(immutable_row_partition(dates, timestamps, row))
+            .entry(immutable_row_partition(timestamps, row))
             .or_default()
             .push(row as u32);
     }
@@ -1519,36 +1578,42 @@ fn split_batch_by_immutable_partition(
 }
 
 fn immutable_row_partition(
-    dates: &arrow58_array::Date32Array,
     timestamps: &arrow58_array::TimestampMicrosecondArray,
     row: usize,
 ) -> ImmutableSegmentPartition {
     let now = Utc::now();
     ImmutableSegmentPartition {
-        event_date: date32_value(dates, row).unwrap_or_else(|| now.date_naive().to_string()),
+        timestamp_day: timestamp_day(timestamps, row)
+            .unwrap_or_else(|| now.date_naive().to_string()),
         hour: timestamp_hour(timestamps, row).unwrap_or_else(|| now.hour()),
     }
 }
 
-fn date32_value(dates: &arrow58_array::Date32Array, row: usize) -> Option<String> {
-    if dates.is_null(row) {
-        return None;
-    }
-    let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).expect("valid Unix epoch date");
-    Some((epoch + chrono::Duration::days(dates.value(row) as i64)).to_string())
+fn timestamp_day(
+    timestamps: &arrow58_array::TimestampMicrosecondArray,
+    row: usize,
+) -> Option<String> {
+    timestamp_utc(timestamps, row).map(|timestamp| timestamp.date_naive().to_string())
 }
 
 fn timestamp_hour(
     timestamps: &arrow58_array::TimestampMicrosecondArray,
     row: usize,
 ) -> Option<u32> {
+    timestamp_utc(timestamps, row).map(|timestamp| timestamp.hour())
+}
+
+fn timestamp_utc(
+    timestamps: &arrow58_array::TimestampMicrosecondArray,
+    row: usize,
+) -> Option<DateTime<Utc>> {
     if timestamps.is_null(row) {
         return None;
     }
     let micros = timestamps.value(row);
     let secs = micros.div_euclid(1_000_000);
     let nanos = micros.rem_euclid(1_000_000) as u32 * 1_000;
-    DateTime::<Utc>::from_timestamp(secs, nanos).map(|timestamp| timestamp.hour())
+    DateTime::<Utc>::from_timestamp(secs, nanos)
 }
 
 fn register_ducklake_data_file(
@@ -1604,7 +1669,6 @@ fn storage_duckdb_batch(
     batch: &RecordBatch,
     source_format: &str,
 ) -> Result<RecordBatch> {
-    let timestamp = timestamp_column(batch)?;
     let rows = batch.num_rows();
     let ingested_at = Utc::now().timestamp_micros();
     let mut fields = Vec::with_capacity(table_columns(table).len());
@@ -1620,17 +1684,6 @@ fn storage_duckdb_batch(
                 ),
                 Arc::new(arrow58_array::TimestampMicrosecondArray::from(
                     (0..rows).map(|_| Some(ingested_at)).collect::<Vec<_>>(),
-                )) as ArrayRef,
-            ),
-            "event_date" => (
-                arrow58_types::Field::new(name, arrow58_types::DataType::Date32, true),
-                Arc::new(arrow58_array::Date32Array::from(
-                    (0..rows)
-                        .map(|row| {
-                            (!timestamp.is_null(row))
-                                .then(|| timestamp.value(row).div_euclid(86_400_000_000) as i32)
-                        })
-                        .collect::<Vec<_>>(),
                 )) as ArrayRef,
             ),
             "source_format" => (
@@ -1703,24 +1756,15 @@ fn storage_duckdb_batch(
         .context("build storage RecordBatch")
 }
 
-fn batch_event_dates(batch: &RecordBatch) -> Result<Vec<String>> {
-    let dates = event_date_column(batch)?;
+fn batch_timestamp_days(batch: &RecordBatch) -> Result<Vec<String>> {
+    let timestamps = timestamp_column(batch)?;
     let mut out = BTreeSet::new();
-    for row in 0..dates.len() {
-        if let Some(date) = date32_value(dates, row) {
-            out.insert(date);
+    for row in 0..timestamps.len() {
+        if let Some(day) = timestamp_day(timestamps, row) {
+            out.insert(day);
         }
     }
     Ok(out.into_iter().collect())
-}
-
-fn event_date_column(batch: &RecordBatch) -> Result<&arrow58_array::Date32Array> {
-    let idx = batch.schema().index_of("event_date")?;
-    batch
-        .column(idx)
-        .as_any()
-        .downcast_ref::<arrow58_array::Date32Array>()
-        .context("event_date column is not Date32Array")
 }
 
 fn timestamp_column(batch: &RecordBatch) -> Result<&arrow58_array::TimestampMicrosecondArray> {
@@ -1832,7 +1876,6 @@ fn dir_size(path: &Path) -> Result<u64> {
 const LOGS_COLUMNS: &[(&str, &str)] = &[
     ("timestamp", "TIMESTAMP"),
     ("ingested_at", "TIMESTAMP"),
-    ("event_date", "DATE"),
     ("source_format", "VARCHAR"),
     ("trace_id", "VARCHAR"),
     ("span_id", "VARCHAR"),
@@ -1857,7 +1900,6 @@ const LOGS_COLUMNS: &[(&str, &str)] = &[
 const SPANS_COLUMNS: &[(&str, &str)] = &[
     ("timestamp", "TIMESTAMP"),
     ("ingested_at", "TIMESTAMP"),
-    ("event_date", "DATE"),
     ("source_format", "VARCHAR"),
     ("end_timestamp", "BIGINT"),
     ("duration", "BIGINT"),
@@ -1893,7 +1935,6 @@ const SPANS_COLUMNS: &[(&str, &str)] = &[
 const METRIC_GAUGE_COLUMNS: &[(&str, &str)] = &[
     ("timestamp", "TIMESTAMP"),
     ("ingested_at", "TIMESTAMP"),
-    ("event_date", "DATE"),
     ("source_format", "VARCHAR"),
     ("start_timestamp", "BIGINT"),
     ("metric_name", "VARCHAR"),
@@ -1916,7 +1957,6 @@ const METRIC_GAUGE_COLUMNS: &[(&str, &str)] = &[
 const METRIC_SUM_COLUMNS: &[(&str, &str)] = &[
     ("timestamp", "TIMESTAMP"),
     ("ingested_at", "TIMESTAMP"),
-    ("event_date", "DATE"),
     ("source_format", "VARCHAR"),
     ("start_timestamp", "BIGINT"),
     ("metric_name", "VARCHAR"),
@@ -2106,13 +2146,7 @@ mod tests {
     }
 
     #[test]
-    fn immutable_segment_split_preserves_event_date_hour_partitions() {
-        fn date32(year: i32, month: u32, day: u32) -> i32 {
-            let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
-            let date = NaiveDate::from_ymd_opt(year, month, day).unwrap();
-            (date - epoch).num_days() as i32
-        }
-
+    fn immutable_segment_split_preserves_timestamp_day_hour_partitions() {
         fn timestamp_micros(year: i32, month: u32, day: u32, hour: u32) -> i64 {
             DateTime::<Utc>::from_naive_utc_and_offset(
                 NaiveDate::from_ymd_opt(year, month, day)
@@ -2130,7 +2164,6 @@ mod tests {
                 arrow58_types::DataType::Timestamp(arrow58_types::TimeUnit::Microsecond, None),
                 true,
             ),
-            arrow58_types::Field::new("event_date", arrow58_types::DataType::Date32, true),
             arrow58_types::Field::new("value", arrow58_types::DataType::Int64, true),
         ]));
         let batch = RecordBatch::try_new(
@@ -2141,11 +2174,6 @@ mod tests {
                     Some(timestamp_micros(2026, 5, 16, 1)),
                     Some(timestamp_micros(2026, 5, 17, 0)),
                 ])),
-                Arc::new(arrow58_array::Date32Array::from(vec![
-                    Some(date32(2026, 5, 16)),
-                    Some(date32(2026, 5, 16)),
-                    Some(date32(2026, 5, 17)),
-                ])),
                 Arc::new(arrow58_array::Int64Array::from(vec![1, 2, 3])),
             ],
         )
@@ -2154,13 +2182,13 @@ mod tests {
         let splits = split_batch_by_immutable_partition(&batch).unwrap();
 
         assert_eq!(splits.len(), 3);
-        assert_eq!(splits[0].0.event_date, "2026-05-16");
+        assert_eq!(splits[0].0.timestamp_day, "2026-05-16");
         assert_eq!(splits[0].0.hour, 0);
         assert_eq!(splits[0].1.num_rows(), 1);
-        assert_eq!(splits[1].0.event_date, "2026-05-16");
+        assert_eq!(splits[1].0.timestamp_day, "2026-05-16");
         assert_eq!(splits[1].0.hour, 1);
         assert_eq!(splits[1].1.num_rows(), 1);
-        assert_eq!(splits[2].0.event_date, "2026-05-17");
+        assert_eq!(splits[2].0.timestamp_day, "2026-05-17");
         assert_eq!(splits[2].0.hour, 0);
         assert_eq!(splits[2].1.num_rows(), 1);
     }
