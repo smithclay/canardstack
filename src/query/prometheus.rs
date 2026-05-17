@@ -178,6 +178,6 @@ fn unsupported_promql() -> ApiError {
     ApiError::new(
         400,
         "unsupported_promql",
-        "supported PromQL subset is metric selectors plus avg/min/max/sum/count/rate(metric) and avg/min/max/sum/count by/without promoted labels",
+        "supported PromQL subset is metric selectors plus avg/min/max/sum/count/rate(metric) and avg/min/max/sum/count by/without supported labels",
     )
 }

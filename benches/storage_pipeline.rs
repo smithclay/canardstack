@@ -8,7 +8,6 @@ use canardstack::config::Config;
 use canardstack::ingest::Signal;
 use canardstack::storage::{ArrowBatchInsert, ArrowBatchInsertTiming, Storage};
 use chrono::Utc;
-use serde_json::Value;
 use std::collections::BTreeMap;
 use std::env;
 use std::path::PathBuf;
@@ -72,15 +71,9 @@ fn run() -> Result<()> {
             phase_stats.record_timings(result.timings);
         }
         let flush = storage.flush_immutable_segments(true)?;
-        sealed_rows += flush
-            .get("sealed_rows")
-            .and_then(Value::as_u64)
-            .unwrap_or(0) as usize;
-        sealed_files += flush
-            .get("sealed_files")
-            .and_then(Value::as_u64)
-            .unwrap_or(0) as usize;
-        phase_stats.record_json_timings(&flush);
+        sealed_rows += flush.sealed_rows;
+        sealed_files += flush.sealed_files;
+        phase_stats.record_timings(flush.timings);
         storage_elapsed += started.elapsed();
     }
 
@@ -162,29 +155,6 @@ impl PhaseStats {
             stat.count += 1;
             stat.rows += timing.rows;
             stat.seconds += timing.seconds;
-        }
-    }
-
-    fn record_json_timings(&mut self, result: &Value) {
-        let Some(timings) = result.get("timings").and_then(Value::as_array) else {
-            return;
-        };
-        for timing in timings {
-            let Some(table) = timing.get("table").and_then(Value::as_str) else {
-                continue;
-            };
-            let Some(phase) = timing.get("phase").and_then(Value::as_str) else {
-                continue;
-            };
-            let rows = timing.get("rows").and_then(Value::as_u64).unwrap_or(0) as usize;
-            let seconds = timing.get("seconds").and_then(Value::as_f64).unwrap_or(0.0);
-            let stat = self
-                .by_phase
-                .entry((table.to_string(), phase.to_string()))
-                .or_default();
-            stat.count += 1;
-            stat.rows += rows;
-            stat.seconds += seconds;
         }
     }
 

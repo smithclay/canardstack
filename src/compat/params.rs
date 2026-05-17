@@ -28,18 +28,20 @@ pub(super) fn optional_range(
     Ok((from, to))
 }
 
+fn invalid_time(name: &str) -> ApiError {
+    ApiError::new(
+        400,
+        "invalid_time_range",
+        format!("{name} must be RFC3339, Unix seconds, or Unix nanoseconds"),
+    )
+}
+
 pub(super) fn required_time(
     params: &HashMap<String, String>,
     name: &'static str,
 ) -> ApiResult<DateTime<Utc>> {
     let raw = required_param(params, name)?;
-    parse_time(raw).ok_or_else(|| {
-        ApiError::new(
-            400,
-            "invalid_time_range",
-            format!("{name} must be RFC3339, Unix seconds, or Unix nanoseconds"),
-        )
-    })
+    parse_time(raw).ok_or_else(|| invalid_time(name))
 }
 
 pub(super) fn optional_time(
@@ -51,13 +53,7 @@ pub(super) fn optional_time(
         .map(String::as_str)
         .filter(|v| !v.is_empty())
     {
-        Some(raw) => parse_time(raw).map(Some).ok_or_else(|| {
-            ApiError::new(
-                400,
-                "invalid_time_range",
-                format!("{name} must be RFC3339, Unix seconds, or Unix nanoseconds"),
-            )
-        }),
+        Some(raw) => parse_time(raw).map(Some).ok_or_else(|| invalid_time(name)),
         None => Ok(None),
     }
 }
@@ -105,22 +101,16 @@ pub(super) fn validate_range(
 }
 
 pub(super) fn parse_step(raw: &str) -> ApiResult<i64> {
-    if let Some(stripped) = raw.strip_suffix('s') {
-        return stripped.parse::<i64>().map_err(|_| {
+    raw.strip_suffix('s')
+        .unwrap_or(raw)
+        .parse::<i64>()
+        .map_err(|_| {
             ApiError::new(
                 400,
                 "invalid_step",
                 "step must be seconds or a duration ending in s",
             )
-        });
-    }
-    raw.parse::<i64>().map_err(|_| {
-        ApiError::new(
-            400,
-            "invalid_step",
-            "step must be seconds or a duration ending in s",
-        )
-    })
+        })
 }
 
 pub(super) fn parse_usize(value: Option<&String>, default: usize, max: usize) -> ApiResult<usize> {

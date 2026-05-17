@@ -1,4 +1,7 @@
-use crate::db::sql::quote as sql_quote;
+use crate::db::sql::{
+    logs_deployment_environment_expr, logs_http_method_expr, logs_http_route_expr,
+    metrics_deployment_environment_expr, quote as sql_quote, spans_http_route_expr,
+};
 use crate::ingest::Signal;
 use anyhow::{Context, Result};
 use chrono::NaiveDate;
@@ -106,14 +109,14 @@ impl<'a> MetadataRefreshDay<'a> {
 
 pub(super) fn logs_metadata_sql(prefix: &str, day: &MetadataRefreshDay<'_>) -> Vec<String> {
     let mut sql = Vec::new();
-    for (name, column) in [
-        ("service_name", "service_name"),
-        ("deployment_environment", "deployment_environment"),
-        ("severity_text", "severity_text"),
-        ("trace_id", "trace_id"),
-        ("span_id", "span_id"),
-        ("http_route", "http_route"),
-        ("http_method", "http_method"),
+    for (name, value_expr) in [
+        ("service_name", "service_name".to_string()),
+        ("deployment_environment", logs_deployment_environment_expr()),
+        ("severity_text", "severity_text".to_string()),
+        ("trace_id", "trace_id".to_string()),
+        ("span_id", "span_id".to_string()),
+        ("http_route", logs_http_route_expr()),
+        ("http_method", logs_http_method_expr()),
     ] {
         sql.push(label_value_insert_sql(
             prefix,
@@ -122,17 +125,18 @@ pub(super) fn logs_metadata_sql(prefix: &str, day: &MetadataRefreshDay<'_>) -> V
             day,
             "label_value",
             name,
-            column,
+            &value_expr,
         ));
     }
+    let deployment_environment = logs_deployment_environment_expr();
     sql.push(format!(
         "\
         SELECT 'logs', DATE {}, 'series', 'stream', NULL, NULL, NULL, NULL, \
-               service_name, deployment_environment, severity_text, \
+               service_name, {deployment_environment}, severity_text, \
                count(*), min(timestamp), max(timestamp) \
         FROM {prefix}logs \
         WHERE {} \
-        GROUP BY service_name, deployment_environment, severity_text",
+        GROUP BY service_name, {deployment_environment}, severity_text",
         sql_quote(day.date),
         day.predicate()
     ));
@@ -141,13 +145,13 @@ pub(super) fn logs_metadata_sql(prefix: &str, day: &MetadataRefreshDay<'_>) -> V
 
 pub(super) fn spans_metadata_sql(prefix: &str, day: &MetadataRefreshDay<'_>) -> Vec<String> {
     let mut sql = Vec::new();
-    for (name, column) in [
-        ("service.name", "service_name"),
-        ("span.name", "span_name"),
-        ("http.route", "http_route"),
-        ("status", "status_code"),
-        ("status.code", "status_code"),
-        ("traceID", "trace_id"),
+    for (name, value_expr) in [
+        ("service.name", "service_name".to_string()),
+        ("span.name", "span_name".to_string()),
+        ("http.route", spans_http_route_expr()),
+        ("status", "status_code".to_string()),
+        ("status.code", "status_code".to_string()),
+        ("traceID", "trace_id".to_string()),
     ] {
         sql.push(label_value_insert_sql(
             prefix,
@@ -156,7 +160,7 @@ pub(super) fn spans_metadata_sql(prefix: &str, day: &MetadataRefreshDay<'_>) -> 
             day,
             "tag_value",
             name,
-            column,
+            &value_expr,
         ));
     }
     sql
@@ -171,10 +175,13 @@ pub(super) fn metric_metadata_sql(
     let table = signal.as_str();
     let signal = signal.as_str();
     let mut sql = Vec::new();
-    for (name, column) in [
-        ("__name__", "metric_name"),
-        ("service_name", "service_name"),
-        ("deployment_environment", "deployment_environment"),
+    for (name, value_expr) in [
+        ("__name__", "metric_name".to_string()),
+        ("service_name", "service_name".to_string()),
+        (
+            "deployment_environment",
+            metrics_deployment_environment_expr(),
+        ),
     ] {
         sql.push(label_value_insert_sql(
             prefix,
@@ -183,17 +190,18 @@ pub(super) fn metric_metadata_sql(
             day,
             "label_value",
             name,
-            column,
+            &value_expr,
         ));
     }
+    let deployment_environment = metrics_deployment_environment_expr();
     sql.push(format!(
         "\
         SELECT {}, DATE {}, 'series', metric_name, NULL, {}, NULL, NULL, \
-               service_name, deployment_environment, NULL, \
+               service_name, {deployment_environment}, NULL, \
                count(*), min(timestamp), max(timestamp) \
         FROM {prefix}{table} \
         WHERE {} AND metric_name IS NOT NULL AND metric_name <> '' \
-        GROUP BY metric_name, service_name, deployment_environment",
+        GROUP BY metric_name, service_name, {deployment_environment}",
         sql_quote(signal),
         sql_quote(day.date),
         sql_quote(metric_type),
@@ -222,15 +230,15 @@ pub(super) fn label_value_insert_sql(
     day: &MetadataRefreshDay<'_>,
     kind: &str,
     name: &str,
-    column: &str,
+    value_expr: &str,
 ) -> String {
     format!(
         "\
-        SELECT {}, DATE {}, {}, {}, {column}::VARCHAR, NULL, NULL, NULL, \
+        SELECT {}, DATE {}, {}, {}, {value_expr}::VARCHAR, NULL, NULL, NULL, \
                NULL, NULL, NULL, count(*), min(timestamp), max(timestamp) \
         FROM {prefix}{table} \
-        WHERE {} AND {column} IS NOT NULL AND {column}::VARCHAR <> '' \
-        GROUP BY {column}",
+        WHERE {} AND {value_expr} IS NOT NULL AND {value_expr}::VARCHAR <> '' \
+        GROUP BY {value_expr}",
         sql_quote(signal),
         sql_quote(day.date),
         sql_quote(kind),

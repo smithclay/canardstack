@@ -36,7 +36,6 @@ pub struct Config {
     pub immutable_segment_target_bytes: usize,
     pub immutable_segment_max_age: Duration,
     pub ducklake_data_inlining_row_limit: usize,
-    pub ducklake_compaction_min_files: usize,
     pub query_interactive: QueryLane,
     pub query_background: QueryLane,
     pub logs_retention_days: i64,
@@ -112,10 +111,6 @@ impl Config {
             ducklake_data_inlining_row_limit: env_usize(
                 "CANARDSTACK_DUCKLAKE_DATA_INLINING_ROW_LIMIT",
                 0,
-            )?,
-            ducklake_compaction_min_files: env_usize(
-                "CANARDSTACK_DUCKLAKE_COMPACTION_MIN_FILES",
-                8,
             )?,
             query_interactive: QueryLane {
                 concurrency: env_usize("CANARDSTACK_QUERY_INTERACTIVE_CONCURRENCY", 4)?,
@@ -198,7 +193,6 @@ impl Config {
             immutable_segment_target_bytes: 64 * 1024 * 1024,
             immutable_segment_max_age: Duration::from_secs(10),
             ducklake_data_inlining_row_limit: 0,
-            ducklake_compaction_min_files: 8,
             query_interactive: QueryLane {
                 concurrency: 4,
                 timeout_secs: 15,
@@ -265,9 +259,6 @@ impl Config {
         }
         if self.immutable_segment_max_age.is_zero() {
             anyhow::bail!("CANARDSTACK_IMMUTABLE_SEGMENT_MAX_AGE_SECS must be > 0");
-        }
-        if self.ducklake_compaction_min_files == 0 {
-            anyhow::bail!("CANARDSTACK_DUCKLAKE_COMPACTION_MIN_FILES must be > 0");
         }
         if self.high_pressure_max_age > self.max_age {
             anyhow::bail!(

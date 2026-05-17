@@ -1,5 +1,8 @@
 use super::params::{optional_range, parse_any_time_to_utc, parse_usize, result_rows};
-use crate::db::sql::{quote as sql_quote, span_row, time_predicate};
+use crate::db::sql::{
+    quote as sql_quote, span_row, spans_deployment_environment_expr, spans_exception_type_expr,
+    spans_http_method_expr, spans_http_route_expr, spans_http_status_code_expr, time_predicate,
+};
 use crate::query::plan::TimeBounds;
 use crate::query::trace::plan_tempo_search;
 use crate::validation::{ApiError, ApiResult};
@@ -23,7 +26,9 @@ pub fn tempo_trace(state: &AppState, trace_id: &str) -> ApiResult<Value> {
     let mut spans = Vec::new();
     state.queries.run_interactive(&state.storage, |conn, prefix| {
         let sql = format!(
-            "SELECT timestamp::VARCHAR, trace_id, span_id, parent_span_id, service_name, span_name, duration, status_code, http_method, http_status_code FROM {prefix}spans WHERE trace_id = {} AND {} ORDER BY timestamp ASC LIMIT 20000",
+            "SELECT timestamp::VARCHAR, trace_id, span_id, parent_span_id, service_name, span_name, duration, status_code, {} AS http_method, {} AS http_status_code FROM {prefix}spans WHERE trace_id = {} AND {} ORDER BY timestamp ASC LIMIT 20000",
+            spans_http_method_expr(),
+            spans_http_status_code_expr(),
             sql_quote(trace_id),
             time_predicate(from, to)
         );
@@ -51,7 +56,12 @@ pub fn tempo_trace_proto(state: &AppState, trace_id: &str) -> ApiResult<Vec<u8>>
     let mut spans = Vec::new();
     state.queries.run_interactive(&state.storage, |conn, prefix| {
         let sql = format!(
-            "SELECT timestamp::VARCHAR, trace_id, span_id, parent_span_id, service_name, span_name, duration, status_code, http_method, http_status_code, trace_state, span_kind, status_message, scope_name, scope_version, deployment_environment, http_route, exception_type FROM {prefix}spans WHERE trace_id = {} AND {} ORDER BY timestamp ASC LIMIT 20000",
+            "SELECT timestamp::VARCHAR, trace_id, span_id, parent_span_id, service_name, span_name, duration, status_code, {} AS http_method, {} AS http_status_code, trace_state, span_kind, status_message, scope_name, scope_version, {} AS deployment_environment, {} AS http_route, {} AS exception_type FROM {prefix}spans WHERE trace_id = {} AND {} ORDER BY timestamp ASC LIMIT 20000",
+            spans_http_method_expr(),
+            spans_http_status_code_expr(),
+            spans_deployment_environment_expr(),
+            spans_http_route_expr(),
+            spans_exception_type_expr(),
             sql_quote(trace_id),
             time_predicate(from, to)
         );

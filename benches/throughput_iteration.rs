@@ -2,6 +2,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use chrono::{Duration as ChronoDuration, Utc};
 use serde::Serialize;
 use serde_json::Value;
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
@@ -15,9 +16,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const BENCH_NAME: &str = "throughput_iteration";
-const BENCH_VERSION: &str = "0.3.0";
+const BENCH_VERSION: &str = "0.3.1";
 const SCENARIO_NAME: &str = "throughput-iteration";
-const USAGE: &str = "cargo bench --bench throughput_iteration -- [--base-url URL] [--warmup 2m] [--duration 20m] [--target-gb-day 100] [--profile ingest-only|mixed-query] [--signals all|logs|spans|metrics] [--ingest-concurrency 1] [--query-pressure off|low|medium|high] [--query-interval 5s] [--query-concurrency 1] [--services 1] [--items-per-batch 256] [--log-records 8] [--log-body-bytes 120000] [--trace-spans 16] [--trace-attribute-bytes 48000] [--metric-series 40] [--metric-description-bytes 192] [--progress-interval 30s] [--max-runtime 27m] [--no-queries] [--report-dir DIR] [--server-pid PID] [--resource-sample-interval 5s]";
+const USAGE: &str = "cargo bench --bench throughput_iteration -- [--base-url URL] [--warmup 2m] [--duration 20m] [--target-gb-day 100] [--profile ingest-only|mixed-query] [--signals all|logs|spans|metrics] [--ingest-concurrency 1] [--query-pressure off|low|medium|high] [--query-interval 5s] [--query-concurrency 1] [--services 1] [--items-per-batch 256] [--log-records 8] [--log-body-bytes 120000] [--trace-spans 16] [--trace-attribute-bytes 48000] [--metric-series 40] [--metric-description-bytes 192] [--timestamp-mode fixed|advancing] [--progress-interval 30s] [--max-runtime 27m] [--no-queries] [--report-dir DIR] [--server-pid PID] [--resource-sample-interval 5s]";
 const DETERMINISTIC_SEED: u64 = 0xCA4A_D57A_C5AC;
 const DEFAULT_TARGET_GB_PER_DAY: f64 = 100.0;
 const DEFAULT_BASE_URL: &str = "http://127.0.0.1:4318";
@@ -64,7 +65,12 @@ fn run() -> Result<(Report, PathBuf)> {
     let storage_config = fetch_storage_config(&client, &admin_key);
 
     let run_started = Utc::now();
-    let workload = Workload::new(run_started, args.workload.clone(), args.signals);
+    let workload = Workload::new(
+        run_started,
+        args.workload.clone(),
+        args.signals,
+        args.timestamp_mode,
+    );
     let target_bytes_per_sec = args.target_decoded_bytes_per_sec();
     let guard_deadline = Instant::now() + args.max_runtime();
 
@@ -253,17 +259,19 @@ fn run_phase(
         }
 
         let elapsed = started.elapsed().as_secs_f64();
-        let Some(payload) =
-            workload.next_payload(elapsed, config.target_bytes_per_sec, &sent_by_signal)
+        let Some(payload_idx) =
+            workload.next_payload_index(elapsed, config.target_bytes_per_sec, &sent_by_signal)
         else {
             let slept = sleep_until_next_tick(deadline);
             stats.record_pacing_wait(slept);
             continue;
         };
-        *sent_by_signal.entry(payload.signal).or_default() += payload.decoded_bytes;
+        let template = &workload.payloads[payload_idx];
+        *sent_by_signal.entry(template.signal).or_default() += template.decoded_bytes;
 
-        let outcome = send_ingest_payload(client, api_key, payload, config.measured);
-        stats.record_ingest_outcome(payload, outcome, config.measured);
+        let payload = workload.prepare_payload(payload_idx);
+        let outcome = send_ingest_payload(client, api_key, &payload, config.measured);
+        stats.record_ingest_outcome(&payload, outcome, config.measured);
     }
 
     stats.elapsed = started.elapsed();
@@ -405,18 +413,18 @@ fn ingest_worker(worker: IngestWorker) {
             *sent_by_signal.entry(payload.signal).or_default() += payload.decoded_bytes;
             payload_idx
         };
-        let payload = &worker.workload.payloads[payload_idx];
+        let payload = worker.workload.prepare_payload(payload_idx);
         let outcome = send_ingest_payload(
             &worker.client,
             &worker.api_key,
-            payload,
+            &payload,
             worker.config.measured,
         );
         worker
             .stats
             .lock()
             .expect("lock benchmark stats")
-            .record_ingest_outcome(payload, outcome, worker.config.measured);
+            .record_ingest_outcome(&payload, outcome, worker.config.measured);
     }
 }
 
@@ -541,7 +549,7 @@ fn record_query_outcome(outcome: QueryOutcome, stats: &mut RunStats) {
 fn send_ingest_payload(
     client: &Client,
     api_key: &str,
-    payload: &WorkloadPayload,
+    payload: &PreparedPayload<'_>,
     measured: bool,
 ) -> IngestOutcome {
     let started_request = Instant::now();
@@ -549,7 +557,7 @@ fn send_ingest_payload(
         payload.path,
         Some(api_key),
         payload.content_type,
-        &payload.body,
+        payload.body.as_ref(),
     ) {
         Ok(response) => IngestOutcome {
             status: Some(response.status),
@@ -926,6 +934,7 @@ fn build_report(input: BuildReportInput) -> Report {
             deterministic_seed: DETERMINISTIC_SEED,
             target_gb_per_day: args.target_gb_per_day,
             signals: args.signals.as_str().to_string(),
+            timestamp_mode: args.timestamp_mode.as_str().to_string(),
             byte_mix: workload
                 .payloads
                 .iter()
@@ -990,13 +999,14 @@ fn write_report(report: &Report, report_dir: Option<&Path>) -> Result<PathBuf> {
 
 fn print_summary(report: &Report, path: &Path) {
     println!(
-        "throughput_iteration scenario={} pass={} actual={:.0}B/s target={:.0}B/s profile={} query_concurrency={}",
+        "throughput_iteration scenario={} pass={} actual={:.0}B/s target={:.0}B/s profile={} query_concurrency={} timestamp_mode={}",
         report.scenario.name,
         report.pass,
         report.actual_decoded_bytes_per_sec,
         report.target_decoded_bytes_per_sec,
         report.query_profile.profile,
-        report.query_profile.concurrency
+        report.query_profile.concurrency,
+        report.scenario.timestamp_mode
     );
     println!(
         "workload services={} log_records={} log_body_bytes={} trace_spans={} trace_attribute_bytes={} metric_series={} metric_description_bytes={}",
@@ -1125,6 +1135,7 @@ struct Args {
     profile: BenchmarkProfile,
     signals: SignalSelection,
     workload: WorkloadProfile,
+    timestamp_mode: TimestampMode,
     progress_interval: Duration,
     max_runtime: Option<Duration>,
     no_queries_legacy: bool,
@@ -1147,6 +1158,7 @@ impl Args {
             profile: BenchmarkProfile::MixedQuery,
             signals: SignalSelection::All,
             workload: WorkloadProfile::default(),
+            timestamp_mode: TimestampMode::Fixed,
             progress_interval: DEFAULT_PROGRESS_INTERVAL,
             max_runtime: None,
             no_queries_legacy: false,
@@ -1226,6 +1238,10 @@ impl Args {
                 "--metric-description-bytes" => {
                     parsed.workload.metric_description_bytes =
                         parse_next(&mut args, "--metric-description-bytes")?;
+                }
+                "--timestamp-mode" => {
+                    parsed.timestamp_mode =
+                        TimestampMode::parse(&next_arg(&mut args, "--timestamp-mode")?)?;
                 }
                 "--progress-interval" => {
                     parsed.progress_interval =
@@ -1413,6 +1429,29 @@ impl QueryPressure {
             Self::Off | Self::Low => 1,
             Self::Medium => 2,
             Self::High => 4,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum TimestampMode {
+    Fixed,
+    Advancing,
+}
+
+impl TimestampMode {
+    fn parse(raw: &str) -> Result<Self> {
+        match raw {
+            "fixed" => Ok(Self::Fixed),
+            "advancing" | "advance" => Ok(Self::Advancing),
+            _ => bail!("--timestamp-mode must be fixed or advancing"),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Fixed => "fixed",
+            Self::Advancing => "advancing",
         }
     }
 }
@@ -1676,6 +1715,8 @@ struct ResourceSample {
 #[derive(Clone)]
 struct Workload {
     payloads: Vec<WorkloadPayload>,
+    profile: WorkloadProfile,
+    timestamp_mode: TimestampMode,
 }
 
 impl Workload {
@@ -1683,6 +1724,7 @@ impl Workload {
         run_started: chrono::DateTime<Utc>,
         profile: WorkloadProfile,
         signals: SignalSelection,
+        timestamp_mode: TimestampMode,
     ) -> Self {
         let base_nanos = run_started
             .timestamp_nanos_opt()
@@ -1699,17 +1741,11 @@ impl Workload {
         for payload in &mut payloads {
             payload.ratio /= ratio_total;
         }
-        Self { payloads }
-    }
-
-    fn next_payload(
-        &self,
-        elapsed_seconds: f64,
-        target_bytes_per_sec: f64,
-        sent_by_signal: &BTreeMap<&'static str, usize>,
-    ) -> Option<&WorkloadPayload> {
-        self.next_payload_index(elapsed_seconds, target_bytes_per_sec, sent_by_signal)
-            .map(|idx| &self.payloads[idx])
+        Self {
+            payloads,
+            profile,
+            timestamp_mode,
+        }
     }
 
     fn next_payload_index(
@@ -1731,10 +1767,15 @@ impl Workload {
             .max_by(|(left, _), (right, _)| left.total_cmp(right))
             .map(|(_, idx)| idx)
     }
+
+    fn prepare_payload(&self, idx: usize) -> PreparedPayload<'_> {
+        self.payloads[idx].prepare(self.timestamp_mode, &self.profile)
+    }
 }
 
 #[derive(Clone)]
 struct WorkloadPayload {
+    kind: PayloadKind,
     signal: &'static str,
     path: &'static str,
     content_type: &'static str,
@@ -1748,6 +1789,7 @@ impl WorkloadPayload {
     fn logs(base_nanos: i64, profile: &WorkloadProfile) -> Self {
         let body = otlp_fixture::encode_logs(base_nanos, profile);
         Self {
+            kind: PayloadKind::Logs,
             signal: "logs",
             path: "/v1/logs",
             content_type: otlp_fixture::CONTENT_TYPE,
@@ -1761,6 +1803,7 @@ impl WorkloadPayload {
     fn spans(base_nanos: i64, profile: &WorkloadProfile) -> Self {
         let body = otlp_fixture::encode_traces(base_nanos, profile);
         Self {
+            kind: PayloadKind::Spans,
             signal: "spans",
             path: "/v1/traces",
             content_type: otlp_fixture::CONTENT_TYPE,
@@ -1774,6 +1817,7 @@ impl WorkloadPayload {
     fn metrics(base_nanos: i64, profile: &WorkloadProfile) -> Self {
         let body = otlp_fixture::encode_metrics(base_nanos, profile);
         Self {
+            kind: PayloadKind::Metrics,
             signal: "metrics",
             path: "/v1/metrics",
             content_type: otlp_fixture::CONTENT_TYPE,
@@ -1783,6 +1827,57 @@ impl WorkloadPayload {
             body,
         }
     }
+
+    fn prepare<'a>(
+        &'a self,
+        timestamp_mode: TimestampMode,
+        profile: &WorkloadProfile,
+    ) -> PreparedPayload<'a> {
+        let body = match timestamp_mode {
+            TimestampMode::Fixed => Cow::Borrowed(self.body.as_slice()),
+            TimestampMode::Advancing => Cow::Owned(self.kind.encode(current_nanos(), profile)),
+        };
+        PreparedPayload {
+            signal: self.signal,
+            path: self.path,
+            content_type: self.content_type,
+            decoded_bytes: body.len(),
+            body,
+            records_per_request: self.records_per_request,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PayloadKind {
+    Logs,
+    Spans,
+    Metrics,
+}
+
+impl PayloadKind {
+    fn encode(self, base_nanos: i64, profile: &WorkloadProfile) -> Vec<u8> {
+        match self {
+            Self::Logs => otlp_fixture::encode_logs(base_nanos, profile),
+            Self::Spans => otlp_fixture::encode_traces(base_nanos, profile),
+            Self::Metrics => otlp_fixture::encode_metrics(base_nanos, profile),
+        }
+    }
+}
+
+struct PreparedPayload<'a> {
+    signal: &'static str,
+    path: &'static str,
+    content_type: &'static str,
+    body: Cow<'a, [u8]>,
+    decoded_bytes: usize,
+    records_per_request: u64,
+}
+
+fn current_nanos() -> i64 {
+    let now = Utc::now();
+    now.timestamp_nanos_opt()
+        .unwrap_or(now.timestamp_millis() * 1_000_000)
 }
 
 fn deterministic_ascii(seed: u64, len: usize) -> String {
@@ -2149,7 +2244,7 @@ impl RunStats {
 
     fn record_ingest_outcome(
         &mut self,
-        payload: &WorkloadPayload,
+        payload: &PreparedPayload<'_>,
         outcome: IngestOutcome,
         measured: bool,
     ) {
@@ -2721,6 +2816,7 @@ struct ScenarioReport {
     deterministic_seed: u64,
     target_gb_per_day: f64,
     signals: String,
+    timestamp_mode: String,
     byte_mix: BTreeMap<String, f64>,
     payloads: Vec<PayloadReport>,
 }

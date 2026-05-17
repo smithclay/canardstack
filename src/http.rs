@@ -356,9 +356,11 @@ pub fn route(
                 .run_flush(
                     &state.ingestor,
                     &state.storage,
-                    query.get("table").map(String::as_str),
-                    Some(&state.metrics),
-                    true,
+                    &state.metrics,
+                    crate::maintenance::FlushOptions {
+                        table: query.get("table").map(String::as_str),
+                        force_immutable_segments: true,
+                    },
                 )
                 .map_err(|err| {
                     if let Some((partial_signal, committed)) =
@@ -387,7 +389,7 @@ pub fn route(
                 .run_compaction(
                     &state.storage,
                     query.get("table").map(String::as_str),
-                    Some(&state.metrics),
+                    &state.metrics,
                 )
                 .map_err(storage_error);
             record_maintenance_metrics(state, "compaction", &result, started);

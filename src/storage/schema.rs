@@ -60,11 +60,6 @@ pub(super) const LOGS_COLUMNS: &[(&str, &str)] = &[
     ("scope_version", "VARCHAR"),
     ("scope_attributes", "VARCHAR"),
     ("log_attributes", "VARCHAR"),
-    ("deployment_environment", "VARCHAR"),
-    ("http_method", "VARCHAR"),
-    ("http_status_code", "INTEGER"),
-    ("http_route", "VARCHAR"),
-    ("exception_type", "VARCHAR"),
 ];
 
 pub(super) const SPANS_COLUMNS: &[(&str, &str)] = &[
@@ -95,11 +90,6 @@ pub(super) const SPANS_COLUMNS: &[(&str, &str)] = &[
     ("dropped_events_count", "INTEGER"),
     ("dropped_links_count", "INTEGER"),
     ("flags", "INTEGER"),
-    ("deployment_environment", "VARCHAR"),
-    ("http_method", "VARCHAR"),
-    ("http_status_code", "INTEGER"),
-    ("http_route", "VARCHAR"),
-    ("exception_type", "VARCHAR"),
 ];
 
 pub(super) const METRIC_GAUGE_COLUMNS: &[(&str, &str)] = &[
@@ -121,7 +111,6 @@ pub(super) const METRIC_GAUGE_COLUMNS: &[(&str, &str)] = &[
     ("metric_attributes", "VARCHAR"),
     ("flags", "INTEGER"),
     ("exemplars_json", "VARCHAR"),
-    ("deployment_environment", "VARCHAR"),
 ];
 
 pub(super) const METRIC_SUM_COLUMNS: &[(&str, &str)] = &[
@@ -143,7 +132,6 @@ pub(super) const METRIC_SUM_COLUMNS: &[(&str, &str)] = &[
     ("metric_attributes", "VARCHAR"),
     ("flags", "INTEGER"),
     ("exemplars_json", "VARCHAR"),
-    ("deployment_environment", "VARCHAR"),
     ("aggregation_temporality", "INTEGER"),
     ("is_monotonic", "BOOLEAN"),
 ];

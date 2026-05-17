@@ -2,7 +2,7 @@ use crate::app::AppState;
 use crate::config::Config;
 use crate::ingest::Ingestor;
 use crate::metrics::Metrics;
-use crate::storage::{RetentionPolicy, Storage};
+use crate::storage::{ArrowBatchInsertTiming, RetentionPolicy, Storage};
 use crate::LockExt;
 use anyhow::Result;
 use serde_json::{json, Value};
@@ -19,12 +19,19 @@ struct FailureRecord {
     consecutive: u32,
 }
 
+#[derive(Clone, Copy, Default)]
+pub struct FlushOptions<'a> {
+    pub table: Option<&'a str>,
+    /// Seal every in-memory immutable-segment buffer immediately, ignoring size
+    /// and age thresholds. The scheduler leaves this unset; admin flush sets it.
+    pub force_immutable_segments: bool,
+}
+
 pub struct Maintenance {
     paused: AtomicBool,
     last_runs: Mutex<BTreeMap<String, String>>,
     last_failures: Mutex<BTreeMap<String, FailureRecord>>,
     retention: RetentionPolicy,
-    compaction_min_files: usize,
 }
 
 impl Maintenance {
@@ -38,7 +45,6 @@ impl Maintenance {
                 spans_days: config.spans_retention_days,
                 metrics_days: config.metrics_retention_days,
             },
-            compaction_min_files: config.ducklake_compaction_min_files,
         }
     }
 
@@ -89,7 +95,6 @@ impl Maintenance {
                 "spans": self.retention.spans_days,
                 "metrics": self.retention.metrics_days
             },
-            "compaction_min_files": self.compaction_min_files,
             "priority_order": ["queue_watchdog", "flush_inlined_data", "merge_adjacent_files", "retention"]
         })
     }
@@ -98,33 +103,28 @@ impl Maintenance {
         &self,
         ingestor: &Ingestor,
         storage: &Storage,
-        table: Option<&str>,
-        metrics: Option<&Metrics>,
-        force_immutable_segments: bool,
+        metrics: &Metrics,
+        options: FlushOptions<'_>,
     ) -> Result<Value> {
         if self.is_paused() {
             return Ok(json!({"status": "paused"}));
         }
         let started = Instant::now();
         let process_rows = ingestor.flush_all(storage)?;
-        let immutable_segments = storage.flush_immutable_segments(force_immutable_segments)?;
-        if let Some(metrics) = metrics {
-            observe_immutable_segment_timings(metrics, &immutable_segments);
-        }
+        let immutable = storage.flush_immutable_segments(options.force_immutable_segments)?;
+        observe_phase_timings(metrics, &immutable.timings);
         let ducklake_started = Instant::now();
-        let ducklake = storage.flush_inlined_data(table)?;
-        if let Some(metrics) = metrics {
-            metrics.observe_seconds(
-                "canardstack_ducklake_flush_inlined_duration_seconds",
-                &[("table", table.unwrap_or("all"))],
-                ducklake_started.elapsed().as_secs_f64(),
-            );
-        }
+        let ducklake = storage.flush_inlined_data(options.table)?;
+        metrics.observe_seconds(
+            "canardstack_ducklake_flush_inlined_duration_seconds",
+            &[("table", options.table.unwrap_or("all"))],
+            ducklake_started.elapsed().as_secs_f64(),
+        );
         self.record_run("flush");
         Ok(json!({
             "status": "ok",
             "process_rows_flushed": process_rows,
-            "immutable_segments": immutable_segments,
+            "immutable_segments": immutable.to_json(),
             "ducklake": ducklake,
             "duration_ms": started.elapsed().as_millis()
         }))
@@ -134,13 +134,13 @@ impl Maintenance {
         &self,
         storage: &Storage,
         table: Option<&str>,
-        metrics: Option<&Metrics>,
+        metrics: &Metrics,
     ) -> Result<Value> {
         if self.is_paused() {
             return Ok(json!({"status": "paused"}));
         }
         let started = Instant::now();
-        let decision = storage.compaction_decision(table, self.compaction_min_files)?;
+        let decision = storage.compaction_decision(table)?;
         if !decision
             .get("should_compact")
             .and_then(Value::as_bool)
@@ -157,13 +157,11 @@ impl Maintenance {
 
         let compaction_started = Instant::now();
         let compaction = storage.merge_adjacent_files(table)?;
-        if let Some(metrics) = metrics {
-            metrics.observe_seconds(
-                "canardstack_ducklake_compaction_duration_seconds",
-                &[("table", table.unwrap_or("all"))],
-                compaction_started.elapsed().as_secs_f64(),
-            );
-        }
+        metrics.observe_seconds(
+            "canardstack_ducklake_compaction_duration_seconds",
+            &[("table", table.unwrap_or("all"))],
+            compaction_started.elapsed().as_secs_f64(),
+        );
         self.record_run("compaction");
         Ok(json!({
             "status": "ok",
@@ -211,8 +209,8 @@ impl Maintenance {
         }
         let started = Instant::now();
         let flushed = ingestor.flush_due(storage, Some(metrics))?;
-        let immutable_segments = storage.flush_immutable_segments(false)?;
-        observe_immutable_segment_timings(metrics, &immutable_segments);
+        let immutable = storage.flush_immutable_segments(false)?;
+        observe_phase_timings(metrics, &immutable.timings);
         if !flushed.is_empty() {
             self.record_run("watchdog");
         }
@@ -223,7 +221,7 @@ impl Maintenance {
         Ok(json!({
             "status": "ok",
             "flushed": by_signal,
-            "immutable_segments": immutable_segments,
+            "immutable_segments": immutable.to_json(),
             "duration_ms": started.elapsed().as_millis()
         }))
     }
@@ -259,21 +257,14 @@ impl Maintenance {
     }
 }
 
-fn observe_immutable_segment_timings(metrics: &Metrics, result: &Value) {
-    let Some(timings) = result.get("timings").and_then(Value::as_array) else {
-        return;
-    };
+fn observe_phase_timings(metrics: &Metrics, timings: &[ArrowBatchInsertTiming]) {
     for timing in timings {
-        let Some(table) = timing.get("table").and_then(Value::as_str) else {
-            continue;
-        };
-        let Some(phase) = timing.get("phase").and_then(Value::as_str) else {
-            continue;
-        };
-        let Some(seconds) = timing.get("seconds").and_then(Value::as_f64) else {
-            continue;
-        };
-        metrics.observe_phase_seconds(table, phase, None, seconds);
+        metrics.observe_phase_seconds(
+            timing.table.as_str(),
+            timing.phase.as_str(),
+            None,
+            timing.seconds,
+        );
     }
 }
 
@@ -343,8 +334,12 @@ fn scheduler_loop(state: Arc<AppState>, stop: Arc<AtomicBool>) {
 
         if now >= next_flush {
             let ok = run_job(&state, "flush", |s| {
-                s.maintenance
-                    .run_flush(&s.ingestor, &s.storage, None, Some(&s.metrics), false)
+                s.maintenance.run_flush(
+                    &s.ingestor,
+                    &s.storage,
+                    &s.metrics,
+                    FlushOptions::default(),
+                )
             });
             next_flush = now + next_interval(&state, "flush", flush_every, ok);
         }
@@ -371,8 +366,7 @@ fn scheduler_loop(state: Arc<AppState>, stop: Arc<AtomicBool>) {
 
         if now >= next_compaction {
             let ok = run_job(&state, "compaction", |s| {
-                s.maintenance
-                    .run_compaction(&s.storage, None, Some(&s.metrics))
+                s.maintenance.run_compaction(&s.storage, None, &s.metrics)
             });
             next_compaction = now + next_interval(&state, "compaction", compaction_every, ok);
         }

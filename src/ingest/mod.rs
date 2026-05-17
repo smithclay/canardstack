@@ -135,6 +135,9 @@ impl Ingestor {
         let body = body_result?;
         validation::validate_body_size(body.len(), &self.config)?;
         let started = Instant::now();
+        #[cfg(feature = "transform-split-instrumentation")]
+        let transformed_result = otlp::transform_observed(signal, headers, &body, metrics);
+        #[cfg(not(feature = "transform-split-instrumentation"))]
         let transformed_result = otlp::transform(signal, headers, &body);
         metrics.observe_phase_seconds(
             signal.as_str(),

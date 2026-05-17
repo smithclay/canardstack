@@ -1,7 +1,7 @@
 use super::queue::{self, QueueKey, QueuedBatch};
 use super::{Ingestor, Signal};
 use crate::metrics::Metrics;
-use crate::storage::{ArrowBatchInsert, Storage};
+use crate::storage::{ArrowBatchInsert, Storage, TimingPhase};
 use crate::LockExt;
 use anyhow::Context;
 use arrow58::compute::concat_batches;
@@ -182,12 +182,12 @@ impl Ingestor {
                     if let Some(metrics) = metrics {
                         metrics.observe_phase_seconds(
                             timing.table.as_str(),
-                            timing.phase,
+                            timing.phase.as_str(),
                             None,
                             timing.seconds,
                         );
                     }
-                    if timing.phase == "storage_insert" {
+                    if timing.phase == TimingPhase::Insert {
                         rows.insert(timing.table, timing.rows);
                         if let Some(metrics) = metrics {
                             metrics.inc(

@@ -4,7 +4,12 @@ pub mod prometheus;
 pub mod trace;
 
 use crate::config::Config;
-use crate::db::sql::{push_eq, quote as sql_quote, span_row, time_predicate};
+use crate::db::sql::{
+    logs_deployment_environment_expr, logs_http_method_expr, logs_http_route_expr,
+    logs_http_status_code_expr, metrics_deployment_environment_expr, push_eq, push_eq_expr,
+    push_eq_i_expr, quote as sql_quote, span_row, spans_deployment_environment_expr,
+    spans_http_method_expr, spans_http_route_expr, spans_http_status_code_expr, time_predicate,
+};
 use crate::metrics::Timer;
 use crate::query::plan::{
     FieldMatcher, LogPlan, MetricAggregation, MetricPlan, MetricSignal, SelectorPlan,
@@ -101,7 +106,12 @@ impl QueryEngine {
         let timer = Timer::start();
         let mut where_sql = vec![time_predicate(plan.time_bounds.from, plan.time_bounds.to)];
         for matcher in &plan.selector.matchers {
-            push_matcher(&mut where_sql, matcher, LOG_COLUMNS, "unsupported_selector")?;
+            push_matcher(
+                &mut where_sql,
+                matcher,
+                log_label_expr,
+                "unsupported_selector",
+            )?;
         }
         for filter in &plan.selector.text_filters {
             match filter {
@@ -109,7 +119,11 @@ impl QueryEngine {
             }
         }
         let sql = format!(
-            "SELECT timestamp::VARCHAR, ingested_at::VARCHAR, trace_id, span_id, service_name, severity_text, body, deployment_environment, http_method, http_status_code, http_route FROM {{prefix}}logs WHERE {} ORDER BY timestamp {} LIMIT {}",
+            "SELECT timestamp::VARCHAR, ingested_at::VARCHAR, trace_id, span_id, service_name, severity_text, body, {} AS deployment_environment, {} AS http_method, {} AS http_status_code, {} AS http_route FROM {{prefix}}logs WHERE {} ORDER BY timestamp {} LIMIT {}",
+            logs_deployment_environment_expr(),
+            logs_http_method_expr(),
+            logs_http_status_code_expr(),
+            logs_http_route_expr(),
             where_sql.join(" AND "),
             plan.direction.sql(),
             plan.limit + 1
@@ -140,18 +154,22 @@ impl QueryEngine {
         let limit = validation::parse_limit(req.get("limit"), 200, 1000)?;
         let mut where_sql = vec![time_predicate(from, to)];
         push_eq(&mut where_sql, "service_name", req.get("service_name"));
-        push_eq(
+        push_eq_expr(
             &mut where_sql,
-            "deployment_environment",
+            &spans_deployment_environment_expr(),
             req.get("deployment_environment"),
         );
         push_eq(&mut where_sql, "span_name", req.get("span_name"));
         push_eq(&mut where_sql, "trace_id", req.get("trace_id"));
         push_eq_i(&mut where_sql, "status_code", req.get("status_code"));
-        push_eq(&mut where_sql, "http_method", req.get("http_method"));
-        push_eq_i(
+        push_eq_expr(
             &mut where_sql,
-            "http_status_code",
+            &spans_http_method_expr(),
+            req.get("http_method"),
+        );
+        push_eq_i_expr(
+            &mut where_sql,
+            &spans_http_status_code_expr(),
             req.get("http_status_code"),
         );
         if let Some(ms) = req.get("min_duration_ms").and_then(Value::as_i64) {
@@ -163,7 +181,9 @@ impl QueryEngine {
             "timestamp DESC"
         };
         let sql = format!(
-            "SELECT timestamp::VARCHAR, trace_id, span_id, parent_span_id, service_name, span_name, duration, status_code, http_method, http_status_code FROM {{prefix}}spans WHERE {} ORDER BY {} LIMIT {}",
+            "SELECT timestamp::VARCHAR, trace_id, span_id, parent_span_id, service_name, span_name, duration, status_code, {} AS http_method, {} AS http_status_code FROM {{prefix}}spans WHERE {} ORDER BY {} LIMIT {}",
+            spans_http_method_expr(),
+            spans_http_status_code_expr(),
             where_sql.join(" AND "),
             sort,
             limit + 1
@@ -201,7 +221,7 @@ impl QueryEngine {
             push_matcher(
                 &mut where_sql,
                 matcher,
-                TRACE_COLUMNS,
+                trace_label_expr,
                 "unsupported_selector",
             )?;
         }
@@ -277,18 +297,33 @@ impl QueryEngine {
             push_matcher(
                 &mut where_sql,
                 matcher,
-                METRIC_COLUMNS,
+                metric_label_expr,
                 "unsupported_promql",
             )?;
         }
         let group_by = &plan.group_by;
-        let group_clause = if group_by.is_empty() {
+        let group_selects = group_by
+            .iter()
+            .filter_map(|label| metric_label_expr(label).map(|expr| (label.as_str(), expr)))
+            .collect::<Vec<_>>();
+        let group_select_clause = if group_selects.is_empty() {
             String::new()
         } else {
-            format!(", {}", group_by.join(", "))
+            group_selects
+                .iter()
+                .map(|(label, expr)| format!(", {expr} AS {label}"))
+                .collect::<String>()
+        };
+        let group_clause = if group_selects.is_empty() {
+            String::new()
+        } else {
+            group_selects
+                .iter()
+                .map(|(_, expr)| format!(", {expr}"))
+                .collect::<String>()
         };
         let sql = format!(
-            "SELECT to_timestamp(floor(epoch(timestamp)/{step})*{step})::VARCHAR AS bucket{group_clause}, {agg_sql} AS value FROM {{prefix}}{table} WHERE {} GROUP BY bucket{group_clause} ORDER BY bucket {} LIMIT {}",
+            "SELECT to_timestamp(floor(epoch(timestamp)/{step})*{step})::VARCHAR AS bucket{group_select_clause}, {agg_sql} AS value FROM {{prefix}}{table} WHERE {} GROUP BY bucket{group_clause} ORDER BY bucket {} LIMIT {}",
             where_sql.join(" AND "),
             plan.order.sql(),
             plan.limit + 1
@@ -503,18 +538,50 @@ fn push_req_matcher(matchers: &mut Vec<FieldMatcher>, field: &str, value: Option
 fn push_matcher(
     where_sql: &mut Vec<String>,
     matcher: &FieldMatcher,
-    supported: &[&str],
+    label_expr: fn(&str) -> Option<String>,
     reason: &'static str,
 ) -> ApiResult<()> {
-    if !supported.iter().any(|column| *column == matcher.field) {
-        return Err(ApiError::new(
+    let expr = label_expr(&matcher.field).ok_or_else(|| {
+        ApiError::new(
             400,
             reason,
             format!("unsupported label {} in v0 selector", matcher.field),
-        ));
-    }
-    where_sql.push(format!("{} = {}", matcher.field, sql_quote(&matcher.value)));
+        )
+    })?;
+    where_sql.push(format!("{expr} = {}", sql_quote(&matcher.value)));
     Ok(())
+}
+
+fn log_label_expr(label: &str) -> Option<String> {
+    if !LOG_COLUMNS.contains(&label) {
+        return None;
+    }
+    Some(match label {
+        "deployment_environment" => logs_deployment_environment_expr(),
+        "http_route" => logs_http_route_expr(),
+        "http_method" => logs_http_method_expr(),
+        direct => direct.to_string(),
+    })
+}
+
+fn metric_label_expr(label: &str) -> Option<String> {
+    if !METRIC_COLUMNS.contains(&label) {
+        return None;
+    }
+    Some(match label {
+        "deployment_environment" => metrics_deployment_environment_expr(),
+        direct => direct.to_string(),
+    })
+}
+
+fn trace_label_expr(label: &str) -> Option<String> {
+    if !TRACE_COLUMNS.contains(&label) {
+        return None;
+    }
+    Some(match label {
+        "http_route" => spans_http_route_expr(),
+        direct => direct.to_string(),
+    })
 }
 
 fn text_terms(column: &str, query: &str) -> ApiResult<String> {

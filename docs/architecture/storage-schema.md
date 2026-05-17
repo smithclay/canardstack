@@ -51,15 +51,10 @@ Canonical fields from `otlp2records`:
 | `scope_attributes` | `VARCHAR` | JSON string. |
 | `log_attributes` | `VARCHAR` | JSON string. |
 
-Derived promoted fields for product filters:
-
-| Column | Type | Source |
-| --- | --- | --- |
-| `deployment_environment` | `VARCHAR` | `resource_attributes["deployment.environment"]`. |
-| `http_method` | `VARCHAR` | `log_attributes["http.request.method"]` or legacy equivalent. |
-| `http_status_code` | `INTEGER` | `log_attributes["http.response.status_code"]` or legacy equivalent. |
-| `http_route` | `VARCHAR` | `log_attributes["http.route"]`. |
-| `exception_type` | `VARCHAR` | `log_attributes["exception.type"]`. |
+Compatibility labels such as `deployment_environment`, `http_method`, and
+`http_route` are derived from `resource_attributes` and `log_attributes` in
+bounded query or metadata-refresh paths. They are not physical telemetry-table
+columns.
 
 ## Spans
 
@@ -93,15 +88,10 @@ Canonical fields from `otlp2records`:
 | `dropped_links_count` | `INTEGER` | OTel dropped count. |
 | `flags` | `INTEGER` | Span flags. |
 
-Derived promoted fields:
-
-| Column | Type | Source |
-| --- | --- | --- |
-| `deployment_environment` | `VARCHAR` | `resource_attributes["deployment.environment"]`. |
-| `http_method` | `VARCHAR` | `span_attributes["http.request.method"]` or legacy equivalent. |
-| `http_status_code` | `INTEGER` | `span_attributes["http.response.status_code"]` or legacy equivalent. |
-| `http_route` | `VARCHAR` | `span_attributes["http.route"]`. |
-| `exception_type` | `VARCHAR` | Span event exception or `span_attributes["exception.type"]`. |
+Compatibility labels such as `deployment_environment`, `http_method`,
+`http_status_code`, `http_route`, and `exception_type` are derived from
+`resource_attributes` and `span_attributes` in bounded query or
+metadata-refresh paths. They are not physical telemetry-table columns.
 
 ## Gauge Metrics
 
@@ -126,15 +116,13 @@ Canonical fields from `otlp2records`:
 | `flags` | `INTEGER` | Data point flags. |
 | `exemplars_json` | `VARCHAR` | JSON string. |
 
-Derived promoted fields:
-
-| Column | Type | Source |
-| --- | --- | --- |
-| `deployment_environment` | `VARCHAR` | `resource_attributes["deployment.environment"]`. |
+Compatibility labels such as `deployment_environment` are derived from
+`resource_attributes` in bounded query or metadata-refresh paths. They are not
+physical telemetry-table columns.
 
 ## Sum Metrics
 
-`metric_sum` includes every `metric_gauge` canonical and derived field, plus:
+`metric_sum` includes every `metric_gauge` canonical field, plus:
 
 | Column | Type | Notes |
 | --- | --- | --- |
@@ -157,19 +145,20 @@ lookup. The table is durable in both local DuckDB and DuckLake modes.
 | `metric_type` | `VARCHAR` | Prometheus metadata type (`gauge` or `counter`). |
 | `metric_unit` | `VARCHAR` | Representative metric unit. |
 | `metric_description` | `VARCHAR` | Representative metric help text. |
-| `service_name` | `VARCHAR` | Promoted series dimension. |
-| `deployment_environment` | `VARCHAR` | Promoted series dimension. |
-| `severity_text` | `VARCHAR` | Promoted Loki stream dimension. |
+| `service_name` | `VARCHAR` | Series dimension derived during metadata refresh. |
+| `deployment_environment` | `VARCHAR` | Series dimension derived during metadata refresh. |
+| `severity_text` | `VARCHAR` | Loki stream dimension derived during metadata refresh. |
 | `row_count` | `BIGINT` | Rows represented by this summary entry. |
 | `first_seen` | `TIMESTAMP` | Earliest event timestamp in the summary entry. |
 | `last_seen` | `TIMESTAMP` | Latest event timestamp in the summary entry. |
 
 Committed inserts record their affected `(signal, event_date)` buckets as dirty.
 The `metadata_refresh` scheduler job drains that set, rebuilding each bucket's
-summary rows from promoted columns; a failed refresh re-queues the buckets for
-the next tick. Keeping the day-partition scan off the commit path stops it from
-blocking the writer on every flush. An in-process generation counter, bumped
-after each committed refresh, lets bounded discovery caches invalidate.
+summary rows from canonical columns and JSON attribute extraction; a failed
+refresh re-queues the buckets for the next tick. Keeping the day-partition scan
+off the commit path stops it from blocking the writer on every flush. An
+in-process generation counter, bumped after each committed refresh, lets bounded
+discovery caches invalidate.
 
 ## Partitioning
 
@@ -186,7 +175,12 @@ If DuckLake partition-drop behavior is not cheap enough, switch to physical day 
 
 ## Schema Evolution Rules
 
-- Adding nullable derived promoted columns is allowed.
+- Adding physical promoted telemetry columns is not allowed in v0; derive those
+  labels from canonical `otlp2records` columns instead.
 - Renaming or removing canonical `otlp2records` columns is not allowed in v0.
-- Attribute JSON fields remain strings; extraction happens at insert time for the small promoted set.
+- Attribute JSON fields remain strings; extraction happens in bounded query or
+  metadata-refresh paths for the small compatibility label set.
 - Store unknown fields only inside the existing JSON attribute columns.
+- The current schema contract is proven for fresh DuckLake catalogs. In-place
+  migration of catalogs that already contain older promoted telemetry columns is
+  not yet a proven path and should be gated separately before reuse.

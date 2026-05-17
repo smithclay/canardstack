@@ -16,6 +16,10 @@ prost = "0.14.3"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 
+[features]
+default = []
+transform-split-instrumentation = []
+
 [dev-dependencies]
 tempfile = "3.27.0"
 

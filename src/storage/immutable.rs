@@ -1,4 +1,4 @@
-use super::{ArrowBatchInsertTiming, PreparedArrowBatch};
+use super::{ArrowBatchInsertTiming, PreparedArrowBatch, TimingPhase};
 use crate::db::sql::quote as sql_quote;
 use crate::ingest::Signal;
 use crate::storage::arrow::timestamp_column;
@@ -34,6 +34,27 @@ pub(super) struct ImmutableSealResult {
     pub(super) files: usize,
     pub(super) timings: Vec<ArrowBatchInsertTiming>,
     pub(super) affected: BTreeMap<Signal, BTreeSet<String>>,
+}
+
+pub struct ImmutableFlushOutcome {
+    pub force: bool,
+    pub sealed_files: usize,
+    pub sealed_rows: usize,
+    pub timings: Vec<ArrowBatchInsertTiming>,
+    pub active_buffers: Value,
+}
+
+impl ImmutableFlushOutcome {
+    pub fn to_json(&self) -> Value {
+        json!({
+            "supported": true,
+            "force": self.force,
+            "sealed_files": self.sealed_files,
+            "sealed_rows": self.sealed_rows,
+            "timings": immutable_timing_snapshot(&self.timings),
+            "active_buffers": self.active_buffers,
+        })
+    }
 }
 
 pub(super) struct ImmutableSegmentWrite {
@@ -96,7 +117,7 @@ pub(super) fn distribute_commit_seconds(
     }
     let insert_timings = timings
         .iter_mut()
-        .filter(|timing| timing.phase == "storage_insert")
+        .filter(|timing| timing.phase == TimingPhase::Insert)
         .collect::<Vec<_>>();
     if insert_timings.is_empty() {
         return;
@@ -115,7 +136,7 @@ pub(super) fn distribute_commit_seconds(
 }
 
 pub(super) fn distributed_segment_timing(
-    phase: &'static str,
+    phase: TimingPhase,
     sealed: &[SealedSegment],
     seconds: f64,
 ) -> Vec<ArrowBatchInsertTiming> {
@@ -168,7 +189,7 @@ pub(super) fn write_immutable_segment(
     let parquet_bytes = to_parquet(batch).context("encode immutable segment parquet")?;
     timings.push(ArrowBatchInsertTiming {
         table,
-        phase: "storage_parquet_encode",
+        phase: TimingPhase::ParquetEncode,
         rows,
         seconds: started.elapsed().as_secs_f64(),
     });
@@ -185,7 +206,7 @@ pub(super) fn write_immutable_segment(
         .context("flush immutable segment writer before seal")?;
     timings.push(ArrowBatchInsertTiming {
         table,
-        phase: "storage_file_write",
+        phase: TimingPhase::FileWrite,
         rows,
         seconds: started.elapsed().as_secs_f64(),
     });
@@ -195,7 +216,7 @@ pub(super) fn write_immutable_segment(
         .with_context(|| format!("fsync immutable segment {}", tmp_path.display()))?;
     timings.push(ArrowBatchInsertTiming {
         table,
-        phase: "storage_file_fsync",
+        phase: TimingPhase::FileFsync,
         rows,
         seconds: started.elapsed().as_secs_f64(),
     });
@@ -211,7 +232,7 @@ pub(super) fn write_immutable_segment(
     })?;
     timings.push(ArrowBatchInsertTiming {
         table,
-        phase: "storage_file_rename",
+        phase: TimingPhase::FileRename,
         rows,
         seconds: started.elapsed().as_secs_f64(),
     });
@@ -376,7 +397,7 @@ pub(super) fn immutable_timing_snapshot(timings: &[ArrowBatchInsertTiming]) -> V
             .map(|timing| {
                 json!({
                     "table": timing.table.as_str(),
-                    "phase": timing.phase,
+                    "phase": timing.phase.as_str(),
                     "rows": timing.rows,
                     "seconds": timing.seconds,
                 })
@@ -431,10 +452,10 @@ mod tests {
         assert_eq!(
             phases,
             vec![
-                "storage_parquet_encode",
-                "storage_file_write",
-                "storage_file_fsync",
-                "storage_file_rename",
+                TimingPhase::ParquetEncode,
+                TimingPhase::FileWrite,
+                TimingPhase::FileFsync,
+                TimingPhase::FileRename,
             ]
         );
         assert!(written

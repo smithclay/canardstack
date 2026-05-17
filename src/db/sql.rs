@@ -1,7 +1,6 @@
 use chrono::{DateTime, Utc};
 use duckdb::Row;
 use serde_json::{json, Value};
-use std::collections::BTreeSet;
 
 pub fn escape_value(value: &str) -> String {
     value.replace('\'', "''")
@@ -25,6 +24,82 @@ pub fn push_eq(where_sql: &mut Vec<String>, column: &str, value: Option<&Value>)
     }
 }
 
+pub fn push_eq_expr(where_sql: &mut Vec<String>, expr: &str, value: Option<&Value>) {
+    if let Some(v) = value.and_then(Value::as_str).filter(|s| !s.is_empty()) {
+        where_sql.push(format!("{expr} = {}", quote(v)));
+    }
+}
+
+pub fn push_eq_i_expr(where_sql: &mut Vec<String>, expr: &str, value: Option<&Value>) {
+    if let Some(v) = value.and_then(Value::as_i64) {
+        where_sql.push(format!("{expr} = {v}"));
+    }
+}
+
+pub fn json_attr(column: &str, key: &str) -> String {
+    format!("json_extract_string({column}, '$.\"{key}\"')")
+}
+
+pub fn json_attr_i32(column: &str, key: &str) -> String {
+    format!("try_cast({} AS INTEGER)", json_attr(column, key))
+}
+
+pub fn coalesce_expr(exprs: &[String]) -> String {
+    format!("coalesce({})", exprs.join(", "))
+}
+
+pub fn logs_deployment_environment_expr() -> String {
+    json_attr("resource_attributes", "deployment.environment")
+}
+
+pub fn logs_http_method_expr() -> String {
+    coalesce_expr(&[
+        json_attr("log_attributes", "http.request.method"),
+        json_attr("log_attributes", "http.method"),
+    ])
+}
+
+pub fn logs_http_status_code_expr() -> String {
+    coalesce_expr(&[
+        json_attr_i32("log_attributes", "http.response.status_code"),
+        json_attr_i32("log_attributes", "http.status_code"),
+    ])
+}
+
+pub fn logs_http_route_expr() -> String {
+    json_attr("log_attributes", "http.route")
+}
+
+pub fn spans_deployment_environment_expr() -> String {
+    json_attr("resource_attributes", "deployment.environment")
+}
+
+pub fn spans_http_method_expr() -> String {
+    coalesce_expr(&[
+        json_attr("span_attributes", "http.request.method"),
+        json_attr("span_attributes", "http.method"),
+    ])
+}
+
+pub fn spans_http_status_code_expr() -> String {
+    coalesce_expr(&[
+        json_attr_i32("span_attributes", "http.response.status_code"),
+        json_attr_i32("span_attributes", "http.status_code"),
+    ])
+}
+
+pub fn spans_http_route_expr() -> String {
+    json_attr("span_attributes", "http.route")
+}
+
+pub fn spans_exception_type_expr() -> String {
+    json_attr("span_attributes", "exception.type")
+}
+
+pub fn metrics_deployment_environment_expr() -> String {
+    json_attr("resource_attributes", "deployment.environment")
+}
+
 pub fn span_row(row: &Row<'_>) -> duckdb::Result<Value> {
     Ok(json!({
         "timestamp": row.get::<_, String>(0)?,
@@ -38,15 +113,4 @@ pub fn span_row(row: &Row<'_>) -> duckdb::Result<Value> {
         "http_method": row.get::<_, Option<String>>(8)?,
         "http_status_code": row.get::<_, Option<i32>>(9)?,
     }))
-}
-
-pub fn missing_parent_count(rows: &[Value]) -> usize {
-    let spans = rows
-        .iter()
-        .filter_map(|r| r.get("span_id").and_then(Value::as_str))
-        .collect::<BTreeSet<_>>();
-    rows.iter()
-        .filter_map(|r| r.get("parent_span_id").and_then(Value::as_str))
-        .filter(|parent| !parent.is_empty() && !spans.contains(parent))
-        .count()
 }

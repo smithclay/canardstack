@@ -28,6 +28,7 @@ use ducklake::{
     attach_ducklake_connection, configure_base_connection, configure_write_connection,
     ducklake_attach_plan,
 };
+pub use immutable::ImmutableFlushOutcome;
 use immutable::ImmutableSegmentBuffer;
 use schema::create_tables_on;
 
@@ -161,10 +162,49 @@ pub struct ArrowBatchInsert<'a> {
     pub source_format: &'a str,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TimingPhase {
+    Prepare,
+    Buffer,
+    PartitionSplit,
+    ParquetEncode,
+    ParquetWrite,
+    FileWrite,
+    FileFsync,
+    FileRename,
+    DucklakeRegister,
+    DucklakeCommit,
+    Insert,
+}
+
+impl TimingPhase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TimingPhase::Prepare => "storage_prepare",
+            TimingPhase::Buffer => "storage_buffer",
+            TimingPhase::PartitionSplit => "storage_partition_split",
+            TimingPhase::ParquetEncode => "storage_parquet_encode",
+            TimingPhase::ParquetWrite => "storage_parquet_write",
+            TimingPhase::FileWrite => "storage_file_write",
+            TimingPhase::FileFsync => "storage_file_fsync",
+            TimingPhase::FileRename => "storage_file_rename",
+            TimingPhase::DucklakeRegister => "storage_ducklake_register",
+            TimingPhase::DucklakeCommit => "storage_ducklake_commit",
+            TimingPhase::Insert => "storage_insert",
+        }
+    }
+}
+
+impl std::fmt::Display for TimingPhase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ArrowBatchInsertTiming {
     pub table: Signal,
-    pub phase: &'static str,
+    pub phase: TimingPhase,
     pub rows: usize,
     pub seconds: f64,
 }

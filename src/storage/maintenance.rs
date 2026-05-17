@@ -29,7 +29,7 @@ impl Storage {
         Ok(json!({"supported": true, "status": "ok"}))
     }
 
-    pub fn compaction_decision(&self, table: Option<&str>, _min_files: usize) -> Result<Value> {
+    pub fn compaction_decision(&self, table: Option<&str>) -> Result<Value> {
         if !self.ducklake_managed_maintenance {
             return Ok(
                 json!({"supported": false, "reason": "ducklake maintenance is not managed by this process"}),
