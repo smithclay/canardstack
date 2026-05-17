@@ -263,6 +263,5 @@ Known v0 limits:
 - [Storage schema](docs/architecture/storage-schema.md)
 - [Query API](docs/architecture/query-api.md)
 - [Operator metrics](docs/architecture/operator-metrics.md)
-- [Benchmark plan](docs/planning/benchmark-plan.md)
-- [Proof gates](docs/planning/proof-gates.md)
+- [Benchmark evidence and proof gates](docs/planning/benchmark.md)
 - [Failure runbooks](docs/runbooks/failure-runbooks.md)

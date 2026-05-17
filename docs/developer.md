@@ -317,6 +317,5 @@ maintenance only. The scheduler shuts down cleanly when `serve` exits.
 - [Storage schema](architecture/storage-schema.md)
 - [Query API](architecture/query-api.md)
 - [Operator metrics](architecture/operator-metrics.md)
-- [Benchmark plan](planning/benchmark-plan.md)
-- [Proof gates](planning/proof-gates.md)
+- [Benchmark evidence and proof gates](planning/benchmark.md)
 - [Failure runbooks](runbooks/failure-runbooks.md)

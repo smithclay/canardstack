@@ -56,6 +56,15 @@ Do not label metrics by `service_name`, trace id, query text, API key, or arbitr
 | `canardstack_ducklake_flush_inlined_duration_seconds` | Histogram (`_count` / `_sum`) | `table` | Time spent in DuckLake inlined-data flush during maintenance. |
 | `canardstack_ducklake_compaction_duration_seconds` | Histogram (`_count` / `_sum`) | `table` | Time spent in DuckLake adjacent-file compaction during maintenance. Immutable telemetry disables this path, so this should normally remain flat. |
 
+The shared phase metric `canardstack_phase_duration_seconds` also records
+storage proof phases with `signal` and `phase` labels:
+`storage_prepare`, `storage_buffer`, `storage_partition_split`,
+`storage_parquet_encode`, `storage_file_write`, `storage_file_fsync`,
+`storage_file_rename`, `storage_parquet_write`,
+`storage_ducklake_register`, `storage_ducklake_commit`, and
+`storage_insert`. `storage_insert` is retained for flush accounting and
+backward-compatible benchmark parsing.
+
 ## Query Metrics
 
 | Metric | Type | Labels | Purpose |

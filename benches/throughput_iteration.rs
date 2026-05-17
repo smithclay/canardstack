@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use chrono::{Duration as ChronoDuration, Utc};
 use serde::Serialize;
 use serde_json::Value;
@@ -9,13 +9,15 @@ use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 const BENCH_NAME: &str = "throughput_iteration";
-const BENCH_VERSION: &str = "0.1.0";
-const SCENARIO_NAME: &str = "v0-local-100gpd";
+const BENCH_VERSION: &str = "0.3.0";
+const SCENARIO_NAME: &str = "throughput-iteration";
+const USAGE: &str = "cargo bench --bench throughput_iteration -- [--base-url URL] [--warmup 2m] [--duration 20m] [--target-gb-day 100] [--profile ingest-only|mixed-query] [--signals all|logs|spans|metrics] [--ingest-concurrency 1] [--query-pressure off|low|medium|high] [--query-interval 5s] [--query-concurrency 1] [--services 1] [--items-per-batch 256] [--log-records 8] [--log-body-bytes 120000] [--trace-spans 16] [--trace-attribute-bytes 48000] [--metric-series 40] [--metric-description-bytes 192] [--progress-interval 30s] [--max-runtime 27m] [--no-queries] [--report-dir DIR] [--server-pid PID] [--resource-sample-interval 5s]";
 const DETERMINISTIC_SEED: u64 = 0xCA4A_D57A_C5AC;
 const DEFAULT_TARGET_GB_PER_DAY: f64 = 100.0;
 const DEFAULT_BASE_URL: &str = "http://127.0.0.1:4318";
@@ -28,6 +30,7 @@ const DEFAULT_MAX_RUNTIME_GRACE: Duration = Duration::from_secs(5 * 60);
 const NEAR_TIMEOUT_MS: f64 = 25_000.0;
 const CLIENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_SERVICE_COUNT: usize = 1;
+const DEFAULT_LOG_RECORD_COUNT: usize = 8;
 const DEFAULT_LOG_BODY_BYTES: usize = 120_000;
 const DEFAULT_TRACE_SPAN_COUNT: usize = 16;
 const DEFAULT_TRACE_ATTRIBUTE_BYTES: usize = 48_000;
@@ -61,7 +64,7 @@ fn run() -> Result<(Report, PathBuf)> {
     let storage_config = fetch_storage_config(&client, &admin_key);
 
     let run_started = Utc::now();
-    let workload = Workload::new(run_started, args.workload.clone());
+    let workload = Workload::new(run_started, args.workload.clone(), args.signals);
     let target_bytes_per_sec = args.target_decoded_bytes_per_sec();
     let guard_deadline = Instant::now() + args.max_runtime();
 
@@ -105,6 +108,11 @@ fn run() -> Result<(Report, PathBuf)> {
         );
     }
     let measured_start = Instant::now();
+    let mut resource_sampler = ResourceSampler::spawn(
+        args.server_pid,
+        args.resource_sample_interval,
+        measured_start,
+    );
     let mut metric_samples = Vec::new();
     metric_samples.push(MetricSample::capture(
         "start",
@@ -131,6 +139,7 @@ fn run() -> Result<(Report, PathBuf)> {
         },
         Some(&mut midpoint_sample),
     );
+    let resource_samples = resource_sampler.stop();
     if let Some(sample) = midpoint_sample {
         metric_samples.push(sample);
     }
@@ -157,15 +166,16 @@ fn run() -> Result<(Report, PathBuf)> {
         metrics: scraped.clone(),
     });
 
-    let report = build_report(
-        args.clone(),
+    let report = build_report(BuildReportInput {
+        args: args.clone(),
         workload,
-        measured,
+        stats: measured,
         scraped,
         metric_samples,
+        resource_samples,
         resource_envelope,
         storage_config,
-    );
+    });
     let path = write_report(&report, args.report_dir.as_deref())?;
     Ok((report, path))
 }
@@ -246,7 +256,8 @@ fn run_phase(
         let Some(payload) =
             workload.next_payload(elapsed, config.target_bytes_per_sec, &sent_by_signal)
         else {
-            sleep_until_next_tick(deadline);
+            let slept = sleep_until_next_tick(deadline);
+            stats.record_pacing_wait(slept);
             continue;
         };
         *sent_by_signal.entry(payload.signal).or_default() += payload.decoded_bytes;
@@ -330,7 +341,7 @@ fn run_phase_concurrent_ingest(
             next_query += config.query_interval.max(Duration::from_millis(1));
             continue;
         }
-        sleep_until_next_tick(deadline);
+        let _ = sleep_until_next_tick(deadline);
     }
 
     for handle in handles {
@@ -382,7 +393,12 @@ fn ingest_worker(worker: IngestWorker) {
                 &sent_by_signal,
             ) else {
                 drop(sent_by_signal);
-                sleep_until_next_tick(worker.deadline);
+                let slept = sleep_until_next_tick(worker.deadline);
+                worker
+                    .stats
+                    .lock()
+                    .expect("lock benchmark stats")
+                    .record_pacing_wait(slept);
                 continue;
             };
             let payload = &worker.workload.payloads[payload_idx];
@@ -592,12 +608,14 @@ fn format_error_chain(err: &anyhow::Error) -> String {
         .join(": ")
 }
 
-fn sleep_until_next_tick(deadline: Instant) {
+fn sleep_until_next_tick(deadline: Instant) -> Duration {
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
-        return;
+        return Duration::ZERO;
     }
-    thread::sleep(remaining.min(Duration::from_millis(10)));
+    let sleep_for = remaining.min(Duration::from_millis(10));
+    thread::sleep(sleep_for);
+    sleep_for
 }
 
 #[derive(Clone, Copy)]
@@ -614,19 +632,44 @@ struct PhaseConfig {
     guard_deadline: Instant,
 }
 
-fn build_report(
+struct BuildReportInput {
     args: Args,
     workload: Workload,
     stats: RunStats,
     scraped: Option<ScrapedMetrics>,
     metric_samples: Vec<MetricSample>,
+    resource_samples: Vec<ResourceSample>,
     resource_envelope: ResourceEnvelope,
     storage_config: Option<Value>,
-) -> Report {
+}
+
+fn build_report(input: BuildReportInput) -> Report {
+    let BuildReportInput {
+        args,
+        workload,
+        stats,
+        scraped,
+        metric_samples,
+        resource_samples,
+        resource_envelope,
+        storage_config,
+    } = input;
     let measured_seconds = stats.elapsed.as_secs_f64().max(0.001);
     let target_decoded_bytes_per_sec = args.target_decoded_bytes_per_sec();
     let actual_decoded_bytes_per_sec = stats.accepted_decoded_bytes as f64 / measured_seconds;
     let request_bytes_per_sec = stats.request_bytes_sent as f64 / measured_seconds;
+    let generator = GeneratorReport {
+        ingest_concurrency: args.ingest_concurrency,
+        pacing_wait_count: stats.pacing_wait_count,
+        pacing_wait_seconds: stats.pacing_wait_seconds,
+        pacing_wait_fraction_of_worker_time: (args.ingest_concurrency > 0).then_some(
+            stats.pacing_wait_seconds / (measured_seconds * args.ingest_concurrency as f64),
+        ),
+        target_utilization: Some(actual_decoded_bytes_per_sec / target_decoded_bytes_per_sec),
+        likely_generator_or_schedule_limited: actual_decoded_bytes_per_sec
+            < target_decoded_bytes_per_sec * 0.98
+            && stats.pacing_wait_seconds > measured_seconds * 0.05,
+    };
     let accepted_records_per_sec_by_signal = stats
         .accepted_records_by_signal
         .iter()
@@ -667,6 +710,23 @@ fn build_report(
             "{} transport errors observed",
             stats.transport_errors
         ));
+    }
+    if generator.likely_generator_or_schedule_limited {
+        smell_observations.push(
+            "generator pacing suggests the benchmark schedule may be limiting throughput"
+                .to_string(),
+        );
+    }
+    if args.server_pid.is_none() {
+        smell_observations.push(
+            "server process resource sampling unavailable; pass --server-pid or set CANARDSTACK_BENCHMARK_SERVER_PID".to_string(),
+        );
+    }
+    if !resource_samples
+        .iter()
+        .any(|sample| sample.process == "server" && sample.available)
+    {
+        smell_observations.push("server CPU/RSS samples unavailable".to_string());
     }
     if stats.guard_exceeded {
         failure_reasons.push("benchmark max-runtime guard expired".to_string());
@@ -852,6 +912,7 @@ fn build_report(
         base_url: args.base_url.clone(),
         resource_envelope,
         storage_config,
+        generator,
         workload_profile: args.workload.clone(),
         query_profile: QueryProfileReport {
             profile: args.profile.as_str().to_string(),
@@ -864,11 +925,12 @@ fn build_report(
             name: SCENARIO_NAME.to_string(),
             deterministic_seed: DETERMINISTIC_SEED,
             target_gb_per_day: args.target_gb_per_day,
-            byte_mix: BTreeMap::from([
-                ("logs".to_string(), 0.60),
-                ("spans".to_string(), 0.25),
-                ("metrics".to_string(), 0.15),
-            ]),
+            signals: args.signals.as_str().to_string(),
+            byte_mix: workload
+                .payloads
+                .iter()
+                .map(|payload| (payload.signal.to_string(), payload.ratio))
+                .collect(),
             payloads: workload
                 .payloads
                 .iter()
@@ -897,6 +959,7 @@ fn build_report(
         storage,
         server_phase_timing,
         ducklake_maintenance_timing,
+        resource_samples,
         metric_snapshots,
         queue_oldest_age_trend,
         queue_rows_trend,
@@ -936,10 +999,12 @@ fn print_summary(report: &Report, path: &Path) {
         report.query_profile.concurrency
     );
     println!(
-        "workload services={} log_body_bytes={} trace_spans={} metric_series={} metric_description_bytes={}",
+        "workload services={} log_records={} log_body_bytes={} trace_spans={} trace_attribute_bytes={} metric_series={} metric_description_bytes={}",
         report.workload_profile.service_count,
+        report.workload_profile.log_record_count,
         report.workload_profile.log_body_bytes,
         report.workload_profile.trace_span_count,
+        report.workload_profile.trace_attribute_bytes,
         report.workload_profile.metric_series_count,
         report.workload_profile.metric_description_bytes
     );
@@ -962,6 +1027,39 @@ fn print_summary(report: &Report, path: &Path) {
             .unwrap_or("n/a")
     );
     println!("status_counts={:?}", report.http_status_counts);
+    println!(
+        "generator pacing_wait_seconds={:.3} pacing_wait_fraction={} target_utilization={} schedule_limited={}",
+        report.generator.pacing_wait_seconds,
+        report
+            .generator
+            .pacing_wait_fraction_of_worker_time
+            .map(|value| format!("{value:.3}"))
+            .unwrap_or_else(|| "n/a".to_string()),
+        report
+            .generator
+            .target_utilization
+            .map(|value| format!("{value:.3}"))
+            .unwrap_or_else(|| "n/a".to_string()),
+        report.generator.likely_generator_or_schedule_limited
+    );
+    for (process, sample) in peak_resource_samples(&report.resource_samples) {
+        println!(
+            "resource_peak process={} cpu_percent={} memory_percent={} rss_mib={}",
+            process,
+            sample
+                .cpu_percent
+                .map(|value| format!("{value:.1}"))
+                .unwrap_or_else(|| "n/a".to_string()),
+            sample
+                .memory_percent
+                .map(|value| format!("{value:.1}"))
+                .unwrap_or_else(|| "n/a".to_string()),
+            sample
+                .rss_kib
+                .map(|value| format!("{:.1}", value as f64 / 1024.0))
+                .unwrap_or_else(|| "n/a".to_string())
+        );
+    }
     println!(
         "ingest_latency_ms p50={} p95={} p99={} count={}",
         fmt_optional(report.ingest_latency_ms.p50),
@@ -1025,11 +1123,14 @@ struct Args {
     query_concurrency: usize,
     query_pressure: QueryPressure,
     profile: BenchmarkProfile,
+    signals: SignalSelection,
     workload: WorkloadProfile,
     progress_interval: Duration,
     max_runtime: Option<Duration>,
     no_queries_legacy: bool,
     report_dir: Option<PathBuf>,
+    server_pid: Option<u32>,
+    resource_sample_interval: Duration,
 }
 
 impl Args {
@@ -1044,11 +1145,16 @@ impl Args {
             query_concurrency: DEFAULT_QUERY_CONCURRENCY,
             query_pressure: QueryPressure::Medium,
             profile: BenchmarkProfile::MixedQuery,
+            signals: SignalSelection::All,
             workload: WorkloadProfile::default(),
             progress_interval: DEFAULT_PROGRESS_INTERVAL,
             max_runtime: None,
             no_queries_legacy: false,
             report_dir: None,
+            server_pid: env::var("CANARDSTACK_BENCHMARK_SERVER_PID")
+                .ok()
+                .and_then(|pid| pid.parse().ok()),
+            resource_sample_interval: Duration::from_secs(5),
         };
         let mut explicit_query_interval = false;
         let mut explicit_query_concurrency = false;
@@ -1056,114 +1162,96 @@ impl Args {
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--base-url" => {
-                    parsed.base_url = args.next().context("--base-url requires a value")?;
+                    parsed.base_url = next_arg(&mut args, "--base-url")?;
                 }
                 "--warmup" => {
-                    parsed.warmup =
-                        parse_duration(&args.next().context("--warmup requires a value")?)?;
+                    parsed.warmup = parse_duration(&next_arg(&mut args, "--warmup")?)?;
                 }
                 "--duration" => {
-                    parsed.duration =
-                        parse_duration(&args.next().context("--duration requires a value")?)?;
+                    parsed.duration = parse_duration(&next_arg(&mut args, "--duration")?)?;
                 }
                 "--target-gb-day" => {
-                    parsed.target_gb_per_day = args
-                        .next()
-                        .context("--target-gb-day requires a value")?
-                        .parse()
-                        .context("invalid --target-gb-day")?;
+                    parsed.target_gb_per_day = parse_next(&mut args, "--target-gb-day")?;
                 }
                 "--query-interval" => {
                     parsed.query_interval =
-                        parse_duration(&args.next().context("--query-interval requires a value")?)?;
+                        parse_duration(&next_arg(&mut args, "--query-interval")?)?;
                     explicit_query_interval = true;
                 }
                 "--ingest-concurrency" => {
-                    parsed.ingest_concurrency = args
-                        .next()
-                        .context("--ingest-concurrency requires a value")?
-                        .parse()
-                        .context("invalid --ingest-concurrency")?;
+                    parsed.ingest_concurrency = parse_next(&mut args, "--ingest-concurrency")?;
                 }
                 "--query-concurrency" => {
-                    parsed.query_concurrency = args
-                        .next()
-                        .context("--query-concurrency requires a value")?
-                        .parse()
-                        .context("invalid --query-concurrency")?;
+                    parsed.query_concurrency = parse_next(&mut args, "--query-concurrency")?;
                     explicit_query_concurrency = true;
                 }
                 "--query-pressure" => {
-                    parsed.query_pressure = QueryPressure::parse(
-                        &args.next().context("--query-pressure requires a value")?,
-                    )?;
+                    parsed.query_pressure =
+                        QueryPressure::parse(&next_arg(&mut args, "--query-pressure")?)?;
                 }
                 "--profile" => {
-                    parsed.profile = BenchmarkProfile::parse(
-                        &args.next().context("--profile requires a value")?,
-                    )?;
+                    parsed.profile = BenchmarkProfile::parse(&next_arg(&mut args, "--profile")?)?;
+                }
+                "--signals" | "--signal" => {
+                    parsed.signals = SignalSelection::parse(&next_arg(&mut args, "--signals")?)?;
                 }
                 "--services" => {
-                    parsed.workload.service_count = args
-                        .next()
-                        .context("--services requires a value")?
-                        .parse()
-                        .context("invalid --services")?;
+                    parsed.workload.service_count = parse_next(&mut args, "--services")?;
                 }
                 "--log-body-bytes" => {
-                    parsed.workload.log_body_bytes = args
-                        .next()
-                        .context("--log-body-bytes requires a value")?
-                        .parse()
-                        .context("invalid --log-body-bytes")?;
+                    parsed.workload.log_body_bytes = parse_next(&mut args, "--log-body-bytes")?;
+                }
+                "--log-records" => {
+                    parsed.workload.log_record_count = parse_next(&mut args, "--log-records")?;
+                }
+                "--items-per-batch" => {
+                    let items_per_batch: usize = parse_next(&mut args, "--items-per-batch")?;
+                    if items_per_batch == 0 {
+                        bail!("--items-per-batch must be > 0");
+                    }
+                    parsed.workload.log_record_count = items_per_batch;
+                    parsed.workload.trace_span_count = items_per_batch;
+                    parsed.workload.metric_series_count = items_per_batch.div_ceil(2);
                 }
                 "--trace-spans" => {
-                    parsed.workload.trace_span_count = args
-                        .next()
-                        .context("--trace-spans requires a value")?
-                        .parse()
-                        .context("invalid --trace-spans")?;
+                    parsed.workload.trace_span_count = parse_next(&mut args, "--trace-spans")?;
+                }
+                "--trace-attribute-bytes" => {
+                    parsed.workload.trace_attribute_bytes =
+                        parse_next(&mut args, "--trace-attribute-bytes")?;
                 }
                 "--metric-series" => {
-                    parsed.workload.metric_series_count = args
-                        .next()
-                        .context("--metric-series requires a value")?
-                        .parse()
-                        .context("invalid --metric-series")?;
+                    parsed.workload.metric_series_count = parse_next(&mut args, "--metric-series")?;
                 }
                 "--metric-description-bytes" => {
-                    parsed.workload.metric_description_bytes = args
-                        .next()
-                        .context("--metric-description-bytes requires a value")?
-                        .parse()
-                        .context("invalid --metric-description-bytes")?;
+                    parsed.workload.metric_description_bytes =
+                        parse_next(&mut args, "--metric-description-bytes")?;
                 }
                 "--progress-interval" => {
-                    parsed.progress_interval = parse_duration(
-                        &args
-                            .next()
-                            .context("--progress-interval requires a value")?,
-                    )?;
+                    parsed.progress_interval =
+                        parse_duration(&next_arg(&mut args, "--progress-interval")?)?;
                 }
                 "--max-runtime" => {
-                    parsed.max_runtime = Some(parse_duration(
-                        &args.next().context("--max-runtime requires a value")?,
-                    )?);
+                    parsed.max_runtime =
+                        Some(parse_duration(&next_arg(&mut args, "--max-runtime")?)?);
                 }
                 "--no-queries" => {
                     parsed.no_queries_legacy = true;
                     parsed.profile = BenchmarkProfile::IngestOnly;
                 }
                 "--report-dir" => {
-                    parsed.report_dir = Some(PathBuf::from(
-                        args.next().context("--report-dir requires a value")?,
-                    ));
+                    parsed.report_dir = Some(PathBuf::from(next_arg(&mut args, "--report-dir")?));
+                }
+                "--server-pid" => {
+                    parsed.server_pid = Some(parse_next(&mut args, "--server-pid")?);
+                }
+                "--resource-sample-interval" => {
+                    parsed.resource_sample_interval =
+                        parse_duration(&next_arg(&mut args, "--resource-sample-interval")?)?;
                 }
                 "--bench" => {}
                 "--help" | "-h" => {
-                    println!(
-                        "cargo bench --bench throughput_iteration -- [--base-url URL] [--warmup 2m] [--duration 20m] [--target-gb-day 100] [--profile ingest-only|mixed-query] [--ingest-concurrency 1] [--query-pressure off|low|medium|high] [--query-interval 5s] [--query-concurrency 1] [--services 1] [--log-body-bytes 120000] [--trace-spans 16] [--metric-series 40] [--metric-description-bytes 192] [--progress-interval 30s] [--max-runtime 27m] [--no-queries] [--report-dir DIR]"
-                    );
+                    println!("{USAGE}");
                     std::process::exit(0);
                 }
                 _ => bail!("unknown argument {arg}; use --help"),
@@ -1194,6 +1282,9 @@ impl Args {
         if parsed.progress_interval.is_zero() {
             bail!("--progress-interval must be positive");
         }
+        if parsed.resource_sample_interval.is_zero() {
+            bail!("--resource-sample-interval must be positive");
+        }
         if parsed
             .max_runtime
             .is_some_and(|max_runtime| max_runtime < parsed.warmup + parsed.duration)
@@ -1216,6 +1307,44 @@ impl Args {
         self.no_queries_legacy
             || matches!(self.profile, BenchmarkProfile::IngestOnly)
             || matches!(self.query_pressure, QueryPressure::Off)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SignalSelection {
+    All,
+    Logs,
+    Spans,
+    Metrics,
+}
+
+impl SignalSelection {
+    fn parse(raw: &str) -> Result<Self> {
+        match raw {
+            "all" => Ok(Self::All),
+            "logs" | "log" => Ok(Self::Logs),
+            "spans" | "traces" | "trace" => Ok(Self::Spans),
+            "metrics" | "metric" => Ok(Self::Metrics),
+            _ => bail!("--signals must be all, logs, spans, or metrics"),
+        }
+    }
+
+    fn includes(self, signal: &str) -> bool {
+        match self {
+            Self::All => true,
+            Self::Logs => signal == "logs",
+            Self::Spans => signal == "spans",
+            Self::Metrics => signal == "metrics",
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Logs => "logs",
+            Self::Spans => "spans",
+            Self::Metrics => "metrics",
+        }
     }
 }
 
@@ -1291,6 +1420,7 @@ impl QueryPressure {
 #[derive(Clone, Serialize)]
 struct WorkloadProfile {
     service_count: usize,
+    log_record_count: usize,
     log_body_bytes: usize,
     trace_span_count: usize,
     trace_attribute_bytes: usize,
@@ -1302,6 +1432,7 @@ impl Default for WorkloadProfile {
     fn default() -> Self {
         Self {
             service_count: DEFAULT_SERVICE_COUNT,
+            log_record_count: DEFAULT_LOG_RECORD_COUNT,
             log_body_bytes: DEFAULT_LOG_BODY_BYTES,
             trace_span_count: DEFAULT_TRACE_SPAN_COUNT,
             trace_attribute_bytes: DEFAULT_TRACE_ATTRIBUTE_BYTES,
@@ -1319,6 +1450,9 @@ impl WorkloadProfile {
         if self.log_body_bytes == 0 {
             bail!("--log-body-bytes must be > 0");
         }
+        if self.log_record_count == 0 {
+            bail!("--log-records must be > 0");
+        }
         if self.trace_span_count == 0 {
             bail!("--trace-spans must be > 0");
         }
@@ -1327,6 +1461,20 @@ impl WorkloadProfile {
         }
         Ok(())
     }
+}
+
+fn next_arg(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<String> {
+    args.next()
+        .with_context(|| format!("{flag} requires a value"))
+}
+
+fn parse_next<T>(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<T>
+where
+    T: std::str::FromStr,
+{
+    next_arg(args, flag)?
+        .parse()
+        .map_err(|_| anyhow!("invalid {flag}"))
 }
 
 fn parse_duration(raw: &str) -> Result<Duration> {
@@ -1408,23 +1556,150 @@ fn read_trimmed(path: &str) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
+struct ResourceSampler {
+    stop: Arc<AtomicBool>,
+    samples: Arc<Mutex<Vec<ResourceSample>>>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl ResourceSampler {
+    fn spawn(server_pid: Option<u32>, interval: Duration, started: Instant) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let samples = Arc::new(Mutex::new(Vec::new()));
+        let stop_for_thread = stop.clone();
+        let samples_for_thread = samples.clone();
+        let benchmark_pid = std::process::id();
+        let handle = thread::Builder::new()
+            .name("canardstack-bench-resource-sampler".to_string())
+            .spawn(move || {
+                while !stop_for_thread.load(Ordering::SeqCst) {
+                    push_resource_samples(&samples_for_thread, started, benchmark_pid, server_pid);
+                    let sleep_until = Instant::now() + interval;
+                    while !stop_for_thread.load(Ordering::SeqCst) && Instant::now() < sleep_until {
+                        thread::sleep(Duration::from_millis(100));
+                    }
+                }
+                push_resource_samples(&samples_for_thread, started, benchmark_pid, server_pid);
+            })
+            .expect("spawn benchmark resource sampler");
+        Self {
+            stop,
+            samples,
+            handle: Some(handle),
+        }
+    }
+
+    fn stop(&mut self) -> Vec<ResourceSample> {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+        self.samples.lock().expect("lock resource samples").clone()
+    }
+}
+
+fn push_resource_samples(
+    samples: &Arc<Mutex<Vec<ResourceSample>>>,
+    started: Instant,
+    benchmark_pid: u32,
+    server_pid: Option<u32>,
+) {
+    let elapsed = started.elapsed().as_secs_f64();
+    let mut next = Vec::new();
+    next.push(process_resource_sample("benchmark", benchmark_pid, elapsed));
+    if let Some(pid) = server_pid {
+        next.push(process_resource_sample("server", pid, elapsed));
+    }
+    samples.lock().expect("lock resource samples").extend(next);
+}
+
+fn process_resource_sample(process: &'static str, pid: u32, elapsed: f64) -> ResourceSample {
+    match read_process_stats(pid) {
+        Some(stats) => ResourceSample {
+            process,
+            pid,
+            seconds_from_measured_start: elapsed,
+            available: true,
+            cpu_percent: stats.cpu_percent,
+            memory_percent: stats.memory_percent,
+            rss_kib: stats.rss_kib,
+            error: None,
+        },
+        None => ResourceSample {
+            process,
+            pid,
+            seconds_from_measured_start: elapsed,
+            available: false,
+            cpu_percent: None,
+            memory_percent: None,
+            rss_kib: None,
+            error: Some("ps sample unavailable".to_string()),
+        },
+    }
+}
+
+fn read_process_stats(pid: u32) -> Option<ProcessStats> {
+    let output = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "%cpu=,%mem=,rss="])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut fields = stdout.split_whitespace();
+    Some(ProcessStats {
+        cpu_percent: fields.next()?.parse().ok(),
+        memory_percent: fields.next()?.parse().ok(),
+        rss_kib: fields.next()?.parse().ok(),
+    })
+}
+
+struct ProcessStats {
+    cpu_percent: Option<f64>,
+    memory_percent: Option<f64>,
+    rss_kib: Option<u64>,
+}
+
+#[derive(Clone, Serialize)]
+struct ResourceSample {
+    process: &'static str,
+    pid: u32,
+    seconds_from_measured_start: f64,
+    available: bool,
+    cpu_percent: Option<f64>,
+    memory_percent: Option<f64>,
+    rss_kib: Option<u64>,
+    error: Option<String>,
+}
+
 #[derive(Clone)]
 struct Workload {
     payloads: Vec<WorkloadPayload>,
 }
 
 impl Workload {
-    fn new(run_started: chrono::DateTime<Utc>, profile: WorkloadProfile) -> Self {
+    fn new(
+        run_started: chrono::DateTime<Utc>,
+        profile: WorkloadProfile,
+        signals: SignalSelection,
+    ) -> Self {
         let base_nanos = run_started
             .timestamp_nanos_opt()
             .unwrap_or(run_started.timestamp_millis() * 1_000_000);
-        Self {
-            payloads: vec![
-                WorkloadPayload::logs(base_nanos, &profile),
-                WorkloadPayload::spans(base_nanos, &profile),
-                WorkloadPayload::metrics(base_nanos, &profile),
-            ],
+        let mut payloads = vec![
+            WorkloadPayload::logs(base_nanos, &profile),
+            WorkloadPayload::spans(base_nanos, &profile),
+            WorkloadPayload::metrics(base_nanos, &profile),
+        ]
+        .into_iter()
+        .filter(|payload| signals.includes(payload.signal))
+        .collect::<Vec<_>>();
+        let ratio_total = payloads.iter().map(|payload| payload.ratio).sum::<f64>();
+        for payload in &mut payloads {
+            payload.ratio /= ratio_total;
         }
+        Self { payloads }
     }
 
     fn next_payload(
@@ -1478,7 +1753,7 @@ impl WorkloadPayload {
             content_type: otlp_fixture::CONTENT_TYPE,
             ratio: 0.60,
             decoded_bytes: body.len(),
-            records_per_request: (profile.service_count * 8) as u64,
+            records_per_request: (profile.service_count * profile.log_record_count) as u64,
             body,
         }
     }
@@ -1565,7 +1840,7 @@ mod otlp_fixture {
                     resource: Some(resource(service_idx)),
                     scope_logs: vec![ScopeLogs {
                         scope: Some(scope()),
-                        log_records: (0..8)
+                        log_records: (0..profile.log_record_count as i64)
                             .map(|idx| {
                                 let logical_idx = service_idx as i64 * 1_000 + idx;
                                 let nanos = nanos(base_nanos, logical_idx);
@@ -1853,6 +2128,8 @@ struct RunStats {
     query_requests: u64,
     query_failures: u64,
     transport_errors: u64,
+    pacing_wait_count: u64,
+    pacing_wait_seconds: f64,
     errors: Vec<String>,
     guard_exceeded: bool,
 }
@@ -1860,6 +2137,14 @@ struct RunStats {
 impl RunStats {
     fn status_counts_inc(&mut self, status: u16) {
         *self.status_counts.entry(status).or_default() += 1;
+    }
+
+    fn record_pacing_wait(&mut self, slept: Duration) {
+        if slept.is_zero() {
+            return;
+        }
+        self.pacing_wait_count += 1;
+        self.pacing_wait_seconds += slept.as_secs_f64();
     }
 
     fn record_ingest_outcome(
@@ -1906,6 +2191,8 @@ impl RunStats {
         self.query_requests += other.query_requests;
         self.query_failures += other.query_failures;
         self.transport_errors += other.transport_errors;
+        self.pacing_wait_count += other.pacing_wait_count;
+        self.pacing_wait_seconds += other.pacing_wait_seconds;
         self.errors.extend(other.errors);
         self.guard_exceeded |= other.guard_exceeded;
     }
@@ -2339,6 +2626,21 @@ fn top_phase_timings(
     timings
 }
 
+fn peak_resource_samples(samples: &[ResourceSample]) -> Vec<(&'static str, &ResourceSample)> {
+    let mut peaks = BTreeMap::new();
+    for sample in samples.iter().filter(|sample| sample.available) {
+        let replace = peaks
+            .get(sample.process)
+            .is_none_or(|current: &&ResourceSample| {
+                sample.cpu_percent.unwrap_or(0.0) > current.cpu_percent.unwrap_or(0.0)
+            });
+        if replace {
+            peaks.insert(sample.process, sample);
+        }
+    }
+    peaks.into_iter().collect()
+}
+
 #[derive(Serialize)]
 struct Report {
     git_sha: Option<String>,
@@ -2347,6 +2649,7 @@ struct Report {
     base_url: String,
     resource_envelope: ResourceEnvelope,
     storage_config: Option<Value>,
+    generator: GeneratorReport,
     workload_profile: WorkloadProfile,
     query_profile: QueryProfileReport,
     scenario: ScenarioReport,
@@ -2364,6 +2667,7 @@ struct Report {
     storage: Option<StorageReport>,
     server_phase_timing: BTreeMap<String, PhaseTimingReport>,
     ducklake_maintenance_timing: BTreeMap<String, PhaseTimingReport>,
+    resource_samples: Vec<ResourceSample>,
     metric_snapshots: Vec<MetricSnapshotReport>,
     queue_oldest_age_trend: TrendReport,
     queue_rows_trend: TrendReport,
@@ -2373,6 +2677,16 @@ struct Report {
     smell_observations: Vec<String>,
     pass: bool,
     failure_reasons: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct GeneratorReport {
+    ingest_concurrency: usize,
+    pacing_wait_count: u64,
+    pacing_wait_seconds: f64,
+    pacing_wait_fraction_of_worker_time: Option<f64>,
+    target_utilization: Option<f64>,
+    likely_generator_or_schedule_limited: bool,
 }
 
 #[derive(Serialize)]
@@ -2406,6 +2720,7 @@ struct ScenarioReport {
     name: String,
     deterministic_seed: u64,
     target_gb_per_day: f64,
+    signals: String,
     byte_mix: BTreeMap<String, f64>,
     payloads: Vec<PayloadReport>,
 }

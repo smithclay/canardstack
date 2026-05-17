@@ -9,11 +9,11 @@ use arrow58::compute::{concat_batches, take};
 use arrow58::record_batch::RecordBatch;
 use chrono::{DateTime, Datelike, NaiveDate, Timelike, Utc};
 use duckdb::Connection;
-use otlp2records::output::write_parquet;
+use otlp2records::to_parquet;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
-use std::io::BufWriter;
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -34,6 +34,11 @@ pub(super) struct ImmutableSealResult {
     pub(super) files: usize,
     pub(super) timings: Vec<ArrowBatchInsertTiming>,
     pub(super) affected: BTreeMap<Signal, BTreeSet<String>>,
+}
+
+pub(super) struct ImmutableSegmentWrite {
+    pub(super) segment: SealedSegment,
+    pub(super) timings: Vec<ArrowBatchInsertTiming>,
 }
 
 impl ImmutableSegmentBuffer {
@@ -108,6 +113,34 @@ pub(super) fn distribute_commit_seconds(
         timing.seconds += commit_seconds * timing.rows as f64 / total_rows as f64;
     }
 }
+
+pub(super) fn distributed_segment_timing(
+    phase: &'static str,
+    sealed: &[SealedSegment],
+    seconds: f64,
+) -> Vec<ArrowBatchInsertTiming> {
+    if sealed.is_empty() {
+        return Vec::new();
+    }
+    let total_rows = sealed.iter().map(|segment| segment.rows).sum::<usize>();
+    sealed
+        .iter()
+        .map(|segment| {
+            let segment_seconds = if total_rows == 0 {
+                seconds / sealed.len() as f64
+            } else {
+                seconds * segment.rows as f64 / total_rows as f64
+            };
+            ArrowBatchInsertTiming {
+                table: segment.table,
+                phase,
+                rows: segment.rows,
+                seconds: segment_seconds,
+            }
+        })
+        .collect()
+}
+
 pub(super) struct SealedSegment {
     pub(super) table: Signal,
     pub(super) path: PathBuf,
@@ -119,7 +152,7 @@ pub(super) fn write_immutable_segment(
     table: Signal,
     partition: ImmutableSegmentPartition,
     batch: &RecordBatch,
-) -> Result<SealedSegment> {
+) -> Result<ImmutableSegmentWrite> {
     let final_path = immutable_segment_path(storage_dir, table, partition)?;
     let parent = final_path
         .parent()
@@ -128,17 +161,47 @@ pub(super) fn write_immutable_segment(
         .with_context(|| format!("create immutable segment directory {}", parent.display()))?;
 
     let tmp_path = final_path.with_extension("parquet.tmp");
+    let mut timings = Vec::new();
+    let rows = batch.num_rows();
+
+    let started = Instant::now();
+    let parquet_bytes = to_parquet(batch).context("encode immutable segment parquet")?;
+    timings.push(ArrowBatchInsertTiming {
+        table,
+        phase: "storage_parquet_encode",
+        rows,
+        seconds: started.elapsed().as_secs_f64(),
+    });
+
+    let started = Instant::now();
     let mut file = BufWriter::new(
         File::create(&tmp_path)
             .with_context(|| format!("create immutable segment {}", tmp_path.display()))?,
     );
-    write_parquet(batch, &mut file, None).context("encode immutable segment parquet")?;
+    file.write_all(&parquet_bytes)
+        .with_context(|| format!("write immutable segment {}", tmp_path.display()))?;
     let file = file
         .into_inner()
         .context("flush immutable segment writer before seal")?;
+    timings.push(ArrowBatchInsertTiming {
+        table,
+        phase: "storage_file_write",
+        rows,
+        seconds: started.elapsed().as_secs_f64(),
+    });
+
+    let started = Instant::now();
     file.sync_all()
         .with_context(|| format!("fsync immutable segment {}", tmp_path.display()))?;
+    timings.push(ArrowBatchInsertTiming {
+        table,
+        phase: "storage_file_fsync",
+        rows,
+        seconds: started.elapsed().as_secs_f64(),
+    });
     drop(file);
+
+    let started = Instant::now();
     fs::rename(&tmp_path, &final_path).with_context(|| {
         format!(
             "seal immutable segment {} -> {}",
@@ -146,11 +209,20 @@ pub(super) fn write_immutable_segment(
             final_path.display()
         )
     })?;
-
-    Ok(SealedSegment {
+    timings.push(ArrowBatchInsertTiming {
         table,
-        path: final_path,
-        rows: batch.num_rows(),
+        phase: "storage_file_rename",
+        rows,
+        seconds: started.elapsed().as_secs_f64(),
+    });
+
+    Ok(ImmutableSegmentWrite {
+        segment: SealedSegment {
+            table,
+            path: final_path,
+            rows,
+        },
+        timings,
     })
 }
 
@@ -311,4 +383,63 @@ pub(super) fn immutable_timing_snapshot(timings: &[ArrowBatchInsertTiming]) -> V
             })
             .collect(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow58::array::{Int64Array, TimestampMicrosecondArray};
+    use arrow58::datatypes::{DataType, Field, Schema, TimeUnit};
+    use std::sync::Arc;
+    use tempfile::tempdir;
+
+    #[test]
+    fn immutable_segment_write_reports_detailed_timings() {
+        let dir = tempdir().unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                false,
+            ),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(TimestampMicrosecondArray::from(vec![1_000_000, 2_000_000])),
+                Arc::new(Int64Array::from(vec![10, 20])),
+            ],
+        )
+        .unwrap();
+        let partition = ImmutableSegmentPartition {
+            timestamp_day: "2026-05-16".to_string(),
+            hour: 0,
+        };
+
+        let written = write_immutable_segment(dir.path(), Signal::Logs, partition, &batch).unwrap();
+
+        assert_eq!(written.segment.table, Signal::Logs);
+        assert_eq!(written.segment.rows, 2);
+        assert!(written.segment.path.exists());
+
+        let phases = written
+            .timings
+            .iter()
+            .map(|timing| timing.phase)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            phases,
+            vec![
+                "storage_parquet_encode",
+                "storage_file_write",
+                "storage_file_fsync",
+                "storage_file_rename",
+            ]
+        );
+        assert!(written
+            .timings
+            .iter()
+            .all(|timing| timing.table == Signal::Logs && timing.rows == 2));
+    }
 }

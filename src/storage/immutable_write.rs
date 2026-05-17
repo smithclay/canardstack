@@ -1,9 +1,9 @@
 use super::arrow::{batch_timestamp_days, storage_duckdb_batch};
 use super::ducklake::configure_write_connection;
 use super::immutable::{
-    distribute_commit_seconds, immutable_buffer_snapshot, immutable_timing_snapshot,
-    register_ducklake_data_file, split_batch_by_immutable_partition, write_immutable_segment,
-    ImmutableSealResult,
+    distribute_commit_seconds, distributed_segment_timing, immutable_buffer_snapshot,
+    immutable_timing_snapshot, register_ducklake_data_file, split_batch_by_immutable_partition,
+    write_immutable_segment, ImmutableSealResult,
 };
 use super::{
     ArrowBatchInsert, ArrowBatchInsertResult, ArrowBatchInsertTiming, ImmutableSegmentBuffer,
@@ -181,13 +181,19 @@ impl Storage {
         for (&table, buffer) in buffers {
             let batch = buffer.record_batch(table)?;
             let started = Instant::now();
-            let segments = split_batch_by_immutable_partition(&batch)?
-                .into_iter()
-                .map(|(partition, batch)| {
-                    write_immutable_segment(&self.local_storage_dir, table, partition, &batch)
-                })
-                .collect::<Result<Vec<_>>>()?;
-            sealed.extend(segments);
+            let partitions = split_batch_by_immutable_partition(&batch)?;
+            timings.push(ArrowBatchInsertTiming {
+                table,
+                phase: "storage_partition_split",
+                rows: buffer.rows,
+                seconds: started.elapsed().as_secs_f64(),
+            });
+            for (partition, batch) in partitions {
+                let write =
+                    write_immutable_segment(&self.local_storage_dir, table, partition, &batch)?;
+                timings.extend(write.timings);
+                sealed.push(write.segment);
+            }
             timings.push(ArrowBatchInsertTiming {
                 table,
                 phase: "storage_parquet_write",
@@ -209,16 +215,29 @@ impl Storage {
                     segment.table,
                     &segment.path,
                 )?;
+                let register_seconds = started.elapsed().as_secs_f64();
+                timings.push(ArrowBatchInsertTiming {
+                    table: segment.table,
+                    phase: "storage_ducklake_register",
+                    rows: segment.rows,
+                    seconds: register_seconds,
+                });
                 timings.push(ArrowBatchInsertTiming {
                     table: segment.table,
                     phase: "storage_insert",
                     rows: segment.rows,
-                    seconds: started.elapsed().as_secs_f64(),
+                    seconds: register_seconds,
                 });
             }
             let commit_started = Instant::now();
             conn.execute_batch("COMMIT;")?;
-            distribute_commit_seconds(&mut timings, commit_started.elapsed().as_secs_f64());
+            let commit_seconds = commit_started.elapsed().as_secs_f64();
+            timings.extend(distributed_segment_timing(
+                "storage_ducklake_commit",
+                &sealed,
+                commit_seconds,
+            ));
+            distribute_commit_seconds(&mut timings, commit_seconds);
             Ok(())
         })();
 
