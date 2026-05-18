@@ -80,12 +80,26 @@ impl Metrics {
             .insert(key(name, labels), value);
     }
 
+    pub fn gauge_max(&self, name: &str, labels: &[(&str, &str)], value: f64) {
+        let mut inner = self.inner.lock_or_poisoned();
+        let metric_key = key(name, labels);
+        let current = inner.gauges.get(&metric_key).copied().unwrap_or(value);
+        inner.gauges.insert(metric_key, current.max(value));
+    }
+
     pub fn observe_seconds(&self, name: &str, labels: &[(&str, &str)], seconds: f64) {
+        self.observe_seconds_n(name, labels, 1, seconds);
+    }
+
+    pub fn observe_seconds_n(&self, name: &str, labels: &[(&str, &str)], count: u64, seconds: f64) {
+        if count == 0 {
+            return;
+        }
         let mut inner = self.inner.lock_or_poisoned();
         *inner
             .counters
             .entry(key(&format!("{name}_count"), labels))
-            .or_default() += 1;
+            .or_default() += count;
         let sum_key = key(&format!("{name}_sum"), labels);
         let current = inner.gauges.get(&sum_key).copied().unwrap_or(0.0);
         inner.gauges.insert(sum_key, current + seconds);
@@ -112,6 +126,35 @@ impl Metrics {
             self.observe_seconds(
                 "canardstack_phase_duration_seconds",
                 &[("signal", signal), ("phase", phase)],
+                seconds,
+            );
+        }
+    }
+
+    pub fn observe_phase_seconds_n(
+        &self,
+        signal: &str,
+        phase: &str,
+        query_class: Option<&str>,
+        count: u64,
+        seconds: f64,
+    ) {
+        if let Some(query_class) = query_class {
+            self.observe_seconds_n(
+                "canardstack_phase_duration_seconds",
+                &[
+                    ("signal", signal),
+                    ("phase", phase),
+                    ("query_class", query_class),
+                ],
+                count,
+                seconds,
+            );
+        } else {
+            self.observe_seconds_n(
+                "canardstack_phase_duration_seconds",
+                &[("signal", signal), ("phase", phase)],
+                count,
                 seconds,
             );
         }

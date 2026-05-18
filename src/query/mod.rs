@@ -139,12 +139,7 @@ impl QueryEngine {
                 },
             )
             .map_err(storage_err)?;
-        Ok(wrap_rows(
-            rows,
-            plan.limit,
-            timer.elapsed_ms(),
-            freshness(storage).unwrap_or(Value::Null),
-        ))
+        Ok(wrap_rows(rows, plan.limit, timer.elapsed_ms()))
     }
 
     pub fn span_search(&self, storage: &Storage, req: &Value) -> ApiResult<Value> {
@@ -199,12 +194,7 @@ impl QueryEngine {
                 },
             )
             .map_err(storage_err)?;
-        Ok(wrap_rows(
-            rows,
-            limit,
-            timer.elapsed_ms(),
-            freshness(storage).unwrap_or(Value::Null),
-        ))
+        Ok(wrap_rows(rows, limit, timer.elapsed_ms()))
     }
 
     pub fn execute_trace_search(&self, storage: &Storage, plan: &TracePlan) -> ApiResult<Value> {
@@ -255,12 +245,7 @@ impl QueryEngine {
                 },
             )
             .map_err(storage_err)?;
-        Ok(wrap_rows(
-            rows,
-            *limit,
-            timer.elapsed_ms(),
-            freshness(storage).unwrap_or(Value::Null),
-        ))
+        Ok(wrap_rows(rows, *limit, timer.elapsed_ms()))
     }
 
     pub fn execute_metric(&self, storage: &Storage, plan: &MetricPlan) -> ApiResult<Value> {
@@ -353,12 +338,7 @@ impl QueryEngine {
                 },
             )
             .map_err(storage_err)?;
-        Ok(wrap_rows(
-            rows,
-            plan.limit,
-            timer.elapsed_ms(),
-            freshness(storage).unwrap_or(Value::Null),
-        ))
+        Ok(wrap_rows(rows, plan.limit, timer.elapsed_ms()))
     }
 
     pub fn metric_query(&self, storage: &Storage, req: &Value) -> ApiResult<Value> {
@@ -495,18 +475,12 @@ fn collect_rows(
     iter.collect()
 }
 
-fn wrap_rows(
-    mut rows: Vec<Value>,
-    limit: usize,
-    query_duration_ms: u128,
-    freshness_watermark: Value,
-) -> Value {
+fn wrap_rows(mut rows: Vec<Value>, limit: usize, query_duration_ms: u128) -> Value {
     let truncated = rows.len() > limit;
     rows.truncate(limit);
     json!({
         "rows": rows,
         "next_cursor": null,
-        "freshness_watermark": freshness_watermark,
         "applied_limit": limit,
         "truncated": truncated,
         "query_duration_ms": query_duration_ms
@@ -622,8 +596,4 @@ fn storage_err(err: anyhow::Error) -> ApiError {
         return ApiError::new(503, "query_timeout", err.to_string());
     }
     ApiError::new(503, "query_storage_unavailable", err.to_string())
-}
-
-fn freshness(storage: &Storage) -> anyhow::Result<Value> {
-    storage.freshness_watermarks()
 }

@@ -1,26 +1,20 @@
 use crate::ingest::Signal;
-#[cfg(feature = "transform-split-instrumentation")]
+#[cfg(feature = "otlp2records-observer")]
 use crate::metrics::Metrics;
 use crate::validation::{ApiError, ApiResult};
 use arrow58::record_batch::RecordBatch;
 use flate2::read::GzDecoder;
-#[cfg(feature = "transform-split-instrumentation")]
-use opentelemetry_proto::tonic::collector::{
-    logs::v1::ExportLogsServiceRequest, metrics::v1::ExportMetricsServiceRequest,
-    trace::v1::ExportTraceServiceRequest,
-};
 use otlp2records::{transform_logs, transform_metrics, transform_traces, InputFormat};
-#[cfg(feature = "transform-split-instrumentation")]
+#[cfg(feature = "otlp2records-observer")]
 use otlp2records::{
-    transform_logs_decoded_for_bench, transform_metrics_decoded_for_bench,
-    transform_traces_decoded_for_bench,
+    transform_logs_with_observer, transform_metrics_with_observer, transform_traces_with_observer,
+    TransformCounter, TransformCounterValue, TransformObserver, TransformPhase,
+    TransformPhaseTiming,
 };
-#[cfg(feature = "transform-split-instrumentation")]
-use prost::Message;
+#[cfg(feature = "otlp2records-observer")]
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::io::Read;
-#[cfg(feature = "transform-split-instrumentation")]
-use std::time::Instant;
 
 #[derive(Clone, Debug)]
 pub struct Transformed {
@@ -123,42 +117,20 @@ pub fn transform(
     }
 }
 
-#[cfg(feature = "transform-split-instrumentation")]
+#[cfg(feature = "otlp2records-observer")]
 pub fn transform_observed(
     signal: Signal,
     headers: &HashMap<String, String>,
     body: &[u8],
     metrics: &Metrics,
 ) -> ApiResult<Transformed> {
-    let started = Instant::now();
     let format = input_format(headers);
     let source_format = source_format(format);
-    metrics.observe_phase_seconds(
-        signal.as_str(),
-        "otlp_input_format",
-        None,
-        started.elapsed().as_secs_f64(),
-    );
+    let mut observer = OtlpTransformMetrics::new(signal);
 
-    if format != InputFormat::Protobuf {
-        let started = Instant::now();
-        let transformed = transform(signal, headers, body);
-        metrics.observe_phase_seconds(
-            signal.as_str(),
-            "otlp2records_transform_blackbox",
-            None,
-            started.elapsed().as_secs_f64(),
-        );
-        return transformed;
-    }
-
-    match signal {
-        Signal::Logs => {
-            let request = decode_protobuf::<ExportLogsServiceRequest>(signal, body, metrics)?;
-            let logs = build_arrow(signal, metrics, || {
-                transform_logs_decoded_for_bench(request, body.len())
-            })?;
-            build_transformed(signal, metrics, || Transformed {
+    let result = match signal {
+        Signal::Logs => transform_logs_with_observer(body, format, &mut observer)
+            .map(|logs| Transformed {
                 logs: Some(logs),
                 spans: None,
                 gauge: None,
@@ -166,13 +138,9 @@ pub fn transform_observed(
                 source_format,
                 unsupported_histograms: 0,
             })
-        }
-        Signal::Spans => {
-            let request = decode_protobuf::<ExportTraceServiceRequest>(signal, body, metrics)?;
-            let spans = build_arrow(signal, metrics, || {
-                transform_traces_decoded_for_bench(request, body.len())
-            })?;
-            build_transformed(signal, metrics, || Transformed {
+            .map_err(|e| ApiError::new(400, "invalid_payload", e.to_string())),
+        Signal::Spans => transform_traces_with_observer(body, format, &mut observer)
+            .map(|spans| Transformed {
                 logs: None,
                 spans: Some(spans),
                 gauge: None,
@@ -180,31 +148,91 @@ pub fn transform_observed(
                 source_format,
                 unsupported_histograms: 0,
             })
-        }
+            .map_err(|e| ApiError::new(400, "invalid_payload", e.to_string())),
         Signal::MetricGauge | Signal::MetricSum => {
-            let request = decode_protobuf::<ExportMetricsServiceRequest>(signal, body, metrics)?;
-            let batches = build_arrow(signal, metrics, || {
-                transform_metrics_decoded_for_bench(request)
-            })?;
-            let unsupported_histograms = batches
-                .histogram
-                .as_ref()
-                .map(RecordBatch::num_rows)
-                .unwrap_or(0)
-                + batches
-                    .exp_histogram
-                    .as_ref()
-                    .map(RecordBatch::num_rows)
-                    .unwrap_or(0);
-            build_transformed(signal, metrics, || Transformed {
-                logs: None,
-                spans: None,
-                gauge: batches.gauge,
-                sum: batches.sum,
-                source_format,
-                unsupported_histograms,
-            })
+            transform_metrics_with_observer(body, format, &mut observer)
+                .map(|batches| {
+                    let unsupported_histograms = batches
+                        .histogram
+                        .as_ref()
+                        .map(RecordBatch::num_rows)
+                        .unwrap_or(0)
+                        + batches
+                            .exp_histogram
+                            .as_ref()
+                            .map(RecordBatch::num_rows)
+                            .unwrap_or(0);
+                    Transformed {
+                        logs: None,
+                        spans: None,
+                        gauge: batches.gauge,
+                        sum: batches.sum,
+                        source_format,
+                        unsupported_histograms,
+                    }
+                })
+                .map_err(|e| ApiError::new(400, "invalid_payload", e.to_string()))
         }
+    };
+    observer.flush(metrics);
+    result
+}
+
+#[cfg(feature = "otlp2records-observer")]
+struct OtlpTransformMetrics {
+    signal: Signal,
+    phase_totals: BTreeMap<&'static str, PhaseTotal>,
+    counters: BTreeMap<&'static str, u64>,
+}
+
+#[cfg(feature = "otlp2records-observer")]
+#[derive(Default)]
+struct PhaseTotal {
+    count: u64,
+    sum_seconds: f64,
+}
+
+#[cfg(feature = "otlp2records-observer")]
+impl OtlpTransformMetrics {
+    fn new(signal: Signal) -> Self {
+        Self {
+            signal,
+            phase_totals: BTreeMap::new(),
+            counters: BTreeMap::new(),
+        }
+    }
+
+    fn flush(&self, metrics: &Metrics) {
+        let signal = self.signal.as_str();
+        for (phase, total) in &self.phase_totals {
+            metrics.observe_phase_seconds_n(signal, phase, None, total.count, total.sum_seconds);
+        }
+        for (counter, value) in &self.counters {
+            metrics.inc(
+                "canardstack_otlp2records_transform_events_total",
+                &[("signal", signal), ("event", counter)],
+                *value,
+            );
+        }
+    }
+}
+
+#[cfg(feature = "otlp2records-observer")]
+impl TransformObserver for OtlpTransformMetrics {
+    fn on_phase(&mut self, timing: TransformPhaseTiming) {
+        let total = self
+            .phase_totals
+            .entry(phase_name(timing.phase))
+            .or_default();
+        total.count += 1;
+        total.sum_seconds += timing.elapsed.as_secs_f64();
+    }
+
+    fn on_counter(&mut self, counter: TransformCounterValue) {
+        *self
+            .counters
+            .entry(counter_name(counter.counter))
+            .or_default() += counter.value;
     }
 }
 
@@ -215,54 +243,53 @@ fn source_format(format: InputFormat) -> &'static str {
     }
 }
 
-#[cfg(feature = "transform-split-instrumentation")]
-fn decode_protobuf<T>(signal: Signal, body: &[u8], metrics: &Metrics) -> ApiResult<T>
-where
-    T: Message + Default,
-{
-    let started = Instant::now();
-    let decoded = T::decode(body).map_err(|e| ApiError::new(400, "invalid_payload", e.to_string()));
-    metrics.observe_phase_seconds(
-        signal.as_str(),
-        "otlp_protobuf_decode",
-        None,
-        started.elapsed().as_secs_f64(),
-    );
-    decoded
+#[cfg(feature = "otlp2records-observer")]
+fn phase_name(phase: TransformPhase) -> &'static str {
+    match phase {
+        TransformPhase::ProtobufDecode => "otlp2records_protobuf_decode",
+        TransformPhase::JsonDecode => "otlp2records_json_decode",
+        TransformPhase::JsonlDecode => "otlp2records_jsonl_decode",
+        TransformPhase::RowCount => "otlp2records_row_count",
+        TransformPhase::BuilderInit => "otlp2records_builder_init",
+        TransformPhase::ResourceLogsBuild => "otlp2records_resource_logs_build",
+        TransformPhase::ResourceSpansBuild => "otlp2records_resource_spans_build",
+        TransformPhase::ResourceContextBuild => "otlp2records_resource_context_build",
+        TransformPhase::ResourceAttributesJson => "otlp2records_resource_attributes_json",
+        TransformPhase::ScopeLogsBuild => "otlp2records_scope_logs_build",
+        TransformPhase::ScopeSpansBuild => "otlp2records_scope_spans_build",
+        TransformPhase::ScopeContextBuild => "otlp2records_scope_context_build",
+        TransformPhase::ScopeAttributesJson => "otlp2records_scope_attributes_json",
+        TransformPhase::LogRecordBuild => "otlp2records_log_record_build",
+        TransformPhase::SpanBuild => "otlp2records_span_build",
+        TransformPhase::ArrowAppend => "otlp2records_arrow_append",
+        TransformPhase::BodyAppend => "otlp2records_body_append",
+        TransformPhase::ResourceAttributesAppend => "otlp2records_resource_attributes_append",
+        TransformPhase::ScopeAttributesAppend => "otlp2records_scope_attributes_append",
+        TransformPhase::LogAttributesJson => "otlp2records_log_attributes_json",
+        TransformPhase::SpanAttributesJson => "otlp2records_span_attributes_json",
+        TransformPhase::MetricAttributesJson => "otlp2records_metric_attributes_json",
+        TransformPhase::EventsJson => "otlp2records_events_json",
+        TransformPhase::LinksJson => "otlp2records_links_json",
+        TransformPhase::ExemplarsJson => "otlp2records_exemplars_json",
+        TransformPhase::MetricArrayJson => "otlp2records_metric_array_json",
+        TransformPhase::MetricsCapacity => "otlp2records_metrics_capacity",
+        TransformPhase::ArrowFinalize => "otlp2records_arrow_finalize",
+    }
 }
 
-#[cfg(feature = "transform-split-instrumentation")]
-fn build_arrow<T>(
-    signal: Signal,
-    metrics: &Metrics,
-    build: impl FnOnce() -> otlp2records::Result<T>,
-) -> ApiResult<T> {
-    let started = Instant::now();
-    let built = build().map_err(|e| ApiError::new(400, "invalid_payload", e.to_string()));
-    metrics.observe_phase_seconds(
-        signal.as_str(),
-        "otlp2records_arrow_build",
-        None,
-        started.elapsed().as_secs_f64(),
-    );
-    built
-}
-
-#[cfg(feature = "transform-split-instrumentation")]
-fn build_transformed(
-    signal: Signal,
-    metrics: &Metrics,
-    build: impl FnOnce() -> Transformed,
-) -> ApiResult<Transformed> {
-    let started = Instant::now();
-    let transformed = build();
-    metrics.observe_phase_seconds(
-        signal.as_str(),
-        "otlp_transformed_build",
-        None,
-        started.elapsed().as_secs_f64(),
-    );
-    Ok(transformed)
+#[cfg(feature = "otlp2records-observer")]
+fn counter_name(counter: TransformCounter) -> &'static str {
+    match counter {
+        TransformCounter::OutputRows => "output_rows",
+        TransformCounter::ResourceContextDuplicateHit => "resource_context_duplicate_hit",
+        TransformCounter::ResourceContextDuplicateMiss => "resource_context_duplicate_miss",
+        TransformCounter::ScopeContextDuplicateHit => "scope_context_duplicate_hit",
+        TransformCounter::ScopeContextDuplicateMiss => "scope_context_duplicate_miss",
+        TransformCounter::ResourceAttributesRowCopies => "resource_attributes_row_copies",
+        TransformCounter::ResourceAttributesRowCopyBytes => "resource_attributes_row_copy_bytes",
+        TransformCounter::ScopeAttributesRowCopies => "scope_attributes_row_copies",
+        TransformCounter::ScopeAttributesRowCopyBytes => "scope_attributes_row_copy_bytes",
+    }
 }
 
 fn input_format(headers: &HashMap<String, String>) -> InputFormat {

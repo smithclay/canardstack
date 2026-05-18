@@ -57,9 +57,10 @@ Seed representative telemetry through the running service:
 docker compose run --rm smoke
 ```
 
-The smoke command sends one log, one trace, one gauge metric, and one sum metric
-over OTLP/HTTP. It then verifies storage health plus the Prometheus, Loki, and
-Tempo-compatible query paths.
+The smoke command sends a small multi-service demo workload over OTLP/HTTP:
+logs, a multi-span trace, gauge samples, and cumulative sum samples. It then
+verifies storage health plus the Prometheus, Loki, and Tempo-compatible query
+paths.
 
 Open the provisioned canardstack Grafana dashboard:
 
@@ -68,8 +69,8 @@ http://localhost:3000/d/canardstack-overview/canardstack-overview
 ```
 
 Grafana is the bundled UI. It is provisioned with canardstack datasources, and
-the default dashboard uses canardstack's stored self-metrics written by the
-scheduler. Use `admin/admin` if you log in directly.
+the default dashboard shows the smoke workload alongside canardstack's stored
+self-metrics. Use `admin/admin` if you log in directly.
 
 ## Quickstart: MotherDuck-hosted DuckLake
 
@@ -118,8 +119,9 @@ http://localhost:3000/d/canardstack-overview/canardstack-overview
 ```
 
 Grafana is the bundled UI. It is provisioned with canardstack datasources based
-on Prometheus, Loki, and Tempo APIs. The default dashboard uses canardstack's
-stored self-metrics. Use `admin/admin` for logging on.
+on Prometheus, Loki, and Tempo APIs. The default dashboard shows the smoke
+workload alongside canardstack's stored self-metrics. Use `admin/admin` for
+logging on.
 
 ## Who It Is For
 

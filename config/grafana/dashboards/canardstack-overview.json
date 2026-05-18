@@ -4,7 +4,7 @@
   },
   "editable": true,
   "fiscalYearStartMonth": 0,
-  "graphTooltip": 0,
+  "graphTooltip": 1,
   "links": [],
   "panels": [
     {
@@ -16,14 +16,14 @@
         "defaults": {
           "custom": {
             "drawStyle": "line",
-            "fillOpacity": 10,
-            "lineInterpolation": "linear",
+            "fillOpacity": 18,
+            "lineInterpolation": "smooth",
             "lineWidth": 2,
             "pointSize": 5,
             "showPoints": "auto",
             "spanNulls": false
           },
-          "unit": "short"
+          "unit": "ms"
         },
         "overrides": []
       },
@@ -37,15 +37,16 @@
       "options": {
         "legend": {
           "calcs": [
-            "lastNotNull"
+            "lastNotNull",
+            "max"
           ],
-          "displayMode": "list",
+          "displayMode": "table",
           "placement": "bottom",
           "showLegend": true
         },
         "tooltip": {
-          "mode": "single",
-          "sort": "none"
+          "mode": "multi",
+          "sort": "desc"
         }
       },
       "targets": [
@@ -55,13 +56,13 @@
             "uid": "canardstack-prometheus"
           },
           "editorMode": "code",
-          "expr": "sum({__name__=\"canardstack_ingest_requests_total\",service_name=\"canardstack\"})",
-          "legendFormat": "ingest requests",
+          "expr": "avg by (service_name) (smoke.gauge)",
+          "legendFormat": "{{service_name}}",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "Ingest Requests",
+      "title": "Demo Latency by Service",
       "type": "timeseries"
     },
     {
@@ -72,12 +73,12 @@
       "fieldConfig": {
         "defaults": {
           "custom": {
-            "drawStyle": "line",
-            "fillOpacity": 10,
+            "drawStyle": "bars",
+            "fillOpacity": 35,
             "lineInterpolation": "linear",
-            "lineWidth": 2,
+            "lineWidth": 1,
             "pointSize": 5,
-            "showPoints": "auto",
+            "showPoints": "never",
             "spanNulls": false
           },
           "unit": "short"
@@ -96,13 +97,13 @@
           "calcs": [
             "lastNotNull"
           ],
-          "displayMode": "list",
+          "displayMode": "table",
           "placement": "bottom",
           "showLegend": true
         },
         "tooltip": {
-          "mode": "single",
-          "sort": "none"
+          "mode": "multi",
+          "sort": "desc"
         }
       },
       "targets": [
@@ -112,71 +113,52 @@
             "uid": "canardstack-prometheus"
           },
           "editorMode": "code",
-          "expr": "sum({__name__=\"canardstack_query_requests_total\",service_name=\"canardstack\"})",
-          "legendFormat": "query requests",
+          "expr": "sum by (service_name) (smoke.sum)",
+          "legendFormat": "{{service_name}}",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "Query Requests",
+      "title": "Demo Requests by Service",
       "type": "timeseries"
     },
     {
       "datasource": {
-        "type": "prometheus",
-        "uid": "canardstack-prometheus"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "custom": {
-            "drawStyle": "line",
-            "fillOpacity": 10,
-            "lineInterpolation": "linear",
-            "lineWidth": 2,
-            "pointSize": 5,
-            "showPoints": "auto",
-            "spanNulls": false
-          },
-          "unit": "short"
-        },
-        "overrides": []
+        "type": "loki",
+        "uid": "canardstack-loki"
       },
       "gridPos": {
-        "h": 8,
-        "w": 12,
+        "h": 9,
+        "w": 16,
         "x": 0,
         "y": 8
       },
       "id": 3,
       "options": {
-        "legend": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "displayMode": "list",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "mode": "single",
-          "sort": "none"
-        }
+        "dedupStrategy": "none",
+        "enableLogDetails": true,
+        "prettifyLogMessage": false,
+        "showCommonLabels": false,
+        "showLabels": true,
+        "showTime": true,
+        "sortOrder": "Descending",
+        "wrapLogMessage": true
       },
       "targets": [
         {
           "datasource": {
-            "type": "prometheus",
-            "uid": "canardstack-prometheus"
+            "type": "loki",
+            "uid": "canardstack-loki"
           },
+          "direction": "backward",
           "editorMode": "code",
-          "expr": "max({__name__=\"canardstack_ingest_queue_rows\",service_name=\"canardstack\"})",
-          "legendFormat": "queued rows",
-          "range": true,
+          "expr": "{deployment_environment=\"dev\"} |= \"smoke\"",
+          "queryType": "range",
           "refId": "A"
         }
       ],
-      "title": "Queued Rows",
-      "type": "timeseries"
+      "title": "Recent Demo Logs",
+      "type": "logs"
     },
     {
       "datasource": {
@@ -187,10 +169,10 @@
         "defaults": {
           "custom": {
             "drawStyle": "line",
-            "fillOpacity": 10,
+            "fillOpacity": 12,
             "lineInterpolation": "linear",
             "lineWidth": 2,
-            "pointSize": 5,
+            "pointSize": 4,
             "showPoints": "auto",
             "spanNulls": false
           },
@@ -199,9 +181,9 @@
         "overrides": []
       },
       "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
+        "h": 9,
+        "w": 8,
+        "x": 16,
         "y": 8
       },
       "id": 4,
@@ -232,8 +214,191 @@
           "refId": "A"
         }
       ],
-      "title": "Storage Rows",
+      "title": "Stored Rows",
       "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "canardstack-prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 0,
+        "y": 17
+      },
+      "id": 5,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "canardstack-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum({__name__=\"canardstack_ingest_requests_total\",service_name=\"canardstack\"})",
+          "legendFormat": "accepted",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Ingest Requests",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "canardstack-prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 8,
+        "y": 17
+      },
+      "id": 6,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "canardstack-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum({__name__=\"canardstack_query_requests_total\",service_name=\"canardstack\"})",
+          "legendFormat": "queries",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Query Requests",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "canardstack-prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 16,
+        "y": 17
+      },
+      "id": 7,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "canardstack-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "max({__name__=\"canardstack_ingest_queue_rows\",service_name=\"canardstack\"})",
+          "legendFormat": "queued rows",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Queued Rows",
+      "type": "stat"
     }
   ],
   "refresh": "10s",
@@ -245,13 +410,13 @@
     "list": []
   },
   "time": {
-    "from": "now-6h",
+    "from": "now-30m",
     "to": "now"
   },
   "timepicker": {},
   "timezone": "browser",
   "title": "Canardstack",
   "uid": "canardstack-overview",
-  "version": 1,
+  "version": 2,
   "weekStart": ""
 }

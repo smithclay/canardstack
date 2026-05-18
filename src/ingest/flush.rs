@@ -7,6 +7,7 @@ use anyhow::Context;
 use arrow58::compute::concat_batches;
 use arrow58::record_batch::RecordBatch;
 use std::collections::{HashMap, HashSet};
+use std::time::Instant;
 
 /// Flush failed mid-batch. `committed_rows` were accepted by the catalog
 /// before the failure; remote object-storage durability is the lake's
@@ -53,9 +54,29 @@ impl Ingestor {
             let queues = self.queues.lock_or_poisoned();
             queue::due_keys(&queues, &self.config)
         };
+        observe_due_keys(metrics, &due);
+        let lock_started = Instant::now();
         let _guard = self.flush_lock.lock_or_poisoned();
+        if let Some(metrics) = metrics {
+            metrics.observe_phase_seconds(
+                "all",
+                "flush_lock_wait",
+                None,
+                lock_started.elapsed().as_secs_f64(),
+            );
+        }
+        let hold_started = Instant::now();
+        let rows_by_signal = self.flush_due_keys_observed(due, storage, metrics);
+        if let Some(metrics) = metrics {
+            metrics.observe_phase_seconds(
+                "all",
+                "flush_lock_hold",
+                None,
+                hold_started.elapsed().as_secs_f64(),
+            );
+        }
         let mut flushed = HashMap::new();
-        for (signal, rows) in self.flush_due_keys_observed(due, storage, metrics)? {
+        for (signal, rows) in rows_by_signal? {
             if rows > 0 {
                 flushed.insert(signal, rows);
             }
@@ -152,6 +173,7 @@ impl Ingestor {
             for (key, batches) in &sets {
                 let attempted_rows: usize = batches.iter().map(QueuedBatch::len).sum();
                 let attempted_bytes: usize = batches.iter().map(|batch| batch.approx_bytes).sum();
+                let attempted_batches = batches.len();
                 if attempted_rows == 0 {
                     continue;
                 }
@@ -169,6 +191,40 @@ impl Ingestor {
                     "canardstack_ingest_flush_attempted_bytes_total",
                     &[("signal", key.signal.as_str())],
                     attempted_bytes as u64,
+                );
+                metrics.inc(
+                    "canardstack_ingest_flush_drained_batches_total",
+                    &[("signal", key.signal.as_str())],
+                    attempted_batches as u64,
+                );
+                metrics.inc(
+                    "canardstack_ingest_flush_drained_rows_total",
+                    &[("signal", key.signal.as_str())],
+                    attempted_rows as u64,
+                );
+                metrics.inc(
+                    "canardstack_ingest_flush_drained_bytes_total",
+                    &[("signal", key.signal.as_str())],
+                    attempted_bytes as u64,
+                );
+            }
+        }
+        if let Some(metrics) = metrics {
+            for batch in &coalesced {
+                metrics.inc(
+                    "canardstack_ingest_flush_coalesced_batches_total",
+                    &[("signal", batch.table.as_str())],
+                    1,
+                );
+                metrics.inc(
+                    "canardstack_ingest_flush_coalesced_rows_total",
+                    &[("signal", batch.table.as_str())],
+                    batch.batch.num_rows() as u64,
+                );
+                metrics.inc(
+                    "canardstack_ingest_flush_coalesced_bytes_total",
+                    &[("signal", batch.table.as_str())],
+                    batch.batch.get_array_memory_size() as u64,
                 );
             }
         }
@@ -321,6 +377,36 @@ fn flush_failure_reason(err: &anyhow::Error) -> &'static str {
         "duckdb_lock_conflict"
     } else {
         "storage_error"
+    }
+}
+
+fn observe_due_keys(metrics: Option<&Metrics>, due: &[QueueKey]) {
+    let Some(metrics) = metrics else {
+        return;
+    };
+    let mut by_signal: HashMap<Signal, u64> = HashMap::new();
+    for key in due {
+        *by_signal.entry(key.signal).or_default() += 1;
+    }
+    for signal in [
+        Signal::Logs,
+        Signal::Spans,
+        Signal::MetricGauge,
+        Signal::MetricSum,
+    ] {
+        let due_count = by_signal.get(&signal).copied().unwrap_or(0);
+        metrics.gauge(
+            "canardstack_ingest_flush_due_keys",
+            &[("signal", signal.as_str())],
+            due_count as f64,
+        );
+        if due_count > 0 {
+            metrics.inc(
+                "canardstack_ingest_flush_due_keys_total",
+                &[("signal", signal.as_str())],
+                due_count,
+            );
+        }
     }
 }
 

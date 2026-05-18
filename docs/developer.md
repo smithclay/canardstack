@@ -114,8 +114,8 @@ compatibility query visibility against the configured remote DuckLake.
 ## Host Workflow
 
 Host Rust is useful for contributors, but is not required for Docker evaluation.
-The default dependency on `otlp2records` is the published crates.io package, not
-a sibling checkout.
+The benchmark-only `otlp2records-observer` feature uses observer-based
+transform instrumentation from the crates.io `otlp2records` dependency.
 
 Start from the checked-in example:
 

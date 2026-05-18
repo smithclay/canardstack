@@ -135,9 +135,9 @@ impl Ingestor {
         let body = body_result?;
         validation::validate_body_size(body.len(), &self.config)?;
         let started = Instant::now();
-        #[cfg(feature = "transform-split-instrumentation")]
+        #[cfg(feature = "otlp2records-observer")]
         let transformed_result = otlp::transform_observed(signal, headers, &body, metrics);
-        #[cfg(not(feature = "transform-split-instrumentation"))]
+        #[cfg(not(feature = "otlp2records-observer"))]
         let transformed_result = otlp::transform(signal, headers, &body);
         metrics.observe_phase_seconds(
             signal.as_str(),
@@ -170,6 +170,7 @@ impl Ingestor {
         let accepted = match self.enqueue(signal, batches, metrics) {
             Ok(accepted) => accepted,
             Err(err) => {
+                self.record_queue_metrics(metrics);
                 metrics.ingest_request(signal, err.status, err.reason);
                 return Err(err);
             }
@@ -243,8 +244,18 @@ impl Ingestor {
                 &[("signal", snapshot.signal)],
                 snapshot.queued_rows as f64,
             );
+            metrics.gauge_max(
+                "canardstack_ingest_queue_rows_max",
+                &[("signal", snapshot.signal)],
+                snapshot.queued_rows as f64,
+            );
             metrics.gauge(
                 "canardstack_ingest_queue_bytes",
+                &[("signal", snapshot.signal)],
+                snapshot.queued_bytes as f64,
+            );
+            metrics.gauge_max(
+                "canardstack_ingest_queue_bytes_max",
                 &[("signal", snapshot.signal)],
                 snapshot.queued_bytes as f64,
             );
@@ -253,8 +264,18 @@ impl Ingestor {
                 &[("signal", snapshot.signal)],
                 snapshot.oldest_age_seconds,
             );
+            metrics.gauge_max(
+                "canardstack_ingest_queue_oldest_age_seconds_max",
+                &[("signal", snapshot.signal)],
+                snapshot.oldest_age_seconds,
+            );
             metrics.gauge(
                 "canardstack_ingest_queue_pressure",
+                &[("signal", snapshot.signal)],
+                snapshot.pressure,
+            );
+            metrics.gauge_max(
+                "canardstack_ingest_queue_pressure_max",
                 &[("signal", snapshot.signal)],
                 snapshot.pressure,
             );

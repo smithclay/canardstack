@@ -1,5 +1,6 @@
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{Duration as ChronoDuration, Utc};
+use otlp2records::fixtures::{encode_logs, encode_metrics, encode_traces, FixtureProfile};
 use serde::Serialize;
 use serde_json::Value;
 use std::borrow::Cow;
@@ -803,6 +804,9 @@ fn build_report(input: BuildReportInput) -> Report {
         queue,
         storage,
         mut server_phase_timing,
+        transform_counters,
+        flush_counters,
+        flush_gauges,
         ducklake_maintenance_timing,
     ) = match scraped {
         Some(scraped) => (
@@ -810,12 +814,18 @@ fn build_report(input: BuildReportInput) -> Report {
             Some(scraped.queue),
             Some(scraped.storage),
             scraped.server_phase_timing,
+            scraped.transform_counters,
+            scraped.flush_counters,
+            scraped.flush_gauges,
             scraped.ducklake_maintenance_timing,
         ),
         None => (
             BTreeMap::new(),
             None,
             None,
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
             BTreeMap::new(),
             BTreeMap::new(),
         ),
@@ -967,6 +977,9 @@ fn build_report(input: BuildReportInput) -> Report {
         queue,
         storage,
         server_phase_timing,
+        transform_counters,
+        flush_counters,
+        flush_gauges,
         ducklake_maintenance_timing,
         resource_samples,
         metric_snapshots,
@@ -1482,6 +1495,30 @@ impl Default for WorkloadProfile {
 }
 
 impl WorkloadProfile {
+    fn fixture_profile(&self) -> FixtureProfile {
+        FixtureProfile {
+            service_count: self.service_count,
+            log_record_count: self.log_record_count,
+            log_body_bytes: self.log_body_bytes,
+            trace_span_count: self.trace_span_count,
+            trace_attribute_bytes: self.trace_attribute_bytes,
+            metric_series_count: self.metric_series_count,
+            metric_description_bytes: self.metric_description_bytes,
+            scenario_name: SCENARIO_NAME.to_string(),
+            deployment_environment: "bench".to_string(),
+            scope_name: "throughput_iteration".to_string(),
+            scope_version: BENCH_VERSION.to_string(),
+            deterministic_seed: DETERMINISTIC_SEED,
+            primary_service_name: "bench-checkout".to_string(),
+            service_name_prefix: "bench-service".to_string(),
+            route: "/bench".to_string(),
+            log_message_prefix: "canardstack-v0-iteration".to_string(),
+            trace_span_name: "GET /bench".to_string(),
+            metric_gauge_name: "canardstack.bench.gauge".to_string(),
+            metric_sum_name: "canardstack.bench.sum".to_string(),
+        }
+    }
+
     fn validate(&self) -> Result<()> {
         if self.service_count == 0 {
             bail!("--services must be > 0");
@@ -1715,7 +1752,7 @@ struct ResourceSample {
 #[derive(Clone)]
 struct Workload {
     payloads: Vec<WorkloadPayload>,
-    profile: WorkloadProfile,
+    fixture_profile: FixtureProfile,
     timestamp_mode: TimestampMode,
 }
 
@@ -1729,10 +1766,11 @@ impl Workload {
         let base_nanos = run_started
             .timestamp_nanos_opt()
             .unwrap_or(run_started.timestamp_millis() * 1_000_000);
+        let fixture_profile = profile.fixture_profile();
         let mut payloads = vec![
-            WorkloadPayload::logs(base_nanos, &profile),
-            WorkloadPayload::spans(base_nanos, &profile),
-            WorkloadPayload::metrics(base_nanos, &profile),
+            WorkloadPayload::logs(base_nanos, &fixture_profile),
+            WorkloadPayload::spans(base_nanos, &fixture_profile),
+            WorkloadPayload::metrics(base_nanos, &fixture_profile),
         ]
         .into_iter()
         .filter(|payload| signals.includes(payload.signal))
@@ -1743,7 +1781,7 @@ impl Workload {
         }
         Self {
             payloads,
-            profile,
+            fixture_profile,
             timestamp_mode,
         }
     }
@@ -1769,7 +1807,7 @@ impl Workload {
     }
 
     fn prepare_payload(&self, idx: usize) -> PreparedPayload<'_> {
-        self.payloads[idx].prepare(self.timestamp_mode, &self.profile)
+        self.payloads[idx].prepare(self.timestamp_mode, &self.fixture_profile)
     }
 }
 
@@ -1786,13 +1824,13 @@ struct WorkloadPayload {
 }
 
 impl WorkloadPayload {
-    fn logs(base_nanos: i64, profile: &WorkloadProfile) -> Self {
-        let body = otlp_fixture::encode_logs(base_nanos, profile);
+    fn logs(base_nanos: i64, profile: &FixtureProfile) -> Self {
+        let body = encode_logs(profile, base_nanos);
         Self {
             kind: PayloadKind::Logs,
             signal: "logs",
             path: "/v1/logs",
-            content_type: otlp_fixture::CONTENT_TYPE,
+            content_type: otlp2records::fixtures::CONTENT_TYPE_PROTOBUF,
             ratio: 0.60,
             decoded_bytes: body.len(),
             records_per_request: (profile.service_count * profile.log_record_count) as u64,
@@ -1800,13 +1838,13 @@ impl WorkloadPayload {
         }
     }
 
-    fn spans(base_nanos: i64, profile: &WorkloadProfile) -> Self {
-        let body = otlp_fixture::encode_traces(base_nanos, profile);
+    fn spans(base_nanos: i64, profile: &FixtureProfile) -> Self {
+        let body = encode_traces(profile, base_nanos);
         Self {
             kind: PayloadKind::Spans,
             signal: "spans",
             path: "/v1/traces",
-            content_type: otlp_fixture::CONTENT_TYPE,
+            content_type: otlp2records::fixtures::CONTENT_TYPE_PROTOBUF,
             ratio: 0.25,
             decoded_bytes: body.len(),
             records_per_request: (profile.service_count * profile.trace_span_count) as u64,
@@ -1814,13 +1852,13 @@ impl WorkloadPayload {
         }
     }
 
-    fn metrics(base_nanos: i64, profile: &WorkloadProfile) -> Self {
-        let body = otlp_fixture::encode_metrics(base_nanos, profile);
+    fn metrics(base_nanos: i64, profile: &FixtureProfile) -> Self {
+        let body = encode_metrics(profile, base_nanos);
         Self {
             kind: PayloadKind::Metrics,
             signal: "metrics",
             path: "/v1/metrics",
-            content_type: otlp_fixture::CONTENT_TYPE,
+            content_type: otlp2records::fixtures::CONTENT_TYPE_PROTOBUF,
             ratio: 0.15,
             decoded_bytes: body.len(),
             records_per_request: (profile.service_count * profile.metric_series_count * 2) as u64,
@@ -1831,7 +1869,7 @@ impl WorkloadPayload {
     fn prepare<'a>(
         &'a self,
         timestamp_mode: TimestampMode,
-        profile: &WorkloadProfile,
+        profile: &FixtureProfile,
     ) -> PreparedPayload<'a> {
         let body = match timestamp_mode {
             TimestampMode::Fixed => Cow::Borrowed(self.body.as_slice()),
@@ -1856,11 +1894,11 @@ enum PayloadKind {
 }
 
 impl PayloadKind {
-    fn encode(self, base_nanos: i64, profile: &WorkloadProfile) -> Vec<u8> {
+    fn encode(self, base_nanos: i64, profile: &FixtureProfile) -> Vec<u8> {
         match self {
-            Self::Logs => otlp_fixture::encode_logs(base_nanos, profile),
-            Self::Spans => otlp_fixture::encode_traces(base_nanos, profile),
-            Self::Metrics => otlp_fixture::encode_metrics(base_nanos, profile),
+            Self::Logs => encode_logs(profile, base_nanos),
+            Self::Spans => encode_traces(profile, base_nanos),
+            Self::Metrics => encode_metrics(profile, base_nanos),
         }
     }
 }
@@ -1878,296 +1916,6 @@ fn current_nanos() -> i64 {
     let now = Utc::now();
     now.timestamp_nanos_opt()
         .unwrap_or(now.timestamp_millis() * 1_000_000)
-}
-
-fn deterministic_ascii(seed: u64, len: usize) -> String {
-    let mut state = DETERMINISTIC_SEED ^ seed;
-    let mut out = String::with_capacity(len);
-    for _ in 0..len {
-        state ^= state << 7;
-        state ^= state >> 9;
-        state ^= state << 8;
-        let ch = b'a' + (state % 26) as u8;
-        out.push(ch as char);
-    }
-    out
-}
-
-fn deterministic_bytes(seed: u64, len: usize) -> Vec<u8> {
-    let mut state = DETERMINISTIC_SEED ^ seed;
-    let mut out = Vec::with_capacity(len);
-    for _ in 0..len {
-        state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
-        out.push((state & 0xff) as u8);
-    }
-    out
-}
-
-mod otlp_fixture {
-    use super::{
-        deterministic_ascii, deterministic_bytes, WorkloadProfile, BENCH_VERSION, SCENARIO_NAME,
-    };
-    use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
-    use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
-    use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
-    use opentelemetry_proto::tonic::common::v1::{
-        any_value, AnyValue, InstrumentationScope, KeyValue,
-    };
-    use opentelemetry_proto::tonic::logs::v1::{
-        LogRecord, ResourceLogs, ScopeLogs, SeverityNumber,
-    };
-    use opentelemetry_proto::tonic::metrics::v1::{
-        metric, number_data_point, AggregationTemporality, Gauge, Metric, NumberDataPoint,
-        ResourceMetrics, ScopeMetrics, Sum,
-    };
-    use opentelemetry_proto::tonic::resource::v1::Resource;
-    use opentelemetry_proto::tonic::trace::v1::{
-        span, status, ResourceSpans, ScopeSpans, Span, Status,
-    };
-    use prost::Message;
-
-    pub const CONTENT_TYPE: &str = "application/x-protobuf";
-
-    pub fn encode_logs(base_nanos: i64, profile: &WorkloadProfile) -> Vec<u8> {
-        ExportLogsServiceRequest {
-            resource_logs: (0..profile.service_count)
-                .map(|service_idx| ResourceLogs {
-                    resource: Some(resource(service_idx)),
-                    scope_logs: vec![ScopeLogs {
-                        scope: Some(scope()),
-                        log_records: (0..profile.log_record_count as i64)
-                            .map(|idx| {
-                                let logical_idx = service_idx as i64 * 1_000 + idx;
-                                let nanos = nanos(base_nanos, logical_idx);
-                                LogRecord {
-                                    time_unix_nano: nanos,
-                                    observed_time_unix_nano: nanos,
-                                    severity_number: SeverityNumber::Info as i32,
-                                    severity_text: "INFO".to_string(),
-                                    body: Some(any_str(format!(
-                                        "canardstack-v0-iteration log event {} {}",
-                                        logical_idx,
-                                        deterministic_ascii(
-                                            logical_idx as u64,
-                                            profile.log_body_bytes
-                                        )
-                                    ))),
-                                    attributes: vec![
-                                        kv_str("http.route", "/bench"),
-                                        kv_str("workload.id", SCENARIO_NAME),
-                                    ],
-                                    trace_id: deterministic_bytes(logical_idx as u64, 16),
-                                    span_id: deterministic_bytes(logical_idx as u64 + 10_000, 8),
-                                    ..Default::default()
-                                }
-                            })
-                            .collect(),
-                        schema_url: String::new(),
-                    }],
-                    schema_url: String::new(),
-                })
-                .collect(),
-        }
-        .encode_to_vec()
-    }
-
-    pub fn encode_traces(base_nanos: i64, profile: &WorkloadProfile) -> Vec<u8> {
-        ExportTraceServiceRequest {
-            resource_spans: (0..profile.service_count)
-                .map(|service_idx| ResourceSpans {
-                    resource: Some(resource(service_idx)),
-                    scope_spans: vec![ScopeSpans {
-                        scope: Some(scope()),
-                        spans: (0..profile.trace_span_count as i64)
-                            .map(|idx| {
-                                let logical_idx = service_idx as i64 * 10_000 + idx;
-                                let start = nanos(base_nanos, logical_idx);
-                                Span {
-                                    trace_id: deterministic_bytes(service_idx as u64, 16),
-                                    span_id: deterministic_bytes(logical_idx as u64 + 20_000, 8),
-                                    name: "GET /bench".to_string(),
-                                    kind: span::SpanKind::Server as i32,
-                                    start_time_unix_nano: start,
-                                    end_time_unix_nano: start
-                                        + 12_000_000
-                                        + (idx % 17) as u64 * 1_000_000,
-                                    attributes: vec![
-                                        kv_str("http.request.method", "GET"),
-                                        kv_i64("http.response.status_code", 200),
-                                        kv_str("http.route", "/bench"),
-                                        kv_str("workload.bucket", format!("bucket-{}", idx % 16)),
-                                        kv_str(
-                                            "payload.sample",
-                                            deterministic_ascii(
-                                                logical_idx as u64 + 1_000,
-                                                profile.trace_attribute_bytes,
-                                            ),
-                                        ),
-                                    ],
-                                    status: Some(Status {
-                                        code: status::StatusCode::Ok as i32,
-                                        message: String::new(),
-                                    }),
-                                    ..Default::default()
-                                }
-                            })
-                            .collect(),
-                        schema_url: String::new(),
-                    }],
-                    schema_url: String::new(),
-                })
-                .collect(),
-        }
-        .encode_to_vec()
-    }
-
-    pub fn encode_metrics(base_nanos: i64, profile: &WorkloadProfile) -> Vec<u8> {
-        ExportMetricsServiceRequest {
-            resource_metrics: (0..profile.service_count)
-                .map(|service_idx| ResourceMetrics {
-                    resource: Some(resource(service_idx)),
-                    scope_metrics: vec![ScopeMetrics {
-                        scope: Some(scope()),
-                        metrics: vec![
-                            Metric {
-                                name: "canardstack.bench.gauge".to_string(),
-                                description: deterministic_ascii(
-                                    30_000 + service_idx as u64,
-                                    profile.metric_description_bytes,
-                                ),
-                                unit: "1".to_string(),
-                                data: Some(metric::Data::Gauge(Gauge {
-                                    data_points: (0..profile.metric_series_count as i64)
-                                        .map(|idx| {
-                                            number_point(
-                                                base_nanos,
-                                                service_idx,
-                                                idx,
-                                                "gauge",
-                                                NumberValue::Double(100.0 + (idx % 23) as f64),
-                                            )
-                                        })
-                                        .collect(),
-                                })),
-                                metadata: vec![],
-                            },
-                            Metric {
-                                name: "canardstack.bench.sum".to_string(),
-                                description: deterministic_ascii(
-                                    40_000 + service_idx as u64,
-                                    profile.metric_description_bytes,
-                                ),
-                                unit: "1".to_string(),
-                                data: Some(metric::Data::Sum(Sum {
-                                    aggregation_temporality: AggregationTemporality::Cumulative
-                                        as i32,
-                                    is_monotonic: true,
-                                    data_points: (0..profile.metric_series_count as i64)
-                                        .map(|idx| {
-                                            number_point(
-                                                base_nanos,
-                                                service_idx,
-                                                idx,
-                                                "sum",
-                                                NumberValue::Int(10_000 + idx),
-                                            )
-                                        })
-                                        .collect(),
-                                })),
-                                metadata: vec![],
-                            },
-                        ],
-                        schema_url: String::new(),
-                    }],
-                    schema_url: String::new(),
-                })
-                .collect(),
-        }
-        .encode_to_vec()
-    }
-
-    pub fn kv_str(key: impl Into<String>, value: impl Into<String>) -> KeyValue {
-        KeyValue {
-            key: key.into(),
-            value: Some(any_str(value)),
-        }
-    }
-
-    pub fn kv_i64(key: impl Into<String>, value: i64) -> KeyValue {
-        KeyValue {
-            key: key.into(),
-            value: Some(AnyValue {
-                value: Some(any_value::Value::IntValue(value)),
-            }),
-        }
-    }
-
-    pub fn resource(service_idx: usize) -> Resource {
-        Resource {
-            attributes: vec![
-                kv_str("service.name", service_name(service_idx)),
-                kv_str("deployment.environment", "bench"),
-                kv_str("benchmark.scenario", SCENARIO_NAME),
-            ],
-            dropped_attributes_count: 0,
-            entity_refs: vec![],
-        }
-    }
-
-    pub fn scope() -> InstrumentationScope {
-        InstrumentationScope {
-            name: "throughput_iteration".to_string(),
-            version: BENCH_VERSION.to_string(),
-            attributes: vec![],
-            dropped_attributes_count: 0,
-        }
-    }
-
-    fn any_str(value: impl Into<String>) -> AnyValue {
-        AnyValue {
-            value: Some(any_value::Value::StringValue(value.into())),
-        }
-    }
-
-    enum NumberValue {
-        Double(f64),
-        Int(i64),
-    }
-
-    fn number_point(
-        base_nanos: i64,
-        service_idx: usize,
-        idx: i64,
-        series_prefix: &str,
-        value: NumberValue,
-    ) -> NumberDataPoint {
-        NumberDataPoint {
-            attributes: vec![
-                kv_str("route", "/bench"),
-                kv_str("series", format!("{series_prefix}-{service_idx}-{idx}")),
-            ],
-            start_time_unix_nano: nanos(base_nanos, 0),
-            time_unix_nano: nanos(base_nanos, service_idx as i64 * 10_000 + idx),
-            exemplars: vec![],
-            flags: 0,
-            value: Some(match value {
-                NumberValue::Double(value) => number_data_point::Value::AsDouble(value),
-                NumberValue::Int(value) => number_data_point::Value::AsInt(value),
-            }),
-        }
-    }
-
-    fn nanos(base_nanos: i64, idx: i64) -> u64 {
-        (base_nanos + idx * 1_000_000) as u64
-    }
-
-    fn service_name(service_idx: usize) -> String {
-        if service_idx == 0 {
-            "bench-checkout".to_string()
-        } else {
-            format!("bench-service-{service_idx}")
-        }
-    }
 }
 
 struct QueryPlan {
@@ -2468,6 +2216,9 @@ struct ScrapedMetrics {
     queue: QueueReport,
     storage: StorageReport,
     server_phase_timing: BTreeMap<String, PhaseTimingReport>,
+    transform_counters: BTreeMap<String, u64>,
+    flush_counters: BTreeMap<String, u64>,
+    flush_gauges: BTreeMap<String, f64>,
     ducklake_maintenance_timing: BTreeMap<String, PhaseTimingReport>,
 }
 
@@ -2489,13 +2240,14 @@ fn scrape_metrics(text: &str) -> ScrapedMetrics {
                         .insert(table.clone(), metric.value);
                 }
             }
-            "canardstack_ingest_queue_rows" => {
+            "canardstack_ingest_queue_rows" | "canardstack_ingest_queue_rows_max" => {
                 out.queue.max_rows = Some(out.queue.max_rows.unwrap_or(0.0).max(metric.value));
             }
-            "canardstack_ingest_queue_bytes" => {
+            "canardstack_ingest_queue_bytes" | "canardstack_ingest_queue_bytes_max" => {
                 out.queue.max_bytes = Some(out.queue.max_bytes.unwrap_or(0.0).max(metric.value));
             }
-            "canardstack_ingest_queue_oldest_age_seconds" => {
+            "canardstack_ingest_queue_oldest_age_seconds"
+            | "canardstack_ingest_queue_oldest_age_seconds_max" => {
                 out.queue.max_oldest_age_seconds = Some(
                     out.queue
                         .max_oldest_age_seconds
@@ -2539,6 +2291,22 @@ fn scrape_metrics(text: &str) -> ScrapedMetrics {
             }
             "canardstack_phase_duration_seconds_sum" => {
                 phase_sums.insert(labels_key(&metric.labels), metric.value);
+            }
+            "canardstack_otlp2records_transform_events_total" => {
+                out.transform_counters
+                    .insert(labels_key(&metric.labels), metric.value as u64);
+            }
+            name if name.starts_with("canardstack_ingest_flush_") && name.ends_with("_total") => {
+                out.flush_counters.insert(
+                    format!("{} {}", metric.name, labels_key(&metric.labels)),
+                    metric.value as u64,
+                );
+            }
+            name if name.starts_with("canardstack_ingest_flush_") => {
+                out.flush_gauges.insert(
+                    format!("{} {}", metric.name, labels_key(&metric.labels)),
+                    metric.value,
+                );
             }
             "canardstack_ducklake_flush_inlined_duration_seconds_count"
             | "canardstack_ducklake_compaction_duration_seconds_count" => {
@@ -2761,6 +2529,9 @@ struct Report {
     queue: Option<QueueReport>,
     storage: Option<StorageReport>,
     server_phase_timing: BTreeMap<String, PhaseTimingReport>,
+    transform_counters: BTreeMap<String, u64>,
+    flush_counters: BTreeMap<String, u64>,
+    flush_gauges: BTreeMap<String, f64>,
     ducklake_maintenance_timing: BTreeMap<String, PhaseTimingReport>,
     resource_samples: Vec<ResourceSample>,
     metric_snapshots: Vec<MetricSnapshotReport>,

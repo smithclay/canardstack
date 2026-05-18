@@ -48,20 +48,23 @@ behavior.
 
 ## Current Implementation Facts
 
-- `Cargo.toml` uses crates.io `otlp2records = { version = "0.6.0", features = ["parquet"] }`.
+- `Cargo.toml` uses crates.io `otlp2records` `0.7.0` with the `parquet`
+  feature. That release includes the observer-based transform instrumentation
+  used by the benchmark harness.
 - `src/otlp.rs::transform` calls non-partitioned `transform_logs`,
   `transform_traces`, and `transform_metrics`.
-- `otlp2records` `0.6.0` exposes `transform_logs_partitioned`,
-  `transform_traces_partitioned`, and `transform_metrics_partitioned`.
-- Crates.io source inspection showed those partitioned APIs call the existing
+- Crates.io source inspection showed the partitioned `otlp2records` APIs call the existing
   non-partitioned transform first, then split batches by `service_name` with
   `group_batch_by_service`. They are useful for deterministic lane ownership
   after transform, but they do not provide parallel decode or transform.
-- Do not use `*_decoded_for_bench` APIs in production unless upstream promotes
-  them intentionally.
-- The non-default `transform-split-instrumentation` Cargo feature is allowed
-  for benchmark probes that need to split protobuf decode from `otlp2records`
-  Arrow construction. Do not enable it in normal production builds.
+- The non-default `otlp2records-observer` Cargo feature uses the supported
+  `transform_*_with_observer` APIs to report internal `otlp2records` phase
+  timings and transform counters. Do not enable it in normal production builds.
+- The Canardstack observer sink aggregates `otlp2records` phase timings and
+  counters per request before touching the global `Metrics` mutex. Earlier
+  observer-enabled benchmark runs that emitted one global metrics update per
+  per-span/per-log phase event overstated transform cost and could create
+  artificial queue pressure.
 
 ## Current Serial Bottlenecks
 
@@ -356,6 +359,16 @@ truth for full details.
 
 | Date | Gate | Shape | Result | Report |
 | --- | --- | --- | --- | --- |
+| 2026-05-17 | OrbStack Linux observer-buffered logs low-query with fresh DuckLake catalog | OrbStack VM `canardstack-bench-logs`, Ubuntu Linux `aarch64`, 30m, low query pressure, `2000 GB/day`, 256 records/request, 512-byte log bodies, advancing timestamps, concurrency 32, `otlp2records-observer`, request-local observer aggregation; reset removed `data/`, `storage/`, `canardstack.duckdb`, and `canardstack.ducklake` | failed on sustained admission: `25,689 logs/sec`, `16.59 MiB/s`, `133.5 req/sec`, `180/180` queries succeeded, no `503`/transport errors; first observed `429` around minute 7, final `59,727` HTTP `429`; query p50/p95/p99 `274/1521/1635ms`; server peak CPU/RSS `66.7% / 753 MiB`; max queue `219,617` rows / `536.86 MiB` / `23.22s`; top phases `otlp_transform` `153.11s`, Loki query execute `56.33s`, protobuf decode `47.20s`, resource/scope/log build `32.93/32.31/23.03s`, queue admission `19.49s`, flush lock hold `17.17s`, Parquet write/encode `22.27/14.04s` | `target/canardstack-bench/orbstack-linux-lowquery-30m-fresh-ducklake-20260517/logs-target2000-30m/20260517T232830Z/report.json` |
+| 2026-05-17 | OrbStack Linux observer-buffered spans low-query with fresh DuckLake catalog | OrbStack VM `canardstack-bench-spans`, Ubuntu Linux `aarch64`, 30m, low query pressure, `1500 GB/day`, 256 spans/request, `trace_attribute_bytes=256`, advancing timestamps, concurrency 32, `otlp2records-observer`, request-local observer aggregation; reset removed `data/`, `storage/`, `canardstack.duckdb`, and `canardstack.ducklake` | failed on sustained admission: `29,898 spans/sec`, `13.34 MiB/s`, `144.9 req/sec`, `180/180` queries succeeded, no `503`/transport errors; first observed `429` around minute 9, final `50,611` HTTP `429`; query p50/p95/p99 `295/1203/1273ms`; server peak CPU/RSS `63.3% / 746 MiB`; max queue `251,330` rows / `536.86 MiB` / `21.17s`; top phases `otlp_transform` `254.26s`, resource/scope/span build `87.40/86.75/62.81s`, protobuf decode `81.96s`, Tempo query execute `43.83s`, span attributes JSON `37.03s`, flush lock hold `21.83s`, Parquet write/encode `26.38/16.56s` | `target/canardstack-bench/orbstack-linux-lowquery-30m-fresh-ducklake-20260517/spans-target1500-30m/20260517T232836Z/report.json` |
+| 2026-05-17 | OrbStack Linux observer-buffered logs low-query with stale DuckLake catalog | same low-query logs shape, but reset removed `storage/` and `canardstack.duckdb` without removing local `canardstack.ducklake` | failed on query `503`, not ingest: `34,182 logs/sec`, `22.07 MiB/s`, `240,351` HTTP `202`, no `429`, max queue `6,676` rows / `16.32 MiB` / `0.40s`; `120/180` queries succeeded, all `60` failures were Loki `/loki/api/v1/query_range` with `query_storage_unavailable` reading an old DuckLake-registered logs Parquet path that had been deleted by the harness reset; retained as harness-cleanup evidence, not a product query-lifecycle bug | `target/canardstack-bench/orbstack-linux-lowquery-30m-observer-buffered-20260517/logs-target2000-30m/20260517T222915Z/report.json` |
+| 2026-05-17 | OrbStack Linux observer-buffered spans low-query with stale DuckLake catalog | same low-query spans shape, but reset removed `storage/` and `canardstack.duckdb` without removing local `canardstack.ducklake` | failed on query `503`, not ingest: `37,096 spans/sec`, `16.56 MiB/s`, `260,843` HTTP `202`, no `429`, max queue `9,824` rows / `20.98 MiB` / `0.30s`; `120/180` queries succeeded, all `60` failures were Tempo `/api/search` with `query_storage_unavailable` reading an old DuckLake-registered spans Parquet path that had been deleted by the harness reset; retained as harness-cleanup evidence, not a product query-lifecycle bug | `target/canardstack-bench/orbstack-linux-lowquery-30m-observer-buffered-20260517/spans-target1500-30m/20260517T222934Z/report.json` |
+| 2026-05-17 | OrbStack Linux observer-buffered logs ingest-only | OrbStack VM `canardstack-bench-logs`, Ubuntu Linux `aarch64`, 30m, no queries, `2000 GB/day`, 256 records/request, 512-byte log bodies, advancing timestamps, concurrency 32, `otlp2records-observer`, request-local observer aggregation | pass: `34,183 logs/sec`, `22.07 MiB/s`, `133.5 req/sec`, `240,351` HTTP `202`, no `429/503`, ingest p50/p95/p99 `55.9/101.2/106.3ms`, server peak CPU/RSS `30.8% / 218 MiB`, max queue `5,757` rows / `14.07 MiB` / `0.40s`; top phases `otlp_transform` `193.43s`, protobuf decode `54.32s`, resource/scope/log build `47.67/46.63/33.03s`; storage write/encode `34.04/21.13s` | `target/canardstack-bench/orbstack-linux-ingestonly-30m-observer-buffered-20260517/logs-target2000-30m/20260517T214949Z/report.json` |
+| 2026-05-17 | OrbStack Linux observer-buffered spans ingest-only | OrbStack VM `canardstack-bench-spans`, Ubuntu Linux `aarch64`, 30m, no queries, `1500 GB/day`, 256 spans/request, `trace_attribute_bytes=256`, advancing timestamps, concurrency 32, `otlp2records-observer`, request-local observer aggregation | pass: `37,096 spans/sec`, `16.56 MiB/s`, `144.9 req/sec`, `260,843` HTTP `202`, no `429/503`, ingest p50/p95/p99 `56.2/101.2/106.3ms`, server peak CPU/RSS `33.2% / 224 MiB`, max queue `6,943` rows / `14.83 MiB` / `0.32s`; top phases `otlp_transform` `328.08s`, resource/scope/span build `129.30/128.19/94.93s`, protobuf decode `92.33s`, span attributes JSON `54.56s`; storage write/encode `34.42/21.86s` | `target/canardstack-bench/orbstack-linux-ingestonly-30m-observer-buffered-20260517/spans-target1500-30m/20260517T214958Z/report.json` |
+| 2026-05-17 | OrbStack Linux unbuffered observer logs ingest-only | same OrbStack logs VM shape as above before request-local observer aggregation | failed: `429` first appeared at minute 7; final `25,361 logs/sec`, `16.38 MiB/s`, `62,032` HTTP `429`, max queue `536.87 MiB` / `23.45s`; `otlp_transform` `2050.65s`, `otlp2records_log_record_build` `1525.13s`; this run is retained as evidence of observer-sink overhead, not a product ingest ceiling | `target/canardstack-bench/orbstack-linux-ingestonly-30m-20260517/logs-target2000-30m/20260517T211552Z/report.json` |
+| 2026-05-17 | OrbStack Linux unbuffered observer spans ingest-only | same OrbStack spans VM shape as above before request-local observer aggregation | failed: `429` first appeared at minute 8; final `29,497 spans/sec`, `13.16 MiB/s`, `53,435` HTTP `429`, max queue `536.85 MiB` / `21.53s`; `otlp_transform` `3799.19s`, `otlp2records_span_build` `3063.84s`; the broad span timer included tens of millions of global metrics updates and is not reliable evidence of pure transform cost | `target/canardstack-bench/orbstack-linux-ingestonly-30m-20260517/spans-target1500-30m/20260517T211557Z/report.json` |
+| 2026-05-17 | Local macOS observer drain instrumentation spans | local macOS directional, spans-only ingest, no queries, 10m, `1500 GB/day`, 256 spans/request, `trace_attribute_bytes=256`, advancing timestamps, concurrency 32, default flush caps | failed late on `429`: actual `36,235 spans/sec`, `16.17 MiB/s`, `2,011` HTTP `429`; high-water queue reached `251,303` rows / `536,799,896` bytes / `10.05s` oldest age; `otlp_transform` `6222.47s`, `otlp2records_span_build` `5660.20s`; flush lock hold only `8.64s`, storage prepare `2.82s`, Parquet encode/write `5.41s`/`9.42s`; drain path attempted `22,815,994` rows across `11,623` flush attempts | `target/canardstack-bench/local-observer-span10m-flushmetrics2-20260517/spans-target1500-10m/20260517T195144Z/report.json` |
+| 2026-05-17 | Local macOS high-flush drain experiment spans | local macOS directional, spans-only ingest, no queries, 10m, `1500 GB/day`, 256 spans/request, `trace_attribute_bytes=256`, advancing timestamps, concurrency 32, `CANARDSTACK_MAX_ROWS_PER_FLUSH=20000`, `CANARDSTACK_MAX_BYTES_PER_FLUSH=16777216` | failed on `429` and did not improve baseline: actual `35,677 spans/sec`, `15.92 MiB/s`, `3,317` HTTP `429`; storage prepare calls fell to `2,839`, but `otlp_transform` remained `5936.07s` and `otlp2records_span_build` `5241.92s`; larger flush chunks alone are not the fix | `target/canardstack-bench/local-observer-span10m-flush16m-20260517/spans-target1500-10m/20260517T190242Z/report.json` |
 | 2026-05-17 | Linux VM transform split spans attr256 | `galaxy-disk`, spans-only ingest, no queries, 10m, `1500 GB/day`, 256 spans/request, `trace_attribute_bytes=256`, advancing timestamps, concurrency 32 | failed on `429`: `33,971 spans/sec`, `15.16 MiB/s`, `132.7 req/sec`, `7,319` HTTP `429`; split phases: `otlp_transform` `334.37s`, protobuf decode `138.51s` (`1.52ms/request`), `otlp2records_arrow_build` `173.51s` (`1.90ms/request`) | `galaxy-disk:/home/exedev/canardstack-linux-proof/target/canardstack-bench/vm-linux-transform-split-20260517/spans-attr256-10m/20260517T155053Z/report.json` |
 | 2026-05-17 | Linux VM transform split spans attr0 same GB/day | `galaxy-disk`, spans-only ingest, no queries, 10m, `1500 GB/day`, 256 spans/request, `trace_attribute_bytes=0`, advancing timestamps, concurrency 32 | failed harder because item/request rate nearly doubled: `63,244 spans/sec`, `12.60 MiB/s`, `247.0 req/sec`, `41,902` HTTP `429`; protobuf decode `313.80s`, `otlp2records_arrow_build` `322.92s` | `galaxy-disk:/home/exedev/canardstack-linux-proof/target/canardstack-bench/vm-linux-transform-split-20260517/spans-attr0-10m/20260517T160205Z/report.json` |
 | 2026-05-17 | Linux VM transform split spans attr0 item-rate matched | `galaxy-disk`, spans-only ingest, no queries, 10m, `613 GB/day`, 256 spans/request, `trace_attribute_bytes=0`, advancing timestamps, concurrency 32 | pass at matched item/request rate: `33,948 spans/sec`, `6.77 MiB/s`, `132.6 req/sec`, no `429/503`; `otlp_transform` `231.33s`, protobuf decode `106.32s` (`1.27ms/request`), `otlp2records_arrow_build` `110.15s` (`1.32ms/request`) | `galaxy-disk:/home/exedev/canardstack-linux-proof/target/canardstack-bench/vm-linux-transform-split-20260517/spans-attr0-itemmatch-10m/20260517T161449Z/report.json` |
@@ -393,6 +406,311 @@ truth for full details.
 | 2026-05-16 | 25 GB/day comparison | mixed query, older `otlp2records` | comparison evidence only | old report paths in git history |
 | 2026-05-15 | 10 GB/day realistic metrics | mixed query, realistic descriptions | passed local scout | old report paths in git history |
 | 2026-05-15 | 10 GB/day Docker network | 2h, low query pressure, container network | passed, claim-grade for narrow Docker envelope | `target/canardstack-bench/10gpd-mixed-query-low-2h-container-net-attempt7/20260515T083247Z/report.json` |
+
+## Latest OrbStack Observer Findings
+
+The new `scripts/orbstack-bench-vms.sh` path creates one VM per signal. These
+runs used `canardstack-bench-logs` and `canardstack-bench-spans`; both report
+Linux `aarch64`, unrestricted cgroup CPU/memory (`max`), and
+`available_parallelism=14`. Treat this as directional Linux evidence rather
+than the earlier `galaxy-disk` `x86_64` VM envelope.
+
+Concrete insight from this pass: the observer-enabled benchmark itself had a
+hot path. The unbuffered Canardstack `TransformObserver` updated the global
+`Metrics` mutex for every per-span/per-log phase event. On the failed spans
+run, that meant about `68.2M` `SpanBuild` observations and `136.3M`
+`ArrowAppend` observations. The broad `SpanBuild` timer included nested
+observer-update overhead, so it overstated pure `otlp2records` transform cost
+and created artificial queue/admission pressure.
+
+The fix was to aggregate observer phase counts/sums and counters in the
+request-local observer, then flush one metrics update per phase/counter after
+the transform call. After this change, the exact same 30-minute ingest-only
+controls passed:
+
+- Logs `2000 GB/day`: `34,183 logs/sec`, `22.07 MiB/s`, `240,351` HTTP `202`,
+  no `429/503`, max queue `14.07 MiB` and `0.40s`, server peak CPU/RSS
+  `30.8% / 218 MiB`.
+- Spans `1500 GB/day`: `37,096 spans/sec`, `16.56 MiB/s`, `260,843` HTTP
+  `202`, no `429/503`, max queue `14.83 MiB` and `0.32s`, server peak CPU/RSS
+  `33.2% / 224 MiB`.
+
+The drain path is not the sustained limiter for these passing OrbStack
+ingest-only controls. For spans, storage write/encode/insert plus flush lock
+hold are material but small compared with transform, and queue age stays flat.
+The remaining likely limiter for the next higher or query-interference gates is
+still request-thread transform work, especially protobuf decode plus
+`otlp2records` trace `ResourceSpansBuild` / `ScopeSpansBuild` / `SpanBuild` /
+`SpanAttributesJson`. That is now a real post-fix target rather than an
+observer-lock artifact.
+
+The first low-query rerun at the same target rates failed on
+`503 query_storage_unavailable`, but that was a benchmark-harness freshness bug:
+the reset command removed `storage/` and `canardstack.duckdb` without removing
+the local DuckLake catalog at `canardstack.ducklake`. The stale catalog still
+referenced Parquet files from a prior run. `scripts/orbstack-bench-vms.sh` now
+has `reset-data <profile>` so a fresh run clears `data/`, `storage/`,
+`canardstack.duckdb`, `canardstack.ducklake`, and `tmp/` while preserving the
+Cargo target cache.
+
+- Logs run: Loki `/loki/api/v1/query_range` failed `60/60` attempts with a
+  missing old `storage/main/logs/year=2026/month=5/day=17/...parquet` file.
+  After `reset-data`, `180/180` low-query requests succeeded with no `503`.
+- Spans run: Tempo `/api/search` failed `60/60` attempts with a missing
+  old `storage/main/spans/year=2026/month=5/day=17/...parquet` file. After
+  `reset-data`, `180/180` low-query requests succeeded with no `503`.
+
+With a genuinely fresh DuckLake catalog, the same 30-minute low-query targets
+returned to the real sustained limiter: queue/admission pressure under query
+interference. They both failed with `429`, falling below 90% of target accepted
+decoded throughput:
+
+- Logs `2000 GB/day`: `25,689 logs/sec`, `16.59 MiB/s`, `180/180` queries
+  succeeded, first observed `429` around minute 7, final `59,727` HTTP `429`,
+  query p50/p95/p99 `274/1521/1635ms`, server peak CPU/RSS `66.7% / 753 MiB`,
+  max queue `219,617` rows / `536.86 MiB` / `23.22s`.
+- Spans `1500 GB/day`: `29,898 spans/sec`, `13.34 MiB/s`, `180/180` queries
+  succeeded, first observed `429` around minute 9, final `50,611` HTTP `429`,
+  query p50/p95/p99 `295/1203/1273ms`, server peak CPU/RSS `63.3% / 746 MiB`,
+  max queue `251,330` rows / `536.86 MiB` / `21.17s`.
+
+The likely sustained limiter is still synchronous request-thread transform plus
+bounded queue/admission under accumulated low query load, not DuckLake
+registration correctness. Query execution is now a meaningful interference
+term, especially Loki query-range in the logs run and Tempo search in the spans
+run, but storage encode/write/register remains too small to explain the queue
+cap by itself.
+
+Caveats:
+
+- The ingest-only (`--no-queries`) runs prove only ingest/admission at these
+  targets. The fresh-catalog low-query rerun proves the stale catalog cleanup
+  fix, but it does not prove these target rates for 30 minutes under low query
+  pressure.
+- OrbStack VMs are Linux `aarch64` with many reported scheduling threads; they
+  are not equivalent to the earlier `galaxy-disk` `x86_64`, 2-vCPU VM.
+- The fresh-catalog low-query failures are not a reason to lower product
+  targets by themselves; they identify the next optimization proof gate. The
+  latest proven `galaxy-disk` 30-minute low-query points remain logs
+  `1500 GB/day` and spans `1200 GB/day`.
+
+Exact setup and benchmark commands:
+
+```sh
+scripts/orbstack-bench-vms.sh up
+scripts/orbstack-bench-vms.sh run logs -- \
+  cargo build --release --features otlp2records-observer \
+    --bin canardstack --bench throughput_iteration
+scripts/orbstack-bench-vms.sh run spans -- \
+  env CARGO_BUILD_JOBS=1 cargo build --release \
+    --features otlp2records-observer --bin canardstack \
+    --bench throughput_iteration
+
+scripts/orbstack-bench-vms.sh reset-data logs
+scripts/orbstack-bench-vms.sh reset-data spans
+
+scripts/orbstack-bench-vms.sh run logs -- \
+  bash -lc 'exec "$CARGO_TARGET_DIR/release/canardstack" serve'
+scripts/orbstack-bench-vms.sh run spans -- \
+  bash -lc 'exec "$CARGO_TARGET_DIR/release/canardstack" serve'
+
+scripts/orbstack-bench-vms.sh run logs -- \
+  cargo bench --bench throughput_iteration \
+    --features otlp2records-observer -- \
+    --base-url http://127.0.0.1:4318 \
+    --warmup 30s \
+    --duration 30m \
+    --target-gb-day 2000 \
+    --profile ingest-only \
+    --signals logs \
+    --query-pressure off \
+    --ingest-concurrency 32 \
+    --items-per-batch 256 \
+    --log-body-bytes 512 \
+    --trace-attribute-bytes 256 \
+    --timestamp-mode advancing \
+    --progress-interval 60s \
+    --max-runtime 35m \
+    --no-queries \
+    --server-pid 253509 \
+    --resource-sample-interval 5s \
+    --report-dir target/canardstack-bench/orbstack-linux-ingestonly-30m-observer-buffered-20260517/logs-target2000-30m
+
+scripts/orbstack-bench-vms.sh run spans -- \
+  cargo bench --bench throughput_iteration \
+    --features otlp2records-observer -- \
+    --base-url http://127.0.0.1:4318 \
+    --warmup 30s \
+    --duration 30m \
+    --target-gb-day 1500 \
+    --profile ingest-only \
+    --signals spans \
+    --query-pressure off \
+    --ingest-concurrency 32 \
+    --items-per-batch 256 \
+    --log-body-bytes 512 \
+    --trace-attribute-bytes 256 \
+    --timestamp-mode advancing \
+    --progress-interval 60s \
+    --max-runtime 35m \
+    --no-queries \
+    --server-pid 275170 \
+    --resource-sample-interval 5s \
+    --report-dir target/canardstack-bench/orbstack-linux-ingestonly-30m-observer-buffered-20260517/spans-target1500-30m
+
+scripts/orbstack-bench-vms.sh run logs -- \
+  cargo bench --bench throughput_iteration \
+    --features otlp2records-observer -- \
+    --base-url http://127.0.0.1:4318 \
+    --warmup 30s \
+    --duration 30m \
+    --target-gb-day 2000 \
+    --profile mixed-query \
+    --signals logs \
+    --query-pressure low \
+    --ingest-concurrency 32 \
+    --items-per-batch 256 \
+    --log-body-bytes 512 \
+    --trace-attribute-bytes 256 \
+    --timestamp-mode advancing \
+    --progress-interval 60s \
+    --max-runtime 35m \
+    --server-pid 498789 \
+    --resource-sample-interval 5s \
+    --report-dir target/canardstack-bench/orbstack-linux-lowquery-30m-observer-buffered-20260517/logs-target2000-30m
+
+scripts/orbstack-bench-vms.sh run spans -- \
+  cargo bench --bench throughput_iteration \
+    --features otlp2records-observer -- \
+    --base-url http://127.0.0.1:4318 \
+    --warmup 30s \
+    --duration 30m \
+    --target-gb-day 1500 \
+    --profile mixed-query \
+    --signals spans \
+    --query-pressure low \
+    --ingest-concurrency 32 \
+    --items-per-batch 256 \
+    --log-body-bytes 512 \
+    --trace-attribute-bytes 256 \
+    --timestamp-mode advancing \
+    --progress-interval 60s \
+    --max-runtime 35m \
+    --server-pid 541284 \
+    --resource-sample-interval 5s \
+    --report-dir target/canardstack-bench/orbstack-linux-lowquery-30m-observer-buffered-20260517/spans-target1500-30m
+
+scripts/orbstack-bench-vms.sh reset-data logs
+scripts/orbstack-bench-vms.sh reset-data spans
+
+scripts/orbstack-bench-vms.sh run logs -- \
+  cargo bench --bench throughput_iteration \
+    --features otlp2records-observer -- \
+    --base-url http://127.0.0.1:4318 \
+    --warmup 30s \
+    --duration 30m \
+    --target-gb-day 2000 \
+    --profile mixed-query \
+    --signals logs \
+    --query-pressure low \
+    --ingest-concurrency 32 \
+    --items-per-batch 256 \
+    --log-body-bytes 512 \
+    --trace-attribute-bytes 256 \
+    --timestamp-mode advancing \
+    --progress-interval 60s \
+    --max-runtime 35m \
+    --server-pid 744760 \
+    --resource-sample-interval 5s \
+    --report-dir target/canardstack-bench/orbstack-linux-lowquery-30m-fresh-ducklake-20260517/logs-target2000-30m
+
+scripts/orbstack-bench-vms.sh run spans -- \
+  cargo bench --bench throughput_iteration \
+    --features otlp2records-observer -- \
+    --base-url http://127.0.0.1:4318 \
+    --warmup 30s \
+    --duration 30m \
+    --target-gb-day 1500 \
+    --profile mixed-query \
+    --signals spans \
+    --query-pressure low \
+    --ingest-concurrency 32 \
+    --items-per-batch 256 \
+    --log-body-bytes 512 \
+    --trace-attribute-bytes 256 \
+    --timestamp-mode advancing \
+    --progress-interval 60s \
+    --max-runtime 35m \
+    --server-pid 808187 \
+    --resource-sample-interval 5s \
+    --report-dir target/canardstack-bench/orbstack-linux-lowquery-30m-fresh-ducklake-20260517/spans-target1500-30m
+```
+
+## Latest Local Drain Findings
+
+Local macOS evidence remains directional, and the unbuffered observer runs
+below are now known to include observer-sink overhead. They remain useful for
+the drain-path counters and flush-size comparison, but not as clean
+`otlp2records` transform ceilings:
+
+- Raising flush caps from the defaults (`5000` rows / `4 MiB`) to `20000` rows
+  / `16 MiB` reduced `storage_prepare` call count but did not reduce `429`s.
+  This argues against a simple default flush-size increase.
+- The default-flush, high-water-instrumented run still filled the spans queue to
+  the `512 MiB` cap and started `429`s around 6.5 minutes, even though
+  `flush_lock_hold`, `storage_prepare`, Parquet encode/write, DuckLake
+  register, and DuckLake commit were all small compared with transform time.
+- After request-local observer aggregation, the remaining meaningful transform
+  target is still `otlp2records` trace build work, especially the nested
+  `resource_spans_build` / `scope_spans_build` / `span_build` path and span
+  attribute JSON. Queue/admission is the symptom boundary at failed higher
+  targets, but the measured drain path is not consuming enough time to be the
+  primary sustained limiter.
+- The report now persists `flush_counters`, `flush_gauges`, and queue high-water
+  gauges so later runs can distinguish instantaneous final queue state from
+  peak pressure.
+
+Exact local commands:
+
+```sh
+env CANARDSTACK_DATA_DIR=/private/tmp/canardstack-local-span10m-flush16m-20260517 \
+  CANARDSTACK_DUCKDB_PATH=/private/tmp/canardstack-local-span10m-flush16m-20260517/canardstack.duckdb \
+  CANARDSTACK_STORAGE_DIR=/private/tmp/canardstack-local-span10m-flush16m-20260517/storage \
+  CANARDSTACK_BIND=127.0.0.1:4318 \
+  CANARDSTACK_MAX_ROWS_PER_FLUSH=20000 \
+  CANARDSTACK_MAX_BYTES_PER_FLUSH=16777216 \
+  CANARDSTACK_BENCHMARK_RESOURCE_NOTE=local-macos-directional \
+  target/release/canardstack serve
+
+env CANARDSTACK_BENCHMARK_RESOURCE_NOTE=local-macos-directional \
+  cargo bench --bench throughput_iteration --features otlp2records-observer -- \
+  --base-url http://127.0.0.1:4318 \
+  --warmup 30s --duration 10m --target-gb-day 1500 \
+  --profile ingest-only --signals spans --query-pressure off \
+  --ingest-concurrency 32 --items-per-batch 256 \
+  --trace-attribute-bytes 256 --timestamp-mode advancing \
+  --progress-interval 30s --max-runtime 12m --no-queries \
+  --server-pid 49801 --resource-sample-interval 5s \
+  --report-dir target/canardstack-bench/local-observer-span10m-flush16m-20260517/spans-target1500-10m
+
+env CANARDSTACK_DATA_DIR=/private/tmp/canardstack-local-span10m-flushmetrics2-20260517 \
+  CANARDSTACK_DUCKDB_PATH=/private/tmp/canardstack-local-span10m-flushmetrics2-20260517/canardstack.duckdb \
+  CANARDSTACK_STORAGE_DIR=/private/tmp/canardstack-local-span10m-flushmetrics2-20260517/storage \
+  CANARDSTACK_BIND=127.0.0.1:4318 \
+  CANARDSTACK_BENCHMARK_RESOURCE_NOTE=local-macos-directional \
+  target/release/canardstack serve
+
+env CANARDSTACK_BENCHMARK_RESOURCE_NOTE=local-macos-directional \
+  cargo bench --bench throughput_iteration --features otlp2records-observer -- \
+  --base-url http://127.0.0.1:4318 \
+  --warmup 30s --duration 10m --target-gb-day 1500 \
+  --profile ingest-only --signals spans --query-pressure off \
+  --ingest-concurrency 32 --items-per-batch 256 \
+  --trace-attribute-bytes 256 --timestamp-mode advancing \
+  --progress-interval 30s --max-runtime 12m --no-queries \
+  --server-pid 66910 --resource-sample-interval 5s \
+  --report-dir target/canardstack-bench/local-observer-span10m-flushmetrics2-20260517/spans-target1500-10m
+```
 
 ## Latest Relative Benchmark Findings
 
@@ -790,6 +1108,14 @@ Max-load and 5-minute confirmation results:
   cumulative over 10 minutes to attribute-heavy Arrow/JSON build work, with
   another `0.24ms/request` and `32.20s` showing up in protobuf decode for the
   larger payload.
+- Follow-up implementation: Canardstack now uses crates.io `otlp2records`
+  `0.7.0`, and the benchmark feature uses observer-based instrumentation from
+  the production transform APIs. New benchmark reports can expose finer phases
+  such as `otlp2records_resource_context_build`,
+  `otlp2records_resource_attributes_json`,
+  `otlp2records_span_attributes_json`, and `otlp2records_arrow_finalize`, plus
+  duplicate-context and row-copy counters under
+  `canardstack_otlp2records_transform_events_total`.
 - A same-GB/day `trace_attribute_bytes=0` run is not a valid attribute-isolation
   control because it nearly doubles item/request rate: it drove
   `63,244 spans/sec`, `247.0 req/sec`, and `41,902` HTTP `429`. Use it only as
@@ -808,8 +1134,8 @@ Exact VM benchmark commands:
 ```sh
 cd /home/exedev/canardstack-linux-proof
 
-# Transform split runs require the benchmark-only instrumentation feature.
-cargo build --release --features transform-split-instrumentation \
+# Observer runs require the benchmark-only instrumentation feature.
+cargo build --release --features otlp2records-observer \
   --bin canardstack \
   --bench throughput_iteration
 
@@ -1457,32 +1783,41 @@ Caveats:
 
 ## Next Recommended Proof Gates
 
-1. Do not treat pure `otlp2records` storage as a throughput win yet. It remains
+1. Treat `scripts/orbstack-bench-vms.sh reset-data` as mandatory for OrbStack
+   runs that need a fresh local DuckLake catalog. The earlier missing-file
+   query failure reproduced as stale `canardstack.ducklake` metadata after a
+   partial harness reset; the fresh-catalog rerun cleared the `503`s.
+2. Use the same low-query shape after the next transform/query-interference
+   optimization: logs `2000 GB/day` and spans `1500 GB/day`, low query
+   pressure, advancing timestamps, concurrency 32, `reset-data` first. Do not
+   lower the target based on the stale-catalog run; the fresh-catalog run shows
+   the actual failure is sustained `429` after queue growth.
+3. The next code investigation should prioritize the measured request-thread
+   hot path and query interference:
+   protobuf decode plus `otlp2records` resource/scope/item build for both logs
+   and spans; Loki query-range and Tempo search should be treated as
+   interference terms because they add tens of seconds of query execution under
+   low pressure.
+4. Re-run the same observer-buffered ingest-only controls on the original
+   `galaxy-disk` `x86_64`, 2-vCPU VM if that environment is still the canonical
+   low-query proof host. The OrbStack pass is useful but not hardware-equivalent
+   to the earlier failing VM.
+5. If either observer-buffered ingest-only control fails on a comparable VM,
+   target the real
+   post-fix transform phases: spans `ProtobufDecode`,
+   `ResourceSpansBuild`/`ScopeSpansBuild`/`SpanBuild`, and
+   `SpanAttributesJson`; logs `ProtobufDecode`,
+   `ResourceLogsBuild`/`ScopeLogsBuild`/`LogRecordBuild`, and body/attribute
+   append. Avoid changing queue or flush defaults unless queue age grows while
+   transform headroom remains.
+6. Do not treat pure `otlp2records` storage as a throughput win yet. It remains
    the cleaner schema boundary, but the prototype failed both 30-minute
-   ingest-only controls and worsened 429 onset. If kept for schema correctness,
-   gate it separately at the last known passing 30-minute low-query points:
-   logs `1500 GB/day` and spans `1200 GB/day`.
-2. Split and profile `otlp_transform` before changing storage again. Add
-   one more level inside `otlp2records` trace Arrow build, or vendor/patch
-   `otlp2records` with internal timings around `ResourceContext::from_attrs`,
-   `ScopeContext::new`, and `append_attrs_json` for `span_attributes`. The
-   Canardstack wrapper split proves the hot lane is protobuf decode plus Arrow
-   build, but cannot yet isolate resource/scope/span attribute JSON shares
-   inside the library call.
-3. Prototype the smallest meaningful trace build optimization before running
-   another 30-minute ceiling gate: avoid repeated serialization of identical
-   resource/scope attributes per span, and benchmark whether dictionary-like
-   reuse or cached JSON strings reduces `otlp2records_arrow_build` at the
-   item-rate matched shape.
-4. Add one queue/admission control after transform timing exists: same spans
-   shape, but record accepted/rejected request counters by reason and queue
-   wait/age at the moment of rejection. The current evidence shows
-   `queue_admission` rising while queue age grows late in the run, but not
-   enough to distinguish worker saturation from a too-conservative pressure
-   threshold.
-5. Run one medium-query 5-minute scout only after explicitly choosing
+   ingest-only controls before the observer-sink issue was understood. If kept
+   for schema correctness, gate it separately at the best passing low-query
+   points before claiming a perf win.
+7. Run one medium-query 5-minute scout only after explicitly choosing
    query-saturation exploration over ingest-ceiling bracketing.
-6. Gate any `otlp2records` partitioned API adoption on measurement showing that
+8. Gate any `otlp2records` partitioned API adoption on measurement showing that
    downstream ownership gains offset post-transform grouping cost.
 
 ## External Evidence Rules

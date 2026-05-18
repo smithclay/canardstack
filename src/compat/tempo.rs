@@ -8,12 +8,10 @@ use crate::query::trace::plan_tempo_search;
 use crate::validation::{ApiError, ApiResult};
 use crate::AppState;
 use chrono::Utc;
-use opentelemetry_proto::tonic::common::v1::{any_value, AnyValue, InstrumentationScope, KeyValue};
-use opentelemetry_proto::tonic::resource::v1::Resource;
-use opentelemetry_proto::tonic::trace::v1::{
-    span, status, ResourceSpans, ScopeSpans, Span, Status, TracesData,
+use otlp2records::proto_output::{
+    encode_tempo_trace_by_id_response, Attribute, AttributeValue, Resource, ResourceSpans, Scope,
+    ScopeSpans, Span, SpanStatus, TraceData,
 };
-use prost::Message;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 
@@ -115,38 +113,33 @@ pub fn tempo_trace_proto(state: &AppState, trace_id: &str) -> ApiResult<Vec<u8>>
         .unwrap_or_default()
         .to_string();
 
-    let trace = TracesData {
+    let trace = TraceData {
         resource_spans: vec![ResourceSpans {
-            resource: Some(Resource {
-                attributes: compact_key_values([
+            resource: Resource {
+                attributes: compact_attrs([
                     string_attr("service.name", &service_name),
                     string_attr("deployment.environment", &deployment_environment),
                 ]),
-                dropped_attributes_count: 0,
-                entity_refs: vec![],
-            }),
+            },
             scope_spans: vec![ScopeSpans {
-                scope: Some(InstrumentationScope {
+                scope: Scope {
                     name: scope_name,
                     version: scope_version,
                     attributes: vec![],
-                    dropped_attributes_count: 0,
-                }),
+                },
                 spans: spans.into_iter().map(tempo_proto_span).collect(),
                 schema_url: String::new(),
             }],
             schema_url: String::new(),
         }],
     };
-    Ok(TempoTraceByIdResponse { trace: Some(trace) }.encode_to_vec())
-}
-
-/// Tempo's `/api/v2/traces/{traceID}` returns a `tempopb.TraceByIDResponse`
-/// proto whose first field is the OTLP `TracesData`.
-#[derive(Clone, PartialEq, Message)]
-struct TempoTraceByIdResponse {
-    #[prost(message, optional, tag = "1")]
-    trace: Option<TracesData>,
+    encode_tempo_trace_by_id_response(trace).map_err(|err| {
+        ApiError::new(
+            500,
+            "internal_error",
+            format!("encode Tempo trace response: {err}"),
+        )
+    })
 }
 
 pub fn tempo_search(state: &AppState, params: &HashMap<String, String>) -> ApiResult<Value> {
@@ -255,36 +248,36 @@ pub(super) fn tempo_proto_span(row: Value) -> Span {
         .and_then(Value::as_i64)
         .map(|code| {
             if code == 2 {
-                status::StatusCode::Error as i32
+                2
             } else if code == 1 {
-                status::StatusCode::Ok as i32
+                1
             } else {
-                status::StatusCode::Unset as i32
+                0
             }
         })
-        .unwrap_or(status::StatusCode::Unset as i32);
+        .unwrap_or(0);
 
     Span {
-        trace_id: row
+        trace_id_hex: row
             .get("trace_id")
             .and_then(Value::as_str)
-            .and_then(hex_to_bytes)
-            .unwrap_or_default(),
-        span_id: row
+            .unwrap_or_default()
+            .to_string(),
+        span_id_hex: row
             .get("span_id")
             .and_then(Value::as_str)
-            .and_then(hex_to_bytes)
-            .unwrap_or_default(),
+            .unwrap_or_default()
+            .to_string(),
         trace_state: row
             .get("trace_state")
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string(),
-        parent_span_id: row
+        parent_span_id_hex: row
             .get("parent_span_id")
             .and_then(Value::as_str)
-            .and_then(hex_to_bytes)
-            .unwrap_or_default(),
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
         flags: 0,
         name: row
             .get("span_name")
@@ -295,10 +288,10 @@ pub(super) fn tempo_proto_span(row: Value) -> Span {
             .get("span_kind")
             .and_then(Value::as_i64)
             .map(|kind| kind as i32)
-            .unwrap_or(span::SpanKind::Unspecified as i32),
+            .unwrap_or(0),
         start_time_unix_nano: start_nanos,
         end_time_unix_nano: start_nanos + duration_ms * 1_000_000,
-        attributes: compact_key_values([
+        attributes: compact_attrs([
             string_attr(
                 "service.name",
                 row.get("service_name")
@@ -329,58 +322,38 @@ pub(super) fn tempo_proto_span(row: Value) -> Span {
             ),
         ]),
         dropped_attributes_count: 0,
-        events: vec![],
         dropped_events_count: 0,
-        links: vec![],
         dropped_links_count: 0,
-        status: Some(Status {
+        status: SpanStatus {
             message: row
                 .get("status_message")
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string(),
             code: status_code,
-        }),
+        },
     }
 }
 
-pub(super) fn compact_key_values(
-    values: impl IntoIterator<Item = Option<KeyValue>>,
-) -> Vec<KeyValue> {
+pub(super) fn compact_attrs(values: impl IntoIterator<Item = Option<Attribute>>) -> Vec<Attribute> {
     values.into_iter().flatten().collect()
 }
 
-pub(super) fn string_attr(key: &str, value: &str) -> Option<KeyValue> {
+pub(super) fn string_attr(key: &str, value: &str) -> Option<Attribute> {
     if value.is_empty() {
         return None;
     }
-    Some(KeyValue {
+    Some(Attribute {
         key: key.to_string(),
-        value: Some(AnyValue {
-            value: Some(any_value::Value::StringValue(value.to_string())),
-        }),
+        value: AttributeValue::String(value.to_string()),
     })
 }
 
-pub(super) fn int_attr(key: &str, value: Option<i64>) -> Option<KeyValue> {
-    value.map(|value| KeyValue {
+pub(super) fn int_attr(key: &str, value: Option<i64>) -> Option<Attribute> {
+    value.map(|value| Attribute {
         key: key.to_string(),
-        value: Some(AnyValue {
-            value: Some(any_value::Value::IntValue(value)),
-        }),
+        value: AttributeValue::Int(value),
     })
-}
-
-pub(super) fn hex_to_bytes(value: &str) -> Option<Vec<u8>> {
-    if !value.len().is_multiple_of(2) || !value.chars().all(|c| c.is_ascii_hexdigit()) {
-        return None;
-    }
-    let mut out = Vec::with_capacity(value.len() / 2);
-    for chunk in value.as_bytes().chunks_exact(2) {
-        let raw = std::str::from_utf8(chunk).ok()?;
-        out.push(u8::from_str_radix(raw, 16).ok()?);
-    }
-    Some(out)
 }
 
 pub(super) fn validate_trace_id(trace_id: &str) -> ApiResult<()> {

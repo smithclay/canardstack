@@ -13,8 +13,7 @@ use chrono::{Duration, TimeZone, Utc};
 use common::{log_fixture, metric_fixture, trace_fixture};
 use flate2::write::GzEncoder;
 use flate2::Compression;
-use opentelemetry_proto::tonic::trace::v1::TracesData;
-use prost::Message;
+use otlp2records::proto_output::inspect_tempo_trace_by_id_response;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::env;
@@ -24,12 +23,6 @@ use std::thread;
 use std::time::Duration as StdDuration;
 use std::time::Instant;
 use tempfile::tempdir;
-
-#[derive(Clone, PartialEq, Message)]
-struct TempoTraceByIdResponseForTest {
-    #[prost(message, optional, tag = "1")]
-    trace: Option<TracesData>,
-}
 
 fn app() -> (tempfile::TempDir, AppState) {
     let dir = tempdir().unwrap();
@@ -1594,13 +1587,12 @@ fn grafana_tempo_contract_supports_probe_search_tags_and_trace_lookup() {
         &app.state,
     );
     assert_eq!(trace_proto.status(), 200, "{}", trace_proto.text_body());
-    let decoded = TempoTraceByIdResponseForTest::decode(trace_proto.body())
+    let summary = inspect_tempo_trace_by_id_response(trace_proto.body())
         .unwrap_or_else(|err| panic!("Grafana trace lookup must be Tempo protobuf: {err}"));
-    let trace = decoded
-        .trace
-        .expect("Tempo trace response should include trace");
-    let spans = &trace.resource_spans[0].scope_spans[0].spans;
-    assert_eq!(spans[0].name, "GET /smoke");
+    assert_eq!(summary.resource_span_count, 1);
+    assert_eq!(summary.scope_span_count, 1);
+    assert_eq!(summary.span_count, 1);
+    assert_eq!(summary.first_span_name.as_deref(), Some("GET /smoke"));
 }
 
 #[test]
@@ -1617,6 +1609,7 @@ fn provisioned_grafana_dashboard_uses_supported_compat_queries() {
     let panels = dashboard["panels"].as_array().unwrap();
 
     let mut prom_exprs = Vec::new();
+    let mut loki_exprs = Vec::new();
     for panel in panels {
         if let Some(targets) = panel["targets"].as_array() {
             for target in targets {
@@ -1624,9 +1617,12 @@ fn provisioned_grafana_dashboard_uses_supported_compat_queries() {
                     Some("canardstack-prometheus") => {
                         prom_exprs.push(target["expr"].as_str().unwrap_or_default().to_string());
                     }
-                    other => panic!(
-                        "dashboard should only query stored canardstack metrics, got {other:?}"
-                    ),
+                    Some("canardstack-loki") => {
+                        loki_exprs.push(target["expr"].as_str().unwrap_or_default().to_string());
+                    }
+                    other => {
+                        panic!("dashboard should only query canardstack datasources, got {other:?}")
+                    }
                 }
             }
         }
@@ -1641,8 +1637,27 @@ fn provisioned_grafana_dashboard_uses_supported_compat_queries() {
     assert!(
         prom_exprs
             .iter()
+            .filter(|expr| expr.contains("__name__=\"canardstack_"))
             .all(|expr| expr.contains("service_name=\"canardstack\"")),
         "dashboard should query stored self-metrics for the canardstack service: {prom_exprs:?}"
+    );
+    assert!(
+        prom_exprs
+            .iter()
+            .any(|expr| expr == "avg by (service_name) (smoke.gauge)"),
+        "dashboard should show grouped smoke latency demo metrics: {prom_exprs:?}"
+    );
+    assert!(
+        prom_exprs
+            .iter()
+            .any(|expr| expr == "sum by (service_name) (smoke.sum)"),
+        "dashboard should show grouped smoke request demo metrics: {prom_exprs:?}"
+    );
+    assert!(
+        loki_exprs
+            .iter()
+            .any(|expr| expr == "{deployment_environment=\"dev\"} |= \"smoke\""),
+        "dashboard should show smoke logs through Loki: {loki_exprs:?}"
     );
     assert!(
         !prom_exprs
