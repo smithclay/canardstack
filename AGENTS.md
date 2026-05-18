@@ -20,7 +20,7 @@ cargo build --all-targets --locked
 # Tests (offline; does not touch MotherDuck)
 cargo test
 cargo test <test_name>
-cargo test remote_motherduck_ducklake_smoke -- --ignored --nocapture  # live MotherDuck smoke; requires MOTHERDUCK_TOKEN
+cargo test remote_ducklake_attach_uri_smoke -- --ignored --nocapture  # live remote DuckLake smoke; requires credentials
 
 # Lint and formatting (CI treats warnings as errors)
 cargo fmt --all -- --check
@@ -43,10 +43,10 @@ docker compose run --rm smoke
 scripts/smoke-docker-local.sh
 
 # Bench
-cargo bench --bench v0_iteration
+cargo bench --bench throughput_iteration
 ```
 
-`CANARDSTACK_USE_DUCKLAKE=true` is the default and requires the DuckLake DuckDB extension; startup should fail loudly if it is not loadable. Use `CANARDSTACK_USE_DUCKLAKE=false` for a pure local-DuckDB run when iterating without the lake.
+DuckLake is the only ingest storage mode and requires the DuckLake DuckDB extension; startup should fail loudly if it is not loadable. With no remote catalog configuration, canardstack uses a local DuckLake catalog and local data files.
 
 ## Architecture
 
@@ -57,7 +57,7 @@ OTLP/HTTP (JSON or protobuf, optional gzip)
   -> validation (auth, content type, size, timestamp skew)
   -> otlp2records -> Arrow RecordBatch grouped by Signal
   -> bounded per-signal in-memory queue
-  -> DuckDB Arrow appender into DuckLake tables, or local DuckDB when USE_DUCKLAKE=false
+  -> immutable Parquet segment files registered with DuckLake
   -> bounded compat query adapters for Prometheus / Loki / Tempo subsets
 ```
 
@@ -65,7 +65,7 @@ Signals are `Logs`, `Spans`, `MetricGauge`, and `MetricSum`. Histograms and expo
 
 ## Source Map
 
-The crate is intentionally flat; each module maps to a pipeline stage or boundary.
+Top-level modules map to pipeline stages or boundaries. Subdirectories group helper code by ownership while preserving the public root module shims where they already exist.
 
 - `src/main.rs` - argv dispatch for `serve`, `smoke`, `smoke-http`, `healthcheck`, and `install-ducklake-extension`; installs SIGINT/SIGTERM handlers.
 - `src/lib.rs` - re-exports `AppState`, `Config`, and `Scheduler`; defines `log_event` and `LockExt::lock_or_poisoned`.
@@ -75,13 +75,14 @@ The crate is intentionally flat; each module maps to a pipeline stage or boundar
 - `src/validation.rs` - auth, content-type, size, compression, timestamp-skew checks, `ApiError`, and error envelopes.
 - `src/otlp.rs` - OTLP JSON/protobuf decode and `Transformed` payload construction.
 - `src/ingest/` - request flow, admission, queue accounting, flush orchestration, and `PartialFlushError`.
-- `src/storage.rs` - DuckDB lifecycle, DuckLake `ATTACH`, extension install, Arrow appender writes, `StorageProbe`, retention, and compaction SQL.
-- `src/query.rs` - bounded query helpers with interactive and background lanes.
-- `src/compat.rs` - Prometheus/Loki/Tempo route adapters and the v0 public query surface.
-- `src/maintenance.rs` - `Scheduler` background thread for flush, DuckLake inlined-data flush, compaction, retention, and maintenance pause.
+- `src/storage/` - DuckDB lifecycle, DuckLake `ATTACH`, extension install, immutable segment writes, `StorageProbe`, retention, and maintenance SQL.
+- `src/query/` - bounded query helpers, shared query plans, and Prometheus/Loki/Tempo selector parsing.
+- `src/compat/` - Prometheus/Loki/Tempo route adapters and the v0 public query surface.
+- `src/metadata.rs` - bounded discovery-metadata adapters over `metadata_summary`, with a generation-keyed in-process cache.
+- `src/maintenance.rs` - `Scheduler` background thread for flush, metadata refresh, operator-metrics snapshot, compaction, retention, and maintenance pause.
 - `src/metrics.rs` - Prometheus-style operator metrics at `/metrics`.
-- `src/ui.rs` - thin investigation UI at `/`.
-- `src/sql.rs` - shared SQL fragment helpers used by `storage` and `compat`.
+- `src/db/sql.rs` - shared SQL fragment helpers used by `storage`, `query`, and `compat`.
+- `src/runtime/memory.rs` - runtime memory-pressure probing.
 - `src/cli/` - subcommand implementations.
 
 ## Load-Bearing Constraints
@@ -91,15 +92,15 @@ The crate is intentionally flat; each module maps to a pipeline stage or boundar
 - Treat ingest as best-effort: a 2xx response means "accepted into a bounded in-memory queue," not "durably committed." There is no WAL.
 - Preserve pressure behavior: queues return 429 under pressure, and storage/dependency failures surface as 503 where appropriate.
 - Keep query routes bounded by time range, row limit, timeout, DuckDB memory limit, and concurrency caps through `QueryEngine`.
-- Do not expose arbitrary SQL through the UI or compatibility APIs. Direct SQL is intentionally an external DuckDB CLI / MotherDuck path.
+- Do not expose arbitrary SQL through the compatibility APIs. Direct SQL is intentionally an external DuckDB CLI / MotherDuck path.
 - Preserve the Prometheus/Loki error envelope shape: `{"status":"error","errorType":"...","error":"..."}`.
 - Assume one in-process scheduler and single writer. There is no Postgres-backed maintenance lease yet.
 
 ## Testing Expectations
 
 - Add or update tests for behavior changes when practical.
-- End-to-end tests usually belong in `tests/v0.rs` with shared fixtures under `tests/common/`; do not create a new test crate without a clear reason.
-- For storage-mode changes, cover the relevant `CANARDSTACK_USE_DUCKLAKE`, `CANARDSTACK_POSTGRES_DSN`, and `CANARDSTACK_DUCKLAKE_ATTACH_URI` combinations or explain why a live smoke is required.
+- End-to-end tests usually belong in `tests/integration.rs` with shared fixtures under `tests/common/`; do not create a new test crate without a clear reason.
+- For storage-mode changes, cover local DuckLake plus relevant `CANARDSTACK_POSTGRES_DSN` and `CANARDSTACK_DUCKLAKE_ATTACH_URI` combinations, or explain why a live smoke is required.
 - For compatibility API changes, verify both success payloads and protocol-specific error envelopes.
 - If a check cannot be run locally, say exactly which command was skipped and why.
 

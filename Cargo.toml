@@ -8,17 +8,23 @@ license = "Apache-2.0"
 anyhow = "1.0.102"
 chrono = { version = "0.4.44", features = ["clock", "serde"] }
 arrow58 = { package = "arrow", version = "58", default-features = false, features = ["ffi", "ipc", "json"] }
-duckdb = { version = "1.10502.0", features = ["bundled", "appender-arrow"] }
+duckdb = { version = "1.10502.0", features = ["bundled"] }
 flate2 = "1.1.9"
-otlp2records = "0.4.0"
-opentelemetry-proto = { version = "0.31.0", default-features = false, features = ["gen-tonic-messages", "trace", "logs", "metrics"] }
-prost = "0.14.3"
+otlp2records = { version = "0.7.0", features = ["parquet"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
+
+[features]
+default = []
+otlp2records-observer = []
 
 [dev-dependencies]
 tempfile = "3.27.0"
 
 [[bench]]
-name = "v0_iteration"
+name = "throughput_iteration"
+harness = false
+
+[[bench]]
+name = "storage_pipeline"
 harness = false

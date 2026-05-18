@@ -115,7 +115,7 @@ fn verify_fixture_evidence(client: &Client, api_key: &str, from: &str, to: &str)
     let prom = client.get(
         &format!(
             "/api/v1/query_range?query={}&start={}&end={}&step=60",
-            enc("avg(smoke.gauge{service_name=\"checkout\"})"),
+            enc("avg by (service_name) (smoke.gauge)"),
             enc(from),
             enc(to)
         ),
@@ -128,6 +128,11 @@ fn verify_fixture_evidence(client: &Client, api_key: &str, from: &str, to: &str)
         &prom_body,
         "42",
         "Prometheus query did not return gauge value",
+    )?;
+    ensure_text(
+        &prom_body,
+        "payments",
+        "Prometheus query did not return grouped smoke services",
     )?;
 
     let loki = client.get(

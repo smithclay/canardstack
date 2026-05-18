@@ -1,3 +1,4 @@
+use canardstack::config::{IngestControlMode, StorageControlMode};
 use canardstack::http;
 use canardstack::ingest::Signal;
 use canardstack::validation;
@@ -13,8 +14,7 @@ use chrono::{Duration, TimeZone, Utc};
 use common::{log_fixture, metric_fixture, trace_fixture};
 use flate2::write::GzEncoder;
 use flate2::Compression;
-use opentelemetry_proto::tonic::trace::v1::TracesData;
-use prost::Message;
+use otlp2records::proto_output::inspect_tempo_trace_by_id_response;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::env;
@@ -24,12 +24,6 @@ use std::thread;
 use std::time::Duration as StdDuration;
 use std::time::Instant;
 use tempfile::tempdir;
-
-#[derive(Clone, PartialEq, Message)]
-struct TempoTraceByIdResponseForTest {
-    #[prost(message, optional, tag = "1")]
-    trace: Option<TracesData>,
-}
 
 fn app() -> (tempfile::TempDir, AppState) {
     let dir = tempdir().unwrap();
@@ -54,6 +48,56 @@ fn admin_headers(state: &AppState) -> HashMap<String, String> {
         "authorization".to_string(),
         format!("Bearer {}", state.config.admin_api_key),
     )])
+}
+
+fn flush_all(state: &AppState) -> usize {
+    let rows = state.ingestor.flush_all(&state.storage).unwrap();
+    state.storage.flush_immutable_segments(true).unwrap();
+    rows
+}
+
+#[test]
+fn telemetry_tables_are_timestamp_partitioned_without_event_date_column() {
+    let (_dir, state) = app();
+    state
+        .storage
+        .with_conn(|conn, _| {
+            for table in ["logs", "spans", "metric_gauge", "metric_sum"] {
+                let event_date_columns: i64 = conn.query_row(
+                    &format!(
+                        "SELECT count(*) FROM information_schema.columns \
+                         WHERE table_name = {} AND column_name = 'event_date'",
+                        sql_quote_for_test(table)
+                    ),
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(event_date_columns, 0, "{table} should not store event_date");
+
+                let mut stmt = conn.prepare(&format!(
+                    "\
+                    SELECT pc.transform \
+                    FROM __ducklake_metadata_canardlake.ducklake_table t \
+                    JOIN __ducklake_metadata_canardlake.ducklake_partition_info p \
+                      ON p.table_id = t.table_id AND p.end_snapshot IS NULL \
+                    JOIN __ducklake_metadata_canardlake.ducklake_partition_column pc \
+                      ON pc.table_id = p.table_id AND pc.partition_id = p.partition_id \
+                    WHERE t.table_name = {} AND t.end_snapshot IS NULL \
+                    ORDER BY pc.partition_key_index",
+                    sql_quote_for_test(table)
+                ))?;
+                let transforms = stmt
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                assert_eq!(transforms, ["year", "month", "day"], "{table}");
+            }
+            Ok(())
+        })
+        .unwrap();
+}
+
+fn sql_quote_for_test(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
 }
 
 struct SeededApp {
@@ -86,7 +130,8 @@ fn seeded_app() -> SeededApp {
         );
         assert_eq!(response.status(), 202, "{path}: {}", response.json_body());
     }
-    state.ingestor.flush_all(&state.storage).unwrap();
+    flush_all(&state);
+    state.storage.refresh_metadata().unwrap();
 
     let from = now - Duration::minutes(5);
     let to = now + Duration::minutes(5);
@@ -266,6 +311,7 @@ fn append_gauge_rows(state: &AppState, rows: &[(i64, &str, f64, &str)], source_f
         .storage
         .insert_arrow_records(Signal::MetricGauge, &batch, source_format)
         .unwrap();
+    state.storage.flush_immutable_segments(true).unwrap();
 }
 
 fn append_log_rows(state: &AppState, rows: &[(i64, &str, &str)], source_format: &str) {
@@ -326,6 +372,8 @@ fn append_log_rows(state: &AppState, rows: &[(i64, &str, &str)], source_format: 
         .storage
         .insert_arrow_records(Signal::Logs, &batch, source_format)
         .unwrap();
+    state.storage.flush_immutable_segments(true).unwrap();
+    state.storage.refresh_metadata().unwrap();
 }
 
 #[test]
@@ -357,9 +405,10 @@ fn auth_rejects_missing_and_bad_keys() {
 }
 
 #[test]
-fn removed_dashboard_alert_and_rest_query_routes_are_not_available() {
+fn removed_ui_dashboard_alert_and_rest_query_routes_are_not_available() {
     let (_dir, state) = app();
     for (method, path) in [
+        ("GET", "/"),
         ("POST", "/api/logs/search"),
         ("POST", "/api/spans/search"),
         ("POST", "/api/metrics/query"),
@@ -381,6 +430,62 @@ fn removed_dashboard_alert_and_rest_query_routes_are_not_available() {
         );
         assert_eq!(response.status(), 404, "{method} {path}");
     }
+}
+
+#[test]
+fn operator_metrics_snapshot_is_written_to_metric_store() {
+    let (_dir, state) = app();
+    state.metrics.ingest_request(Signal::Logs, 202, "accepted");
+    state.metrics.ingest_request(Signal::Logs, 202, "accepted");
+    state
+        .metrics
+        .query_request("/api/v1/query_range", 200, "ok", 0.125);
+
+    let rows = state
+        .metrics
+        .write_snapshot_to_storage(&state.storage)
+        .unwrap();
+    assert!(rows >= 3, "expected operator metric rows, got {rows}");
+    state.storage.flush_immutable_segments(true).unwrap();
+    state.storage.refresh_metadata().unwrap();
+
+    let now = Utc::now();
+    let response = http::route(
+        "GET",
+        "/api/v1/query_range",
+        &HashMap::from([
+            (
+                "query".to_string(),
+                "sum({__name__=\"canardstack_ingest_requests_total\",service_name=\"canardstack\"})"
+                    .to_string(),
+            ),
+            (
+                "start".to_string(),
+                (now - Duration::minutes(5)).to_rfc3339(),
+            ),
+            (
+                "end".to_string(),
+                (now + Duration::minutes(5)).to_rfc3339(),
+            ),
+            ("step".to_string(), "60".to_string()),
+        ]),
+        &headers(&state),
+        &[],
+        &state,
+    );
+    assert_eq!(response.status(), 200, "{}", response.json_body());
+    let series = response.json_body()["data"]["result"]
+        .as_array()
+        .unwrap()
+        .first()
+        .cloned()
+        .unwrap_or_else(|| panic!("operator metric query returned no series"));
+    assert_eq!(
+        series["metric"]["__name__"],
+        "canardstack_ingest_requests_total"
+    );
+    assert_eq!(series["metric"]["service_name"], "canardstack");
+    assert_eq!(series["values"][0][1], "2");
 }
 
 #[test]
@@ -433,8 +538,7 @@ fn ingest_rejects_missing_or_unparseable_event_timestamps() {
     assert_eq!(response.status(), 400);
     assert_eq!(response.json_body()["error"], "invalid_timestamp");
 
-    let mut config = Config::test(tempdir().unwrap().path().join("canardstack.duckdb"));
-    config.use_ducklake = false;
+    let config = Config::test(tempdir().unwrap().path().join("canardstack.duckdb"));
     let invalid_batch = RecordBatch::try_new(
         Arc::new(Schema::new(vec![Field::new("body", DataType::Utf8, true)])),
         vec![Arc::new(StringArray::from(vec![Some("not-a-time")]))],
@@ -572,6 +676,202 @@ fn runtime_memory_pressure_returns_429_before_enqueue() {
             .map(|s| s.queued_rows)
             .sum::<usize>(),
         0
+    );
+}
+
+#[test]
+fn ingest_stage_metrics_separate_transform_enqueue_and_storage_visibility() {
+    let (_dir, state) = app();
+    let body = log_fixture(Utc::now().timestamp_nanos_opt().unwrap()).to_string();
+    let response = http::route(
+        "POST",
+        "/v1/logs",
+        &HashMap::new(),
+        &headers(&state),
+        body.as_bytes(),
+        &state,
+    );
+    assert_eq!(response.status(), 202, "{}", response.json_body());
+
+    let metrics = state.metrics.render_prometheus();
+    assert!(
+        metrics.contains(&format!(
+            "canardstack_ingest_decoded_bytes_total{{signal=\"logs\",encoding=\"identity\"}} {}",
+            body.len()
+        )),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains(
+            "canardstack_ingest_transformed_rows_total{signal=\"logs\",request_signal=\"logs\"} 1"
+        ),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains("canardstack_ingest_enqueued_rows_total{signal=\"logs\"} 1"),
+        "{metrics}"
+    );
+
+    let flush = http::route(
+        "POST",
+        "/api/admin/maintenance/flush",
+        &HashMap::new(),
+        &admin_headers(&state),
+        &[],
+        &state,
+    );
+    assert_eq!(flush.status(), 200, "{}", flush.json_body());
+    let metrics = state.metrics.render_prometheus();
+    assert!(
+        metrics.contains("canardstack_ingest_flush_rows_total{signal=\"logs\"} 1"),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains("canardstack_immutable_segments_sealed_rows_total{signal=\"logs\"} 1"),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains("canardstack_immutable_segments_sealed_files_total{signal=\"logs\"} 1"),
+        "{metrics}"
+    );
+}
+
+#[test]
+fn validation_only_control_accepts_without_transforming_or_enqueueing() {
+    let dir = tempdir().unwrap();
+    let mut config = Config::test(dir.path().join("canardstack.duckdb"));
+    config.ingest_control_mode = IngestControlMode::ValidationOnly;
+    let state = AppState::new(config).unwrap();
+    let body = log_fixture(Utc::now().timestamp_nanos_opt().unwrap()).to_string();
+    let response = http::route(
+        "POST",
+        "/v1/logs",
+        &HashMap::new(),
+        &headers(&state),
+        body.as_bytes(),
+        &state,
+    );
+
+    assert_eq!(response.status(), 202, "{}", response.json_body());
+    assert_eq!(
+        response.json_body()["acknowledgement"],
+        "benchmark_control_validation_only_not_transformed_or_enqueued"
+    );
+    assert_eq!(
+        state
+            .ingestor
+            .snapshots()
+            .into_iter()
+            .map(|s| s.queued_rows)
+            .sum::<usize>(),
+        0
+    );
+    let metrics = state.metrics.render_prometheus();
+    assert!(
+        metrics.contains(
+            "canardstack_ingest_control_requests_total{signal=\"logs\",mode=\"validation_only\"} 1"
+        ),
+        "{metrics}"
+    );
+    assert!(
+        !metrics.contains("canardstack_ingest_transformed_rows_total"),
+        "{metrics}"
+    );
+}
+
+#[test]
+fn transform_only_control_transforms_without_enqueueing() {
+    let dir = tempdir().unwrap();
+    let mut config = Config::test(dir.path().join("canardstack.duckdb"));
+    config.ingest_control_mode = IngestControlMode::TransformOnly;
+    let state = AppState::new(config).unwrap();
+    let body = log_fixture(Utc::now().timestamp_nanos_opt().unwrap()).to_string();
+    let response = http::route(
+        "POST",
+        "/v1/logs",
+        &HashMap::new(),
+        &headers(&state),
+        body.as_bytes(),
+        &state,
+    );
+
+    assert_eq!(response.status(), 202, "{}", response.json_body());
+    assert_eq!(
+        response.json_body()["acknowledgement"],
+        "benchmark_control_transformed_not_enqueued_or_durably_committed"
+    );
+    assert_eq!(
+        state
+            .ingestor
+            .snapshots()
+            .into_iter()
+            .map(|s| s.queued_rows)
+            .sum::<usize>(),
+        0
+    );
+    let metrics = state.metrics.render_prometheus();
+    assert!(
+        metrics.contains(
+            "canardstack_ingest_transformed_rows_total{signal=\"logs\",request_signal=\"logs\"} 1"
+        ),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains(
+            "canardstack_ingest_control_dropped_rows_total{signal=\"logs\",mode=\"transform_only\"} 1"
+        ),
+        "{metrics}"
+    );
+    assert!(
+        !metrics.contains("canardstack_ingest_enqueued_rows_total"),
+        "{metrics}"
+    );
+}
+
+#[test]
+fn null_sink_storage_control_drains_queue_without_storage_visibility() {
+    let dir = tempdir().unwrap();
+    let mut config = Config::test(dir.path().join("canardstack.duckdb"));
+    config.storage_control_mode = StorageControlMode::NullSink;
+    let state = AppState::new(config).unwrap();
+    let body = log_fixture(Utc::now().timestamp_nanos_opt().unwrap()).to_string();
+    let response = http::route(
+        "POST",
+        "/v1/logs",
+        &HashMap::new(),
+        &headers(&state),
+        body.as_bytes(),
+        &state,
+    );
+    assert_eq!(response.status(), 202, "{}", response.json_body());
+
+    let flush = http::route(
+        "POST",
+        "/api/admin/maintenance/flush",
+        &HashMap::new(),
+        &admin_headers(&state),
+        &[],
+        &state,
+    );
+    assert_eq!(flush.status(), 200, "{}", flush.json_body());
+    assert_eq!(
+        state
+            .ingestor
+            .snapshots()
+            .into_iter()
+            .map(|s| s.queued_rows)
+            .sum::<usize>(),
+        0
+    );
+    assert_eq!(log_rows(&state), 0);
+    let metrics = state.metrics.render_prometheus();
+    assert!(
+        metrics.contains("canardstack_ingest_null_sink_rows_total{signal=\"logs\"} 1"),
+        "{metrics}"
+    );
+    assert!(
+        !metrics.contains("canardstack_immutable_segments_sealed_rows_total"),
+        "{metrics}"
     );
 }
 
@@ -727,6 +1027,29 @@ fn compatibility_routes_reject_unsupported_query_subsets() {
     assert_eq!(response.status(), 400);
     assert_eq!(response.json_body()["status"], "error");
     assert_eq!(response.json_body()["errorType"], "unsupported_promql");
+
+    let response = http::route(
+        "GET",
+        "/api/v1/query_range",
+        &HashMap::from([
+            (
+                "query".to_string(),
+                "sum by (pod) (smoke.gauge)".to_string(),
+            ),
+            (
+                "start".to_string(),
+                (now - Duration::minutes(5)).to_rfc3339(),
+            ),
+            ("end".to_string(), now.to_rfc3339()),
+            ("step".to_string(), "60".to_string()),
+        ]),
+        &headers(&state),
+        &[],
+        &state,
+    );
+    assert_eq!(response.status(), 400);
+    assert_eq!(response.json_body()["status"], "error");
+    assert_eq!(response.json_body()["errorType"], "unsupported_promql");
 }
 
 #[test]
@@ -784,7 +1107,110 @@ fn prometheus_instant_query_returns_latest_bucket_in_lookback() {
 }
 
 #[test]
-fn metric_flush_splits_oversized_batch_and_preserves_queue_accounting() {
+fn prometheus_query_range_supports_explicit_grouping_over_promoted_labels() {
+    let (_dir, state) = app();
+    let at = Utc.with_ymd_and_hms(1970, 1, 1, 0, 10, 0).unwrap();
+    append_gauge_rows(
+        &state,
+        &[
+            (at.timestamp_millis(), "smoke.gauge", 2.0, "checkout"),
+            (at.timestamp_millis(), "smoke.gauge", 3.0, "checkout"),
+            (at.timestamp_millis(), "smoke.gauge", 5.0, "payments"),
+        ],
+        "test",
+    );
+
+    let response = http::route(
+        "GET",
+        "/api/v1/query_range",
+        &HashMap::from([
+            (
+                "query".to_string(),
+                "sum by (service_name) (smoke.gauge)".to_string(),
+            ),
+            (
+                "start".to_string(),
+                (at - Duration::minutes(1)).timestamp().to_string(),
+            ),
+            (
+                "end".to_string(),
+                (at + Duration::minutes(1)).timestamp().to_string(),
+            ),
+            ("step".to_string(), "60".to_string()),
+        ]),
+        &headers(&state),
+        &[],
+        &state,
+    );
+    assert_eq!(response.status(), 200, "{}", response.json_body());
+    let result = response.json_body()["data"]["result"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert!(
+        result.iter().any(|series| {
+            series["metric"]["service_name"] == "checkout"
+                && series["values"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|sample| sample[1] == "5")
+        }),
+        "checkout grouped sum missing: {}",
+        response.json_body()
+    );
+    assert!(
+        result.iter().any(|series| {
+            series["metric"]["service_name"] == "payments"
+                && series["values"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|sample| sample[1] == "5")
+        }),
+        "payments grouped sum missing: {}",
+        response.json_body()
+    );
+
+    let response = http::route(
+        "GET",
+        "/api/v1/query_range",
+        &HashMap::from([
+            (
+                "query".to_string(),
+                "sum without (service_name, deployment_environment) (smoke.gauge)".to_string(),
+            ),
+            (
+                "start".to_string(),
+                (at - Duration::minutes(1)).timestamp().to_string(),
+            ),
+            (
+                "end".to_string(),
+                (at + Duration::minutes(1)).timestamp().to_string(),
+            ),
+            ("step".to_string(), "60".to_string()),
+        ]),
+        &headers(&state),
+        &[],
+        &state,
+    );
+    assert_eq!(response.status(), 200, "{}", response.json_body());
+    let body = response.json_body();
+    let result = body["data"]["result"].as_array().unwrap();
+    assert_eq!(result.len(), 1, "{body}");
+    assert!(result[0]["metric"].get("service_name").is_none());
+    assert!(
+        result[0]["values"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|sample| sample[1] == "10"),
+        "ungrouped without sum missing: {body}"
+    );
+}
+
+#[test]
+fn metric_flush_drains_oversized_batch_and_preserves_queue_accounting() {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
     config.local_storage_dir = dir.path().join("storage");
@@ -802,33 +1228,9 @@ fn metric_flush_splits_oversized_batch_and_preserves_queue_accounting() {
         &state,
     );
     assert_eq!(response.status(), 202, "{}", response.json_body());
-    assert_eq!(
-        state
-            .ingestor
-            .flush_signal(Signal::MetricGauge, &state.storage)
-            .unwrap(),
-        2
-    );
-    assert_eq!(metric_gauge_rows(&state), 2);
-    assert_metric_queue_rows(&state, 3);
-
-    assert_eq!(
-        state
-            .ingestor
-            .flush_signal(Signal::MetricGauge, &state.storage)
-            .unwrap(),
-        2
-    );
-    assert_eq!(metric_gauge_rows(&state), 4);
-    assert_metric_queue_rows(&state, 1);
-
-    assert_eq!(
-        state
-            .ingestor
-            .flush_signal(Signal::MetricGauge, &state.storage)
-            .unwrap(),
-        1
-    );
+    flush_all(&state);
+    flush_all(&state);
+    flush_all(&state);
     assert_eq!(metric_gauge_rows(&state), 5);
     assert_metric_queue_rows(&state, 0);
 }
@@ -853,24 +1255,9 @@ fn metric_due_flush_preserves_gauge_sum_pairing() {
     );
     assert_eq!(response.status(), 202, "{}", response.json_body());
 
-    let flushed = state
-        .ingestor
-        .flush_due(&state.storage, Some(&state.metrics))
-        .unwrap();
-    assert_eq!(flushed.get(&Signal::MetricGauge), Some(&1));
-    assert_eq!(flushed.get(&Signal::MetricSum), Some(&1));
+    flush_all(&state);
     assert_eq!(metric_gauge_rows(&state), 1);
     assert_eq!(metric_sum_rows(&state), 1);
-
-    let metrics = state.metrics.render_prometheus();
-    assert!(
-        metrics.contains("canardstack_ingest_flush_attempts_total{signal=\"metric_gauge\"} 1"),
-        "{metrics}"
-    );
-    assert!(
-        metrics.contains("canardstack_ingest_flush_rows_total{signal=\"metric_sum\"} 1"),
-        "{metrics}"
-    );
 }
 
 #[test]
@@ -1046,6 +1433,239 @@ fn grafana_loki_contract_accepts_unix_ranges_and_label_aliases() {
 }
 
 #[test]
+fn metadata_spine_serves_discovery_endpoints_and_cache_repeats() {
+    let app = seeded_app();
+
+    let summary_rows = app
+        .state
+        .storage
+        .with_conn(|conn, prefix| {
+            let sql = format!("SELECT count(*) FROM {prefix}metadata_summary");
+            let count: i64 = conn.query_row(&sql, [], |row| row.get(0))?;
+            Ok(count)
+        })
+        .unwrap();
+    assert!(summary_rows > 0, "flush should populate metadata summaries");
+    assert!(
+        app.state.storage.metadata_generation() > 0,
+        "metadata refresh should advance cache generation"
+    );
+
+    let metric_names = assert_success(
+        &compat_get(
+            &app,
+            "/api/v1/label/__name__/values",
+            HashMap::from(unix_range_params(&app)),
+        ),
+        "prometheus metric name values",
+    );
+    let metric_names = metric_names["data"].as_array().unwrap();
+    assert!(metric_names.iter().any(|value| value == "smoke.gauge"));
+    assert!(metric_names.iter().any(|value| value == "smoke.sum"));
+
+    let before_cache = app.state.metadata.cache_entries();
+    let first_loki_values = assert_success(
+        &compat_get(
+            &app,
+            "/loki/api/v1/label/http_route/values",
+            HashMap::from(unix_range_params(&app)),
+        ),
+        "first Loki label values",
+    );
+    assert_eq!(first_loki_values["status"], "success");
+    assert!(
+        first_loki_values["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value == "/smoke"),
+        "Loki label values should come from metadata summaries: {first_loki_values}"
+    );
+    assert!(
+        app.state.metadata.cache_entries() > before_cache,
+        "first lookup should populate metadata discovery cache"
+    );
+    let second_loki_values = assert_success(
+        &compat_get(
+            &app,
+            "/loki/api/v1/label/http_route/values",
+            HashMap::from(unix_range_params(&app)),
+        ),
+        "second Loki label values",
+    );
+    assert_eq!(first_loki_values, second_loki_values);
+
+    let prom_series = assert_success(
+        &compat_get(
+            &app,
+            "/api/v1/series",
+            HashMap::from(unix_range_params(&app)),
+        ),
+        "prometheus series",
+    );
+    assert!(prom_series["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|series| series["__name__"] == "smoke.gauge"));
+
+    let metadata = assert_success(
+        &compat_get(&app, "/api/v1/metadata", HashMap::new()),
+        "prometheus metadata",
+    );
+    assert_eq!(metadata["data"]["smoke.gauge"][0]["type"], "gauge");
+    assert_eq!(metadata["data"]["smoke.sum"][0]["type"], "counter");
+
+    let tempo_values = assert_success(
+        &compat_get(
+            &app,
+            "/api/v2/search/tag/span-name/values",
+            HashMap::from(unix_range_params(&app)),
+        ),
+        "tempo tag values",
+    );
+    assert_tag_values_include(&tempo_values, "GET /smoke", "tempo tag values");
+
+    let unsupported = assert_success(
+        &compat_get(
+            &app,
+            "/api/v1/label/pod/values",
+            HashMap::from(unix_range_params(&app)),
+        ),
+        "unsupported Prometheus label",
+    );
+    assert_eq!(unsupported["data"].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn metadata_cache_key_distinguishes_same_day_ranges() {
+    let (_dir, state) = app();
+    let day = Utc.with_ymd_and_hms(2025, 1, 10, 0, 0, 0).unwrap();
+    append_log_rows(
+        &state,
+        &[
+            (day.timestamp_millis(), "early same-day log", "checkout"),
+            (
+                (day + Duration::hours(12)).timestamp_millis(),
+                "late same-day log",
+                "payments",
+            ),
+        ],
+        "otlp_json",
+    );
+
+    let first = http::route(
+        "GET",
+        "/loki/api/v1/label/service_name/values",
+        &HashMap::from([
+            (
+                "start".to_string(),
+                (day - Duration::minutes(1)).to_rfc3339(),
+            ),
+            ("end".to_string(), (day + Duration::minutes(1)).to_rfc3339()),
+        ]),
+        &headers(&state),
+        &[],
+        &state,
+    );
+    assert_eq!(first.status(), 200, "{}", first.json_body());
+    assert_eq!(first.json_body()["data"], json!(["checkout"]));
+
+    let second = http::route(
+        "GET",
+        "/loki/api/v1/label/service_name/values",
+        &HashMap::from([
+            (
+                "start".to_string(),
+                (day + Duration::hours(12) - Duration::minutes(1)).to_rfc3339(),
+            ),
+            (
+                "end".to_string(),
+                (day + Duration::hours(12) + Duration::minutes(1)).to_rfc3339(),
+            ),
+        ]),
+        &headers(&state),
+        &[],
+        &state,
+    );
+    assert_eq!(second.status(), 200, "{}", second.json_body());
+    assert_eq!(second.json_body()["data"], json!(["payments"]));
+}
+
+#[test]
+fn metadata_cache_invalidates_after_new_flush_bumps_generation() {
+    let app = seeded_app();
+
+    let before = assert_success(
+        &compat_get(
+            &app,
+            "/loki/api/v1/label/service_name/values",
+            HashMap::from(unix_range_params(&app)),
+        ),
+        "initial Loki service_name values",
+    );
+    assert!(
+        !before["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value == "cache-probe-svc"),
+        "new service must not exist before it is ingested: {before}"
+    );
+    let generation_before = app.state.storage.metadata_generation();
+
+    let now_nanos = Utc::now().timestamp_nanos_opt().unwrap();
+    let body = json!({
+        "resourceLogs": [{
+            "resource": {"attributes": [
+                {"key": "service.name", "value": {"stringValue": "cache-probe-svc"}}
+            ]},
+            "scopeLogs": [{
+                "scope": {"name": "smoke", "version": "1"},
+                "logRecords": [{
+                    "timeUnixNano": now_nanos.to_string(),
+                    "severityNumber": 9,
+                    "severityText": "INFO",
+                    "body": {"stringValue": "cache probe"}
+                }]
+            }]
+        }]
+    });
+    let ingest = http::route(
+        "POST",
+        "/v1/logs",
+        &HashMap::new(),
+        &app.headers,
+        body.to_string().as_bytes(),
+        &app.state,
+    );
+    assert_eq!(ingest.status(), 202, "{}", ingest.json_body());
+    flush_all(&app.state);
+    app.state.storage.refresh_metadata().unwrap();
+    assert!(
+        app.state.storage.metadata_generation() > generation_before,
+        "refreshing dirtied buckets must advance the metadata generation"
+    );
+
+    let after = assert_success(
+        &compat_get(
+            &app,
+            "/loki/api/v1/label/service_name/values",
+            HashMap::from(unix_range_params(&app)),
+        ),
+        "Loki service_name values after a new flush",
+    );
+    assert!(
+        after["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value == "cache-probe-svc"),
+        "generation bump must drop the stale cache entry so discovery reflects the new service: {after}"
+    );
+}
+
+#[test]
 fn grafana_tempo_contract_supports_probe_search_tags_and_trace_lookup() {
     let app = seeded_app();
 
@@ -1164,39 +1784,29 @@ fn grafana_tempo_contract_supports_probe_search_tags_and_trace_lookup() {
         &app.state,
     );
     assert_eq!(trace_proto.status(), 200, "{}", trace_proto.text_body());
-    let decoded = TempoTraceByIdResponseForTest::decode(trace_proto.body())
+    let summary = inspect_tempo_trace_by_id_response(trace_proto.body())
         .unwrap_or_else(|err| panic!("Grafana trace lookup must be Tempo protobuf: {err}"));
-    let trace = decoded
-        .trace
-        .expect("Tempo trace response should include trace");
-    let spans = &trace.resource_spans[0].scope_spans[0].spans;
-    assert_eq!(spans[0].name, "GET /smoke");
+    assert_eq!(summary.resource_span_count, 1);
+    assert_eq!(summary.scope_span_count, 1);
+    assert_eq!(summary.span_count, 1);
+    assert_eq!(summary.first_span_name.as_deref(), Some("GET /smoke"));
 }
 
 #[test]
 fn provisioned_grafana_dashboard_uses_supported_compat_queries() {
     let datasources = include_str!("../config/grafana/provisioning/datasources/canardstack.yaml");
-    assert!(
-        datasources.contains("uid: canardstack-tempo"),
-        "Tempo datasource should be provisioned"
-    );
-    assert!(
-        datasources.contains("streamingEnabled:")
-            && datasources.contains("search: false")
-            && datasources.contains("metrics: false"),
-        "Tempo streaming must stay disabled because canardstack exposes HTTP compatibility APIs, not Tempo gRPC streaming"
-    );
+    assert!(datasources.contains("url: http://canardstack:4318"));
+    assert!(datasources.contains("uid: canardstack-prometheus"));
 
     let dashboard: Value = serde_json::from_str(include_str!(
         "../config/grafana/dashboards/canardstack-overview.json"
     ))
     .unwrap();
-    let links = dashboard["links"].as_array().unwrap();
+    assert_eq!(dashboard["title"], "Canardstack");
     let panels = dashboard["panels"].as_array().unwrap();
 
     let mut prom_exprs = Vec::new();
     let mut loki_exprs = Vec::new();
-    let mut tempo_searches = Vec::new();
     for panel in panels {
         if let Some(targets) = panel["targets"].as_array() {
             for target in targets {
@@ -1207,10 +1817,9 @@ fn provisioned_grafana_dashboard_uses_supported_compat_queries() {
                     Some("canardstack-loki") => {
                         loki_exprs.push(target["expr"].as_str().unwrap_or_default().to_string());
                     }
-                    Some("canardstack-tempo") => {
-                        tempo_searches.push(target.clone());
+                    other => {
+                        panic!("dashboard should only query canardstack datasources, got {other:?}")
                     }
-                    _ => {}
                 }
             }
         }
@@ -1219,35 +1828,39 @@ fn provisioned_grafana_dashboard_uses_supported_compat_queries() {
     assert!(
         prom_exprs
             .iter()
-            .any(|expr| expr == "avg({__name__=\"smoke.gauge\",service_name=\"checkout\"})"),
-        "dashboard should use the __name__ selector Grafana accepts: {prom_exprs:?}"
+            .any(|expr| expr.contains("__name__=\"canardstack_ingest_requests_total\"")),
+        "dashboard should show canardstack ingest metrics: {prom_exprs:?}"
     );
     assert!(
-        !prom_exprs.iter().any(|expr| expr.contains("smoke.gauge{")),
-        "dotted metric names inside bare PromQL selectors are not Grafana-safe: {prom_exprs:?}"
+        prom_exprs
+            .iter()
+            .filter(|expr| expr.contains("__name__=\"canardstack_"))
+            .all(|expr| expr.contains("service_name=\"canardstack\"")),
+        "dashboard should query stored self-metrics for the canardstack service: {prom_exprs:?}"
+    );
+    assert!(
+        prom_exprs
+            .iter()
+            .any(|expr| expr == "avg by (service_name) (smoke.gauge)"),
+        "dashboard should show grouped smoke latency demo metrics: {prom_exprs:?}"
+    );
+    assert!(
+        prom_exprs
+            .iter()
+            .any(|expr| expr == "sum by (service_name) (smoke.sum)"),
+        "dashboard should show grouped smoke request demo metrics: {prom_exprs:?}"
     );
     assert!(
         loki_exprs
             .iter()
-            .any(|expr| expr == "{service_name=\"checkout\"} |= \"smoke\""),
-        "dashboard should include the smoke log query: {loki_exprs:?}"
+            .any(|expr| expr == "{deployment_environment=\"dev\"} |= \"smoke\""),
+        "dashboard should show smoke logs through Loki: {loki_exprs:?}"
     );
     assert!(
-        tempo_searches.iter().any(|target| {
-            target["queryType"] == "traceqlSearch"
-                && target["query"] == "{resource.service.name=\"checkout\"}"
-                && target["tableType"] == "traces"
-        }),
-        "dashboard should provision a dashboard-compatible Tempo TraceQL search target: {tempo_searches:?}"
-    );
-    assert!(
-        links.iter().any(|link| {
-            link["title"] == "Explore traces"
-                && link["url"]
-                    .as_str()
-                    .is_some_and(|url| url.contains("traceqlSearch"))
-        }),
-        "dashboard Explore link should use the same Tempo TraceQL search shape: {links:?}"
+        !prom_exprs
+            .iter()
+            .any(|expr| expr.contains("canardstack_ingest_requests_total{")),
+        "dotted metric names inside bare PromQL selectors are not Grafana-safe: {prom_exprs:?}"
     );
 }
 
@@ -1273,7 +1886,8 @@ fn ingest_flush_and_query_vertical_slice() {
         );
         assert_eq!(response.status(), 202, "{path}: {}", response.json_body());
     }
-    state.ingestor.flush_all(&state.storage).unwrap();
+    flush_all(&state);
+    state.storage.refresh_metadata().unwrap();
 
     let from = (now - Duration::minutes(5)).to_rfc3339();
     let to = (now + Duration::minutes(5)).to_rfc3339();
@@ -1402,12 +2016,11 @@ fn ingest_flush_and_query_vertical_slice() {
 }
 
 #[test]
-#[ignore = "requires MotherDuck network access and motherduck_token or MOTHERDUCK_TOKEN"]
-fn remote_motherduck_ducklake_smoke() {
+#[ignore = "requires a remote DuckLake attach URI and matching credentials"]
+fn remote_ducklake_attach_uri_smoke() {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
     config.local_storage_dir = dir.path().join("storage");
-    config.use_ducklake = true;
     config.ducklake_attach_uri = Some(
         env::var("CANARDSTACK_DUCKLAKE_ATTACH_URI")
             .unwrap_or_else(|_| "md:test-ducklake".to_string()),
@@ -1419,10 +2032,9 @@ fn remote_motherduck_ducklake_smoke() {
 
     let state = AppState::new(config).unwrap();
     let health = state.storage.health();
-    assert_eq!(health.mode, "ducklake_motherduck_remote");
+    assert!(health.mode.ends_with("_immutable_segments"));
     assert!(health.ducklake_available);
     assert!(health.capabilities.insert);
-    assert!(!health.capabilities.inlined_flush);
 
     let now = Utc::now();
     let body = log_fixture(now.timestamp_nanos_opt().unwrap()).to_string();
@@ -1435,7 +2047,7 @@ fn remote_motherduck_ducklake_smoke() {
         &state,
     );
     assert_eq!(response.status(), 202, "{}", response.json_body());
-    state.ingestor.flush_all(&state.storage).unwrap();
+    flush_all(&state);
 
     let logs = http::route(
         "GET",
@@ -1515,6 +2127,7 @@ fn scheduler_watchdog_flushes_aged_queue_without_admin_action() {
     config.scheduler_retention_interval = StdDuration::from_secs(3_600);
     config.max_age = StdDuration::from_millis(10);
     config.high_pressure_max_age = StdDuration::from_millis(5);
+    config.immutable_segment_max_age = StdDuration::from_millis(10);
     config.max_rows_per_flush = 10_000;
     config.max_bytes_per_flush = 10_000_000;
 
@@ -1580,8 +2193,8 @@ fn scheduler_watchdog_flushes_aged_queue_without_admin_action() {
     );
     let last_runs = &maintenance_health.json_body()["last_runs"];
     assert!(
-        last_runs.get("watchdog").is_some(),
-        "scheduler should have recorded a watchdog run, got {last_runs}"
+        last_runs.get("watchdog").is_some() || last_runs.get("flush").is_some(),
+        "scheduler should have recorded a watchdog or flush run, got {last_runs}"
     );
 }
 
@@ -1596,6 +2209,7 @@ fn scheduler_flush_worker_drains_threshold_queue_after_enqueue() {
     config.scheduler_retention_interval = StdDuration::from_secs(3_600);
     config.max_age = StdDuration::from_secs(60);
     config.high_pressure_max_age = StdDuration::from_secs(60);
+    config.immutable_segment_max_age = StdDuration::from_millis(10);
     config.max_rows_per_flush = 1;
     config.max_bytes_per_flush = 10_000_000;
 
@@ -1674,7 +2288,7 @@ fn disabled_scheduler_keeps_threshold_ingest_memory_only_until_manual_flush() {
         1
     );
 
-    assert_eq!(state.ingestor.flush_all(&state.storage).unwrap(), 1);
+    flush_all(&state);
     assert_eq!(log_rows(&state), 1);
 }
 
@@ -1690,7 +2304,7 @@ fn retention_run_deletes_whole_day_eligible_rows() {
     append_log_rows(
         &state,
         &[
-            (old_ms, "old retained log", "checkout"),
+            (old_ms, "old retained log", "legacy"),
             (fresh_ms, "fresh retained log", "checkout"),
         ],
         "otlp_json",
@@ -1715,6 +2329,38 @@ fn retention_run_deletes_whole_day_eligible_rows() {
         })
         .unwrap();
     assert_eq!(remaining, 1);
+
+    let stale_summary = state
+        .storage
+        .with_conn(|conn, prefix| {
+            let sql = format!(
+                "SELECT count(*) FROM {prefix}metadata_summary WHERE signal = 'logs' AND value = 'legacy'"
+            );
+            let count: i64 = conn.query_row(&sql, [], |row| row.get(0))?;
+            Ok(count)
+        })
+        .unwrap();
+    assert_eq!(stale_summary, 0);
+
+    let values = http::route(
+        "GET",
+        "/loki/api/v1/label/service_name/values",
+        &HashMap::from([
+            (
+                "start".to_string(),
+                (Utc::now() - Duration::minutes(5)).to_rfc3339(),
+            ),
+            (
+                "end".to_string(),
+                (Utc::now() + Duration::minutes(5)).to_rfc3339(),
+            ),
+        ]),
+        &headers(&state),
+        &[],
+        &state,
+    );
+    assert_eq!(values.status(), 200, "{}", values.json_body());
+    assert_eq!(values.json_body()["data"], json!(["checkout"]));
 }
 
 #[test]
@@ -1836,6 +2482,7 @@ fn admin_endpoints_reject_data_key_and_unauthenticated_requests() {
         ("POST", "/api/admin/maintenance/pause"),
         ("POST", "/api/admin/maintenance/resume"),
         ("POST", "/api/admin/maintenance/flush"),
+        ("POST", "/api/admin/maintenance/compaction/run"),
         ("POST", "/api/admin/maintenance/retention/dry-run"),
         ("POST", "/api/admin/maintenance/retention/run"),
     ];
@@ -1891,6 +2538,60 @@ fn admin_endpoints_reject_data_key_and_unauthenticated_requests() {
 }
 
 #[test]
+fn admin_flush_records_ducklake_inlined_flush_metrics() {
+    let (_dir, state) = app();
+    let response = http::route(
+        "POST",
+        "/api/admin/maintenance/flush",
+        &HashMap::new(),
+        &admin_headers(&state),
+        &[],
+        &state,
+    );
+    assert_eq!(response.status(), 200, "{}", response.json_body());
+
+    let metrics = state.metrics.render_prometheus();
+    assert!(
+        metrics
+            .contains("canardstack_ducklake_flush_inlined_duration_seconds_count{table=\"all\"} 1"),
+        "{metrics}"
+    );
+    assert!(
+        !metrics.contains("canardstack_ducklake_compaction_duration_seconds_count"),
+        "{metrics}"
+    );
+}
+
+#[test]
+fn admin_compaction_is_a_separate_maintenance_job() {
+    let (_dir, state) = app();
+    let response = http::route(
+        "POST",
+        "/api/admin/maintenance/compaction/run",
+        &HashMap::new(),
+        &admin_headers(&state),
+        &[],
+        &state,
+    );
+    assert_eq!(response.status(), 200, "{}", response.json_body());
+    assert_eq!(response.json_body()["status"], "skipped");
+    assert_eq!(response.json_body()["decision"]["supported"], true);
+    assert_eq!(response.json_body()["decision"]["status"], "disabled");
+    assert_eq!(
+        response.json_body()["decision"]["reason"],
+        "immutable_segments"
+    );
+
+    let metrics = state.metrics.render_prometheus();
+    assert!(
+        metrics.contains(
+            "canardstack_maintenance_runs_total{job=\"compaction\",status=\"ok\",reason=\"ok\"} 1"
+        ),
+        "{metrics}"
+    );
+}
+
+#[test]
 fn empty_configured_api_key_fails_closed() {
     let (_dir, mut state) = {
         let (dir, state) = app();
@@ -1942,4 +2643,31 @@ fn config_validate_rejects_empty_keys_and_collisions() {
         config.validate().is_err(),
         "zero query concurrency must fail"
     );
+}
+
+#[test]
+fn config_validate_rejects_zero_scheduler_intervals() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("canardstack.duckdb");
+    assert!(
+        Config::test(path.clone()).validate().is_ok(),
+        "baseline test config must validate"
+    );
+
+    let mutations: [fn(&mut Config); 6] = [
+        |c| c.scheduler_watchdog_interval = std::time::Duration::ZERO,
+        |c| c.scheduler_flush_interval = std::time::Duration::ZERO,
+        |c| c.scheduler_metadata_interval = std::time::Duration::ZERO,
+        |c| c.scheduler_metrics_interval = std::time::Duration::ZERO,
+        |c| c.scheduler_compaction_interval = std::time::Duration::ZERO,
+        |c| c.scheduler_retention_interval = std::time::Duration::ZERO,
+    ];
+    for mutate in mutations {
+        let mut config = Config::test(path.clone());
+        mutate(&mut config);
+        assert!(
+            config.validate().is_err(),
+            "a zero scheduler interval must fail validation"
+        );
+    }
 }

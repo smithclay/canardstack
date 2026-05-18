@@ -18,8 +18,8 @@ Parquet, and object storage.
 
 It accepts OpenTelemetry logs, traces, gauge metrics, and sum metrics over
 OTLP/HTTP. It stores normalized tables in DuckLake and exposes small
-Prometheus-, Loki-, and Tempo-shaped query surfaces for Grafana and local
-investigation.
+Prometheus-, Loki-, and Tempo-shaped query surfaces for Grafana, curl, and
+other protocol-compatible clients.
 
 It is not a full observability suite. It is a small backend for operators who
 want telemetry in DuckLake/DuckDB-accessible tables, with enough compatibility
@@ -51,30 +51,26 @@ Docker Compose runs canardstack on `http://localhost:4318` and Grafana on
 `http://localhost:3000`. Local DuckLake metadata and data files live in the
 `canardstack-data` Docker volume.
 
-Open the local investigation UI:
-
-```text
-http://localhost:4318/
-```
-
 Seed representative telemetry through the running service:
 
 ```bash
 docker compose run --rm smoke
 ```
 
-The smoke command sends one log, one trace, one gauge metric, and one sum metric
-over OTLP/HTTP. It then verifies storage health plus the Prometheus, Loki, and
-Tempo-compatible query paths.
+The smoke command sends a small multi-service demo workload over OTLP/HTTP:
+logs, a multi-span trace, gauge samples, and cumulative sum samples. It then
+verifies storage health plus the Prometheus, Loki, and Tempo-compatible query
+paths.
 
-Open the provisioned Grafana dashboard:
+Open the provisioned canardstack Grafana dashboard:
 
 ```text
 http://localhost:3000/d/canardstack-overview/canardstack-overview
 ```
 
-Grafana is provisioned with canardstack datasources for the Prometheus, Loki,
-and Tempo APIs. Use `admin/admin` if you log in directly.
+Grafana is the bundled UI. It is provisioned with canardstack datasources, and
+the default dashboard shows the smoke workload alongside canardstack's stored
+self-metrics. Use `admin/admin` if you log in directly.
 
 ## Quickstart: MotherDuck-hosted DuckLake
 
@@ -109,12 +105,6 @@ Docker Compose runs canardstack on `http://localhost:4318` and Grafana on
 Grafana container stays local and queries canardstack through the provisioned
 Prometheus, Loki, and Tempo-compatible datasources.
 
-Open the local investigation UI:
-
-```text
-http://localhost:4318/
-```
-
 In another terminal, seed representative telemetry through the local
 canardstack service:
 
@@ -128,7 +118,10 @@ Then open the local Grafana overview dashboard:
 http://localhost:3000/d/canardstack-overview/canardstack-overview
 ```
 
-Grafana is provisioned with canardstack datasources based on Prometheus, Loki, and Tempo APIs. Use `admin/admin` for logging on.
+Grafana is the bundled UI. It is provisioned with canardstack datasources based
+on Prometheus, Loki, and Tempo APIs. The default dashboard shows the smoke
+workload alongside canardstack's stored self-metrics. Use `admin/admin` for
+logging on.
 
 ## Who It Is For
 
@@ -175,8 +168,7 @@ flowchart LR
     Collector -->|OTLP| Ingest
     Grafana -->|PromQL · LogQL · trace lookup| Compat
 
-    Storage -->|USE_DUCKLAKE=true| Lake[("DuckLake catalog<br/>")]
-    Storage -.->|USE_DUCKLAKE=false| Local[("Local DuckDB file")]
+    Storage -->|immutable Parquet files| Lake[("DuckLake catalog<br/>")]
 ```
 
 ## Send Telemetry
@@ -243,8 +235,8 @@ MotherDuck, or SQL clients.
 | Durability | A `2xx` ingest response means accepted into bounded process memory. It does not mean committed to DuckLake. |
 | Storage | DuckLake-backed DuckDB tables by default. Local DuckLake is the quickstart path; MotherDuck and Postgres-catalog DuckLake are supported paths. |
 | Query | Prometheus, Loki, and Tempo compatibility subsets with server-side time range, row limit, timeout, memory, and concurrency guards. |
-| SQL | Direct SQL is intentionally outside the HTTP/UI product surface. Use DuckDB CLI, MotherDuck, or another SQL client. |
-| UI | Thin local investigation UI plus provisioned Grafana dashboards. |
+| SQL | Direct SQL is intentionally outside the HTTP product surface. Use DuckDB CLI, MotherDuck, or another SQL client. |
+| UI | Grafana only. There is no custom canardstack web UI. |
 | Retention | Whole-day retention on telemetry tables, followed by DuckLake cleanup hooks when attached. |
 
 ## Caveats
@@ -259,7 +251,7 @@ Known v0 limits:
 - No histograms or exponential histograms.
 - No multi-tenancy.
 - No full PromQL, LogQL, TraceQL, Prometheus, Loki, or Tempo implementation.
-- No arbitrary SQL through the local UI or compatibility APIs.
+- No arbitrary SQL through compatibility APIs.
 - No sub-second freshness target.
 
 ## Acknowledgements
@@ -272,8 +264,6 @@ Known v0 limits:
 - [V0 architecture](docs/architecture/v0-architecture.md)
 - [Storage schema](docs/architecture/storage-schema.md)
 - [Query API](docs/architecture/query-api.md)
-- [UI workflows](docs/architecture/ui-workflows.md)
 - [Operator metrics](docs/architecture/operator-metrics.md)
-- [Benchmark plan](docs/planning/benchmark-plan.md)
-- [Proof gates](docs/planning/proof-gates.md)
+- [Benchmark evidence and proof gates](docs/planning/benchmark.md)
 - [Failure runbooks](docs/runbooks/failure-runbooks.md)

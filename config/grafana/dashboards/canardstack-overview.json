@@ -4,21 +4,8 @@
   },
   "editable": true,
   "fiscalYearStartMonth": 0,
-  "graphTooltip": 0,
-  "links": [
-    {
-      "asDropdown": false,
-      "icon": "external link",
-      "includeVars": false,
-      "keepTime": true,
-      "tags": [],
-      "targetBlank": false,
-      "title": "Explore traces",
-      "tooltip": "Open Tempo Explore",
-      "type": "link",
-      "url": "/explore?left=%7B%22datasource%22%3A%22canardstack-tempo%22%2C%22queries%22%3A%5B%7B%22refId%22%3A%22A%22%2C%22queryType%22%3A%22traceqlSearch%22%2C%22query%22%3A%22%7Bresource.service.name%3D%5C%22checkout%5C%22%7D%22%2C%22limit%22%3A20%2C%22tableType%22%3A%22traces%22%7D%5D%2C%22range%22%3A%7B%22from%22%3A%22now-6h%22%2C%22to%22%3A%22now%22%7D%7D"
-    }
-  ],
+  "graphTooltip": 1,
+  "links": [],
   "panels": [
     {
       "datasource": {
@@ -29,10 +16,163 @@
         "defaults": {
           "custom": {
             "drawStyle": "line",
-            "fillOpacity": 10,
-            "lineInterpolation": "linear",
+            "fillOpacity": 18,
+            "lineInterpolation": "smooth",
             "lineWidth": 2,
             "pointSize": 5,
+            "showPoints": "auto",
+            "spanNulls": false
+          },
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
+      "id": 1,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "canardstack-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "avg by (service_name) (smoke.gauge)",
+          "legendFormat": "{{service_name}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Demo Latency by Service",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "canardstack-prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "bars",
+            "fillOpacity": 35,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "id": 2,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "canardstack-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum by (service_name) (smoke.sum)",
+          "legendFormat": "{{service_name}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Demo Requests by Service",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "loki",
+        "uid": "canardstack-loki"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 16,
+        "x": 0,
+        "y": 8
+      },
+      "id": 3,
+      "options": {
+        "dedupStrategy": "none",
+        "enableLogDetails": true,
+        "prettifyLogMessage": false,
+        "showCommonLabels": false,
+        "showLabels": true,
+        "showTime": true,
+        "sortOrder": "Descending",
+        "wrapLogMessage": true
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "loki",
+            "uid": "canardstack-loki"
+          },
+          "direction": "backward",
+          "editorMode": "code",
+          "expr": "{deployment_environment=\"dev\"} |= \"smoke\"",
+          "queryType": "range",
+          "refId": "A"
+        }
+      ],
+      "title": "Recent Demo Logs",
+      "type": "logs"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "canardstack-prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 12,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 4,
             "showPoints": "auto",
             "spanNulls": false
           },
@@ -42,11 +182,11 @@
       },
       "gridPos": {
         "h": 9,
-        "w": 12,
-        "x": 0,
-        "y": 0
+        "w": 8,
+        "x": 16,
+        "y": 8
       },
-      "id": 1,
+      "id": 4,
       "options": {
         "legend": {
           "calcs": [
@@ -68,91 +208,197 @@
             "uid": "canardstack-prometheus"
           },
           "editorMode": "code",
-          "expr": "avg({__name__=\"smoke.gauge\",service_name=\"checkout\"})",
-          "legendFormat": "{{service_name}}",
+          "expr": "max({__name__=\"canardstack_storage_logical_rows\",service_name=\"canardstack\"})",
+          "legendFormat": "rows",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "Smoke Gauge",
+      "title": "Stored Rows",
       "type": "timeseries"
     },
     {
       "datasource": {
-        "type": "loki",
-        "uid": "canardstack-loki"
+        "type": "prometheus",
+        "uid": "canardstack-prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
       },
       "gridPos": {
-        "h": 9,
-        "w": 12,
-        "x": 12,
-        "y": 0
+        "h": 7,
+        "w": 8,
+        "x": 0,
+        "y": 17
       },
-      "id": 2,
+      "id": 5,
       "options": {
-        "dedupStrategy": "none",
-        "enableLogDetails": true,
-        "prettifyLogMessage": false,
-        "showCommonLabels": false,
-        "showLabels": false,
-        "showTime": true,
-        "sortOrder": "Descending",
-        "wrapLogMessage": true
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
       },
       "targets": [
         {
           "datasource": {
-            "type": "loki",
-            "uid": "canardstack-loki"
+            "type": "prometheus",
+            "uid": "canardstack-prometheus"
           },
           "editorMode": "code",
-          "expr": "{service_name=\"checkout\"} |= \"smoke\"",
-          "queryType": "range",
+          "expr": "sum({__name__=\"canardstack_ingest_requests_total\",service_name=\"canardstack\"})",
+          "legendFormat": "accepted",
+          "range": true,
           "refId": "A"
         }
       ],
-      "title": "Smoke Logs",
-      "type": "logs"
+      "title": "Ingest Requests",
+      "type": "stat"
     },
     {
       "datasource": {
-        "type": "tempo",
-        "uid": "canardstack-tempo"
+        "type": "prometheus",
+        "uid": "canardstack-prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
       },
       "gridPos": {
-        "h": 8,
-        "w": 24,
-        "x": 0,
-        "y": 9
+        "h": 7,
+        "w": 8,
+        "x": 8,
+        "y": 17
       },
-      "id": 3,
+      "id": 6,
       "options": {
-        "cellHeight": "sm",
-        "footer": {
-          "countRows": false,
-          "fields": "",
-          "reducer": [
-            "sum"
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
           ],
-          "show": false
+          "fields": "",
+          "values": false
         },
-        "showHeader": true
+        "textMode": "auto"
       },
       "targets": [
         {
           "datasource": {
-            "type": "tempo",
-            "uid": "canardstack-tempo"
+            "type": "prometheus",
+            "uid": "canardstack-prometheus"
           },
-          "limit": 20,
-          "query": "{resource.service.name=\"checkout\"}",
-          "queryType": "traceqlSearch",
-          "refId": "A",
-          "tableType": "traces"
+          "editorMode": "code",
+          "expr": "sum({__name__=\"canardstack_query_requests_total\",service_name=\"canardstack\"})",
+          "legendFormat": "queries",
+          "range": true,
+          "refId": "A"
         }
       ],
-      "title": "Smoke Traces",
-      "type": "table"
+      "title": "Query Requests",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "canardstack-prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 16,
+        "y": 17
+      },
+      "id": 7,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "canardstack-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "max({__name__=\"canardstack_ingest_queue_rows\",service_name=\"canardstack\"})",
+          "legendFormat": "queued rows",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Queued Rows",
+      "type": "stat"
     }
   ],
   "refresh": "10s",
@@ -164,13 +410,13 @@
     "list": []
   },
   "time": {
-    "from": "now-6h",
+    "from": "now-30m",
     "to": "now"
   },
   "timepicker": {},
   "timezone": "browser",
-  "title": "Canardstack Overview",
+  "title": "Canardstack",
   "uid": "canardstack-overview",
-  "version": 1,
+  "version": 2,
   "weekStart": ""
 }

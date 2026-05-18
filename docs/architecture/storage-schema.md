@@ -24,11 +24,11 @@ Each table should add a small number of storage-management columns around the ca
 
 | Column | Type | Purpose |
 | --- | --- | --- |
-| `event_date` | `DATE` | Day partition/retention key derived from `timestamp`. |
 | `ingested_at` | `TIMESTAMP` | Server receive/commit time for freshness diagnostics. |
 | `source_format` | `VARCHAR` | `otlp_proto` or `otlp_json`. |
 
-`event_date` must be derived from event time, not ingest time.
+Raw telemetry tables are partitioned from event time using the canonical
+`timestamp` column. Do not add a separate day column to the raw tables.
 
 ## Logs
 
@@ -51,15 +51,10 @@ Canonical fields from `otlp2records`:
 | `scope_attributes` | `VARCHAR` | JSON string. |
 | `log_attributes` | `VARCHAR` | JSON string. |
 
-Derived promoted fields for product filters:
-
-| Column | Type | Source |
-| --- | --- | --- |
-| `deployment_environment` | `VARCHAR` | `resource_attributes["deployment.environment"]`. |
-| `http_method` | `VARCHAR` | `log_attributes["http.request.method"]` or legacy equivalent. |
-| `http_status_code` | `INTEGER` | `log_attributes["http.response.status_code"]` or legacy equivalent. |
-| `http_route` | `VARCHAR` | `log_attributes["http.route"]`. |
-| `exception_type` | `VARCHAR` | `log_attributes["exception.type"]`. |
+Compatibility labels such as `deployment_environment`, `http_method`, and
+`http_route` are derived from `resource_attributes` and `log_attributes` in
+bounded query or metadata-refresh paths. They are not physical telemetry-table
+columns.
 
 ## Spans
 
@@ -93,15 +88,10 @@ Canonical fields from `otlp2records`:
 | `dropped_links_count` | `INTEGER` | OTel dropped count. |
 | `flags` | `INTEGER` | Span flags. |
 
-Derived promoted fields:
-
-| Column | Type | Source |
-| --- | --- | --- |
-| `deployment_environment` | `VARCHAR` | `resource_attributes["deployment.environment"]`. |
-| `http_method` | `VARCHAR` | `span_attributes["http.request.method"]` or legacy equivalent. |
-| `http_status_code` | `INTEGER` | `span_attributes["http.response.status_code"]` or legacy equivalent. |
-| `http_route` | `VARCHAR` | `span_attributes["http.route"]`. |
-| `exception_type` | `VARCHAR` | Span event exception or `span_attributes["exception.type"]`. |
+Compatibility labels such as `deployment_environment`, `http_method`,
+`http_status_code`, `http_route`, and `exception_type` are derived from
+`resource_attributes` and `span_attributes` in bounded query or
+metadata-refresh paths. They are not physical telemetry-table columns.
 
 ## Gauge Metrics
 
@@ -126,35 +116,71 @@ Canonical fields from `otlp2records`:
 | `flags` | `INTEGER` | Data point flags. |
 | `exemplars_json` | `VARCHAR` | JSON string. |
 
-Derived promoted fields:
-
-| Column | Type | Source |
-| --- | --- | --- |
-| `deployment_environment` | `VARCHAR` | `resource_attributes["deployment.environment"]`. |
+Compatibility labels such as `deployment_environment` are derived from
+`resource_attributes` in bounded query or metadata-refresh paths. They are not
+physical telemetry-table columns.
 
 ## Sum Metrics
 
-`metric_sum` includes every `metric_gauge` canonical and derived field, plus:
+`metric_sum` includes every `metric_gauge` canonical field, plus:
 
 | Column | Type | Notes |
 | --- | --- | --- |
 | `aggregation_temporality` | `INTEGER` | `1 = delta`, `2 = cumulative`. |
 | `is_monotonic` | `BOOLEAN` | OTel monotonic flag. |
 
+## Metadata Summary
+
+Discovery endpoints use one shared `metadata_summary` table instead of scanning
+raw telemetry for every Grafana label, series, metric metadata, and Tempo tag
+lookup. The table is durable in both local DuckDB and DuckLake modes.
+
+| Column | Type | Purpose |
+| --- | --- | --- |
+| `signal` | `VARCHAR` | `logs`, `spans`, `metric_gauge`, or `metric_sum`. |
+| `event_date` | `DATE` | Daily summary bucket derived from telemetry event time. |
+| `kind` | `VARCHAR` | `label_value`, `series`, `metric_metadata`, or `tag_value`. |
+| `name` | `VARCHAR` | Label, tag, metric, or series name. |
+| `value` | `VARCHAR` | Label/tag value when applicable. |
+| `metric_type` | `VARCHAR` | Prometheus metadata type (`gauge` or `counter`). |
+| `metric_unit` | `VARCHAR` | Representative metric unit. |
+| `metric_description` | `VARCHAR` | Representative metric help text. |
+| `service_name` | `VARCHAR` | Series dimension derived during metadata refresh. |
+| `deployment_environment` | `VARCHAR` | Series dimension derived during metadata refresh. |
+| `severity_text` | `VARCHAR` | Loki stream dimension derived during metadata refresh. |
+| `row_count` | `BIGINT` | Rows represented by this summary entry. |
+| `first_seen` | `TIMESTAMP` | Earliest event timestamp in the summary entry. |
+| `last_seen` | `TIMESTAMP` | Latest event timestamp in the summary entry. |
+
+Committed inserts record their affected `(signal, event_date)` buckets as dirty.
+The `metadata_refresh` scheduler job drains that set, rebuilding each bucket's
+summary rows from canonical columns and JSON attribute extraction; a failed
+refresh re-queues the buckets for the next tick. Keeping the day-partition scan
+off the commit path stops it from blocking the writer on every flush. An
+in-process generation counter, bumped after each committed refresh, lets bounded
+discovery caches invalidate.
+
 ## Partitioning
 
 Default:
 
-- Partition by `event_date`.
+- Partition telemetry tables in DuckLake by
+  `year(timestamp), month(timestamp), day(timestamp)`.
 - Do not partition by `service_name` in v0.
-- Consider hourly physical layout only after benchmark evidence shows day files are too broad.
+- Immutable segment files may be pre-split by timestamp day/hour before
+  registration, but DuckLake partition pruning should use the configured
+  timestamp transforms, not a duplicated raw-table date column.
 
 If DuckLake partition-drop behavior is not cheap enough, switch to physical day tables behind stable views.
 
 ## Schema Evolution Rules
 
-- Adding nullable derived promoted columns is allowed.
+- Adding physical promoted telemetry columns is not allowed in v0; derive those
+  labels from canonical `otlp2records` columns instead.
 - Renaming or removing canonical `otlp2records` columns is not allowed in v0.
-- Attribute JSON fields remain strings; extraction happens at insert time for the small promoted set.
+- Attribute JSON fields remain strings; extraction happens in bounded query or
+  metadata-refresh paths for the small compatibility label set.
 - Store unknown fields only inside the existing JSON attribute columns.
-
+- The current schema contract is proven for fresh DuckLake catalogs. In-place
+  migration of catalogs that already contain older promoted telemetry columns is
+  not yet a proven path and should be gated separately before reuse.

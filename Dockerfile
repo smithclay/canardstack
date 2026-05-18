@@ -47,9 +47,7 @@ ENV HOME=/var/lib/canardstack \
     CANARDSTACK_DATA_DIR=/var/lib/canardstack \
     CANARDSTACK_DUCKDB_PATH=/var/lib/canardstack/canardstack.duckdb \
     CANARDSTACK_STORAGE_DIR=/var/lib/canardstack/storage \
-    CANARDSTACK_DUCKDB_EXTENSION_DIR=/usr/local/lib/duckdb/extensions \
-    CANARDSTACK_USE_DUCKLAKE=true \
-    CANARDSTACK_ALLOW_LOCAL_FALLBACK=false
+    CANARDSTACK_DUCKDB_EXTENSION_DIR=/usr/local/lib/duckdb/extensions
 
 USER 10001:10001
 EXPOSE 4318

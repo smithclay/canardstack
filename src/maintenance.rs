@@ -2,7 +2,7 @@ use crate::app::AppState;
 use crate::config::Config;
 use crate::ingest::Ingestor;
 use crate::metrics::Metrics;
-use crate::storage::{RetentionPolicy, Storage};
+use crate::storage::{ArrowBatchInsertTiming, ImmutableFlushOutcome, RetentionPolicy, Storage};
 use crate::LockExt;
 use anyhow::Result;
 use serde_json::{json, Value};
@@ -17,6 +17,14 @@ struct FailureRecord {
     at: String,
     reason: String,
     consecutive: u32,
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct FlushOptions<'a> {
+    pub table: Option<&'a str>,
+    /// Seal every in-memory immutable-segment buffer immediately, ignoring size
+    /// and age thresholds. The scheduler leaves this unset; admin flush sets it.
+    pub force_immutable_segments: bool,
 }
 
 pub struct Maintenance {
@@ -95,20 +103,70 @@ impl Maintenance {
         &self,
         ingestor: &Ingestor,
         storage: &Storage,
-        table: Option<&str>,
+        metrics: &Metrics,
+        options: FlushOptions<'_>,
     ) -> Result<Value> {
         if self.is_paused() {
             return Ok(json!({"status": "paused"}));
         }
         let started = Instant::now();
-        let process_rows = ingestor.flush_all(storage)?;
-        let ducklake = storage.flush_inlined_data(table)?;
-        let compaction = storage.merge_adjacent_files(table)?;
+        let process_rows = ingestor.flush_all_with_metrics(storage, Some(metrics))?;
+        let immutable = storage.flush_immutable_segments(options.force_immutable_segments)?;
+        observe_phase_timings(metrics, &immutable.timings);
+        observe_immutable_flush(metrics, &immutable);
+        let ducklake_started = Instant::now();
+        let ducklake = storage.flush_inlined_data(options.table)?;
+        metrics.observe_seconds(
+            "canardstack_ducklake_flush_inlined_duration_seconds",
+            &[("table", options.table.unwrap_or("all"))],
+            ducklake_started.elapsed().as_secs_f64(),
+        );
         self.record_run("flush");
         Ok(json!({
             "status": "ok",
             "process_rows_flushed": process_rows,
+            "immutable_segments": immutable.to_json(),
             "ducklake": ducklake,
+            "duration_ms": started.elapsed().as_millis()
+        }))
+    }
+
+    pub fn run_compaction(
+        &self,
+        storage: &Storage,
+        table: Option<&str>,
+        metrics: &Metrics,
+    ) -> Result<Value> {
+        if self.is_paused() {
+            return Ok(json!({"status": "paused"}));
+        }
+        let started = Instant::now();
+        let decision = storage.compaction_decision(table)?;
+        if !decision
+            .get("should_compact")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            self.record_run("compaction");
+            return Ok(json!({
+                "status": "skipped",
+                "reason": decision.get("status").and_then(Value::as_str).unwrap_or("not_needed"),
+                "decision": decision,
+                "duration_ms": started.elapsed().as_millis()
+            }));
+        }
+
+        let compaction_started = Instant::now();
+        let compaction = storage.merge_adjacent_files(table)?;
+        metrics.observe_seconds(
+            "canardstack_ducklake_compaction_duration_seconds",
+            &[("table", table.unwrap_or("all"))],
+            compaction_started.elapsed().as_secs_f64(),
+        );
+        self.record_run("compaction");
+        Ok(json!({
+            "status": "ok",
+            "decision": decision,
             "compaction": compaction,
             "duration_ms": started.elapsed().as_millis()
         }))
@@ -152,6 +210,9 @@ impl Maintenance {
         }
         let started = Instant::now();
         let flushed = ingestor.flush_due(storage, Some(metrics))?;
+        let immutable = storage.flush_immutable_segments(false)?;
+        observe_phase_timings(metrics, &immutable.timings);
+        observe_immutable_flush(metrics, &immutable);
         if !flushed.is_empty() {
             self.record_run("watchdog");
         }
@@ -162,6 +223,7 @@ impl Maintenance {
         Ok(json!({
             "status": "ok",
             "flushed": by_signal,
+            "immutable_segments": immutable.to_json(),
             "duration_ms": started.elapsed().as_millis()
         }))
     }
@@ -197,6 +259,37 @@ impl Maintenance {
     }
 }
 
+fn observe_phase_timings(metrics: &Metrics, timings: &[ArrowBatchInsertTiming]) {
+    for timing in timings {
+        metrics.observe_phase_seconds(
+            timing.table.as_str(),
+            timing.phase.as_str(),
+            None,
+            timing.seconds,
+        );
+    }
+}
+
+fn observe_immutable_flush(metrics: &Metrics, outcome: &ImmutableFlushOutcome) {
+    if outcome.sealed_rows == 0 && outcome.sealed_files == 0 {
+        return;
+    }
+    for timing in &outcome.timings {
+        if timing.phase == crate::storage::TimingPhase::ParquetEncode {
+            metrics.inc(
+                "canardstack_immutable_segments_sealed_files_total",
+                &[("signal", timing.table.as_str())],
+                1,
+            );
+            metrics.inc(
+                "canardstack_immutable_segments_sealed_rows_total",
+                &[("signal", timing.table.as_str())],
+                timing.rows as u64,
+            );
+        }
+    }
+}
+
 pub struct Scheduler {
     stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
@@ -206,12 +299,9 @@ impl Scheduler {
     pub fn spawn(state: Arc<AppState>) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_for_thread = stop.clone();
-        let watchdog = state.config.scheduler_watchdog_interval;
-        let flush = state.config.scheduler_flush_interval;
-        let retention = state.config.scheduler_retention_interval;
         let handle = thread::Builder::new()
             .name("canardstack-scheduler".to_string())
-            .spawn(move || scheduler_loop(state, stop_for_thread, watchdog, flush, retention))
+            .spawn(move || scheduler_loop(state, stop_for_thread))
             .expect("spawn scheduler thread");
         Self {
             stop,
@@ -229,18 +319,21 @@ impl Drop for Scheduler {
     }
 }
 
-fn scheduler_loop(
-    state: Arc<AppState>,
-    stop: Arc<AtomicBool>,
-    watchdog_every: Duration,
-    flush_every: Duration,
-    retention_every: Duration,
-) {
+fn scheduler_loop(state: Arc<AppState>, stop: Arc<AtomicBool>) {
+    let watchdog_every = state.config.scheduler_watchdog_interval;
+    let flush_every = state.config.scheduler_flush_interval;
+    let metadata_every = state.config.scheduler_metadata_interval;
+    let metrics_every = state.config.scheduler_metrics_interval;
+    let compaction_every = state.config.scheduler_compaction_interval;
+    let retention_every = state.config.scheduler_retention_interval;
     let tick = watchdog_every
         .min(Duration::from_millis(500))
         .max(Duration::from_millis(10));
     let mut next_watchdog = Instant::now();
     let mut next_flush = Instant::now();
+    let mut next_metadata = Instant::now() + metadata_every;
+    let mut next_metrics = Instant::now() + metrics_every;
+    let mut next_compaction = Instant::now() + compaction_every;
     let mut next_retention = Instant::now() + retention_every;
 
     loop {
@@ -263,9 +356,41 @@ fn scheduler_loop(
 
         if now >= next_flush {
             let ok = run_job(&state, "flush", |s| {
-                s.maintenance.run_flush(&s.ingestor, &s.storage, None)
+                s.maintenance.run_flush(
+                    &s.ingestor,
+                    &s.storage,
+                    &s.metrics,
+                    FlushOptions::default(),
+                )
             });
             next_flush = now + next_interval(&state, "flush", flush_every, ok);
+        }
+
+        if now >= next_metadata {
+            let ok = run_job(&state, "metadata_refresh", |s| {
+                if s.maintenance.is_paused() {
+                    return Ok(json!({"status": "paused"}));
+                }
+                let buckets = s.storage.refresh_metadata()?;
+                Ok(json!({"status": "ok", "buckets": buckets}))
+            });
+            next_metadata = now + next_interval(&state, "metadata_refresh", metadata_every, ok);
+        }
+
+        if now >= next_metrics {
+            let ok = run_job(&state, "metrics_snapshot", |s| {
+                crate::http::record_operator_gauges(s);
+                let rows = s.metrics.write_snapshot_to_storage(&s.storage)?;
+                Ok(json!({"status": "ok", "rows": rows}))
+            });
+            next_metrics = now + next_interval(&state, "metrics_snapshot", metrics_every, ok);
+        }
+
+        if now >= next_compaction {
+            let ok = run_job(&state, "compaction", |s| {
+                s.maintenance.run_compaction(&s.storage, None, &s.metrics)
+            });
+            next_compaction = now + next_interval(&state, "compaction", compaction_every, ok);
         }
 
         if now >= next_retention {
@@ -353,6 +478,9 @@ fn classify_job_error(err: &anyhow::Error, job: &str) -> &'static str {
     }
     match job {
         "flush" | "watchdog" => "flush_failed",
+        "metadata_refresh" => "metadata_refresh_failed",
+        "metrics_snapshot" => "metrics_snapshot_failed",
+        "compaction" => "compaction_failed",
         "retention" | "retention_dry_run" => "retention_failed",
         _ => "scheduler_job_failed",
     }

@@ -1,8 +1,8 @@
 use super::queue::{self, PendingBatch, QueueMap};
 use super::Signal;
 use crate::config::Config;
-use crate::memory;
 use crate::metrics::Metrics;
+use crate::runtime::memory;
 use crate::validation::{ApiError, ApiResult};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};

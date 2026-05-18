@@ -1,6 +1,7 @@
 use crate::config::Config;
 use crate::ingest::Ingestor;
 use crate::maintenance::Maintenance;
+use crate::metadata::Metadata;
 use crate::metrics::Metrics;
 use crate::query::QueryEngine;
 use crate::storage::Storage;
@@ -11,6 +12,7 @@ pub struct AppState {
     pub storage: Storage,
     pub ingestor: Ingestor,
     pub queries: QueryEngine,
+    pub metadata: Metadata,
     pub maintenance: Maintenance,
     pub metrics: Metrics,
 }
@@ -23,6 +25,7 @@ impl AppState {
             storage,
             ingestor,
             queries: QueryEngine::new(&config),
+            metadata: Metadata::new(),
             maintenance: Maintenance::new(&config),
             metrics: Metrics::default(),
             config,

@@ -2,7 +2,14 @@
 
 ## Metric Naming
 
-The canardstack process exposes Prometheus-text metrics at `GET /metrics`. The names below are the implemented contract — only metrics that are actually emitted are listed here. Histograms are rendered as a counter pair (`*_count` / `*_sum`) rather than full HDR-style buckets.
+The canardstack process exposes Prometheus-text metrics at `GET /metrics`. The
+scheduler also writes a snapshot of those same samples every
+`CANARDSTACK_SCHEDULER_METRICS_SECS` seconds with `service_name="canardstack"`:
+counters land in `metric_sum`, and gauges land in `metric_gauge`. Grafana can
+query canardstack's own monitoring data through the normal Prometheus-compatible
+datastore path. The names below are the implemented contract: only metrics that
+are actually emitted are listed here. Histograms are rendered as a counter pair
+(`*_count` / `*_sum`) rather than full HDR-style buckets.
 
 Labels stay low-cardinality:
 
@@ -10,7 +17,7 @@ Labels stay low-cardinality:
 - `table`: `logs`, `spans`, `metric_gauge`, `metric_sum`, or `all`.
 - `status`: HTTP status code or grouped class.
 - `reason`: bounded rejection or failure reason.
-- `job`: maintenance job name (`watchdog`, `flush`, `retention`).
+- `job`: maintenance job name (`watchdog`, `flush`, `metadata_refresh`, `metrics_snapshot`, `compaction`, `retention`).
 - `query_class`: route path (e.g. `/api/v1/query_range`).
 - `encoding`: `identity`, `gzip`.
 - `triggered_by`: who initiated a partial-commit flush.
@@ -28,6 +35,7 @@ Do not label metrics by `service_name`, trace id, query text, API key, or arbitr
 | `canardstack_ingest_queue_bytes` | Gauge | `signal` | Current queued bytes (approximate). |
 | `canardstack_ingest_queue_oldest_age_seconds` | Gauge | `signal` | Oldest queued record age. |
 | `canardstack_ingest_rejections_total` | Counter | `signal`, `status`, `reason` | Admission-control rejections (subset of `_ingest_requests_total`). |
+| `canardstack_ingest_flush_attempted_bytes_total` | Counter | `signal` | Approximate queued Arrow bytes selected for flush attempts. |
 | `canardstack_ingest_partial_commit_rows_total` | Counter | `signal`, `triggered_by` | Rows durably committed before a mid-batch flush failure; surfaces best-effort durability. |
 
 ## HTTP Metrics
@@ -45,6 +53,17 @@ Do not label metrics by `service_name`, trace id, query text, API key, or arbitr
 | `canardstack_ducklake_parquet_files` | Gauge | `table` | Active DuckLake Parquet data files per table. |
 | `canardstack_ducklake_parquet_rows` | Gauge | `table` | Active rows stored in DuckLake Parquet data files per table. |
 | `canardstack_ducklake_inlined_rows` | Gauge | `table` | Rows currently held in DuckLake inlined-data tables per table. |
+| `canardstack_ducklake_flush_inlined_duration_seconds` | Histogram (`_count` / `_sum`) | `table` | Time spent in DuckLake inlined-data flush during maintenance. |
+| `canardstack_ducklake_compaction_duration_seconds` | Histogram (`_count` / `_sum`) | `table` | Time spent in DuckLake adjacent-file compaction during maintenance. Immutable telemetry disables this path, so this should normally remain flat. |
+
+The shared phase metric `canardstack_phase_duration_seconds` also records
+storage proof phases with `signal` and `phase` labels:
+`storage_prepare`, `storage_buffer`, `storage_partition_split`,
+`storage_parquet_encode`, `storage_file_write`, `storage_file_fsync`,
+`storage_file_rename`, `storage_parquet_write`,
+`storage_ducklake_register`, `storage_ducklake_commit`, and
+`storage_insert`. `storage_insert` is retained for flush accounting and
+backward-compatible benchmark parsing.
 
 ## Query Metrics
 
@@ -61,7 +80,7 @@ Do not label metrics by `service_name`, trace id, query text, API key, or arbitr
 | --- | --- | --- | --- |
 | `canardstack_maintenance_runs_total` | Counter | `job`, `status`, `reason` | Job outcomes (`status=ok` or `status=error`). |
 | `canardstack_maintenance_duration_seconds` | Histogram (`_count` / `_sum`) | `job`, `table=all` | Job runtime. |
-| `canardstack_maintenance_failures_total` | Counter | `job`, `reason` | Failures only, broken out by classified reason. Bounded reason set: `disk_full`, `flush_failed`, `retention_failed`, `scheduler_job_failed`. Reasons derive from the job name where possible (so dependency wording changes do not silently re-route alerts); only `disk_full` substring-matches OS / DuckDB errors. |
+| `canardstack_maintenance_failures_total` | Counter | `job`, `reason` | Failures only, broken out by classified reason. Bounded reason set: `disk_full`, `flush_failed`, `metadata_refresh_failed`, `metrics_snapshot_failed`, `compaction_failed`, `retention_failed`, `scheduler_job_failed`. Reasons derive from the job name where possible (so dependency wording changes do not silently re-route alerts); only `disk_full` substring-matches OS / DuckDB errors. |
 | `canardstack_maintenance_consecutive_failures` | Gauge | `job` | Consecutive failure count; resets to 0 on success. Drives exponential backoff. |
 | `canardstack_maintenance_paused` | Gauge | none | `1` when paused. |
 
@@ -88,7 +107,7 @@ Do not label metrics by `service_name`, trace id, query text, API key, or arbitr
 The following metrics from earlier design drafts are **not** emitted by the current implementation. They are listed here so dashboards and runbooks don't silently depend on them:
 
 - `canardstack_ingest_decode_seconds`
-- `canardstack_ducklake_insert_seconds`, `_commit_seconds`, `_inlined_bytes`, `_inlined_rows`, `_oldest_inlined_age_seconds`, `_snapshot_count`, `_flush_failures_total`
+- `canardstack_ducklake_insert_seconds`, `_commit_seconds`, `_inlined_bytes`, `_oldest_inlined_age_seconds`, `_snapshot_count`, `_flush_failures_total`
 - `canardstack_storage_logical_bytes` (the implementation emits `_logical_rows` instead)
 - `canardstack_object_store_errors_total`, `_request_seconds`
 - `canardstack_query_active`, `_memory_high_water_bytes`, `_oom_total`

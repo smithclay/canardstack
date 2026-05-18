@@ -2,7 +2,7 @@
 
 Canardstack v0 exposes bounded compatibility adapters for existing
 observability clients. It does not define a Canardstack-specific product query
-protocol and does not expose arbitrary SQL through the normal UI/API.
+protocol and does not expose arbitrary SQL through the normal HTTP API.
 
 All telemetry query paths use the internal query engine protections:
 
@@ -11,6 +11,23 @@ All telemetry query paths use the internal query engine protections:
 - Server-owned timeouts.
 - DuckDB memory limits.
 - Query concurrency guards.
+
+## Discovery Metadata Spine
+
+Prometheus label values, Prometheus series, Prometheus metric metadata, Loki
+label values, Loki series, and Tempo tag values read from the shared
+`metadata_summary` table. The `metadata_refresh` scheduler job re-aggregates the
+daily `(signal, event_date)` summary buckets derived from committed telemetry
+timestamps, keeping the timestamp-day scan off the ingest commit path. It uses
+canonical `otlp2records` columns directly where available and derives
+compatibility labels such as `deployment_environment`, `http_route`, and
+`http_method` from canonical JSON attribute columns.
+
+These reads still run through the bounded `QueryEngine` path with normal
+concurrency, timeout, memory, range, and result-limit controls. An in-process
+cache stores only bounded discovery responses, keyed by API family, metadata
+kind, label/tag name, and exact normalized time range. Successful metadata refreshes
+advance a generation counter, invalidating stale cache entries.
 
 ## Prometheus Metrics Subset
 
@@ -39,9 +56,12 @@ Supported PromQL subset:
 
 - A bare metric name such as `smoke.gauge`.
 - A metric selector such as `smoke.gauge{service_name="checkout"}`.
-- Equality filters over promoted labels such as `service_name` and
+- Equality filters over supported labels such as `service_name` and
   `deployment_environment`.
 - `avg`, `min`, `max`, `sum`, `count`, and `rate` around a single selector.
+- `avg`, `min`, `max`, `sum`, and `count` with explicit `by(...)` or
+  `without(...)` grouping over supported labels such as `service_name` and
+  `deployment_environment`.
 
 Not implemented: full PromQL expression evaluation, joins, binary operators,
 subqueries, histograms, exemplars, rule evaluation, staleness semantics, and
@@ -72,7 +92,7 @@ Responses use Loki-style stream results:
 Supported LogQL subset:
 
 - Stream selectors such as `{service_name="checkout"}`.
-- Equality label filters over promoted labels.
+- Equality label filters over supported labels.
 - `start`, `end`, `limit`, and `direction`.
 - Simple text contains filters with `|= "text"`.
 
@@ -95,7 +115,8 @@ Grafana probe shims:
 
 - `GET /api/status/buildinfo`
 
-Supported search filters map to promoted span/resource columns:
+Supported search filters map to canonical span/resource columns or derived
+attribute labels:
 
 - `service.name` or `service_name`.
 - Span `name` or `span_name`.
@@ -122,9 +143,10 @@ The remaining HTTP endpoints are operational or ingest endpoints:
 - `POST /api/admin/maintenance/pause`
 - `POST /api/admin/maintenance/resume`
 - `POST /api/admin/maintenance/flush`
+- `POST /api/admin/maintenance/compaction/run`
 - `POST /api/admin/maintenance/retention/dry-run`
 - `POST /api/admin/maintenance/retention/run`
 
 Direct DuckDB/DuckLake SQL access is available outside Canardstack through
 DuckDB CLI, MotherDuck, or SQL clients. That path is intentionally separate from
-the normal HTTP/UI product surface.
+the normal HTTP product surface.
