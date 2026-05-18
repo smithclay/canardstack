@@ -17,9 +17,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const BENCH_NAME: &str = "throughput_iteration";
-const BENCH_VERSION: &str = "0.3.1";
+const BENCH_VERSION: &str = "0.3.4";
 const SCENARIO_NAME: &str = "throughput-iteration";
-const USAGE: &str = "cargo bench --bench throughput_iteration -- [--base-url URL] [--warmup 2m] [--duration 20m] [--target-gb-day 100] [--profile ingest-only|mixed-query] [--signals all|logs|spans|metrics] [--ingest-concurrency 1] [--query-pressure off|low|medium|high] [--query-interval 5s] [--query-concurrency 1] [--services 1] [--items-per-batch 256] [--log-records 8] [--log-body-bytes 120000] [--trace-spans 16] [--trace-attribute-bytes 48000] [--metric-series 40] [--metric-description-bytes 192] [--timestamp-mode fixed|advancing] [--progress-interval 30s] [--max-runtime 27m] [--no-queries] [--report-dir DIR] [--server-pid PID] [--resource-sample-interval 5s]";
+const USAGE: &str = "cargo bench --bench throughput_iteration -- [--base-url URL] [--warmup 2m] [--duration 20m] [--target-gb-day 100] [--profile ingest-only|mixed-query] [--signals all|logs|spans|metrics] [--ingest-concurrency 1] [--connection-mode close|persistent] [--query-pressure off|low|medium|high] [--query-interval 5s] [--query-concurrency 1] [--services 1] [--items-per-batch 256] [--log-records 8] [--log-body-bytes 120000] [--trace-spans 16] [--trace-attribute-bytes 48000] [--metric-series 40] [--metric-description-bytes 192] [--timestamp-mode fixed|advancing] [--progress-interval 30s] [--max-runtime 27m] [--no-queries] [--report-dir DIR] [--server-pid PID] [--resource-sample-interval 5s]";
 const DETERMINISTIC_SEED: u64 = 0xCA4A_D57A_C5AC;
 const DEFAULT_TARGET_GB_PER_DAY: f64 = 100.0;
 const DEFAULT_BASE_URL: &str = "http://127.0.0.1:4318";
@@ -60,7 +60,7 @@ fn run() -> Result<(Report, PathBuf)> {
         env::var("CANARDSTACK_API_KEY").unwrap_or_else(|_| "dev-canardstack-key".to_string());
     let admin_key = env::var("CANARDSTACK_ADMIN_API_KEY")
         .unwrap_or_else(|_| "dev-canardstack-admin-key".to_string());
-    let client = Client::new(&args.base_url)?;
+    let client = Client::new(&args.base_url, args.connection_mode)?;
     ensure_reachable(&client)?;
     let resource_envelope = ResourceEnvelope::detect();
     let storage_config = fetch_storage_config(&client, &admin_key);
@@ -76,13 +76,14 @@ fn run() -> Result<(Report, PathBuf)> {
     let guard_deadline = Instant::now() + args.max_runtime();
 
     eprintln!(
-        "throughput_iteration: warmup={} measured={} target={:.0} decoded B/s base_url={} profile={} ingest_concurrency={} query_concurrency={} progress={} max_runtime={}",
+        "throughput_iteration: warmup={} measured={} target={:.0} decoded B/s base_url={} profile={} ingest_concurrency={} connection_mode={} query_concurrency={} progress={} max_runtime={}",
         fmt_duration(args.warmup),
         fmt_duration(args.duration),
         target_bytes_per_sec,
         args.base_url,
         args.profile.as_str(),
         args.ingest_concurrency,
+        args.connection_mode.as_str(),
         args.query_concurrency,
         fmt_duration(args.progress_interval),
         fmt_duration(args.max_runtime())
@@ -797,6 +798,40 @@ fn build_report(input: BuildReportInput) -> Report {
         .iter()
         .map(MetricSnapshotReport::from_sample)
         .collect::<Vec<_>>();
+    let stage_throughput = StageThroughputReport::from_samples(&metric_samples);
+    if !stage_throughput.available {
+        smell_observations.push(
+            "measured-window stage throughput deltas unavailable from /metrics samples".to_string(),
+        );
+    } else {
+        let enqueued_rows = stage_throughput
+            .totals
+            .get("enqueued_rows")
+            .copied()
+            .unwrap_or(0.0);
+        let buffered_rows = stage_throughput
+            .totals
+            .get("flush_buffered_rows")
+            .copied()
+            .unwrap_or(0.0);
+        let visible_rows = stage_throughput
+            .totals
+            .get("storage_visible_rows")
+            .copied()
+            .unwrap_or(0.0);
+        if enqueued_rows > 0.0 && buffered_rows < enqueued_rows * 0.80 {
+            smell_observations.push(format!(
+                "flush buffered only {:.0}/{:.0} measured-window enqueued rows",
+                buffered_rows, enqueued_rows
+            ));
+        }
+        if enqueued_rows > 0.0 && visible_rows < enqueued_rows * 0.80 {
+            smell_observations.push(format!(
+                "storage-visible rows advanced only {:.0}/{:.0} measured-window enqueued rows",
+                visible_rows, enqueued_rows
+            ));
+        }
+    }
 
     let accepted_mib = stats.accepted_decoded_bytes as f64 / (1024.0 * 1024.0);
     let (
@@ -945,6 +980,7 @@ fn build_report(input: BuildReportInput) -> Report {
             target_gb_per_day: args.target_gb_per_day,
             signals: args.signals.as_str().to_string(),
             timestamp_mode: args.timestamp_mode.as_str().to_string(),
+            connection_mode: args.connection_mode.as_str().to_string(),
             byte_mix: workload
                 .payloads
                 .iter()
@@ -983,6 +1019,7 @@ fn build_report(input: BuildReportInput) -> Report {
         ducklake_maintenance_timing,
         resource_samples,
         metric_snapshots,
+        stage_throughput,
         queue_oldest_age_trend,
         queue_rows_trend,
         queue_bytes_trend,
@@ -1123,6 +1160,66 @@ fn print_summary(report: &Report, path: &Path) {
             );
         }
     }
+    if report.stage_throughput.available {
+        println!(
+            "stage_rates_per_sec accepted_decoded_bytes={:.0} transformed_rows={:.0} enqueued_rows={:.0} flush_buffered_rows={:.0} storage_visible_rows={:.0}",
+            report
+                .stage_throughput
+                .totals_per_second
+                .get("accepted_decoded_bytes")
+                .copied()
+                .unwrap_or(0.0),
+            report
+                .stage_throughput
+                .totals_per_second
+                .get("transformed_rows")
+                .copied()
+                .unwrap_or(0.0),
+            report
+                .stage_throughput
+                .totals_per_second
+                .get("enqueued_rows")
+                .copied()
+                .unwrap_or(0.0),
+            report
+                .stage_throughput
+                .totals_per_second
+                .get("flush_buffered_rows")
+                .copied()
+                .unwrap_or(0.0),
+            report
+                .stage_throughput
+                .totals_per_second
+                .get("storage_visible_rows")
+                .copied()
+                .unwrap_or(0.0)
+        );
+        if report
+            .stage_throughput
+            .totals_per_second
+            .contains_key("null_sink_rows")
+            || report
+                .stage_throughput
+                .totals_per_second
+                .contains_key("control_dropped_rows")
+        {
+            println!(
+                "control_rates_per_sec dropped_rows={:.0} null_sink_rows={:.0}",
+                report
+                    .stage_throughput
+                    .totals_per_second
+                    .get("control_dropped_rows")
+                    .copied()
+                    .unwrap_or(0.0),
+                report
+                    .stage_throughput
+                    .totals_per_second
+                    .get("null_sink_rows")
+                    .copied()
+                    .unwrap_or(0.0)
+            );
+        }
+    }
     println!("report={}", path.display());
     if !report.failure_reasons.is_empty() {
         println!("failure_reasons={}", report.failure_reasons.join("; "));
@@ -1142,6 +1239,7 @@ struct Args {
     duration: Duration,
     target_gb_per_day: f64,
     ingest_concurrency: usize,
+    connection_mode: ConnectionMode,
     query_interval: Duration,
     query_concurrency: usize,
     query_pressure: QueryPressure,
@@ -1165,6 +1263,7 @@ impl Args {
             duration: DEFAULT_DURATION,
             target_gb_per_day: DEFAULT_TARGET_GB_PER_DAY,
             ingest_concurrency: 1,
+            connection_mode: ConnectionMode::Close,
             query_interval: DEFAULT_QUERY_INTERVAL,
             query_concurrency: DEFAULT_QUERY_CONCURRENCY,
             query_pressure: QueryPressure::Medium,
@@ -1205,6 +1304,10 @@ impl Args {
                 }
                 "--ingest-concurrency" => {
                     parsed.ingest_concurrency = parse_next(&mut args, "--ingest-concurrency")?;
+                }
+                "--connection-mode" => {
+                    parsed.connection_mode =
+                        ConnectionMode::parse(&next_arg(&mut args, "--connection-mode")?)?;
                 }
                 "--query-concurrency" => {
                     parsed.query_concurrency = parse_next(&mut args, "--query-concurrency")?;
@@ -1336,6 +1439,29 @@ impl Args {
         self.no_queries_legacy
             || matches!(self.profile, BenchmarkProfile::IngestOnly)
             || matches!(self.query_pressure, QueryPressure::Off)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ConnectionMode {
+    Close,
+    Persistent,
+}
+
+impl ConnectionMode {
+    fn parse(raw: &str) -> Result<Self> {
+        match raw {
+            "close" => Ok(Self::Close),
+            "persistent" | "keep-alive" | "keepalive" => Ok(Self::Persistent),
+            _ => bail!("--connection-mode must be close or persistent"),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Close => "close",
+            Self::Persistent => "persistent",
+        }
     }
 }
 
@@ -2041,19 +2167,40 @@ impl RunStats {
     }
 }
 
-#[derive(Clone)]
 struct Client {
     host: String,
     port: u16,
+    connection_mode: ConnectionMode,
+    stream: Arc<Mutex<Option<TcpStream>>>,
+}
+
+impl Clone for Client {
+    fn clone(&self) -> Self {
+        Self {
+            host: self.host.clone(),
+            port: self.port,
+            connection_mode: self.connection_mode,
+            stream: Arc::new(Mutex::new(None)),
+        }
+    }
 }
 
 struct Response {
     status: u16,
     body: String,
+    connection_close: bool,
+}
+
+struct RequestSpec<'a> {
+    method: &'a str,
+    path: &'a str,
+    bearer: Option<&'a str>,
+    body: Option<(&'a str, &'a [u8])>,
+    keep_alive: bool,
 }
 
 impl Client {
-    fn new(base_url: &str) -> Result<Self> {
+    fn new(base_url: &str, connection_mode: ConnectionMode) -> Result<Self> {
         let rest = base_url
             .strip_prefix("http://")
             .ok_or_else(|| anyhow::anyhow!("only http:// base URLs are supported"))?;
@@ -2062,6 +2209,8 @@ impl Client {
         Ok(Self {
             host: host.to_string(),
             port: port.parse().context("parse base URL port")?,
+            connection_mode,
+            stream: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -2086,32 +2235,117 @@ impl Client {
         bearer: Option<&str>,
         body: Option<(&str, &[u8])>,
     ) -> Result<Response> {
+        match self.connection_mode {
+            ConnectionMode::Close => self.request_once(method, path, bearer, body),
+            ConnectionMode::Persistent => self.request_persistent(method, path, bearer, body),
+        }
+    }
+
+    fn request_once(
+        &self,
+        method: &str,
+        path: &str,
+        bearer: Option<&str>,
+        body: Option<(&str, &[u8])>,
+    ) -> Result<Response> {
+        let mut stream = self.connect()?;
+        let deadline = Instant::now() + CLIENT_REQUEST_TIMEOUT;
+        self.write_request(
+            &mut stream,
+            RequestSpec {
+                method,
+                path,
+                bearer,
+                body,
+                keep_alive: false,
+            },
+            deadline,
+        )?;
+        read_response(&mut stream, deadline)
+    }
+
+    fn request_persistent(
+        &self,
+        method: &str,
+        path: &str,
+        bearer: Option<&str>,
+        body: Option<(&str, &[u8])>,
+    ) -> Result<Response> {
+        let mut slot = self.stream.lock().expect("lock benchmark client stream");
+        if slot.is_none() {
+            *slot = Some(self.connect()?);
+        }
+        let stream = slot.as_mut().expect("persistent stream exists");
+        let deadline = Instant::now() + CLIENT_REQUEST_TIMEOUT;
+        let result = self
+            .write_request(
+                stream,
+                RequestSpec {
+                    method,
+                    path,
+                    bearer,
+                    body,
+                    keep_alive: true,
+                },
+                deadline,
+            )
+            .and_then(|()| read_response(stream, deadline));
+        match result {
+            Ok(response) => {
+                if response.connection_close {
+                    *slot = None;
+                }
+                Ok(response)
+            }
+            Err(err) => {
+                *slot = None;
+                Err(err)
+            }
+        }
+    }
+
+    fn connect(&self) -> Result<TcpStream> {
         let addr = (self.host.as_str(), self.port)
             .to_socket_addrs()
             .with_context(|| format!("resolve http://{}:{}", self.host, self.port))?
             .next()
             .ok_or_else(|| anyhow::anyhow!("no socket address for {}", self.host))?;
-        let mut stream = TcpStream::connect_timeout(&addr, CLIENT_REQUEST_TIMEOUT)
+        let stream = TcpStream::connect_timeout(&addr, CLIENT_REQUEST_TIMEOUT)
             .with_context(|| format!("connect to {}", fmt_addr(addr)))?;
         stream.set_read_timeout(Some(CLIENT_REQUEST_TIMEOUT))?;
         stream.set_write_timeout(Some(CLIENT_REQUEST_TIMEOUT))?;
-        let deadline = Instant::now() + CLIENT_REQUEST_TIMEOUT;
-        let (content_type, body) = body.unwrap_or(("application/octet-stream", b""));
+        Ok(stream)
+    }
+
+    fn write_request(
+        &self,
+        stream: &mut TcpStream,
+        spec: RequestSpec<'_>,
+        deadline: Instant,
+    ) -> Result<()> {
+        let (content_type, body) = spec.body.unwrap_or(("application/octet-stream", b""));
         let mut head = format!(
-            "{method} {path} HTTP/1.1\r\nhost: {}\r\naccept: application/json\r\ncontent-length: {}\r\nconnection: close\r\n",
+            "{} {} HTTP/1.1\r\nhost: {}\r\naccept: application/json\r\ncontent-length: {}\r\nconnection: {}\r\n",
+            spec.method,
+            spec.path,
             self.host,
-            body.len()
+            body.len(),
+            if spec.keep_alive {
+                "keep-alive"
+            } else {
+                "close"
+            }
         );
-        if let Some(token) = bearer {
+        if let Some(token) = spec.bearer {
             head.push_str(&format!("authorization: Bearer {token}\r\n"));
         }
-        if method == "POST" {
+        if spec.method == "POST" {
             head.push_str(&format!("content-type: {content_type}\r\n"));
         }
         head.push_str("\r\n");
-        write_all_retry(&mut stream, head.as_bytes(), deadline).context("write request headers")?;
-        write_all_retry(&mut stream, body, deadline).context("write request body")?;
-        read_response(stream, deadline)
+        write_all_retry(stream, head.as_bytes(), deadline).context("write request headers")?;
+        write_all_retry(stream, body, deadline).context("write request body")?;
+        Ok(())
     }
 }
 
@@ -2127,7 +2361,7 @@ fn write_all_retry(stream: &mut TcpStream, mut bytes: &[u8], deadline: Instant) 
     Ok(())
 }
 
-fn read_response(mut stream: TcpStream, deadline: Instant) -> Result<Response> {
+fn read_response(stream: &mut TcpStream, deadline: Instant) -> Result<Response> {
     let mut bytes = Vec::new();
     let mut buf = [0u8; 8192];
     loop {
@@ -2153,9 +2387,23 @@ fn read_response(mut stream: TcpStream, deadline: Instant) -> Result<Response> {
         .and_then(|line| line.split_whitespace().nth(1))
         .and_then(|raw| raw.parse::<u16>().ok())
         .ok_or_else(|| anyhow::anyhow!("malformed HTTP status line"))?;
+    let connection_close = response_connection_close(head);
     Ok(Response {
         status,
         body: body.to_string(),
+        connection_close,
+    })
+}
+
+fn response_connection_close(head: &str) -> bool {
+    head.lines().skip(1).any(|line| {
+        let Some((name, value)) = line.split_once(':') else {
+            return false;
+        };
+        name.eq_ignore_ascii_case("connection")
+            && value
+                .split(',')
+                .any(|token| token.trim().eq_ignore_ascii_case("close"))
     })
 }
 
@@ -2212,6 +2460,7 @@ fn fmt_addr(addr: SocketAddr) -> String {
 
 #[derive(Clone, Default)]
 struct ScrapedMetrics {
+    raw_values: BTreeMap<String, f64>,
     freshness_lag_seconds: BTreeMap<String, f64>,
     queue: QueueReport,
     storage: StorageReport,
@@ -2233,6 +2482,10 @@ fn scrape_metrics(text: &str) -> ScrapedMetrics {
         let Some(metric) = parse_metric_line(line) else {
             continue;
         };
+        out.raw_values.insert(
+            metric_series_key(&metric.name, &metric.labels),
+            metric.value,
+        );
         match metric.name.as_str() {
             "canardstack_ingest_to_query_lag_seconds" => {
                 if let Some(table) = metric.labels.get("table") {
@@ -2419,6 +2672,13 @@ fn labels_key(labels: &BTreeMap<String, String>) -> String {
         .join(",")
 }
 
+fn metric_series_key(name: &str, labels: &BTreeMap<String, String>) -> String {
+    if labels.is_empty() {
+        return name.to_string();
+    }
+    format!("{name} {}", labels_key(labels))
+}
+
 #[derive(Clone)]
 struct MetricSample {
     label: String,
@@ -2535,6 +2795,7 @@ struct Report {
     ducklake_maintenance_timing: BTreeMap<String, PhaseTimingReport>,
     resource_samples: Vec<ResourceSample>,
     metric_snapshots: Vec<MetricSnapshotReport>,
+    stage_throughput: StageThroughputReport,
     queue_oldest_age_trend: TrendReport,
     queue_rows_trend: TrendReport,
     queue_bytes_trend: TrendReport,
@@ -2588,6 +2849,7 @@ struct ScenarioReport {
     target_gb_per_day: f64,
     signals: String,
     timestamp_mode: String,
+    connection_mode: String,
     byte_mix: BTreeMap<String, f64>,
     payloads: Vec<PayloadReport>,
 }
@@ -2647,6 +2909,265 @@ impl MetricSnapshotReport {
                 .unwrap_or_default(),
         }
     }
+}
+
+#[derive(Serialize)]
+struct StageThroughputReport {
+    available: bool,
+    window_seconds: Option<f64>,
+    start_label: Option<String>,
+    end_label: Option<String>,
+    totals: BTreeMap<String, f64>,
+    totals_per_second: BTreeMap<String, f64>,
+    by_signal: BTreeMap<String, BTreeMap<String, f64>>,
+    by_signal_per_second: BTreeMap<String, BTreeMap<String, f64>>,
+}
+
+impl StageThroughputReport {
+    fn from_samples(samples: &[MetricSample]) -> Self {
+        let Some(start) = samples.iter().find(|sample| sample.label == "start") else {
+            return Self::unavailable();
+        };
+        let Some(end) = samples.iter().find(|sample| sample.label == "end") else {
+            return Self::unavailable();
+        };
+        let Some(start_metrics) = start.metrics.as_ref() else {
+            return Self::unavailable();
+        };
+        let Some(end_metrics) = end.metrics.as_ref() else {
+            return Self::unavailable();
+        };
+        let window_seconds =
+            (end.seconds_from_measured_start - start.seconds_from_measured_start).max(0.001);
+        let stages = [
+            StageMetric {
+                stage: "accepted_request_bytes",
+                metric: "canardstack_ingest_request_bytes_total",
+                label: "signal",
+                kind: StageMetricKind::Counter,
+            },
+            StageMetric {
+                stage: "accepted_decoded_bytes",
+                metric: "canardstack_ingest_decoded_bytes_total",
+                label: "signal",
+                kind: StageMetricKind::Counter,
+            },
+            StageMetric {
+                stage: "transformed_rows",
+                metric: "canardstack_ingest_transformed_rows_total",
+                label: "signal",
+                kind: StageMetricKind::Counter,
+            },
+            StageMetric {
+                stage: "enqueued_rows",
+                metric: "canardstack_ingest_enqueued_rows_total",
+                label: "signal",
+                kind: StageMetricKind::Counter,
+            },
+            StageMetric {
+                stage: "enqueued_bytes",
+                metric: "canardstack_ingest_enqueued_bytes_total",
+                label: "signal",
+                kind: StageMetricKind::Counter,
+            },
+            StageMetric {
+                stage: "control_dropped_rows",
+                metric: "canardstack_ingest_control_dropped_rows_total",
+                label: "signal",
+                kind: StageMetricKind::Counter,
+            },
+            StageMetric {
+                stage: "control_dropped_bytes",
+                metric: "canardstack_ingest_control_dropped_bytes_total",
+                label: "signal",
+                kind: StageMetricKind::Counter,
+            },
+            StageMetric {
+                stage: "flush_drained_rows",
+                metric: "canardstack_ingest_flush_drained_rows_total",
+                label: "signal",
+                kind: StageMetricKind::Counter,
+            },
+            StageMetric {
+                stage: "flush_drained_bytes",
+                metric: "canardstack_ingest_flush_drained_bytes_total",
+                label: "signal",
+                kind: StageMetricKind::Counter,
+            },
+            StageMetric {
+                stage: "flush_coalesced_rows",
+                metric: "canardstack_ingest_flush_coalesced_rows_total",
+                label: "signal",
+                kind: StageMetricKind::Counter,
+            },
+            StageMetric {
+                stage: "flush_coalesced_bytes",
+                metric: "canardstack_ingest_flush_coalesced_bytes_total",
+                label: "signal",
+                kind: StageMetricKind::Counter,
+            },
+            StageMetric {
+                stage: "flush_buffered_rows",
+                metric: "canardstack_ingest_flush_buffered_rows_total",
+                label: "signal",
+                kind: StageMetricKind::Counter,
+            },
+            StageMetric {
+                stage: "flush_buffered_bytes",
+                metric: "canardstack_ingest_flush_buffered_bytes_total",
+                label: "signal",
+                kind: StageMetricKind::Counter,
+            },
+            StageMetric {
+                stage: "null_sink_rows",
+                metric: "canardstack_ingest_null_sink_rows_total",
+                label: "signal",
+                kind: StageMetricKind::Counter,
+            },
+            StageMetric {
+                stage: "null_sink_bytes",
+                metric: "canardstack_ingest_null_sink_bytes_total",
+                label: "signal",
+                kind: StageMetricKind::Counter,
+            },
+            StageMetric {
+                stage: "immutable_sealed_rows",
+                metric: "canardstack_immutable_segments_sealed_rows_total",
+                label: "signal",
+                kind: StageMetricKind::Counter,
+            },
+            StageMetric {
+                stage: "immutable_sealed_files",
+                metric: "canardstack_immutable_segments_sealed_files_total",
+                label: "signal",
+                kind: StageMetricKind::Counter,
+            },
+            StageMetric {
+                stage: "storage_visible_rows",
+                metric: "canardstack_storage_logical_rows",
+                label: "table",
+                kind: StageMetricKind::GaugeDelta,
+            },
+            StageMetric {
+                stage: "ducklake_parquet_rows",
+                metric: "canardstack_ducklake_parquet_rows",
+                label: "table",
+                kind: StageMetricKind::GaugeDelta,
+            },
+            StageMetric {
+                stage: "ducklake_parquet_files",
+                metric: "canardstack_ducklake_parquet_files",
+                label: "table",
+                kind: StageMetricKind::GaugeDelta,
+            },
+        ];
+
+        let mut totals = BTreeMap::new();
+        let mut by_signal = BTreeMap::new();
+        for stage in stages {
+            let values = stage_delta_by_label(start_metrics, end_metrics, stage);
+            if values.is_empty() {
+                continue;
+            }
+            let total = values.values().sum::<f64>();
+            totals.insert(stage.stage.to_string(), total);
+            by_signal.insert(stage.stage.to_string(), values);
+        }
+        let totals_per_second = totals
+            .iter()
+            .map(|(stage, value)| (stage.clone(), value / window_seconds))
+            .collect();
+        let by_signal_per_second = by_signal
+            .iter()
+            .map(|(stage, values)| {
+                (
+                    stage.clone(),
+                    values
+                        .iter()
+                        .map(|(signal, value)| (signal.clone(), value / window_seconds))
+                        .collect(),
+                )
+            })
+            .collect();
+        Self {
+            available: true,
+            window_seconds: Some(window_seconds),
+            start_label: Some(start.label.clone()),
+            end_label: Some(end.label.clone()),
+            totals,
+            totals_per_second,
+            by_signal,
+            by_signal_per_second,
+        }
+    }
+
+    fn unavailable() -> Self {
+        Self {
+            available: false,
+            window_seconds: None,
+            start_label: None,
+            end_label: None,
+            totals: BTreeMap::new(),
+            totals_per_second: BTreeMap::new(),
+            by_signal: BTreeMap::new(),
+            by_signal_per_second: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct StageMetric {
+    stage: &'static str,
+    metric: &'static str,
+    label: &'static str,
+    kind: StageMetricKind,
+}
+
+#[derive(Clone, Copy)]
+enum StageMetricKind {
+    Counter,
+    GaugeDelta,
+}
+
+fn stage_delta_by_label(
+    start: &ScrapedMetrics,
+    end: &ScrapedMetrics,
+    stage: StageMetric,
+) -> BTreeMap<String, f64> {
+    let mut values = BTreeMap::new();
+    for line in end.raw_values.keys() {
+        let (name, labels) = parse_metric_series_key(line);
+        if name != stage.metric {
+            continue;
+        }
+        let Some(label_value) = labels.get(stage.label) else {
+            continue;
+        };
+        let end_value = end.raw_values.get(line).copied().unwrap_or(0.0);
+        let start_value = start.raw_values.get(line).copied().unwrap_or(0.0);
+        let delta = match stage.kind {
+            StageMetricKind::Counter => end_value - start_value,
+            StageMetricKind::GaugeDelta => (end_value - start_value).max(0.0),
+        };
+        if delta > 0.0 {
+            values.insert(label_value.clone(), delta);
+        }
+    }
+    values
+}
+
+fn parse_metric_series_key(key: &str) -> (String, BTreeMap<String, String>) {
+    let Some((name, labels)) = key.split_once(' ') else {
+        return (key.to_string(), BTreeMap::new());
+    };
+    let parsed = labels
+        .split(',')
+        .filter_map(|part| {
+            let (key, value) = part.split_once('=')?;
+            Some((key.to_string(), value.to_string()))
+        })
+        .collect();
+    (name.to_string(), parsed)
 }
 
 #[derive(Serialize)]

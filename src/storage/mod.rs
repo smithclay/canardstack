@@ -80,6 +80,14 @@ pub struct StorageCapabilities {
     pub whole_day_retention: bool,
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct ImmutableBufferMetric {
+    pub table: Signal,
+    pub rows: usize,
+    pub bytes: usize,
+    pub age_seconds: f64,
+}
+
 pub struct Storage {
     /// Write-side connection. Held for inserts, DDL, and DuckLake maintenance.
     /// Reader path never touches this mutex — that decoupling keeps /healthz,

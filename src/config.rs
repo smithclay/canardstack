@@ -11,6 +11,38 @@ pub struct QueryLane {
     pub memory_limit: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IngestControlMode {
+    Full,
+    ValidationOnly,
+    TransformOnly,
+}
+
+impl IngestControlMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::ValidationOnly => "validation_only",
+            Self::TransformOnly => "transform_only",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StorageControlMode {
+    Full,
+    NullSink,
+}
+
+impl StorageControlMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::NullSink => "null_sink",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub bind: String,
@@ -51,6 +83,9 @@ pub struct Config {
     pub max_concurrent_connections: usize,
     pub socket_read_timeout: Duration,
     pub socket_write_timeout: Duration,
+    pub ingest_control_mode: IngestControlMode,
+    pub storage_control_mode: StorageControlMode,
+    pub bench_http_keepalive: bool,
 }
 
 impl Config {
@@ -161,6 +196,9 @@ impl Config {
                 "CANARDSTACK_SOCKET_WRITE_TIMEOUT_SECS",
                 30,
             )? as u64),
+            ingest_control_mode: env_ingest_control_mode()?,
+            storage_control_mode: env_storage_control_mode()?,
+            bench_http_keepalive: env_bool("CANARDSTACK_BENCH_HTTP_KEEPALIVE", false)?,
         })
     }
 
@@ -216,6 +254,9 @@ impl Config {
             max_concurrent_connections: 64,
             socket_read_timeout: Duration::from_secs(5),
             socket_write_timeout: Duration::from_secs(5),
+            ingest_control_mode: IngestControlMode::Full,
+            storage_control_mode: StorageControlMode::Full,
+            bench_http_keepalive: false,
         }
     }
 
@@ -345,4 +386,35 @@ fn env_optional_usize(name: &str) -> Result<Option<usize>> {
         Err(env::VarError::NotPresent) => Ok(None),
         Err(err) => Err(err).with_context(|| format!("invalid {name}")),
     }
+}
+
+fn env_ingest_control_mode() -> Result<IngestControlMode> {
+    match env::var("CANARDSTACK_BENCH_INGEST_CONTROL") {
+        Ok(value) => match normalized_control_value(&value).as_str() {
+            "full" => Ok(IngestControlMode::Full),
+            "validation_only" => Ok(IngestControlMode::ValidationOnly),
+            "transform_only" => Ok(IngestControlMode::TransformOnly),
+            _ => anyhow::bail!(
+                "CANARDSTACK_BENCH_INGEST_CONTROL must be full, validation-only, or transform-only"
+            ),
+        },
+        Err(env::VarError::NotPresent) => Ok(IngestControlMode::Full),
+        Err(err) => Err(err).context("read CANARDSTACK_BENCH_INGEST_CONTROL"),
+    }
+}
+
+fn env_storage_control_mode() -> Result<StorageControlMode> {
+    match env::var("CANARDSTACK_BENCH_STORAGE_CONTROL") {
+        Ok(value) => match normalized_control_value(&value).as_str() {
+            "full" => Ok(StorageControlMode::Full),
+            "null_sink" => Ok(StorageControlMode::NullSink),
+            _ => anyhow::bail!("CANARDSTACK_BENCH_STORAGE_CONTROL must be full or null-sink"),
+        },
+        Err(env::VarError::NotPresent) => Ok(StorageControlMode::Full),
+        Err(err) => Err(err).context("read CANARDSTACK_BENCH_STORAGE_CONTROL"),
+    }
+}
+
+fn normalized_control_value(value: &str) -> String {
+    value.trim().to_ascii_lowercase().replace(['-', ' '], "_")
 }

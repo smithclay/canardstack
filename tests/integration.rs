@@ -1,3 +1,4 @@
+use canardstack::config::{IngestControlMode, StorageControlMode};
 use canardstack::http;
 use canardstack::ingest::Signal;
 use canardstack::validation;
@@ -675,6 +676,202 @@ fn runtime_memory_pressure_returns_429_before_enqueue() {
             .map(|s| s.queued_rows)
             .sum::<usize>(),
         0
+    );
+}
+
+#[test]
+fn ingest_stage_metrics_separate_transform_enqueue_and_storage_visibility() {
+    let (_dir, state) = app();
+    let body = log_fixture(Utc::now().timestamp_nanos_opt().unwrap()).to_string();
+    let response = http::route(
+        "POST",
+        "/v1/logs",
+        &HashMap::new(),
+        &headers(&state),
+        body.as_bytes(),
+        &state,
+    );
+    assert_eq!(response.status(), 202, "{}", response.json_body());
+
+    let metrics = state.metrics.render_prometheus();
+    assert!(
+        metrics.contains(&format!(
+            "canardstack_ingest_decoded_bytes_total{{signal=\"logs\",encoding=\"identity\"}} {}",
+            body.len()
+        )),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains(
+            "canardstack_ingest_transformed_rows_total{signal=\"logs\",request_signal=\"logs\"} 1"
+        ),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains("canardstack_ingest_enqueued_rows_total{signal=\"logs\"} 1"),
+        "{metrics}"
+    );
+
+    let flush = http::route(
+        "POST",
+        "/api/admin/maintenance/flush",
+        &HashMap::new(),
+        &admin_headers(&state),
+        &[],
+        &state,
+    );
+    assert_eq!(flush.status(), 200, "{}", flush.json_body());
+    let metrics = state.metrics.render_prometheus();
+    assert!(
+        metrics.contains("canardstack_ingest_flush_rows_total{signal=\"logs\"} 1"),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains("canardstack_immutable_segments_sealed_rows_total{signal=\"logs\"} 1"),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains("canardstack_immutable_segments_sealed_files_total{signal=\"logs\"} 1"),
+        "{metrics}"
+    );
+}
+
+#[test]
+fn validation_only_control_accepts_without_transforming_or_enqueueing() {
+    let dir = tempdir().unwrap();
+    let mut config = Config::test(dir.path().join("canardstack.duckdb"));
+    config.ingest_control_mode = IngestControlMode::ValidationOnly;
+    let state = AppState::new(config).unwrap();
+    let body = log_fixture(Utc::now().timestamp_nanos_opt().unwrap()).to_string();
+    let response = http::route(
+        "POST",
+        "/v1/logs",
+        &HashMap::new(),
+        &headers(&state),
+        body.as_bytes(),
+        &state,
+    );
+
+    assert_eq!(response.status(), 202, "{}", response.json_body());
+    assert_eq!(
+        response.json_body()["acknowledgement"],
+        "benchmark_control_validation_only_not_transformed_or_enqueued"
+    );
+    assert_eq!(
+        state
+            .ingestor
+            .snapshots()
+            .into_iter()
+            .map(|s| s.queued_rows)
+            .sum::<usize>(),
+        0
+    );
+    let metrics = state.metrics.render_prometheus();
+    assert!(
+        metrics.contains(
+            "canardstack_ingest_control_requests_total{signal=\"logs\",mode=\"validation_only\"} 1"
+        ),
+        "{metrics}"
+    );
+    assert!(
+        !metrics.contains("canardstack_ingest_transformed_rows_total"),
+        "{metrics}"
+    );
+}
+
+#[test]
+fn transform_only_control_transforms_without_enqueueing() {
+    let dir = tempdir().unwrap();
+    let mut config = Config::test(dir.path().join("canardstack.duckdb"));
+    config.ingest_control_mode = IngestControlMode::TransformOnly;
+    let state = AppState::new(config).unwrap();
+    let body = log_fixture(Utc::now().timestamp_nanos_opt().unwrap()).to_string();
+    let response = http::route(
+        "POST",
+        "/v1/logs",
+        &HashMap::new(),
+        &headers(&state),
+        body.as_bytes(),
+        &state,
+    );
+
+    assert_eq!(response.status(), 202, "{}", response.json_body());
+    assert_eq!(
+        response.json_body()["acknowledgement"],
+        "benchmark_control_transformed_not_enqueued_or_durably_committed"
+    );
+    assert_eq!(
+        state
+            .ingestor
+            .snapshots()
+            .into_iter()
+            .map(|s| s.queued_rows)
+            .sum::<usize>(),
+        0
+    );
+    let metrics = state.metrics.render_prometheus();
+    assert!(
+        metrics.contains(
+            "canardstack_ingest_transformed_rows_total{signal=\"logs\",request_signal=\"logs\"} 1"
+        ),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains(
+            "canardstack_ingest_control_dropped_rows_total{signal=\"logs\",mode=\"transform_only\"} 1"
+        ),
+        "{metrics}"
+    );
+    assert!(
+        !metrics.contains("canardstack_ingest_enqueued_rows_total"),
+        "{metrics}"
+    );
+}
+
+#[test]
+fn null_sink_storage_control_drains_queue_without_storage_visibility() {
+    let dir = tempdir().unwrap();
+    let mut config = Config::test(dir.path().join("canardstack.duckdb"));
+    config.storage_control_mode = StorageControlMode::NullSink;
+    let state = AppState::new(config).unwrap();
+    let body = log_fixture(Utc::now().timestamp_nanos_opt().unwrap()).to_string();
+    let response = http::route(
+        "POST",
+        "/v1/logs",
+        &HashMap::new(),
+        &headers(&state),
+        body.as_bytes(),
+        &state,
+    );
+    assert_eq!(response.status(), 202, "{}", response.json_body());
+
+    let flush = http::route(
+        "POST",
+        "/api/admin/maintenance/flush",
+        &HashMap::new(),
+        &admin_headers(&state),
+        &[],
+        &state,
+    );
+    assert_eq!(flush.status(), 200, "{}", flush.json_body());
+    assert_eq!(
+        state
+            .ingestor
+            .snapshots()
+            .into_iter()
+            .map(|s| s.queued_rows)
+            .sum::<usize>(),
+        0
+    );
+    assert_eq!(log_rows(&state), 0);
+    let metrics = state.metrics.render_prometheus();
+    assert!(
+        metrics.contains("canardstack_ingest_null_sink_rows_total{signal=\"logs\"} 1"),
+        "{metrics}"
+    );
+    assert!(
+        !metrics.contains("canardstack_immutable_segments_sealed_rows_total"),
+        "{metrics}"
     );
 }
 

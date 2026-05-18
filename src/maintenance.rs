@@ -2,7 +2,7 @@ use crate::app::AppState;
 use crate::config::Config;
 use crate::ingest::Ingestor;
 use crate::metrics::Metrics;
-use crate::storage::{ArrowBatchInsertTiming, RetentionPolicy, Storage};
+use crate::storage::{ArrowBatchInsertTiming, ImmutableFlushOutcome, RetentionPolicy, Storage};
 use crate::LockExt;
 use anyhow::Result;
 use serde_json::{json, Value};
@@ -110,9 +110,10 @@ impl Maintenance {
             return Ok(json!({"status": "paused"}));
         }
         let started = Instant::now();
-        let process_rows = ingestor.flush_all(storage)?;
+        let process_rows = ingestor.flush_all_with_metrics(storage, Some(metrics))?;
         let immutable = storage.flush_immutable_segments(options.force_immutable_segments)?;
         observe_phase_timings(metrics, &immutable.timings);
+        observe_immutable_flush(metrics, &immutable);
         let ducklake_started = Instant::now();
         let ducklake = storage.flush_inlined_data(options.table)?;
         metrics.observe_seconds(
@@ -211,6 +212,7 @@ impl Maintenance {
         let flushed = ingestor.flush_due(storage, Some(metrics))?;
         let immutable = storage.flush_immutable_segments(false)?;
         observe_phase_timings(metrics, &immutable.timings);
+        observe_immutable_flush(metrics, &immutable);
         if !flushed.is_empty() {
             self.record_run("watchdog");
         }
@@ -265,6 +267,26 @@ fn observe_phase_timings(metrics: &Metrics, timings: &[ArrowBatchInsertTiming]) 
             None,
             timing.seconds,
         );
+    }
+}
+
+fn observe_immutable_flush(metrics: &Metrics, outcome: &ImmutableFlushOutcome) {
+    if outcome.sealed_rows == 0 && outcome.sealed_files == 0 {
+        return;
+    }
+    for timing in &outcome.timings {
+        if timing.phase == crate::storage::TimingPhase::ParquetEncode {
+            metrics.inc(
+                "canardstack_immutable_segments_sealed_files_total",
+                &[("signal", timing.table.as_str())],
+                1,
+            );
+            metrics.inc(
+                "canardstack_immutable_segments_sealed_rows_total",
+                &[("signal", timing.table.as_str())],
+                timing.rows as u64,
+            );
+        }
     }
 }
 

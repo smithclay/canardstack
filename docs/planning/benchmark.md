@@ -118,6 +118,195 @@ Backpressure semantics stay unchanged:
 
 ## Implemented Benchmark Instrumentation
 
+2026-05-18 stage-visibility audit:
+
+- `throughput_iteration` still treats HTTP `202` as the primary pass/fail
+  throughput signal. That is accepted decoded bytes/sec, not query-visible or
+  DuckLake-committed bytes/sec.
+- A `202` means accepted into bounded process memory. It does not mean the rows
+  were transformed, enqueued, drained, sealed into Parquet, registered with
+  DuckLake, or visible to compatibility queries.
+- Recent OrbStack reports lacked server CPU/RSS samples because Mac-side
+  benchmark drivers use local `ps`, which cannot sample a server PID inside the
+  Linux VM. Running the driver inside the VM can make `--server-pid` work, but
+  it competes for VM CPU/cache/RSS and can depress receiver throughput compared
+  with Mac-side driver behavior.
+- The null-sink/control matrix separated accepted, transformed, enqueued,
+  flushed, sealed, and query-visible progress. Do not prototype a new staged
+  architecture unless a later report shows the specific stage that is lagging.
+
+Current stage counters and gauges:
+
+- Accepted request bytes: `canardstack_ingest_request_bytes_total`.
+- Accepted decoded bytes: `canardstack_ingest_decoded_bytes_total`.
+- Transform output rows: `canardstack_ingest_transformed_rows_total`.
+- Enqueued rows/bytes: `canardstack_ingest_enqueued_rows_total` and
+  `canardstack_ingest_enqueued_bytes_total`.
+- Queue rows/bytes/oldest age/pressure:
+  `canardstack_ingest_queue_*`.
+- Flush drain/coalesce/buffer rows and bytes:
+  `canardstack_ingest_flush_drained_*`,
+  `canardstack_ingest_flush_coalesced_*`, and
+  `canardstack_ingest_flush_buffered_*`.
+- Immutable segment buffers/seals:
+  `canardstack_immutable_buffer_*` and
+  `canardstack_immutable_segments_sealed_*`.
+- Storage/query-visible gauges:
+  `canardstack_storage_logical_rows`,
+  `canardstack_ducklake_parquet_rows`, and
+  `canardstack_ducklake_parquet_files`.
+- Freshness lag: `canardstack_ingest_to_query_lag_seconds`.
+- Writer/storage phase timings:
+  `canardstack_phase_duration_seconds{phase="storage_*"}`.
+
+`throughput_iteration` report version `0.3.3` added
+`stage_throughput`, computed from measured-window start/end `/metrics`
+samples. Use that section for fast-fail decisions; an accepted-throughput
+increase without matching transformed/enqueued/flushed/visible progress is a
+negative result.
+
+Benchmark-only reversible controls:
+
+- `CANARDSTACK_BENCH_INGEST_CONTROL=validation-only` validates auth, content
+  type, compressed size, dependency health, and runtime memory admission, then
+  returns `202` without decompression, transform, timestamp validation, enqueue,
+  flush, or storage. This estimates the synchronous HTTP + cheap validation
+  ceiling. It is not a production acknowledgement mode.
+- `CANARDSTACK_BENCH_INGEST_CONTROL=transform-only` runs decompression,
+  `otlp2records`, timestamp validation, and peak runtime-memory admission, then
+  returns `202` without enqueue or storage. It emits
+  `canardstack_ingest_control_dropped_*` counters for transformed-but-dropped
+  rows/bytes.
+- `CANARDSTACK_BENCH_STORAGE_CONTROL=null-sink` leaves ingest and queue
+  admission intact, and flush still drains and coalesces batches, but the flush
+  path drops coalesced batches instead of appending immutable buffers or
+  registering DuckLake files. It emits `canardstack_ingest_null_sink_*`
+  counters. Query-visible rows are expected not to advance.
+- Defaults are `full` for both controls. Do not enable these outside controlled
+  benchmark runs.
+
+HTTP keep-alive scout control:
+
+- `CANARDSTACK_BENCH_HTTP_KEEPALIVE=true` enables a benchmark-only HTTP/1.1
+  keep-alive loop in the existing synchronous std-library server. Default server
+  behavior still sends `connection: close`.
+- `throughput_iteration` report version `0.3.4` adds
+  `--connection-mode close|persistent`. `close` is the default. In
+  `persistent` mode each ingest worker owns one reusable TCP connection; worker
+  connections are not shared or serialized.
+- This control isolates TCP accept, socket setup, and per-connection thread
+  churn. It is not a writer-lane experiment and does not change ingest
+  acknowledgement semantics.
+
+2026-05-18 control-matrix scout:
+
+- Environment: OrbStack Linux VMs, VM-local benchmark driver against
+  `127.0.0.1`, `--features otlp2records-observer`, 32 ingest workers,
+  `items-per-batch=256`, advancing timestamps. VM-local driver gives server
+  CPU/RSS samples but competes with the server, so treat throughput ceilings as
+  directional.
+- Logs target was 5000 GB/day for 60s measured / 10s warmup. Accepted decoded
+  throughput stayed in one band across controls: validation-only 53.3 MB/s,
+  transform-only 52.6 MB/s, null-sink 52.5 MB/s, full storage 53.2 MB/s.
+- Spans target was 4000 GB/day for 45s measured / 10s warmup. Accepted decoded
+  throughput again stayed in one band: validation-only 36.5 MB/s,
+  transform-only 36.1 MB/s, null-sink 36.1 MB/s, full storage 36.6 MB/s.
+- Null-sink rows tracked transformed/enqueued rows, and full-storage
+  storage-visible rows tracked transformed/enqueued rows closely over the short
+  window. Removing durable storage did not improve accepted throughput.
+- Interpretation: at this shape, the next bottleneck is not DuckLake
+  registration, Parquet sealing, or queue drain. The current ceiling is at or
+  before HTTP request handling plus payload generation/routing, with transform
+  CPU visible but not decisive for accepted throughput. Do not start a
+  writer-lane rewrite from this evidence. The next experiment should isolate the
+  benchmark driver/routing and HTTP request path before changing storage
+  architecture.
+
+2026-05-18 HTTP keep-alive scout:
+
+- Environment: OrbStack Linux VMs, VM-local benchmark driver against
+  `127.0.0.1`, `--features otlp2records-observer`, 32 ingest workers,
+  advancing timestamps, 45s measured / 10s warmup, query pressure off.
+- Logs used `target=5000 GB/day`, `items-per-batch=256`,
+  `log-body-bytes=512`. Validation-only close mode accepted 52.8 MB/s with
+  server CPU peaking at 60.5% and p50 ingest latency 107.9 ms. Persistent mode
+  accepted 57.8 MB/s with server CPU 22.8% and p50 41.1 ms.
+- Logs transform-only close mode transformed 80.2k rows/s at 54.3 MB/s decoded.
+  Persistent mode transformed 85.1k rows/s at 57.6 MB/s decoded. Rows were
+  intentionally dropped by the control.
+- Logs full-storage close mode made 81.7k rows/s storage-visible at
+  54.4 MB/s decoded; persistent mode made 85.1k rows/s storage-visible at
+  57.6 MB/s decoded. Queue oldest age remained around 1.2s and no `429`s were
+  observed.
+- Spans full-storage close mode made 77.3k rows/s storage-visible at
+  36.9 MB/s decoded and failed the high target. Persistent mode made
+  97.9k rows/s storage-visible at 46.0 MB/s decoded and passed the same target.
+  Queue oldest age fell from 2.0s to 1.0s.
+- Interpretation: the one-request-per-TCP benchmark path was materially
+  depressing accepted, transformed, enqueued, flushed, and storage-visible
+  progress. Keep the reversible keep-alive control and use persistent
+  connections for the next fast-fail gates. This evidence argues against a
+  writer-lane rewrite as the next experiment; the next production-facing
+  question is whether bounded keep-alive semantics should become a real server
+  capability, or whether benchmark targets should assume exporters reuse
+  connections.
+
+Report paths:
+
+- `target/canardstack-bench/http-keepalive/logs-validation-close/20260518T182249Z/report.json`
+- `target/canardstack-bench/http-keepalive/logs-validation-persistent/20260518T182411Z/report.json`
+- `target/canardstack-bench/http-keepalive/logs-transform-close/20260518T182525Z/report.json`
+- `target/canardstack-bench/http-keepalive/logs-transform-persistent/20260518T182636Z/report.json`
+- `target/canardstack-bench/http-keepalive/logs-full-close/20260518T182754Z/report.json`
+- `target/canardstack-bench/http-keepalive/logs-full-persistent/20260518T182906Z/report.json`
+- `target/canardstack-bench/http-keepalive/spans-full-close/20260518T183050Z/report.json`
+- `target/canardstack-bench/http-keepalive/spans-full-persistent/20260518T183202Z/report.json`
+
+2026-05-18 persistent-connection fast-fail gate:
+
+- Environment: same OrbStack Linux VMs, VM-local benchmark driver against
+  `127.0.0.1`, `--features otlp2records-observer`, 32 ingest workers,
+  advancing timestamps, 3m measured / 15s warmup, `items-per-batch=256`,
+  `log-body-bytes=512`, `trace-attribute-bytes=256`.
+- Ingest-only target runs used the original gate targets: logs `2000 GB/day`,
+  spans `1500 GB/day`, query pressure off. Close mode and persistent mode both
+  passed, so at these paced targets this is a latency/CPU/backlog result rather
+  than a max-throughput result.
+- Logs ingest-only close mode: accepted 23.11 MB/s decoded, transformed and
+  enqueued 34.1k rows/s, storage-visible 34.3k rows/s, peak server CPU 29.6%,
+  ingest p50/p99 55.0/104.2 ms, queue oldest 3.0s. Persistent mode: accepted
+  23.12 MB/s decoded, transformed and enqueued 34.1k rows/s, storage-visible
+  34.3k rows/s, peak server CPU 19.1%, ingest p50/p99 0.9/42.7 ms, queue
+  oldest 3.2s.
+- Spans ingest-only close mode: accepted 17.32 MB/s decoded, transformed and
+  enqueued 37.0k rows/s, storage-visible 36.8k rows/s, peak server CPU 30.8%,
+  ingest p50/p99 55.0/104.2 ms, queue oldest 2.5s. Persistent mode: accepted
+  17.34 MB/s decoded, transformed and enqueued 37.1k rows/s, storage-visible
+  36.9k rows/s, peak server CPU 19.2%, ingest p50/p99 0.9/42.5 ms, queue
+  oldest 2.6s.
+- Low-query validation used persistent mode, `--profile mixed-query`, and
+  `--query-pressure low`. Logs passed at 23.11 MB/s accepted decoded,
+  storage-visible 34.3k rows/s, query p95 292 ms. Spans passed at
+  17.34 MB/s accepted decoded, storage-visible 36.9k rows/s, query p95 188 ms.
+  Both runs returned only `200` query responses and `202` ingest responses.
+- Interpretation: persistent connections are worth keeping as a benchmark
+  control and likely worth turning into bounded production behavior, because
+  they cut request latency and server CPU without reducing transformed,
+  enqueued, flushed, or storage-visible throughput. This still does not justify
+  a writer-lane rewrite. The next architecture experiment should first make
+  keep-alive production-safe under bounded connection/thread semantics, then
+  re-run a max-throughput gate to see whether the next visible limiter is
+  transform or storage.
+
+Report paths:
+
+- `target/canardstack-bench/http-keepalive-gate/logs-full-close/20260518T184605Z/report.json`
+- `target/canardstack-bench/http-keepalive-gate/logs-full-persistent/20260518T184950Z/report.json`
+- `target/canardstack-bench/http-keepalive-gate/spans-full-close/20260518T184606Z/report.json`
+- `target/canardstack-bench/http-keepalive-gate/spans-full-persistent/20260518T184950Z/report.json`
+- `target/canardstack-bench/http-keepalive-gate/logs-lowquery-persistent/20260518T185342Z/report.json`
+- `target/canardstack-bench/http-keepalive-gate/spans-lowquery-persistent/20260518T185343Z/report.json`
+
 Storage phase metrics now separate:
 
 - `storage_partition_split`

@@ -155,82 +155,127 @@ fn classify_io_error(err: &anyhow::Error) -> &'static str {
 
 fn handle_stream(mut stream: TcpStream, state: Arc<AppState>) -> anyhow::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
-    let mut first = String::new();
-    let first_read = match read_bounded_line(&mut reader, &mut first, MAX_REQUEST_LINE_BYTES)? {
-        LineRead::Read(read) => read,
-        LineRead::TooLong => {
-            return write_response(&mut stream, header_limit_response());
-        }
-    };
-    if first_read == 0 {
-        return Ok(());
-    }
-    let mut parts = first.split_whitespace();
-    let method = parts.next().unwrap_or("").to_string();
-    let target = parts.next().unwrap_or("/").to_string();
-
-    let mut headers = HashMap::new();
-    let mut header_bytes = 0usize;
+    let keepalive_enabled = state.config.bench_http_keepalive;
+    let mut requests = 0usize;
     loop {
-        let mut line = String::new();
-        let read = match read_bounded_line(&mut reader, &mut line, MAX_HEADER_LINE_BYTES)? {
+        let mut first = String::new();
+        let first_read = match read_bounded_line(&mut reader, &mut first, MAX_REQUEST_LINE_BYTES)? {
             LineRead::Read(read) => read,
             LineRead::TooLong => {
                 return write_response(&mut stream, header_limit_response());
             }
         };
-        header_bytes += read;
-        if header_bytes > MAX_HEADER_BYTES || headers.len() >= MAX_HEADER_COUNT {
-            return write_response(&mut stream, header_limit_response());
+        if first_read == 0 {
+            return Ok(());
         }
-        let trimmed = line.trim_end_matches(['\r', '\n']);
-        if trimmed.is_empty() {
-            break;
-        }
-        if let Some((k, v)) = trimmed.split_once(':') {
-            headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
-        }
-    }
+        let mut parts = first.split_whitespace();
+        let method = parts.next().unwrap_or("").to_string();
+        let target = parts.next().unwrap_or("/").to_string();
 
-    let content_length = match headers.get("content-length") {
-        Some(raw) => match raw.parse() {
-            Ok(value) => value,
-            Err(_) => {
-                return write_response(
-                    &mut stream,
-                    HttpResponse::json(
-                        400,
-                        json!({
-                            "error": "invalid_content_length",
-                            "message": "content-length must be a non-negative integer"
-                        }),
-                    ),
-                )
+        let mut headers = HashMap::new();
+        let mut header_bytes = 0usize;
+        loop {
+            let mut line = String::new();
+            let read = match read_bounded_line(&mut reader, &mut line, MAX_HEADER_LINE_BYTES)? {
+                LineRead::Read(read) => read,
+                LineRead::TooLong => {
+                    return write_response(&mut stream, header_limit_response());
+                }
+            };
+            header_bytes += read;
+            if header_bytes > MAX_HEADER_BYTES || headers.len() >= MAX_HEADER_COUNT {
+                return write_response(&mut stream, header_limit_response());
             }
-        },
-        None => 0,
-    };
-    if content_length > state.config.max_body_bytes {
-        let response = HttpResponse::json(
-            400,
-            json!({
-                "error": "payload_too_large",
-                "message": format!(
-                    "payload has {content_length} bytes; max is {}",
-                    state.config.max_body_bytes
-                )
-            }),
-        );
-        return write_response(&mut stream, response);
-    }
-    let mut body = vec![0; content_length];
-    if content_length > 0 {
-        reader.read_exact(&mut body)?;
-    }
+            let trimmed = line.trim_end_matches(['\r', '\n']);
+            if trimmed.is_empty() {
+                break;
+            }
+            if let Some((k, v)) = trimmed.split_once(':') {
+                headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
+            }
+        }
 
-    let (path, query) = split_target(&target);
-    let response = route(&method, &path, &query, &headers, &body, &state);
-    write_response(&mut stream, response)
+        let content_length = match headers.get("content-length") {
+            Some(raw) => match raw.parse() {
+                Ok(value) => value,
+                Err(_) => {
+                    return write_response(
+                        &mut stream,
+                        HttpResponse::json(
+                            400,
+                            json!({
+                                "error": "invalid_content_length",
+                                "message": "content-length must be a non-negative integer"
+                            }),
+                        ),
+                    )
+                }
+            },
+            None => 0,
+        };
+        if content_length > state.config.max_body_bytes {
+            let response = HttpResponse::json(
+                400,
+                json!({
+                    "error": "payload_too_large",
+                    "message": format!(
+                        "payload has {content_length} bytes; max is {}",
+                        state.config.max_body_bytes
+                    )
+                }),
+            );
+            return write_response(&mut stream, response);
+        }
+        let mut body = vec![0; content_length];
+        if content_length > 0 {
+            reader.read_exact(&mut body)?;
+        }
+
+        let (path, query) = split_target(&target);
+        let response = route(&method, &path, &query, &headers, &body, &state);
+        requests += 1;
+        let client_requested_close = headers
+            .get("connection")
+            .is_some_and(|value| value.eq_ignore_ascii_case("close"));
+        let keep_alive = keepalive_enabled && !client_requested_close;
+        state.metrics.inc(
+            "canardstack_http_connection_requests_total",
+            &[(
+                "mode",
+                if keep_alive {
+                    "keep_alive"
+                } else {
+                    "connection_close"
+                },
+            )],
+            1,
+        );
+        write_response_with_connection(&mut stream, response, keep_alive)?;
+        if !keep_alive {
+            return Ok(());
+        }
+        if requests >= 10_000 {
+            state.metrics.inc(
+                "canardstack_http_connection_closes_total",
+                &[("reason", "keepalive_request_limit")],
+                1,
+            );
+            return Ok(());
+        }
+        if reader.buffer().is_empty() {
+            if let Ok(()) = reader.get_ref().set_nonblocking(true) {
+                let mut probe = [0u8; 1];
+                match reader.get_ref().peek(&mut probe) {
+                    Ok(0) => return Ok(()),
+                    Ok(_) => {}
+                    Err(err) if err.kind() == ErrorKind::WouldBlock => {}
+                    Err(err) => return Err(err.into()),
+                }
+                let _ = reader.get_ref().set_nonblocking(false);
+            }
+            let _ = reader.get_ref().set_nonblocking(false);
+        }
+    }
 }
 
 fn header_limit_response() -> HttpResponse {
@@ -769,6 +814,46 @@ pub(crate) fn record_operator_gauges(state: &AppState) {
         &[("table", "all")],
         storage.physical_bytes as f64,
     );
+    let immutable_buffers = state
+        .storage
+        .immutable_buffer_metrics()
+        .into_iter()
+        .map(|buffer| (buffer.table, buffer))
+        .collect::<HashMap<_, _>>();
+    for table in [
+        Signal::Logs,
+        Signal::Spans,
+        Signal::MetricGauge,
+        Signal::MetricSum,
+    ] {
+        let rows = immutable_buffers
+            .get(&table)
+            .map(|buffer| buffer.rows)
+            .unwrap_or(0);
+        let bytes = immutable_buffers
+            .get(&table)
+            .map(|buffer| buffer.bytes)
+            .unwrap_or(0);
+        let age_seconds = immutable_buffers
+            .get(&table)
+            .map(|buffer| buffer.age_seconds)
+            .unwrap_or(0.0);
+        state.metrics.gauge(
+            "canardstack_immutable_buffer_rows",
+            &[("table", table.as_str())],
+            rows as f64,
+        );
+        state.metrics.gauge(
+            "canardstack_immutable_buffer_bytes",
+            &[("table", table.as_str())],
+            bytes as f64,
+        );
+        state.metrics.gauge(
+            "canardstack_immutable_buffer_age_seconds",
+            &[("table", table.as_str())],
+            age_seconds,
+        );
+    }
     if let Some(rows) = storage.logical_rows.as_object() {
         for (table, value) in rows {
             if let Some(count) = value.as_i64() {
@@ -944,6 +1029,14 @@ impl HttpResponse {
 }
 
 fn write_response(stream: &mut TcpStream, response: HttpResponse) -> anyhow::Result<()> {
+    write_response_with_connection(stream, response, false)
+}
+
+fn write_response_with_connection(
+    stream: &mut TcpStream,
+    response: HttpResponse,
+    keep_alive: bool,
+) -> anyhow::Result<()> {
     let reason = match response.status {
         200 => "OK",
         202 => "Accepted",
@@ -957,11 +1050,12 @@ fn write_response(stream: &mut TcpStream, response: HttpResponse) -> anyhow::Res
     };
     write!(
         stream,
-        "HTTP/1.1 {} {}\r\ncontent-type: {}\r\ncontent-length: {}\r\nconnection: close\r\n",
+        "HTTP/1.1 {} {}\r\ncontent-type: {}\r\ncontent-length: {}\r\nconnection: {}\r\n",
         response.status,
         reason,
         response.content_type,
-        response.body.len()
+        response.body.len(),
+        if keep_alive { "keep-alive" } else { "close" }
     )?;
     if let Some(seconds) = response.retry_after_seconds {
         write!(stream, "retry-after: {seconds}\r\n")?;
@@ -969,4 +1063,89 @@ fn write_response(stream: &mut TcpStream, response: HttpResponse) -> anyhow::Res
     stream.write_all(b"\r\n")?;
     stream.write_all(&response.body)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{AppState, Config};
+    use std::io::{Read, Write};
+
+    #[test]
+    fn benchmark_keepalive_allows_multiple_requests_on_one_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::test(dir.path().join("canardstack.duckdb"));
+        config.local_storage_dir = dir.path().join("storage");
+        config.bench_http_keepalive = true;
+        let state = Arc::new(AppState::new(config).unwrap());
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let state_for_thread = state.clone();
+        let handle = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            handle_stream(stream, state_for_thread).unwrap();
+        });
+
+        let mut client = TcpStream::connect(addr).unwrap();
+        client
+            .write_all(
+                b"GET /healthz HTTP/1.1\r\nhost: localhost\r\ncontent-length: 0\r\nconnection: keep-alive\r\n\r\n",
+            )
+            .unwrap();
+        let first = read_test_response(&mut client);
+        assert!(first.starts_with("HTTP/1.1 200 OK"));
+        assert!(first.contains("\r\nconnection: keep-alive\r\n"));
+
+        client
+            .write_all(
+                b"GET /metrics HTTP/1.1\r\nhost: localhost\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+            )
+            .unwrap();
+        let second = read_test_response(&mut client);
+        assert!(second.starts_with("HTTP/1.1 200 OK"));
+        assert!(second.contains("\r\nconnection: close\r\n"));
+        handle.join().unwrap();
+
+        let metrics = state.metrics.render_prometheus();
+        assert!(
+            metrics.contains("canardstack_http_connection_requests_total{mode=\"keep_alive\"} 1")
+        );
+        assert!(metrics
+            .contains("canardstack_http_connection_requests_total{mode=\"connection_close\"} 1"));
+    }
+
+    fn read_test_response(stream: &mut TcpStream) -> String {
+        let mut bytes = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            let read = stream.read(&mut buf).unwrap();
+            assert!(read > 0, "unexpected eof while reading test response");
+            bytes.extend_from_slice(&buf[..read]);
+            if test_response_complete(&bytes) {
+                break;
+            }
+        }
+        String::from_utf8(bytes).unwrap()
+    }
+
+    fn test_response_complete(bytes: &[u8]) -> bool {
+        let Some(header_end) = bytes
+            .windows(b"\r\n\r\n".len())
+            .position(|window| window == b"\r\n\r\n")
+        else {
+            return false;
+        };
+        let head = String::from_utf8_lossy(&bytes[..header_end]);
+        let content_length = head
+            .lines()
+            .skip(1)
+            .filter_map(|line| line.split_once(':'))
+            .find_map(|(name, value)| {
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap_or(0);
+        bytes.len().saturating_sub(header_end + b"\r\n\r\n".len()) >= content_length
+    }
 }

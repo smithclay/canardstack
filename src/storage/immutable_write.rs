@@ -6,8 +6,8 @@ use super::immutable::{
     ImmutableFlushOutcome, ImmutableSealResult,
 };
 use super::{
-    ArrowBatchInsert, ArrowBatchInsertResult, ArrowBatchInsertTiming, ImmutableSegmentBuffer,
-    PreparedArrowBatch, Signal, Storage, TimingPhase,
+    ArrowBatchInsert, ArrowBatchInsertResult, ArrowBatchInsertTiming, ImmutableBufferMetric,
+    ImmutableSegmentBuffer, PreparedArrowBatch, Signal, Storage, TimingPhase,
 };
 use crate::LockExt;
 use anyhow::Result;
@@ -16,6 +16,19 @@ use std::collections::BTreeMap;
 use std::time::Instant;
 
 impl Storage {
+    pub fn immutable_buffer_metrics(&self) -> Vec<ImmutableBufferMetric> {
+        let buffers = self.immutable_buffers.lock_or_poisoned();
+        buffers
+            .iter()
+            .map(|(table, buffer)| ImmutableBufferMetric {
+                table: *table,
+                rows: buffer.rows,
+                bytes: buffer.bytes,
+                age_seconds: buffer.opened_at.elapsed().as_secs_f64(),
+            })
+            .collect()
+    }
+
     pub fn insert_arrow_records(
         &self,
         table: Signal,
