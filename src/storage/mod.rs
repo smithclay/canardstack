@@ -31,10 +31,7 @@ use ducklake::{
 };
 pub use immutable::ImmutableFlushOutcome;
 use immutable::ImmutableSegmentBuffer;
-pub use planner_metadata::{
-    DuckLakeLogCandidatePlan, DuckLakeLogCandidateWindow, DuckLakePlannerFile,
-    DuckLakePlannerPartition,
-};
+pub use planner_metadata::{DuckLakeLogCandidatePlan, DuckLakeLogCandidateWindow};
 use schema::create_tables_on;
 
 #[derive(Clone, Debug, Serialize)]

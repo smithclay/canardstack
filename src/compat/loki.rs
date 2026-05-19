@@ -4,7 +4,7 @@ use super::params::{
 };
 use crate::query::log::parse_loki_query;
 use crate::query::plan::{LogPlan, TimeBounds};
-use crate::validation::{ApiError, ApiResult};
+use crate::validation::ApiResult;
 use crate::AppState;
 use chrono::Utc;
 use serde_json::{json, Map, Value};
@@ -18,50 +18,6 @@ pub fn loki_query(state: &AppState, params: &HashMap<String, String>) -> ApiResu
 
 pub fn loki_query_range(state: &AppState, params: &HashMap<String, String>) -> ApiResult<Value> {
     loki_query_inner(state, params, true)
-}
-
-pub fn loki_query_range_candidates(
-    state: &AppState,
-    params: &HashMap<String, String>,
-) -> ApiResult<Value> {
-    let plan = loki_plan(params, true)?;
-    let files = state
-        .storage
-        .ducklake_log_candidate_files(plan.time_bounds.from, plan.time_bounds.to, plan.limit)
-        .map_err(|err| ApiError::new(503, "query_storage_unavailable", err.to_string()))?;
-    Ok(loki_success(json!({
-        "resultType": "ducklake_files",
-        "source": "ducklake_metadata",
-        "query": required_param(params, "query")?,
-        "direction": if plan.direction.is_forward() { "forward" } else { "backward" },
-        "time_bounds": {
-            "from": plan.time_bounds.from.to_rfc3339(),
-            "to": plan.time_bounds.to.to_rfc3339()
-        },
-        "candidate_file_limit": plan.limit,
-        "files": files
-    })))
-}
-
-pub fn loki_query_range_explain(
-    state: &AppState,
-    params: &HashMap<String, String>,
-) -> ApiResult<Value> {
-    let plan = loki_plan(params, true)?;
-    if plan.direction.is_forward() {
-        return Err(ApiError::new(
-            400,
-            "unsupported_direction",
-            "progressive explain is only implemented for backward Loki query_range",
-        ));
-    }
-    let analyze = params
-        .get("analyze")
-        .map(|value| matches!(value.as_str(), "1" | "true" | "yes"))
-        .unwrap_or(false);
-    state
-        .queries
-        .explain_logs_progressive_window(&state.storage, &plan, analyze)
 }
 
 pub fn loki_labels(_state: &AppState, params: &HashMap<String, String>) -> ApiResult<Value> {

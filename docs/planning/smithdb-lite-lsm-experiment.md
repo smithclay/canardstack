@@ -45,7 +45,7 @@ useful as a scout, but it is now retired from active code paths.
    batches, reserves peak runtime memory, and enqueues into the bounded
    in-process queue map.
 5. A `202` currently means accepted into process memory, not durably committed.
-6. Scheduler or admin flush takes the single flush lock, drains per-signal
+6. Scheduler or maintenance flush takes the single flush lock, drains per-signal
    batches, coalesces them, and appends to per-signal immutable buffers.
 7. Immutable buffer sealing splits by DuckLake timestamp partition, writes and
    fsyncs Parquet segment files, then registers them through
@@ -96,14 +96,13 @@ If `202` changes to mean durably spooled, ingest must change in these places:
 
 ## DuckLake Metadata Proof Gate
 
-The first implementation is an admin-only DuckLake file metadata probe:
+The first proof used a temporary DuckLake file metadata diagnostic to validate
+that registered segment planning facts are available from DuckLake. That
+diagnostic was a validation artifact and has been retired from the serving
+binary now that the Loki path uses the same metadata internally.
 
-```text
-GET /api/admin/storage/ducklake-files?table=logs&limit=100
-```
-
-It reads DuckLake metadata tables for current registered data files and exposes
-planner-relevant facts:
+The storage helper reads DuckLake metadata tables for current registered data
+files and exposes planner-relevant facts to the internal candidate planner:
 
 - file path: `ducklake_data_file.path`
 - table/signal: `ducklake_table.table_name`
@@ -152,19 +151,11 @@ satisfied or the candidate set is exhausted. If timestamp min/max metadata is
 missing for a candidate window, it keeps correctness by executing the same
 logical query without the extra lower-bound predicate.
 
-Retained diagnostics:
-
-- `GET /api/admin/query/loki-candidates` returns the DuckLake candidate file
-  list for Loki query-range params.
-- `GET /api/admin/query/loki-progressive-explain` compares the full logical
-  query shape with the candidate-window logical query shape through DuckDB
-  `EXPLAIN` / `EXPLAIN ANALYZE`.
-
 Proof gates passed:
 
-1. Metadata probe returns planner facts for local DuckLake after flush.
-2. Metadata probe latency stays small relative to the interactive query budget
-   on benchmark data.
+1. DuckLake metadata returns planner facts for local DuckLake after flush.
+2. DuckLake metadata lookup latency stays small relative to the interactive
+   query budget on benchmark data.
 3. A benchmark-only candidate planner can list newest log files intersecting a
    time range without changing query results. Implemented locally; benchmark
    pressure validation showed low sidecar overhead, but default one-hour Loki
@@ -231,13 +222,14 @@ architecture direction is coherent, while the next performance proof must
 attack DuckDB query shape/plan cost rather than DuckLake metadata or double
 execution alone.
 
-DuckDB/DuckLake plan proof: the admin explain probe confirms the correct
-boundary. Canardstack generated logical SQL against `logs`; DuckDB/DuckLake
-planned physical reads. On benchmark data, the full logical query read 13 files
-and 6256 rows, while the progressive logical-window query read 1 file and 311
-rows. This is the desired architecture: use DuckLake metadata to derive bounded
-logical predicates, then let DuckDB/DuckLake assemble the result. Raw Parquet
-file execution should remain a retired scout, not a serving design.
+DuckDB/DuckLake plan proof: a temporary explain diagnostic confirmed the
+correct boundary and was then retired. Canardstack generated logical SQL
+against `logs`; DuckDB/DuckLake planned physical reads. On benchmark data, the
+full logical query read 13 files and 6256 rows, while the progressive
+logical-window query read 1 file and 311 rows. This is the desired
+architecture: use DuckLake metadata to derive bounded logical predicates, then
+let DuckDB/DuckLake assemble the result. Raw Parquet file execution should
+remain a retired scout, not a serving design.
 
 Timer-fix result: rerunning the authoritative progressive query benchmark
 after fixing query-timeout timer wakeup behavior dropped average candidate
@@ -263,3 +255,9 @@ queries, scanned 1 of 12 candidate files for the final sample, averaged ~14.5ms
 candidate execution, had zero transport errors, and kept queue age flat. This
 confirms the Brooksian end-to-end direction for Loki logs: metadata bounds a
 logical query, and DuckDB/DuckLake executes the physical plan.
+
+Diagnostic cleanup: the DuckLake file metadata diagnostic, Loki candidate-list
+diagnostic, and Loki progressive explain diagnostic are no longer active code
+paths. They proved the architecture and were removed to keep the compatibility
+server focused on serving behavior instead of carrying validation-only API
+surface.

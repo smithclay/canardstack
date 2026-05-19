@@ -37,16 +37,6 @@ impl Signal {
         }
     }
 
-    pub fn from_table_name(value: &str) -> Option<Self> {
-        match value {
-            "logs" => Some(Self::Logs),
-            "spans" => Some(Self::Spans),
-            "metric_gauge" => Some(Self::MetricGauge),
-            "metric_sum" => Some(Self::MetricSum),
-            _ => None,
-        }
-    }
-
     fn is_metric(self) -> bool {
         matches!(self, Signal::MetricGauge | Signal::MetricSum)
     }

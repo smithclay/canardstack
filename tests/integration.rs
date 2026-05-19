@@ -10,7 +10,7 @@ use arrow58::array::{
 };
 use arrow58::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow58::record_batch::RecordBatch;
-use chrono::{Datelike, Duration, TimeZone, Utc};
+use chrono::{Duration, TimeZone, Utc};
 use common::{log_fixture, metric_fixture, trace_fixture};
 use flate2::write::GzEncoder;
 use flate2::Compression;
@@ -2479,9 +2479,6 @@ fn admin_endpoints_reject_data_key_and_unauthenticated_requests() {
         ("GET", "/api/admin/health/ingest"),
         ("GET", "/api/admin/health/maintenance"),
         ("GET", "/api/admin/health/queries"),
-        ("GET", "/api/admin/query/loki-candidates"),
-        ("GET", "/api/admin/query/loki-progressive-explain"),
-        ("GET", "/api/admin/storage/ducklake-files"),
         ("POST", "/api/admin/maintenance/pause"),
         ("POST", "/api/admin/maintenance/resume"),
         ("POST", "/api/admin/maintenance/flush"),
@@ -2538,65 +2535,6 @@ fn admin_endpoints_reject_data_key_and_unauthenticated_requests() {
             admin.json_body()
         );
     }
-}
-
-#[test]
-fn admin_loki_candidate_planner_lists_newest_intersecting_files() {
-    let (_dir, state) = app();
-    let headers = headers(&state);
-    let now = Utc::now();
-    let older = now - Duration::minutes(30);
-    let newer = now - Duration::minutes(5);
-
-    for timestamp in [older, newer] {
-        let body = log_fixture(timestamp.timestamp_nanos_opt().unwrap()).to_string();
-        let ingest = http::route(
-            "POST",
-            "/v1/logs",
-            &HashMap::new(),
-            &headers,
-            body.as_bytes(),
-            &state,
-        );
-        assert_eq!(ingest.status(), 202, "{}", ingest.json_body());
-        flush_all(&state);
-    }
-
-    let response = http::route(
-        "GET",
-        "/api/admin/query/loki-candidates",
-        &HashMap::from([
-            (
-                "query".to_string(),
-                r#"{service_name="checkout"}"#.to_string(),
-            ),
-            (
-                "start".to_string(),
-                (now - Duration::minutes(10)).timestamp().to_string(),
-            ),
-            (
-                "end".to_string(),
-                (now + Duration::minutes(1)).timestamp().to_string(),
-            ),
-            ("limit".to_string(), "10".to_string()),
-            ("direction".to_string(), "backward".to_string()),
-        ]),
-        &admin_headers(&state),
-        &[],
-        &state,
-    );
-    assert_eq!(response.status(), 200, "{}", response.json_body());
-    let body = response.json_body();
-    assert_eq!(body["data"]["source"], "ducklake_metadata");
-    let files = body["data"]["files"].as_array().expect("files array");
-    assert_eq!(files.len(), 1, "{body}");
-    assert_eq!(files[0]["table"], "logs");
-    assert_eq!(files[0]["row_count"], 1);
-    let timestamp_min = files[0]["timestamp_min"].as_str().unwrap_or_default();
-    assert!(
-        timestamp_min.starts_with(&newer.format("%Y-%m-%d %H:%M").to_string()),
-        "{body}"
-    );
 }
 
 #[test]
@@ -2735,140 +2673,6 @@ fn loki_progressive_query_continues_past_newer_nonmatching_candidates() {
         metrics.contains("canardstack_loki_progressive_query_files_scanned 2"),
         "{metrics}"
     );
-}
-
-#[test]
-fn admin_loki_progressive_explain_uses_logical_ducklake_queries() {
-    let (_dir, state) = app();
-    let headers = headers(&state);
-    let now = Utc::now();
-
-    for timestamp in [now - Duration::seconds(10), now] {
-        let body = log_fixture(timestamp.timestamp_nanos_opt().unwrap()).to_string();
-        let ingest = http::route(
-            "POST",
-            "/v1/logs",
-            &HashMap::new(),
-            &headers,
-            body.as_bytes(),
-            &state,
-        );
-        assert_eq!(ingest.status(), 202, "{}", ingest.json_body());
-        flush_all(&state);
-    }
-
-    let response = http::route(
-        "GET",
-        "/api/admin/query/loki-progressive-explain",
-        &HashMap::from([
-            (
-                "query".to_string(),
-                r#"{service_name="checkout"}"#.to_string(),
-            ),
-            (
-                "start".to_string(),
-                (now - Duration::minutes(1)).timestamp().to_string(),
-            ),
-            (
-                "end".to_string(),
-                (now + Duration::minutes(1)).timestamp().to_string(),
-            ),
-            ("limit".to_string(), "1".to_string()),
-            ("direction".to_string(), "backward".to_string()),
-        ]),
-        &admin_headers(&state),
-        &[],
-        &state,
-    );
-    assert_eq!(response.status(), 200, "{}", response.json_body());
-    let body = response.json_body();
-    assert_eq!(body["source"], "duckdb_explain");
-    assert_eq!(body["execution_engine"], "duckdb_ducklake_logical_table");
-    assert_eq!(body["candidate_window"]["selected_files"], 1);
-    let full_sql = body["full_logical_query"]["sql"]
-        .as_str()
-        .unwrap_or_default();
-    let progressive_sql = body["progressive_logical_query"]["sql"]
-        .as_str()
-        .unwrap_or_default();
-    assert!(full_sql.contains("FROM main.logs"), "{body}");
-    assert!(progressive_sql.contains("FROM main.logs"), "{body}");
-    assert!(progressive_sql.contains("timestamp >="), "{body}");
-    assert!(!progressive_sql.contains("read_parquet"), "{body}");
-    assert!(body["full_logical_query"]["plan"]
-        .as_array()
-        .is_some_and(|plan| !plan.is_empty()));
-    assert!(body["progressive_logical_query"]["plan"]
-        .as_array()
-        .is_some_and(|plan| !plan.is_empty()));
-}
-
-#[test]
-fn admin_ducklake_file_probe_exposes_planner_metadata() {
-    let (_dir, state) = app();
-    let headers = headers(&state);
-    let now = Utc::now();
-    let body = log_fixture(now.timestamp_nanos_opt().unwrap()).to_string();
-
-    let ingest = http::route(
-        "POST",
-        "/v1/logs",
-        &HashMap::new(),
-        &headers,
-        body.as_bytes(),
-        &state,
-    );
-    assert_eq!(ingest.status(), 202, "{}", ingest.json_body());
-    flush_all(&state);
-
-    let response = http::route(
-        "GET",
-        "/api/admin/storage/ducklake-files",
-        &HashMap::from([
-            ("table".to_string(), "logs".to_string()),
-            ("limit".to_string(), "10".to_string()),
-        ]),
-        &admin_headers(&state),
-        &[],
-        &state,
-    );
-    assert_eq!(response.status(), 200, "{}", response.json_body());
-    let body = response.json_body();
-    assert_eq!(body["source"], "ducklake_metadata");
-    assert_eq!(
-        body["ordering"],
-        "timestamp_max_desc_then_snapshot_desc_then_file_id_desc"
-    );
-    let files = body["files"].as_array().expect("files array");
-    assert_eq!(files.len(), 1, "{body}");
-    let file = &files[0];
-    assert_eq!(file["table"], "logs");
-    assert_eq!(file["row_count"], 1);
-    assert!(file["path"]
-        .as_str()
-        .unwrap_or_default()
-        .ends_with(".parquet"));
-    assert!(file["file_size_bytes"].as_i64().unwrap_or_default() > 0);
-    assert!(file["begin_snapshot"].as_i64().unwrap_or_default() > 0);
-    assert!(file["begin_snapshot_time"].as_str().is_some());
-    assert!(file["timestamp_min"].as_str().is_some());
-    assert!(file["timestamp_max"].as_str().is_some());
-    assert_eq!(file["active_delete_files"], 0);
-    assert_eq!(file["active_delete_rows"], 0);
-    let partitions = file["partition_values"]
-        .as_array()
-        .expect("partition values");
-    assert_eq!(partitions.len(), 3, "{file}");
-    let partition_values = partitions
-        .iter()
-        .filter_map(|partition| partition["value"].as_str())
-        .collect::<Vec<_>>();
-    let year = now.year().to_string();
-    let month = now.month().to_string();
-    let day = now.day().to_string();
-    assert!(partition_values.contains(&year.as_str()), "{file}");
-    assert!(partition_values.contains(&month.as_str()), "{file}");
-    assert!(partition_values.contains(&day.as_str()), "{file}");
 }
 
 #[test]

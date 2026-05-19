@@ -390,58 +390,6 @@ pub fn route(
                 (state.storage.probe().is_ready(), state.queries.health())
             });
         }
-        ("GET", "/api/admin/query/loki-candidates") => admin(headers, state, || {
-            compat::loki_query_range_candidates(state, query)
-        }),
-        ("GET", "/api/admin/query/loki-progressive-explain") => admin(headers, state, || {
-            compat::loki_query_range_explain(state, query)
-        }),
-        ("GET", "/api/admin/storage/ducklake-files") => admin(headers, state, || {
-            let table = query
-                .get("table")
-                .map(|value| {
-                    Signal::from_table_name(value).ok_or_else(|| {
-                        ApiError::new(
-                            400,
-                            "invalid_table",
-                            "table must be one of logs, spans, metric_gauge, metric_sum",
-                        )
-                    })
-                })
-                .transpose()?;
-            let limit = query
-                .get("limit")
-                .map(|value| {
-                    value.parse::<usize>().map_err(|_| {
-                        ApiError::new(400, "invalid_limit", "limit must be a positive integer")
-                    })
-                })
-                .transpose()?
-                .unwrap_or(100);
-            let files = state
-                .storage
-                .ducklake_planner_files(table, limit)
-                .map_err(storage_error)?;
-            Ok(json!({
-                "source": "ducklake_metadata",
-                "table": table.map(|signal| signal.as_str()),
-                "files": files,
-                "planner_fields": [
-                    "path",
-                    "table",
-                    "begin_snapshot",
-                    "begin_snapshot_time",
-                    "partition_values",
-                    "row_count",
-                    "file_size_bytes",
-                    "timestamp_min",
-                    "timestamp_max",
-                    "active_delete_files",
-                    "active_delete_rows"
-                ],
-                "ordering": "timestamp_max_desc_then_snapshot_desc_then_file_id_desc"
-            }))
-        }),
         ("POST", "/api/admin/maintenance/pause") => admin(headers, state, || {
             state.maintenance.pause();
             Ok(json!({"paused": true}))

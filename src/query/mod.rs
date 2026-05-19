@@ -181,85 +181,6 @@ impl QueryEngine {
         ))
     }
 
-    pub fn explain_logs_progressive_window(
-        &self,
-        storage: &Storage,
-        plan: &LogPlan,
-        analyze: bool,
-    ) -> ApiResult<Value> {
-        let _guard = self.acquire(false)?;
-        let plan_started = Instant::now();
-        let candidate_plan = storage
-            .ducklake_log_candidate_plan(
-                plan.time_bounds.from,
-                plan.time_bounds.to,
-                MAX_PROGRESSIVE_CANDIDATE_FILES,
-                CANDIDATE_WINDOW_BATCH_SIZE,
-            )
-            .map_err(storage_err)?;
-        let candidate_plan_seconds = plan_started.elapsed().as_secs_f64();
-        let selected = candidate_plan.windows.first();
-        let lower_bound = selected.and_then(|window| window.timestamp_lower_bound.clone());
-        let where_sql = log_where_sql(plan)?;
-
-        let full_sql = log_select_sql(
-            "{prefix}logs",
-            &where_sql,
-            plan.direction.sql(),
-            plan.limit + 1,
-        );
-        let mut window_where = where_sql.clone();
-        if let Some(lower_bound) = &lower_bound {
-            window_where.push(format!("timestamp >= TIMESTAMP {}", sql_quote(lower_bound)));
-        }
-        let window_sql = log_select_sql(
-            "{prefix}logs",
-            &window_where,
-            plan.direction.sql(),
-            plan.limit + 1,
-        );
-
-        let (full_plan, progressive_plan) = storage
-            .with_query_conn(
-                self.memory_limit(false),
-                self.timeout(false),
-                |conn, prefix| {
-                    let full = explain_query(conn, &full_sql.replace("{prefix}", prefix), analyze)?;
-                    let progressive =
-                        explain_query(conn, &window_sql.replace("{prefix}", prefix), analyze)?;
-                    Ok((full, progressive))
-                },
-            )
-            .map_err(storage_err)?;
-
-        Ok(json!({
-            "source": "duckdb_explain",
-            "execution_engine": "duckdb_ducklake_logical_table",
-            "analyze": analyze,
-            "query_shape": "loki_query_range",
-            "candidate_window": {
-                "mode": "logical_window",
-                "batch_size": CANDIDATE_WINDOW_BATCH_SIZE,
-                "candidate_files": candidate_plan.candidate_files,
-                "candidate_rows": candidate_plan.candidate_rows.max(0),
-                "candidate_bytes": candidate_plan.candidate_bytes.max(0),
-                "selected_files": selected.map(|window| window.files_scanned).unwrap_or(0),
-                "selected_rows": selected.map(|window| window.rows_scanned).unwrap_or(0),
-                "selected_bytes": selected.map(|window| window.bytes_scanned).unwrap_or(0),
-                "timestamp_lower_bound": lower_bound,
-                "candidate_plan_seconds": candidate_plan_seconds
-            },
-            "full_logical_query": {
-                "sql": full_sql.replace("{prefix}", "main."),
-                "plan": full_plan
-            },
-            "progressive_logical_query": {
-                "sql": window_sql.replace("{prefix}", "main."),
-                "plan": progressive_plan
-            }
-        }))
-    }
-
     pub fn span_search(&self, storage: &Storage, req: &Value) -> ApiResult<Value> {
         let _guard = self.acquire(false)?;
         let timer = Timer::start();
@@ -719,26 +640,6 @@ fn wrap_rows(mut rows: Vec<Value>, limit: usize, query_duration_ms: u128) -> Val
         "truncated": truncated,
         "query_duration_ms": query_duration_ms
     })
-}
-
-fn explain_query(
-    conn: &duckdb::Connection,
-    sql: &str,
-    analyze: bool,
-) -> anyhow::Result<Vec<Value>> {
-    let explain = if analyze {
-        format!("EXPLAIN ANALYZE {sql}")
-    } else {
-        format!("EXPLAIN {sql}")
-    };
-    let mut stmt = conn.prepare(&explain)?;
-    let rows = stmt.query_map([], |row| {
-        Ok(json!({
-            "key": row.get::<_, String>(0)?,
-            "value": row.get::<_, String>(1)?,
-        }))
-    })?;
-    Ok(rows.collect::<Result<Vec<_>, _>>()?)
 }
 
 fn parse_range(req: &Value, max_secs: i64) -> ApiResult<(DateTime<Utc>, DateTime<Utc>)> {

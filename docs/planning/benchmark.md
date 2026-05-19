@@ -336,11 +336,11 @@ HTTP keep-alive scout control:
 
 2026-05-18 DuckDB/DuckLake logical plan proof:
 
-- Added `GET /api/admin/query/loki-progressive-explain`, which generates two
-  bounded Loki `query_range` SQL shapes and asks DuckDB to `EXPLAIN` or
-  `EXPLAIN ANALYZE` them. The generated SQL targets the DuckLake logical table
-  (`main.logs` in the response display, attached as `canardlake.logs` inside
-  DuckDB), not `read_parquet`.
+- Added a temporary `GET /api/admin/query/loki-progressive-explain` proof
+  endpoint, since retired, which generated two bounded Loki `query_range` SQL
+  shapes and asked DuckDB to `EXPLAIN` or `EXPLAIN ANALYZE` them. The generated
+  SQL targeted the DuckLake logical table (`main.logs` in the response display,
+  attached as `canardlake.logs` inside DuckDB), not `read_parquet`.
 - On the authoritative benchmark data, `analyze=true` with a matching `{}` Loki
   selector showed the full logical query reading `13` files / `6256` rows with
   DuckDB total time ~`65.7 ms`.
@@ -437,9 +437,11 @@ HTTP keep-alive scout control:
 
 - `docs/planning/smithdb-lite-lsm-experiment.md` records the single-binary
   LSM-shaped experiment path and durable-spool state machine.
-- The first proof gate is an admin-only DuckLake metadata probe for registered
-  data-file planning facts. This tests whether DuckLake can replace a custom
+- The first proof gate was an admin-only DuckLake metadata probe for registered
+  data-file planning facts. It tested whether DuckLake could replace a custom
   segment manifest for file membership before any progressive query rewrite.
+  That diagnostic endpoint has been retired now that the production Loki path
+  consumes the metadata internally.
 - The first proof gate was a benchmark-only Loki `query_range` candidate scout:
   `GET /api/admin/query/loki-candidates` lists newest intersecting DuckLake log
   files. The sidecar scout flag has since been retired because backward Loki
