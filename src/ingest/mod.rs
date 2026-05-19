@@ -73,7 +73,7 @@ struct FlushSignal {
 #[derive(Clone, Copy, Debug)]
 struct RawSpoolFlushRef {
     signal: Signal,
-    remaining_batches: usize,
+    remaining_rows: usize,
 }
 
 impl Ingestor {
@@ -432,7 +432,7 @@ impl Ingestor {
             id,
             RawSpoolFlushRef {
                 signal,
-                remaining_batches: batches.len(),
+                remaining_rows: batches.iter().map(|batch| batch.batch.num_rows()).sum(),
             },
         );
     }
@@ -450,7 +450,7 @@ impl Ingestor {
         for (_, batches) in sets {
             for batch in batches {
                 if let Some(id) = batch.raw_spool_id {
-                    *committed_counts.entry(id).or_default() += 1;
+                    *committed_counts.entry(id).or_default() += batch.len();
                 }
             }
         }
@@ -461,14 +461,14 @@ impl Ingestor {
         let mut ready_to_checkpoint = Vec::new();
         {
             let mut refs = self.raw_spool_flush_refs.lock_or_poisoned();
-            for (id, committed_batches) in committed_counts {
+            for (id, committed_rows) in committed_counts {
                 let Some(tracked) = refs.get_mut(&id) else {
                     continue;
                 };
-                if committed_batches >= tracked.remaining_batches {
+                if committed_rows >= tracked.remaining_rows {
                     ready_to_checkpoint.push((id, tracked.signal));
                 } else {
-                    tracked.remaining_batches -= committed_batches;
+                    tracked.remaining_rows -= committed_rows;
                 }
             }
         }

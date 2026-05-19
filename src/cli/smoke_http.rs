@@ -1,9 +1,9 @@
 use crate::cli::smoke::{log_fixture, metric_fixture, trace_fixture};
 use crate::cli::tcp_client::{ensure_status, parse_json, Client};
+use crate::Config;
 use anyhow::{bail, Result};
 use chrono::{Duration as ChronoDuration, Utc};
 use serde_json::{json, Value};
-use std::env;
 
 const TRACE_ID: &str = "11111111111111111111111111111111";
 
@@ -21,10 +21,9 @@ pub fn run(args: impl Iterator<Item = String>) -> Result<()> {
         }
     }
 
-    let api_key =
-        env::var("CANARDSTACK_API_KEY").unwrap_or_else(|_| "dev-canardstack-key".to_string());
-    let admin_key = env::var("CANARDSTACK_ADMIN_API_KEY")
-        .unwrap_or_else(|_| "dev-canardstack-admin-key".to_string());
+    let config = Config::from_env()?;
+    let api_key = config.api_key;
+    let admin_key = config.admin_api_key;
     let client = Client::new(&base_url)?;
 
     ensure_service_healthy(&client)?;

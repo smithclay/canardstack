@@ -51,6 +51,10 @@ Docker Compose runs canardstack on `http://localhost:4318` and Grafana on
 `http://localhost:3000`. Local DuckLake metadata and data files live in the
 `canardstack-data` Docker volume.
 
+For host runs, copy `config/example.toml` to `config.toml` and edit the
+structured config there. Environment variables override the file; set
+`CANARDSTACK_CONFIG=/path/to/config.toml` to use a different location.
+
 Seed representative telemetry through the running service:
 
 ```bash

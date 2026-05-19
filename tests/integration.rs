@@ -840,6 +840,63 @@ fn raw_spool_acknowledges_local_durable_spool_before_storage_commit() {
 }
 
 #[test]
+fn raw_spool_checkpoint_waits_for_split_flush_fragments() {
+    let dir = tempdir().unwrap();
+    let mut config = Config::test(dir.path().join("canardstack.duckdb"));
+    config.raw_spool_dir = dir.path().join("raw-spool");
+    config.max_rows_per_flush = 1;
+    config.max_bytes_per_flush = 10_000_000;
+    let state = AppState::new(config).unwrap();
+    let now = Utc::now().timestamp_nanos_opt().unwrap();
+    let mut body = log_fixture(now);
+    let first = body["resourceLogs"][0]["scopeLogs"][0]["logRecords"][0].clone();
+    let mut second = first.clone();
+    second["body"]["stringValue"] = json!("second split flush log");
+    body["resourceLogs"][0]["scopeLogs"][0]["logRecords"] = json!([first, second]);
+    let response = http::route(
+        "POST",
+        "/v1/logs",
+        &HashMap::new(),
+        &headers(&state),
+        body.to_string().as_bytes(),
+        &state,
+    );
+    assert_eq!(response.status(), 202, "{}", response.json_body());
+
+    let first_flush = http::route(
+        "POST",
+        "/api/admin/maintenance/flush",
+        &HashMap::new(),
+        &admin_headers(&state),
+        b"{}",
+        &state,
+    );
+    assert_eq!(first_flush.status(), 200, "{}", first_flush.json_body());
+    assert_eq!(log_rows(&state), 1);
+    let metrics = metrics_text(&state);
+    assert!(
+        metrics.contains("canardstack_raw_spool_pending_records 1.000000"),
+        "{metrics}"
+    );
+
+    let second_flush = http::route(
+        "POST",
+        "/api/admin/maintenance/flush",
+        &HashMap::new(),
+        &admin_headers(&state),
+        b"{}",
+        &state,
+    );
+    assert_eq!(second_flush.status(), 200, "{}", second_flush.json_body());
+    assert_eq!(log_rows(&state), 2);
+    let metrics = metrics_text(&state);
+    assert!(
+        metrics.contains("canardstack_raw_spool_pending_records 0.000000"),
+        "{metrics}"
+    );
+}
+
+#[test]
 fn raw_spool_replays_pending_request_on_startup() {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
@@ -2977,12 +3034,13 @@ fn config_validate_rejects_invalid_raw_spool_limits() {
         "baseline test config must validate"
     );
 
-    let mutations: [fn(&mut Config); 6] = [
+    let mutations: [fn(&mut Config); 7] = [
         |c| c.raw_spool_max_segment_bytes = 0,
         |c| c.raw_spool_max_record_bytes = 0,
         |c| c.raw_spool_max_total_bytes = 0,
         |c| c.raw_spool_writer_queue_capacity = 0,
         |c| c.raw_spool_group_commit_records = 0,
+        |c| c.raw_spool_group_commit_delay = std::time::Duration::ZERO,
         |c| c.raw_spool_max_record_bytes = c.raw_spool_max_total_bytes + 1,
     ];
     for mutate in mutations {

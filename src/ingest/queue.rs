@@ -230,7 +230,7 @@ pub(super) fn drain_flush_batches(
         let row_bytes = batch.approx_bytes.div_ceil(original_rows).max(1);
         let rows_by_bytes = (remaining_bytes / row_bytes).max(1);
         let take_rows = original_rows.min(remaining_rows).min(rows_by_bytes);
-        if take_rows == original_rows || batch.raw_spool_id.is_some() {
+        if take_rows == original_rows {
             queue.rows = queue.rows.saturating_sub(original_rows);
             queue.bytes = queue.bytes.saturating_sub(batch.approx_bytes);
             remaining_rows = remaining_rows.saturating_sub(original_rows);

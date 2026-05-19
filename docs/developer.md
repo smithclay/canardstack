@@ -35,12 +35,29 @@ canardstack is currently shaped as:
 - Prometheus-style operator metrics at `/metrics`, also snapshotted into the
   metric store for Grafana dashboards.
 
+## Configuration
+
+canardstack reads built-in defaults, then `config.toml`, then environment
+overrides. Set `CANARDSTACK_CONFIG=/path/to/config.toml` to load a different
+file. If `CANARDSTACK_CONFIG` is unset, `./config.toml` is loaded when it
+exists; otherwise the defaults are used.
+
+Start from `config/example.toml` for a full structured config grouped by
+operator concern: server, auth, paths, DuckDB, DuckLake, ingest, query,
+retention, scheduler, raw spool, health, and bench. Every TOML setting has a
+matching `CANARDSTACK_*` environment variable, and env vars always win. Empty
+env vars clear optional string/path settings such as
+`CANARDSTACK_DUCKLAKE_ATTACH_URI`, `CANARDSTACK_POSTGRES_DSN`,
+`CANARDSTACK_DUCKDB_EXTENSION_DIR`, and
+`CANARDSTACK_RUNTIME_MEMORY_LIMIT_BYTES`.
+
 ## Local DuckLake Mode
 
 Compose stores local metadata and files in the `canardstack-data` named volume
 mounted at `/var/lib/canardstack`.
 
-The default Compose environment is explicit:
+The default Compose environment is explicit and overrides any image-local
+config file:
 
 ```text
 CANARDSTACK_BIND=0.0.0.0:4318
@@ -288,9 +305,10 @@ loop without operator action:
   snapshots, and cleans old files.
 
 All four respect `POST /api/admin/maintenance/pause`. Cadences are configurable
-via `CANARDSTACK_SCHEDULER_*` env vars. Set
-`CANARDSTACK_SCHEDULER_ENABLED=false` to fall back to operator-triggered
-maintenance only. The scheduler shuts down cleanly when `serve` exits.
+under `[scheduler]` in `config.toml` or via `CANARDSTACK_SCHEDULER_*` env vars.
+Set `scheduler.enabled = false` or `CANARDSTACK_SCHEDULER_ENABLED=false` to
+fall back to operator-triggered maintenance only. The scheduler shuts down
+cleanly when `serve` exits.
 
 ## V0 Gaps
 

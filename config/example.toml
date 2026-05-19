@@ -1,0 +1,86 @@
+# Copy to ./config.toml or set CANARDSTACK_CONFIG=/path/to/config.toml.
+# Every setting here can be overridden by its CANARDSTACK_* environment variable.
+
+[server]
+bind = "127.0.0.1:4318"
+max_connections = 1024
+socket_read_timeout_secs = 30
+socket_write_timeout_secs = 30
+
+[auth]
+api_key = "dev-canardstack-key"
+admin_api_key = "dev-canardstack-admin-key"
+
+[paths]
+data_dir = ".canardstack"
+# duckdb_path, storage_dir, and raw_spool_dir default under data_dir when unset.
+# duckdb_path = ".canardstack/canardstack.duckdb"
+# storage_dir = ".canardstack/storage"
+# raw_spool_dir = ".canardstack/raw-spool"
+# duckdb_extension_dir = "/usr/local/lib/duckdb/extensions"
+
+[duckdb]
+write_memory_limit = "1GiB"
+
+[ducklake]
+# With no remote attach URI or PostgreSQL DSN, canardstack uses a local DuckLake
+# catalog beside duckdb_path and stores local data files under storage_dir.
+# postgres_dsn = "dbname=ducklake_catalog host=localhost user=postgres password=postgres"
+# attach_uri = "md:test-ducklake"
+data_inlining_row_limit = 0
+
+[ingest]
+max_body_bytes = 8388608
+per_signal_queue_bytes = 536870912
+process_ingest_bytes = 2147483648
+# runtime_memory_limit_bytes = 3221225472
+max_rows_per_flush = 5000
+max_bytes_per_flush = 4194304
+max_flush_age_secs = 10
+high_pressure_flush_age_secs = 2
+
+[validation]
+accept_late_secs = 86400
+accept_future_secs = 600
+
+[immutable_segments]
+target_bytes = 67108864
+max_age_secs = 10
+
+[query.interactive]
+concurrency = 4
+timeout_secs = 15
+memory_limit = "1GiB"
+
+[query.background]
+concurrency = 2
+timeout_secs = 60
+memory_limit = "1GiB"
+
+[retention]
+logs_days = 14
+spans_days = 14
+metrics_days = 30
+
+[scheduler]
+enabled = true
+watchdog_ms = 1000
+flush_secs = 30
+metadata_secs = 30
+metrics_secs = 60
+compaction_secs = 300
+retention_secs = 3600
+
+[raw_spool]
+max_segment_bytes = 67108864
+max_record_bytes = 8388608
+max_total_bytes = 1073741824
+writer_queue_capacity = 1024
+group_commit_records = 64
+group_commit_ms = 1
+
+[health]
+force_dependency_unhealthy = false
+
+[bench]
+http_keepalive = false
