@@ -34,6 +34,9 @@ impl Storage {
         let timer = thread::spawn(move || {
             let (done, cvar) = &*timer_state;
             let done = done.lock_or_poisoned();
+            if *done {
+                return false;
+            }
             let (done, wait) = cvar.wait_timeout(done, timeout).unwrap();
             if !*done && wait.timed_out() {
                 interrupt.interrupt();
@@ -46,7 +49,7 @@ impl Storage {
         let (done, cvar) = &*state;
         *done.lock_or_poisoned() = true;
         cvar.notify_one();
-        // Timer panic ⇒ "not timed out": trust the query result over a panicked timer.
+        // Timer panic means "not timed out": trust the query result over a panicked timer.
         let timed_out = match timer.join() {
             Ok(fired) => fired,
             Err(_) => {
@@ -54,7 +57,7 @@ impl Storage {
                 false
             }
         };
-        // Timer fired ⇒ surface a typed timeout even if the query raced to Ok.
+        // Timer fired: surface a typed timeout even if the query raced to Ok.
         if timed_out {
             return Err(anyhow::Error::new(QueryTimeoutError { timeout }));
         }

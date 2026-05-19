@@ -3,7 +3,10 @@ mod params;
 mod prometheus;
 mod tempo;
 
-pub use loki::{loki_label_values, loki_labels, loki_query, loki_query_range, loki_series};
+pub use loki::{
+    loki_label_values, loki_labels, loki_query, loki_query_range, loki_query_range_candidates,
+    loki_query_range_explain, loki_series,
+};
 pub use prometheus::{
     prometheus_label_values, prometheus_labels, prometheus_metadata, prometheus_query,
     prometheus_query_range, prometheus_series,

@@ -15,16 +15,18 @@ use crate::query::plan::{
     FieldMatcher, LogPlan, MetricAggregation, MetricPlan, MetricSignal, SelectorPlan,
     SortDirection, TextFilter, TimeBounds, TracePlan, TraceSort,
 };
-use crate::storage::{QueryTimeoutError, Storage};
+use crate::storage::{DuckLakeLogCandidateWindow, QueryTimeoutError, Storage};
 use crate::validation::{self, ApiError, ApiResult};
 use chrono::{DateTime, Utc};
 use duckdb::Row;
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const INTERACTIVE_RANGE_SECS: i64 = 24 * 60 * 60;
 const METRIC_RANGE_SECS: i64 = 30 * 24 * 60 * 60;
+const CANDIDATE_WINDOW_BATCH_SIZE: usize = 1;
+const MAX_PROGRESSIVE_CANDIDATE_FILES: usize = 10_000;
 const LOG_COLUMNS: &[&str] = &[
     "service_name",
     "deployment_environment",
@@ -104,29 +106,12 @@ impl QueryEngine {
     pub fn execute_logs(&self, storage: &Storage, plan: &LogPlan) -> ApiResult<Value> {
         let _guard = self.acquire(false)?;
         let timer = Timer::start();
-        let mut where_sql = vec![time_predicate(plan.time_bounds.from, plan.time_bounds.to)];
-        for matcher in &plan.selector.matchers {
-            push_matcher(
-                &mut where_sql,
-                matcher,
-                log_label_expr,
-                "unsupported_selector",
-            )?;
-        }
-        for filter in &plan.selector.text_filters {
-            match filter {
-                TextFilter::BodyContains(text) => where_sql.push(text_terms("body", text)?),
-            }
-        }
-        let sql = format!(
-            "SELECT timestamp::VARCHAR, ingested_at::VARCHAR, trace_id, span_id, service_name, severity_text, body, {} AS deployment_environment, {} AS http_method, {} AS http_status_code, {} AS http_route FROM {{prefix}}logs WHERE {} ORDER BY timestamp {} LIMIT {}",
-            logs_deployment_environment_expr(),
-            logs_http_method_expr(),
-            logs_http_status_code_expr(),
-            logs_http_route_expr(),
-            where_sql.join(" AND "),
+        let where_sql = log_where_sql(plan)?;
+        let sql = log_select_sql(
+            "{prefix}logs",
+            &where_sql,
             plan.direction.sql(),
-            plan.limit + 1
+            plan.limit + 1,
         );
         let rows = storage
             .with_query_conn(
@@ -140,6 +125,139 @@ impl QueryEngine {
             )
             .map_err(storage_err)?;
         Ok(wrap_rows(rows, plan.limit, timer.elapsed_ms()))
+    }
+
+    pub fn execute_logs_progressive_window(
+        &self,
+        storage: &Storage,
+        plan: &LogPlan,
+    ) -> ApiResult<(Value, ProgressiveLogQueryReport)> {
+        let _guard = self.acquire(false)?;
+        let total_started = Instant::now();
+        let plan_started = Instant::now();
+        let candidate_plan = storage
+            .ducklake_log_candidate_plan(
+                plan.time_bounds.from,
+                plan.time_bounds.to,
+                MAX_PROGRESSIVE_CANDIDATE_FILES,
+                CANDIDATE_WINDOW_BATCH_SIZE,
+            )
+            .map_err(storage_err)?;
+        let candidate_plan_seconds = plan_started.elapsed().as_secs_f64();
+        let execute_started = Instant::now();
+        let where_sql = log_where_sql(plan)?;
+        let (mut rows, files_scanned, batches_scanned, rows_scanned, bytes_scanned) =
+            execute_logical_candidate_window(
+                self,
+                storage,
+                plan,
+                &where_sql,
+                &candidate_plan.windows,
+            )?;
+
+        sort_log_rows(&mut rows, plan.direction);
+        let candidate_execute_seconds = execute_started.elapsed().as_secs_f64();
+        let truncated = rows.len() > plan.limit;
+        let result_rows = rows.len().min(plan.limit);
+        let query_duration_ms = total_started.elapsed().as_millis();
+        let result = wrap_rows(rows, plan.limit, query_duration_ms);
+        Ok((
+            result,
+            ProgressiveLogQueryReport {
+                candidate_files: candidate_plan.candidate_files,
+                candidate_rows: candidate_plan.candidate_rows.max(0),
+                candidate_bytes: candidate_plan.candidate_bytes.max(0),
+                batch_size: CANDIDATE_WINDOW_BATCH_SIZE,
+                files_scanned,
+                batches_scanned,
+                rows_scanned,
+                bytes_scanned,
+                result_rows,
+                truncated,
+                candidate_plan_seconds,
+                candidate_execute_seconds,
+                query_duration_ms,
+            },
+        ))
+    }
+
+    pub fn explain_logs_progressive_window(
+        &self,
+        storage: &Storage,
+        plan: &LogPlan,
+        analyze: bool,
+    ) -> ApiResult<Value> {
+        let _guard = self.acquire(false)?;
+        let plan_started = Instant::now();
+        let candidate_plan = storage
+            .ducklake_log_candidate_plan(
+                plan.time_bounds.from,
+                plan.time_bounds.to,
+                MAX_PROGRESSIVE_CANDIDATE_FILES,
+                CANDIDATE_WINDOW_BATCH_SIZE,
+            )
+            .map_err(storage_err)?;
+        let candidate_plan_seconds = plan_started.elapsed().as_secs_f64();
+        let selected = candidate_plan.windows.first();
+        let lower_bound = selected.and_then(|window| window.timestamp_lower_bound.clone());
+        let where_sql = log_where_sql(plan)?;
+
+        let full_sql = log_select_sql(
+            "{prefix}logs",
+            &where_sql,
+            plan.direction.sql(),
+            plan.limit + 1,
+        );
+        let mut window_where = where_sql.clone();
+        if let Some(lower_bound) = &lower_bound {
+            window_where.push(format!("timestamp >= TIMESTAMP {}", sql_quote(lower_bound)));
+        }
+        let window_sql = log_select_sql(
+            "{prefix}logs",
+            &window_where,
+            plan.direction.sql(),
+            plan.limit + 1,
+        );
+
+        let (full_plan, progressive_plan) = storage
+            .with_query_conn(
+                self.memory_limit(false),
+                self.timeout(false),
+                |conn, prefix| {
+                    let full = explain_query(conn, &full_sql.replace("{prefix}", prefix), analyze)?;
+                    let progressive =
+                        explain_query(conn, &window_sql.replace("{prefix}", prefix), analyze)?;
+                    Ok((full, progressive))
+                },
+            )
+            .map_err(storage_err)?;
+
+        Ok(json!({
+            "source": "duckdb_explain",
+            "execution_engine": "duckdb_ducklake_logical_table",
+            "analyze": analyze,
+            "query_shape": "loki_query_range",
+            "candidate_window": {
+                "mode": "logical_window",
+                "batch_size": CANDIDATE_WINDOW_BATCH_SIZE,
+                "candidate_files": candidate_plan.candidate_files,
+                "candidate_rows": candidate_plan.candidate_rows.max(0),
+                "candidate_bytes": candidate_plan.candidate_bytes.max(0),
+                "selected_files": selected.map(|window| window.files_scanned).unwrap_or(0),
+                "selected_rows": selected.map(|window| window.rows_scanned).unwrap_or(0),
+                "selected_bytes": selected.map(|window| window.bytes_scanned).unwrap_or(0),
+                "timestamp_lower_bound": lower_bound,
+                "candidate_plan_seconds": candidate_plan_seconds
+            },
+            "full_logical_query": {
+                "sql": full_sql.replace("{prefix}", "main."),
+                "plan": full_plan
+            },
+            "progressive_logical_query": {
+                "sql": window_sql.replace("{prefix}", "main."),
+                "plan": progressive_plan
+            }
+        }))
     }
 
     pub fn span_search(&self, storage: &Storage, req: &Value) -> ApiResult<Value> {
@@ -443,6 +561,23 @@ pub struct QueryLimits {
     pub concurrency_active: usize,
 }
 
+#[derive(Clone, Debug)]
+pub struct ProgressiveLogQueryReport {
+    pub candidate_files: usize,
+    pub candidate_rows: i64,
+    pub candidate_bytes: i64,
+    pub batch_size: usize,
+    pub files_scanned: usize,
+    pub batches_scanned: usize,
+    pub rows_scanned: i64,
+    pub bytes_scanned: i64,
+    pub result_rows: usize,
+    pub truncated: bool,
+    pub candidate_plan_seconds: f64,
+    pub candidate_execute_seconds: f64,
+    pub query_duration_ms: u128,
+}
+
 struct QueryGuard<'a> {
     active: &'a AtomicUsize,
 }
@@ -469,6 +604,105 @@ fn log_row(row: &Row<'_>) -> duckdb::Result<Value> {
     }))
 }
 
+fn log_where_sql(plan: &LogPlan) -> ApiResult<Vec<String>> {
+    let mut where_sql = vec![time_predicate(plan.time_bounds.from, plan.time_bounds.to)];
+    for matcher in &plan.selector.matchers {
+        push_matcher(
+            &mut where_sql,
+            matcher,
+            log_label_expr,
+            "unsupported_selector",
+        )?;
+    }
+    for filter in &plan.selector.text_filters {
+        match filter {
+            TextFilter::BodyContains(text) => where_sql.push(text_terms("body", text)?),
+        }
+    }
+    Ok(where_sql)
+}
+
+fn log_select_sql(source: &str, where_sql: &[String], direction: &str, limit: usize) -> String {
+    format!(
+        "SELECT timestamp::VARCHAR, ingested_at::VARCHAR, trace_id, span_id, service_name, severity_text, body, {} AS deployment_environment, {} AS http_method, {} AS http_status_code, {} AS http_route FROM {source} WHERE {} ORDER BY timestamp {direction} LIMIT {limit}",
+        logs_deployment_environment_expr(),
+        logs_http_method_expr(),
+        logs_http_status_code_expr(),
+        logs_http_route_expr(),
+        where_sql.join(" AND ")
+    )
+}
+
+type CandidateWindowRows = (Vec<Value>, usize, usize, i64, i64);
+
+fn execute_logical_candidate_window(
+    engine: &QueryEngine,
+    storage: &Storage,
+    plan: &LogPlan,
+    where_sql: &[String],
+    windows: &[DuckLakeLogCandidateWindow],
+) -> ApiResult<CandidateWindowRows> {
+    let mut rows = Vec::new();
+    let mut files_scanned = 0usize;
+    let mut batches_scanned = 0usize;
+    let mut rows_scanned = 0i64;
+    let mut bytes_scanned = 0i64;
+
+    storage
+        .with_query_conn(
+            engine.memory_limit(false),
+            engine.timeout(false),
+            |conn, prefix| {
+                for window in windows {
+                    let mut window_where = where_sql.to_vec();
+                    if let Some(lower_bound) = &window.timestamp_lower_bound {
+                        window_where
+                            .push(format!("timestamp >= TIMESTAMP {}", sql_quote(lower_bound)));
+                    }
+                    let source = format!("{prefix}logs");
+                    let sql = log_select_sql(
+                        &source,
+                        &window_where,
+                        plan.direction.sql(),
+                        plan.limit + 1,
+                    );
+                    let mut stmt = conn.prepare(&sql)?;
+                    let mapped = stmt.query_map([], log_row)?;
+                    rows = collect_rows(mapped)?;
+                    batches_scanned += 1;
+                    files_scanned = window.files_scanned;
+                    rows_scanned = window.rows_scanned;
+                    bytes_scanned = window.bytes_scanned;
+                    if rows.len() >= plan.limit {
+                        break;
+                    }
+                }
+                Ok(())
+            },
+        )
+        .map_err(storage_err)?;
+
+    Ok((
+        rows,
+        files_scanned,
+        batches_scanned,
+        rows_scanned,
+        bytes_scanned,
+    ))
+}
+
+fn sort_log_rows(rows: &mut [Value], direction: SortDirection) {
+    rows.sort_by(|left, right| {
+        let left_timestamp = left.get("timestamp").and_then(Value::as_str).unwrap_or("");
+        let right_timestamp = right.get("timestamp").and_then(Value::as_str).unwrap_or("");
+        if direction.is_forward() {
+            left_timestamp.cmp(right_timestamp)
+        } else {
+            right_timestamp.cmp(left_timestamp)
+        }
+    });
+}
+
 fn collect_rows(
     iter: duckdb::MappedRows<'_, impl FnMut(&Row<'_>) -> duckdb::Result<Value>>,
 ) -> Result<Vec<Value>, duckdb::Error> {
@@ -485,6 +719,26 @@ fn wrap_rows(mut rows: Vec<Value>, limit: usize, query_duration_ms: u128) -> Val
         "truncated": truncated,
         "query_duration_ms": query_duration_ms
     })
+}
+
+fn explain_query(
+    conn: &duckdb::Connection,
+    sql: &str,
+    analyze: bool,
+) -> anyhow::Result<Vec<Value>> {
+    let explain = if analyze {
+        format!("EXPLAIN ANALYZE {sql}")
+    } else {
+        format!("EXPLAIN {sql}")
+    };
+    let mut stmt = conn.prepare(&explain)?;
+    let rows = stmt.query_map([], |row| {
+        Ok(json!({
+            "key": row.get::<_, String>(0)?,
+            "value": row.get::<_, String>(1)?,
+        }))
+    })?;
+    Ok(rows.collect::<Result<Vec<_>, _>>()?)
 }
 
 fn parse_range(req: &Value, max_secs: i64) -> ApiResult<(DateTime<Utc>, DateTime<Utc>)> {

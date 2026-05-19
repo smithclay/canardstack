@@ -143,6 +143,9 @@ impl Drop for ConnectionGuard {
 }
 
 fn classify_io_error(err: &anyhow::Error) -> &'static str {
+    if is_socket_timeout(err) {
+        return "socket_timeout";
+    }
     let msg = err.to_string();
     if msg.contains("timed out") || msg.contains("timeout") {
         "socket_timeout"
@@ -153,17 +156,31 @@ fn classify_io_error(err: &anyhow::Error) -> &'static str {
     }
 }
 
+fn is_socket_timeout(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<std::io::Error>()
+        .is_some_and(|err| matches!(err.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock))
+}
+
 fn handle_stream(mut stream: TcpStream, state: Arc<AppState>) -> anyhow::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let keepalive_enabled = state.config.bench_http_keepalive;
     let mut requests = 0usize;
     loop {
         let mut first = String::new();
-        let first_read = match read_bounded_line(&mut reader, &mut first, MAX_REQUEST_LINE_BYTES)? {
-            LineRead::Read(read) => read,
-            LineRead::TooLong => {
+        let first_read = match read_bounded_line(&mut reader, &mut first, MAX_REQUEST_LINE_BYTES) {
+            Ok(LineRead::Read(read)) => read,
+            Ok(LineRead::TooLong) => {
                 return write_response(&mut stream, header_limit_response());
             }
+            Err(err) if requests > 0 && is_socket_timeout(&err) => {
+                state.metrics.inc(
+                    "canardstack_http_connection_closes_total",
+                    &[("reason", "keepalive_idle_timeout")],
+                    1,
+                );
+                return Ok(());
+            }
+            Err(err) => return Err(err),
         };
         if first_read == 0 {
             return Ok(());
@@ -261,19 +278,6 @@ fn handle_stream(mut stream: TcpStream, state: Arc<AppState>) -> anyhow::Result<
                 1,
             );
             return Ok(());
-        }
-        if reader.buffer().is_empty() {
-            if let Ok(()) = reader.get_ref().set_nonblocking(true) {
-                let mut probe = [0u8; 1];
-                match reader.get_ref().peek(&mut probe) {
-                    Ok(0) => return Ok(()),
-                    Ok(_) => {}
-                    Err(err) if err.kind() == ErrorKind::WouldBlock => {}
-                    Err(err) => return Err(err.into()),
-                }
-                let _ = reader.get_ref().set_nonblocking(false);
-            }
-            let _ = reader.get_ref().set_nonblocking(false);
         }
     }
 }
@@ -386,6 +390,58 @@ pub fn route(
                 (state.storage.probe().is_ready(), state.queries.health())
             });
         }
+        ("GET", "/api/admin/query/loki-candidates") => admin(headers, state, || {
+            compat::loki_query_range_candidates(state, query)
+        }),
+        ("GET", "/api/admin/query/loki-progressive-explain") => admin(headers, state, || {
+            compat::loki_query_range_explain(state, query)
+        }),
+        ("GET", "/api/admin/storage/ducklake-files") => admin(headers, state, || {
+            let table = query
+                .get("table")
+                .map(|value| {
+                    Signal::from_table_name(value).ok_or_else(|| {
+                        ApiError::new(
+                            400,
+                            "invalid_table",
+                            "table must be one of logs, spans, metric_gauge, metric_sum",
+                        )
+                    })
+                })
+                .transpose()?;
+            let limit = query
+                .get("limit")
+                .map(|value| {
+                    value.parse::<usize>().map_err(|_| {
+                        ApiError::new(400, "invalid_limit", "limit must be a positive integer")
+                    })
+                })
+                .transpose()?
+                .unwrap_or(100);
+            let files = state
+                .storage
+                .ducklake_planner_files(table, limit)
+                .map_err(storage_error)?;
+            Ok(json!({
+                "source": "ducklake_metadata",
+                "table": table.map(|signal| signal.as_str()),
+                "files": files,
+                "planner_fields": [
+                    "path",
+                    "table",
+                    "begin_snapshot",
+                    "begin_snapshot_time",
+                    "partition_values",
+                    "row_count",
+                    "file_size_bytes",
+                    "timestamp_min",
+                    "timestamp_max",
+                    "active_delete_files",
+                    "active_delete_rows"
+                ],
+                "ordering": "timestamp_max_desc_then_snapshot_desc_then_file_id_desc"
+            }))
+        }),
         ("POST", "/api/admin/maintenance/pause") => admin(headers, state, || {
             state.maintenance.pause();
             Ok(json!({"paused": true}))

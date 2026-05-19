@@ -17,7 +17,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const BENCH_NAME: &str = "throughput_iteration";
-const BENCH_VERSION: &str = "0.3.4";
+const BENCH_VERSION: &str = "0.3.11";
 const SCENARIO_NAME: &str = "throughput-iteration";
 const USAGE: &str = "cargo bench --bench throughput_iteration -- [--base-url URL] [--warmup 2m] [--duration 20m] [--target-gb-day 100] [--profile ingest-only|mixed-query] [--signals all|logs|spans|metrics] [--ingest-concurrency 1] [--connection-mode close|persistent] [--query-pressure off|low|medium|high] [--query-interval 5s] [--query-concurrency 1] [--services 1] [--items-per-batch 256] [--log-records 8] [--log-body-bytes 120000] [--trace-spans 16] [--trace-attribute-bytes 48000] [--metric-series 40] [--metric-description-bytes 192] [--timestamp-mode fixed|advancing] [--progress-interval 30s] [--max-runtime 27m] [--no-queries] [--report-dir DIR] [--server-pid PID] [--resource-sample-interval 5s]";
 const DETERMINISTIC_SEED: u64 = 0xCA4A_D57A_C5AC;
@@ -31,6 +31,7 @@ const DEFAULT_PROGRESS_INTERVAL: Duration = Duration::from_secs(30);
 const DEFAULT_MAX_RUNTIME_GRACE: Duration = Duration::from_secs(5 * 60);
 const NEAR_TIMEOUT_MS: f64 = 25_000.0;
 const CLIENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const PERSISTENT_IDLE_RECONNECT: Duration = Duration::from_secs(25);
 const DEFAULT_SERVICE_COUNT: usize = 1;
 const DEFAULT_LOG_RECORD_COUNT: usize = 8;
 const DEFAULT_LOG_BODY_BYTES: usize = 120_000;
@@ -957,6 +958,8 @@ fn build_report(input: BuildReportInput) -> Report {
     ];
 
     let pass = failure_reasons.is_empty();
+    let loki_progressive_query =
+        LokiProgressiveQueryReport::from_samples(&metric_samples, &server_phase_timing);
 
     Report {
         git_sha: git_sha(),
@@ -1020,6 +1023,7 @@ fn build_report(input: BuildReportInput) -> Report {
         resource_samples,
         metric_snapshots,
         stage_throughput,
+        loki_progressive_query,
         queue_oldest_age_trend,
         queue_rows_trend,
         queue_bytes_trend,
@@ -1219,6 +1223,46 @@ fn print_summary(report: &Report, path: &Path) {
                     .unwrap_or(0.0)
             );
         }
+    }
+    if report.loki_progressive_query.available {
+        println!(
+            "loki_progressive_query ok_delta={} batches_scanned={} files_scanned={} candidate_files={} rows_scanned={} result_rows={} scanned_file_fraction={} plan_avg_ms={} candidate_execute_avg_ms={} total_avg_ms={}",
+            report
+                .loki_progressive_query
+                .requests_ok_delta
+                .unwrap_or(0.0),
+            fmt_optional(report.loki_progressive_query.final_batches_scanned),
+            fmt_optional(report.loki_progressive_query.final_files_scanned),
+            fmt_optional(report.loki_progressive_query.final_candidate_files),
+            fmt_optional(report.loki_progressive_query.final_rows_scanned),
+            fmt_optional(report.loki_progressive_query.final_result_rows),
+            fmt_optional(
+                report
+                    .loki_progressive_query
+                    .scanned_file_fraction_of_candidates
+            ),
+            fmt_optional(
+                report
+                    .loki_progressive_query
+                    .planner_timing
+                    .avg_seconds
+                    .map(|seconds| seconds * 1000.0)
+            ),
+            fmt_optional(
+                report
+                    .loki_progressive_query
+                    .candidate_execute_timing
+                    .avg_seconds
+                    .map(|seconds| seconds * 1000.0)
+            ),
+            fmt_optional(
+                report
+                    .loki_progressive_query
+                    .total_timing
+                    .avg_seconds
+                    .map(|seconds| seconds * 1000.0)
+            )
+        );
     }
     println!("report={}", path.display());
     if !report.failure_reasons.is_empty() {
@@ -2171,7 +2215,12 @@ struct Client {
     host: String,
     port: u16,
     connection_mode: ConnectionMode,
-    stream: Arc<Mutex<Option<TcpStream>>>,
+    stream: Arc<Mutex<Option<PersistentStream>>>,
+}
+
+struct PersistentStream {
+    stream: TcpStream,
+    last_used: Instant,
 }
 
 impl Clone for Client {
@@ -2272,14 +2321,24 @@ impl Client {
         body: Option<(&str, &[u8])>,
     ) -> Result<Response> {
         let mut slot = self.stream.lock().expect("lock benchmark client stream");
-        if slot.is_none() {
-            *slot = Some(self.connect()?);
+        let now = Instant::now();
+        if slot
+            .as_ref()
+            .is_some_and(|slot| now.duration_since(slot.last_used) >= PERSISTENT_IDLE_RECONNECT)
+        {
+            *slot = None;
         }
-        let stream = slot.as_mut().expect("persistent stream exists");
+        if slot.is_none() {
+            *slot = Some(PersistentStream {
+                stream: self.connect()?,
+                last_used: now,
+            });
+        }
+        let slot_stream = slot.as_mut().expect("persistent stream exists");
         let deadline = Instant::now() + CLIENT_REQUEST_TIMEOUT;
         let result = self
             .write_request(
-                stream,
+                &mut slot_stream.stream,
                 RequestSpec {
                     method,
                     path,
@@ -2289,11 +2348,13 @@ impl Client {
                 },
                 deadline,
             )
-            .and_then(|()| read_response(stream, deadline));
+            .and_then(|()| read_response(&mut slot_stream.stream, deadline));
         match result {
             Ok(response) => {
                 if response.connection_close {
                     *slot = None;
+                } else if let Some(slot) = slot.as_mut() {
+                    slot.last_used = Instant::now();
                 }
                 Ok(response)
             }
@@ -2796,6 +2857,7 @@ struct Report {
     resource_samples: Vec<ResourceSample>,
     metric_snapshots: Vec<MetricSnapshotReport>,
     stage_throughput: StageThroughputReport,
+    loki_progressive_query: LokiProgressiveQueryReport,
     queue_oldest_age_trend: TrendReport,
     queue_rows_trend: TrendReport,
     queue_bytes_trend: TrendReport,
@@ -2886,6 +2948,18 @@ struct PhaseTimingReport {
     wall_time_share: Option<f64>,
 }
 
+impl PhaseTimingReport {
+    fn zero() -> Self {
+        Self {
+            count: 0,
+            sum_seconds: 0.0,
+            avg_seconds: None,
+            seconds_per_mib: None,
+            wall_time_share: None,
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct MetricSnapshotReport {
     label: String,
@@ -2907,6 +2981,177 @@ impl MetricSnapshotReport {
                 .as_ref()
                 .map(|metrics| metrics.freshness_lag_seconds.clone())
                 .unwrap_or_default(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct LokiProgressiveQueryReport {
+    available: bool,
+    requests_ok_delta: Option<f64>,
+    final_candidate_files: Option<f64>,
+    final_candidate_rows: Option<f64>,
+    final_candidate_bytes: Option<f64>,
+    final_batch_size: Option<f64>,
+    final_files_scanned: Option<f64>,
+    final_batches_scanned: Option<f64>,
+    final_rows_scanned: Option<f64>,
+    final_bytes_scanned: Option<f64>,
+    final_result_rows: Option<f64>,
+    final_total_log_files: Option<f64>,
+    final_total_log_rows: Option<f64>,
+    scanned_file_fraction_of_candidates: Option<f64>,
+    scanned_row_fraction_of_candidates: Option<f64>,
+    scanned_byte_fraction_of_candidates: Option<f64>,
+    scanned_file_fraction_of_total: Option<f64>,
+    scanned_row_fraction_of_total: Option<f64>,
+    planner_timing: PhaseTimingReport,
+    candidate_execute_timing: PhaseTimingReport,
+    total_timing: PhaseTimingReport,
+}
+
+impl LokiProgressiveQueryReport {
+    fn from_samples(
+        samples: &[MetricSample],
+        server_phase_timing: &BTreeMap<String, PhaseTimingReport>,
+    ) -> Self {
+        let total_timing = server_phase_timing
+            .get(
+                "phase=loki_progressive_query_execute,query_class=/loki/api/v1/query_range,signal=logs",
+            )
+            .cloned()
+            .unwrap_or_else(PhaseTimingReport::zero);
+        let planner_timing = server_phase_timing
+            .get(
+                "phase=loki_progressive_query_candidate_plan,query_class=/loki/api/v1/query_range,signal=logs",
+            )
+            .cloned()
+            .unwrap_or_else(PhaseTimingReport::zero);
+        let candidate_execute_timing = server_phase_timing
+            .get(
+                "phase=loki_progressive_query_candidate_execute,query_class=/loki/api/v1/query_range,signal=logs",
+            )
+            .cloned()
+            .unwrap_or_else(PhaseTimingReport::zero);
+        let Some(end) = samples.iter().find(|sample| sample.label == "end") else {
+            return Self::unavailable(planner_timing, candidate_execute_timing, total_timing);
+        };
+        let Some(end_metrics) = end.metrics.as_ref() else {
+            return Self::unavailable(planner_timing, candidate_execute_timing, total_timing);
+        };
+        let start_metrics = samples
+            .iter()
+            .find(|sample| sample.label == "start")
+            .and_then(|sample| sample.metrics.as_ref());
+
+        let final_candidate_files = metric_value(
+            end_metrics,
+            "canardstack_loki_progressive_query_candidate_files",
+        );
+        let final_candidate_rows = metric_value(
+            end_metrics,
+            "canardstack_loki_progressive_query_candidate_rows",
+        );
+        let final_candidate_bytes = metric_value(
+            end_metrics,
+            "canardstack_loki_progressive_query_candidate_bytes",
+        );
+        let final_batch_size =
+            metric_value(end_metrics, "canardstack_loki_progressive_query_batch_size");
+        let final_files_scanned = metric_value(
+            end_metrics,
+            "canardstack_loki_progressive_query_files_scanned",
+        );
+        let final_batches_scanned = metric_value(
+            end_metrics,
+            "canardstack_loki_progressive_query_batches_scanned",
+        );
+        let final_rows_scanned = metric_value(
+            end_metrics,
+            "canardstack_loki_progressive_query_rows_scanned",
+        );
+        let final_bytes_scanned = metric_value(
+            end_metrics,
+            "canardstack_loki_progressive_query_bytes_scanned",
+        );
+        let final_result_rows = metric_value(
+            end_metrics,
+            "canardstack_loki_progressive_query_result_rows",
+        );
+        let final_total_log_files = labeled_metric_value(
+            end_metrics,
+            "canardstack_ducklake_parquet_files",
+            "table",
+            "logs",
+        );
+        let final_total_log_rows = labeled_metric_value(
+            end_metrics,
+            "canardstack_ducklake_parquet_rows",
+            "table",
+            "logs",
+        );
+        let requests_ok_delta = counter_delta(
+            start_metrics,
+            end_metrics,
+            "canardstack_loki_progressive_query_requests_total",
+            &[("status", "ok")],
+        );
+        let available = final_files_scanned.is_some()
+            || requests_ok_delta.unwrap_or(0.0) > 0.0
+            || total_timing.count > 0;
+
+        Self {
+            available,
+            requests_ok_delta,
+            final_candidate_files,
+            final_candidate_rows,
+            final_candidate_bytes,
+            final_batch_size,
+            final_files_scanned,
+            final_batches_scanned,
+            final_rows_scanned,
+            final_bytes_scanned,
+            final_result_rows,
+            final_total_log_files,
+            final_total_log_rows,
+            scanned_file_fraction_of_candidates: ratio(final_files_scanned, final_candidate_files),
+            scanned_row_fraction_of_candidates: ratio(final_rows_scanned, final_candidate_rows),
+            scanned_byte_fraction_of_candidates: ratio(final_bytes_scanned, final_candidate_bytes),
+            scanned_file_fraction_of_total: ratio(final_files_scanned, final_total_log_files),
+            scanned_row_fraction_of_total: ratio(final_rows_scanned, final_total_log_rows),
+            planner_timing,
+            candidate_execute_timing,
+            total_timing,
+        }
+    }
+
+    fn unavailable(
+        planner_timing: PhaseTimingReport,
+        candidate_execute_timing: PhaseTimingReport,
+        total_timing: PhaseTimingReport,
+    ) -> Self {
+        Self {
+            available: total_timing.count > 0,
+            requests_ok_delta: None,
+            final_candidate_files: None,
+            final_candidate_rows: None,
+            final_candidate_bytes: None,
+            final_batch_size: None,
+            final_files_scanned: None,
+            final_batches_scanned: None,
+            final_rows_scanned: None,
+            final_bytes_scanned: None,
+            final_result_rows: None,
+            final_total_log_files: None,
+            final_total_log_rows: None,
+            scanned_file_fraction_of_candidates: None,
+            scanned_row_fraction_of_candidates: None,
+            scanned_byte_fraction_of_candidates: None,
+            scanned_file_fraction_of_total: None,
+            scanned_row_fraction_of_total: None,
+            planner_timing,
+            candidate_execute_timing,
+            total_timing,
         }
     }
 }
@@ -3168,6 +3413,49 @@ fn parse_metric_series_key(key: &str) -> (String, BTreeMap<String, String>) {
         })
         .collect();
     (name.to_string(), parsed)
+}
+
+fn metric_value(metrics: &ScrapedMetrics, name: &str) -> Option<f64> {
+    metrics.raw_values.get(name).copied()
+}
+
+fn labeled_metric_value(
+    metrics: &ScrapedMetrics,
+    name: &str,
+    label: &str,
+    label_value: &str,
+) -> Option<f64> {
+    series_value(metrics, name, &[(label, label_value)])
+}
+
+fn counter_delta(
+    start: Option<&ScrapedMetrics>,
+    end: &ScrapedMetrics,
+    name: &str,
+    labels: &[(&str, &str)],
+) -> Option<f64> {
+    let end_value = series_value(end, name, labels)?;
+    let start_value = start
+        .and_then(|metrics| series_value(metrics, name, labels))
+        .unwrap_or(0.0);
+    Some((end_value - start_value).max(0.0))
+}
+
+fn series_value(metrics: &ScrapedMetrics, name: &str, labels: &[(&str, &str)]) -> Option<f64> {
+    let labels = labels
+        .iter()
+        .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+        .collect::<BTreeMap<_, _>>();
+    metrics
+        .raw_values
+        .get(&metric_series_key(name, &labels))
+        .copied()
+}
+
+fn ratio(numerator: Option<f64>, denominator: Option<f64>) -> Option<f64> {
+    let numerator = numerator?;
+    let denominator = denominator?;
+    (denominator > 0.0).then_some(numerator / denominator)
 }
 
 #[derive(Serialize)]

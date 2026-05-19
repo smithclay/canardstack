@@ -165,6 +165,33 @@ samples. Use that section for fast-fail decisions; an accepted-throughput
 increase without matching transformed/enqueued/flushed/visible progress is a
 negative result.
 
+`throughput_iteration` report versions `0.3.5` through `0.3.8` added historical
+Loki candidate-scout and shadow metrics. Those were proof scaffolding for the
+progressive query path and are no longer active runtime controls.
+
+`throughput_iteration` report version `0.3.7` added shadow batch fields:
+`final_batch_size` and `final_batches_scanned`. These were originally used to
+distinguish one-file progressive reads from batched raw-Parquet candidate
+reads; raw-Parquet execution is now a retired scout.
+
+`throughput_iteration` report version `0.3.8` added historical shadow mode and
+timing split fields. They separated DuckLake metadata planning from
+logical-window execution cost while the path was still a scout.
+
+`throughput_iteration` report version `0.3.9` added
+`loki_progressive_query`, the authoritative Loki progressive query report. Use
+it to compare candidate scope, scanned rows/files, and planning/execution
+timing.
+
+`throughput_iteration` report version `0.3.10` retires idle persistent client
+sockets before the server read timeout. This keeps low per-worker request-rate
+runs from counting expected idle keep-alive timeout closures as ingest
+transport resets.
+
+`throughput_iteration` report version `0.3.11` removes retired Loki
+candidate-scout and shadow report sections. Backward Loki `query_range`
+progressive metrics now live in `loki_progressive_query`.
+
 Benchmark-only reversible controls:
 
 - `CANARDSTACK_BENCH_INGEST_CONTROL=validation-only` validates auth, content
@@ -184,6 +211,9 @@ Benchmark-only reversible controls:
   counters. Query-visible rows are expected not to advance.
 - Defaults are `full` for both controls. Do not enable these outside controlled
   benchmark runs.
+- Backward Loki `query_range` now always uses the newest-first DuckLake
+  candidate-window logical query path. There is no experimental flag or shadow
+  mode for this path.
 
 HTTP keep-alive scout control:
 
@@ -222,6 +252,158 @@ HTTP keep-alive scout control:
   benchmark driver/routing and HTTP request path before changing storage
   architecture.
 
+2026-05-18 Loki progressive shadow scout:
+
+- Shape: local release server, `CANARDSTACK_BENCH_HTTP_KEEPALIVE=true`, logs
+  only, persistent ingest connections, 32 ingest workers, mixed-query profile,
+  medium query pressure, advancing timestamps, 500 GB/day target, 10s warmup,
+  120s measured. Reports:
+  `target/canardstack-bench/loki-progressive-shadow/off/20260518T223446Z/report.json`
+  and
+  `target/canardstack-bench/loki-progressive-shadow/on/20260518T223207Z/report.json`.
+- Both runs hit one ingest transport reset, so treat pass/fail as inconclusive
+  and compare directional metrics only.
+- Baseline: 5.784 MB/s accepted decoded, query p50/p95/p99
+  `83.8/124.7/127.8 ms`, storage-visible logs `49.8 rows/s`, final logs
+  `5979` rows in `12` files.
+- Shadow enabled: 5.785 MB/s accepted decoded, query p50/p95/p99
+  `83.2/140.7/162.2 ms`, storage-visible logs `45.6 rows/s`, final logs
+  `5961` rows in `12` candidate files. Shadow executed `16` measured matches,
+  `0` mismatches, scanned `1/12` files and `498/5961` rows in the final sample,
+  and recorded ~`895 ms` average shadow execution timing.
+- Interpretation: newest-first DuckLake planning is semantically promising
+  because one recent file satisfied the 100-row Loki limit with exact shadow
+  matches. The direct `read_parquet` shadow executor is not yet a performance
+  win under pressure; it added material sidecar work even while accepted
+  throughput remained unchanged. Treat this as historical evidence only: active
+  progressive work now stays on logical DuckLake table queries.
+
+2026-05-18 Loki progressive shadow batch scout:
+
+- Shape: same as the shadow scout above, with batch size `4`. Report:
+  `target/canardstack-bench/loki-progressive-shadow/batch4/20260518T224645Z/report.json`.
+- The run hit two ingest transport resets, so treat pass/fail as inconclusive
+  and compare directional metrics only.
+- Batch-4 shadow: 5.777 MB/s accepted decoded, query p50/p95/p99
+  `74.0/110.2/145.5 ms`, storage-visible logs `47.8 rows/s`, final logs
+  `5823` rows in `12` files. Shadow executed `16` measured matches,
+  `0` mismatches, scanned one batch containing `4/12` files and `1988/5823`
+  rows in the final sample, and recorded ~`894 ms` average shadow execution
+  timing.
+- Interpretation: batching candidate files did not reduce shadow execution
+  timing compared with the one-file scout (~`895 ms`) and scanned more rows to
+  satisfy the same 100-row limit. This closed the raw-Parquet scout path and
+  moved the proof to candidate-limited logical DuckLake queries.
+
+2026-05-18 Loki logical-window shadow scout:
+
+- Shape: same mixed logs workload, using logical-window shadow mode and batch
+  size `1`. Report:
+  `target/canardstack-bench/loki-progressive-shadow/logical-window/20260518T225741Z/report.json`.
+- The run hit three ingest transport resets, so treat pass/fail as
+  inconclusive and compare directional metrics only.
+- Logical-window shadow: 5.769 MB/s accepted decoded, query p50/p95/p99
+  `74.8/146.0/148.5 ms`, storage-visible logs `47.5 rows/s`, final logs
+  `5783` rows in `12` files. Shadow executed `16` measured matches,
+  `0` mismatches, scoped `1/12` candidate files and `490/5783` rows in the
+  final sample.
+- Timing split: candidate planning averaged ~`3.8 ms`; candidate execution
+  averaged ~`891.6 ms`; total shadow timing averaged ~`896.2 ms`.
+- Interpretation: DuckLake metadata planning is not the shadow cost. The cost
+  is the extra query execution itself. The next proof was to avoid double
+  execution by running the candidate-limited logical path as the sole response
+  source behind a stricter experimental gate.
+
+2026-05-18 Loki authoritative progressive query scout:
+
+- Shape: same mixed logs workload, with authoritative progressive query enabled
+  behind the historical experimental flag and batch size `1`. Report:
+  `target/canardstack-bench/loki-progressive-authoritative/on/20260518T230828Z/report.json`.
+- The run hit two ingest transport resets, so treat pass/fail as inconclusive
+  and compare directional metrics only.
+- Authoritative progressive query: 5.777 MB/s accepted decoded, query
+  p50/p95/p99 `62.9/117.6/144.2 ms`, storage-visible logs `48.8 rows/s`,
+  final logs `5945` rows in `12` files. Progressive query served `16`
+  measured Loki requests, with `0` fallbacks, scoped `1/12` candidate files and
+  `500/5945` rows in the final sample.
+- Timing split: candidate planning averaged ~`7.8 ms`; candidate execution
+  averaged ~`899.7 ms`; total progressive timing averaged ~`907 ms`.
+- Interpretation: removing the shadow double-query tax improved observed Loki
+  query p50/p95 versus the same logical-window shadow run, but the
+  candidate-limited DuckDB execution itself still costs roughly the same as
+  before. This validates the cleaner vertical slice and keeps compatibility
+  stable, but it is not yet a large performance win.
+
+2026-05-18 DuckDB/DuckLake logical plan proof:
+
+- Added `GET /api/admin/query/loki-progressive-explain`, which generates two
+  bounded Loki `query_range` SQL shapes and asks DuckDB to `EXPLAIN` or
+  `EXPLAIN ANALYZE` them. The generated SQL targets the DuckLake logical table
+  (`main.logs` in the response display, attached as `canardlake.logs` inside
+  DuckDB), not `read_parquet`.
+- On the authoritative benchmark data, `analyze=true` with a matching `{}` Loki
+  selector showed the full logical query reading `13` files / `6256` rows with
+  DuckDB total time ~`65.7 ms`.
+- The progressive logical-window query added only a timestamp lower bound from
+  DuckLake metadata and DuckDB read `1` file / `311` rows with total time
+  ~`4.0 ms`.
+- Interpretation: the architecture should rely on DuckDB/DuckLake for physical
+  file planning and reads. Canardstack should not execute Loki queries by raw
+  Parquet file path. The remaining mixed-pressure latency is not because
+  DuckDB cannot prune the logical query; it is likely query contention,
+  connection/setup cost, or the benchmark pressure shape around the query
+  engine.
+
+2026-05-18 current direction and timer-fix proof:
+
+- The Brooksian end-to-end direction is now one coherent vertical slice:
+  DuckLake metadata may bound a logical Loki query, but DuckDB/DuckLake owns
+  physical file planning and reads. Raw-Parquet shadow execution is retired
+  from active code paths.
+- `with_query_conn` now checks the completion flag before waiting, so a fast
+  query that finishes before the timeout thread starts waiting no longer
+  reports a timeout-sized phase delay.
+- Timer-fix rerun report:
+  `target/canardstack-bench/loki-progressive-authoritative/timerfix/20260518T232731Z/report.json`.
+  The run was not a clean pass because it had five ingest socket resets, but
+  the progressive query proof result is decisive: `0` fallbacks,
+  `1/12` files scanned in the final sample, `490` rows scanned, candidate
+  planning averaged ~`7.8 ms`, candidate execution averaged ~`15.3 ms`, and
+  total progressive timing averaged ~`22.6 ms`.
+- Interpretation: the previous ~`900 ms` mixed-pressure candidate execution
+  timing was primarily timer/reporting behavior, not DuckDB failing to prune
+  the logical DuckLake query. Keep the architecture direction. The next proof
+  should move to reliability and freshness: explain the persistent ingest
+  transport resets under mixed pressure, then revisit durable raw spool
+  semantics and query-visible freshness under backlog.
+- A follow-up no-peek server run reduced transport resets from five to one but
+  still logged macOS socket timeout errors on idle keep-alive reads. The likely
+  remaining reset source is the benchmark client reusing a persistent socket
+  after the server's 30s read timeout. Report:
+  `target/canardstack-bench/loki-progressive-authoritative/nopeek/20260518T233732Z/report.json`.
+- Idle-reconnect rerun report:
+  `target/canardstack-bench/loki-progressive-authoritative/idle-reconnect/20260518T234116Z/report.json`.
+  This passed with `0` transport errors, query p50/p95/p99
+  `75.1/134.0/148.6 ms`, progressive `0` fallbacks, `1/12` files scanned,
+  candidate execution ~`16.6 ms`, and total progressive timing ~`23.6 ms`.
+  Queue oldest age stayed ~`0.4s`. Mid-run freshness lag rose and fell with the
+  30s scheduler flush cadence, ending around `20.9s`; this is flush cadence
+  visibility, not queue backlog. The next freshness proof should test shorter
+  flush cadence or explicit freshness SLA controls under sustained pressure.
+- Committed default-path rerun report:
+  `target/canardstack-bench/loki-progressive-committed/default/20260518T235455Z/report.json`.
+  This ran without the historical experimental Loki flag and passed with `0`
+  transport errors, query p50/p95/p99 `67.6/128.3/142.5 ms`, progressive `16`
+  ok requests, `1/12` files scanned, candidate execution ~`14.5 ms`, and total
+  progressive timing ~`21.6 ms`. Queue oldest age stayed ~`0.4s`; freshness
+  lag again tracked flush visibility cadence rather than ingest backlog.
+- Post-review regression report:
+  `target/canardstack-bench/loki-progressive-committed/review/20260519T000414Z/report.json`.
+  This includes the safer full bounded candidate-file set for selective
+  filters and still passed with `0` transport errors, query p50/p95/p99
+  `72.0/135.5/150.4 ms`, progressive `16` ok requests, `1/12` files scanned,
+  candidate execution ~`16.2 ms`, and total progressive timing ~`23.3 ms`.
+
 2026-05-18 HTTP keep-alive scout:
 
 - Environment: OrbStack Linux VMs, VM-local benchmark driver against
@@ -250,6 +432,80 @@ HTTP keep-alive scout control:
   question is whether bounded keep-alive semantics should become a real server
   capability, or whether benchmark targets should assume exporters reuse
   connections.
+
+2026-05-18 SmithDB-lite planning note:
+
+- `docs/planning/smithdb-lite-lsm-experiment.md` records the single-binary
+  LSM-shaped experiment path and durable-spool state machine.
+- The first proof gate is an admin-only DuckLake metadata probe for registered
+  data-file planning facts. This tests whether DuckLake can replace a custom
+  segment manifest for file membership before any progressive query rewrite.
+- The first proof gate was a benchmark-only Loki `query_range` candidate scout:
+  `GET /api/admin/query/loki-candidates` lists newest intersecting DuckLake log
+  files. The sidecar scout flag has since been retired because backward Loki
+  `query_range` now uses the candidate-window path directly.
+
+2026-05-18 local Loki candidate scout comparison:
+
+- Environment: local macOS directional run, release server, logs-only mixed
+  workload, `target=500 GB/day`, 12 ingest workers, persistent connections,
+  medium query pressure, `items-per-batch=256`, `log-body-bytes=512`,
+  advancing timestamps, 10s warmup / 60s measured. Server CPU/RSS sampling was
+  unavailable, so treat this as a scout, not a durable ceiling.
+- Scout off passed at 5.787 MB/s decoded with `24/24` queries successful,
+  query p50/p95/p99 `82.3/172.2/172.5 ms`, storage-visible logs
+  `7,545.6 rows/s`, and final DuckLake logs `598,272 rows` in `8` files.
+- Scout on passed at 5.787 MB/s decoded with `24/24` queries successful, query
+  p50/p95/p99 `93.8/169.9/205.1 ms`, storage-visible logs `7,533.0 rows/s`,
+  and final DuckLake logs `598,272 rows` in `8` files.
+- The scout sidecar executed for `10` Loki query-range requests and spent
+  `0.066s` total (`6.63 ms/query`) in DuckLake candidate planning. Stored
+  operator metrics sampled the candidate set at `5` files, `377,501` rows, and
+  `5,737,635` bytes.
+- Interpretation: the sidecar planner overhead was small in this local scout
+  and did not materially change accepted throughput or storage-visible
+  progress. Query tail latency moved within a small-sample band, not enough to
+  claim improvement or regression. The next gate should run the same scout in a
+  longer mixed workload and then decide whether to execute Loki progressively
+  over those candidates.
+
+Report paths:
+
+- `target/canardstack-bench/loki-candidate-scout/off/20260518T213502Z/report.json`
+- `target/canardstack-bench/loki-candidate-scout/on/20260518T213645Z/report.json`
+
+2026-05-18 local Loki candidate scout 10-minute comparison:
+
+- Environment: local macOS directional run, release server, logs-only mixed
+  workload, `target=500 GB/day`, 12 ingest workers, persistent connections,
+  medium query pressure, `items-per-batch=256`, `log-body-bytes=512`,
+  advancing timestamps, 15s warmup / 10m measured. Server CPU/RSS sampling was
+  unavailable.
+- Scout off passed at 5.787 MB/s decoded with `240/240` queries successful,
+  query p50/p95/p99 `94.3/332.8/413.2 ms`, storage-visible logs
+  `8,543 rows/s`, and final DuckLake logs `5,255,936 rows` in `70` files.
+- Scout on passed at 5.787 MB/s decoded with `240/240` queries successful,
+  query p50/p95/p99 `94.4/360.4/410.5 ms`, storage-visible logs
+  `8,549 rows/s`, and final DuckLake logs `5,255,936 rows` in `71` files.
+- The enriched report recorded `80` measured-window successful scout requests
+  and `82` total planner timings including warmup/end effects. Candidate
+  planning took `1.529s` total, `18.6 ms/query` average, and `0.25%` of
+  measured wall time.
+- End-window candidate set was `69` files, `5,131,430` rows, and `78,165,755`
+  bytes versus `70` total log files and `5,206,890` total report-window log
+  rows. Candidate fractions were `98.6%` of files and `98.6%` of rows.
+- Interpretation: the sidecar planner remained cheap enough not to affect
+  throughput or storage-visible progress, but the default one-hour Loki range
+  covers almost all files in a 10-minute advancing-timestamp run. Time-only
+  candidate filtering does not prove a query-work reduction for this shape.
+  The next useful proof is a shadow progressive executor that walks newest
+  candidate files and records how many files/rows are needed before satisfying
+  the Loki limit.
+
+Report paths:
+
+- `target/canardstack-bench/loki-candidate-scout-long/off/20260518T215906Z/report.json`
+- `target/canardstack-bench/loki-candidate-scout-long/on/20260518T220959Z/report.json`
 
 Report paths:
 
