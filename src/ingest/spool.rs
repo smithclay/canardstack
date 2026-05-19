@@ -81,14 +81,25 @@ impl std::fmt::Display for RawSpoolFull {
 
 impl std::error::Error for RawSpoolFull {}
 
+#[derive(Clone, Copy, Debug, Default)]
+struct SegmentState {
+    bytes: u64,
+    record_count: u64,
+    seq_lo: u64,
+    seq_hi: u64,
+}
+
 pub struct RawSpool {
     dir: PathBuf,
     max_segment_bytes: u64,
     max_record_bytes: u64,
     max_total_bytes: u64,
     completed: BTreeSet<u64>,
+    segments: BTreeMap<u64, SegmentState>,
+    pending: BTreeMap<RawSpoolRecordId, u64>,
+    total_segment_bytes: u64,
+    total_pending_bytes: u64,
     active_segment: u64,
-    active_len: u64,
     active: File,
     checkpoint: File,
     next_sequence: u64,
@@ -105,30 +116,48 @@ impl RawSpool {
 
         let checkpoint_path = checkpoint_path(&options.dir);
         let completed = read_completed_sequences(&checkpoint_path)?;
-        let mut segments = segment_ids(&options.dir)?;
+        let mut existing_segments = segment_ids(&options.dir)?;
         let mut max_sequence = 0u64;
-        let mut segment_lens = BTreeMap::new();
-        for segment in &segments {
+        let mut segments = BTreeMap::new();
+        let mut pending = BTreeMap::new();
+        let mut total_segment_bytes = 0u64;
+        let mut total_pending_bytes = 0u64;
+        for segment in &existing_segments {
             let path = segment_path(&options.dir, *segment);
-            let valid_len = scan_segment(
+            let mut recovered = Vec::new();
+            let scan = scan_segment(
                 &path,
                 *segment,
                 max_record_bytes,
                 &completed,
-                &mut max_sequence,
-                None,
+                Some(&mut recovered),
             )?;
             OpenOptions::new()
                 .write(true)
                 .open(&path)
                 .with_context(|| format!("open raw spool segment {}", path.display()))?
-                .set_len(valid_len)
+                .set_len(scan.valid_len)
                 .with_context(|| format!("truncate raw spool segment {}", path.display()))?;
-            segment_lens.insert(*segment, valid_len);
+            max_sequence = max_sequence.max(scan.seq_hi);
+            total_segment_bytes = total_segment_bytes.saturating_add(scan.valid_len);
+            for record in recovered {
+                let body_len = record.record.compressed_body.len() as u64;
+                total_pending_bytes = total_pending_bytes.saturating_add(body_len);
+                pending.insert(record.id, body_len);
+            }
+            segments.insert(
+                *segment,
+                SegmentState {
+                    bytes: scan.valid_len,
+                    record_count: scan.record_count,
+                    seq_lo: scan.seq_lo,
+                    seq_hi: scan.seq_hi,
+                },
+            );
         }
 
-        if segments.is_empty() {
-            segments.push(1);
+        if existing_segments.is_empty() {
+            existing_segments.push(1);
             let path = segment_path(&options.dir, 1);
             OpenOptions::new()
                 .create(true)
@@ -136,14 +165,13 @@ impl RawSpool {
                 .open(&path)
                 .with_context(|| format!("create raw spool segment {}", path.display()))?;
             sync_dir(&options.dir)?;
-            segment_lens.insert(1, 0);
+            segments.insert(1, SegmentState::default());
         }
 
-        let mut active_segment = *segments.last().unwrap_or(&1);
-        let mut active_len = *segment_lens.get(&active_segment).unwrap_or(&0);
+        let mut active_segment = *existing_segments.last().unwrap_or(&1);
+        let active_len = segments.get(&active_segment).map_or(0, |s| s.bytes);
         if active_len >= max_segment_bytes {
             active_segment += 1;
-            active_len = 0;
             let path = segment_path(&options.dir, active_segment);
             OpenOptions::new()
                 .create_new(true)
@@ -151,6 +179,7 @@ impl RawSpool {
                 .open(&path)
                 .with_context(|| format!("create raw spool segment {}", path.display()))?;
             sync_dir(&options.dir)?;
+            segments.insert(active_segment, SegmentState::default());
         }
 
         let active = open_segment_append(&options.dir, active_segment)?;
@@ -167,8 +196,11 @@ impl RawSpool {
             max_record_bytes,
             max_total_bytes,
             completed,
+            segments,
+            pending,
+            total_segment_bytes,
+            total_pending_bytes,
             active_segment,
-            active_len,
             active,
             checkpoint,
             next_sequence: max_sequence.saturating_add(1).max(1),
@@ -197,17 +229,16 @@ impl RawSpool {
                 );
             }
             let sequence = self.next_sequence + encoded.len() as u64;
+            let body_len = record.compressed_body.len() as u64;
             let bytes = encode_record(sequence, &record)?;
             encoded_bytes = encoded_bytes.saturating_add(bytes.len() as u64);
-            encoded.push((sequence, bytes));
+            encoded.push((sequence, bytes, body_len));
         }
 
-        let mut current_bytes = self.segment_bytes()?;
-        let mut required_bytes = current_bytes.saturating_add(encoded_bytes);
+        let mut required_bytes = self.total_segment_bytes.saturating_add(encoded_bytes);
         if required_bytes > self.max_total_bytes {
             let _removed = self.reclaim_committed_segments()?;
-            current_bytes = self.segment_bytes()?;
-            required_bytes = current_bytes.saturating_add(encoded_bytes);
+            required_bytes = self.total_segment_bytes.saturating_add(encoded_bytes);
         }
         if required_bytes > self.max_total_bytes {
             return Err(RawSpoolFull {
@@ -219,9 +250,13 @@ impl RawSpool {
 
         let mut ids = Vec::with_capacity(encoded.len());
         let mut active_dirty = false;
-        for (sequence, bytes) in encoded {
-            if self.active_len > 0
-                && self.active_len.saturating_add(bytes.len() as u64) > self.max_segment_bytes
+        for (sequence, bytes, body_len) in encoded {
+            let active_bytes = self
+                .segments
+                .get(&self.active_segment)
+                .map_or(0, |s| s.bytes);
+            if active_bytes > 0
+                && active_bytes.saturating_add(bytes.len() as u64) > self.max_segment_bytes
             {
                 if active_dirty {
                     self.active
@@ -237,7 +272,20 @@ impl RawSpool {
             self.active
                 .write_all(&bytes)
                 .context("append raw spool record")?;
-            self.active_len = self.active_len.saturating_add(bytes.len() as u64);
+            let written = bytes.len() as u64;
+            let state = self
+                .segments
+                .get_mut(&self.active_segment)
+                .expect("active segment is tracked");
+            if state.record_count == 0 {
+                state.seq_lo = sequence;
+            }
+            state.seq_hi = sequence;
+            state.record_count += 1;
+            state.bytes = state.bytes.saturating_add(written);
+            self.total_segment_bytes = self.total_segment_bytes.saturating_add(written);
+            self.pending.insert(id, body_len);
+            self.total_pending_bytes = self.total_pending_bytes.saturating_add(body_len);
             self.next_sequence = self.next_sequence.saturating_add(1);
             active_dirty = true;
             ids.push(id);
@@ -251,32 +299,23 @@ impl RawSpool {
     }
 
     pub fn stats(&self) -> Result<RawSpoolStats> {
-        let segments = segment_ids(&self.dir)?;
-        let segment_bytes = self.segment_bytes()?;
-        let pending = self.recover_pending()?;
-        let pending_bytes = pending
-            .iter()
-            .map(|record| record.record.compressed_body.len() as u64)
-            .sum();
         Ok(RawSpoolStats {
-            segment_count: segments.len(),
-            segment_bytes,
-            pending_records: pending.len(),
-            pending_bytes,
+            segment_count: self.segments.len(),
+            segment_bytes: self.total_segment_bytes,
+            pending_records: self.pending.len(),
+            pending_bytes: self.total_pending_bytes,
         })
     }
 
     pub fn recover_pending(&self) -> Result<Vec<RecoveredRawSpoolRecord>> {
         let mut pending = Vec::new();
-        let mut max_sequence = 0u64;
-        for segment in segment_ids(&self.dir)? {
-            let path = segment_path(&self.dir, segment);
-            let _valid_len = scan_segment(
+        for segment in self.segments.keys() {
+            let path = segment_path(&self.dir, *segment);
+            scan_segment(
                 &path,
-                segment,
+                *segment,
                 self.max_record_bytes,
                 &self.completed,
-                &mut max_sequence,
                 Some(&mut pending),
             )?;
         }
@@ -293,6 +332,9 @@ impl RawSpool {
             if !self.completed.insert(id.sequence) {
                 continue;
             }
+            if let Some(body_len) = self.pending.remove(&id) {
+                self.total_pending_bytes = self.total_pending_bytes.saturating_sub(body_len);
+            }
             writeln!(self.checkpoint, "{}", id.sequence).context("append raw spool checkpoint")?;
             wrote = true;
         }
@@ -305,33 +347,89 @@ impl RawSpool {
     }
 
     pub fn reclaim_committed_segments(&mut self) -> Result<usize> {
+        let candidates: Vec<u64> = self
+            .segments
+            .keys()
+            .copied()
+            .filter(|segment| *segment != self.active_segment)
+            .collect();
         let mut removed = 0usize;
-        for segment in segment_ids(&self.dir)? {
-            if segment == self.active_segment {
+        let mut pruned_completed = false;
+        for segment in candidates {
+            if self.segment_has_pending(segment) {
                 continue;
             }
             let path = segment_path(&self.dir, segment);
-            let mut max_sequence = 0u64;
-            let mut recovered = Vec::new();
-            let _valid_len = scan_segment(
-                &path,
-                segment,
-                self.max_record_bytes,
-                &self.completed,
-                &mut max_sequence,
-                Some(&mut recovered),
-            )?;
-            if recovered.is_empty() {
-                fs::remove_file(&path).with_context(|| {
-                    format!("remove committed raw spool segment {}", path.display())
-                })?;
-                removed += 1;
+            fs::remove_file(&path).with_context(|| {
+                format!("remove committed raw spool segment {}", path.display())
+            })?;
+            if let Some(state) = self.segments.remove(&segment) {
+                self.total_segment_bytes = self.total_segment_bytes.saturating_sub(state.bytes);
+                if state.record_count > 0 {
+                    let stale: Vec<u64> = self
+                        .completed
+                        .range(state.seq_lo..=state.seq_hi)
+                        .copied()
+                        .collect();
+                    for sequence in stale {
+                        self.completed.remove(&sequence);
+                        pruned_completed = true;
+                    }
+                }
             }
+            removed += 1;
         }
         if removed > 0 {
             sync_dir(&self.dir)?;
         }
+        if pruned_completed {
+            self.rewrite_checkpoint()?;
+        }
         Ok(removed)
+    }
+
+    fn segment_has_pending(&self, segment: u64) -> bool {
+        let lo = RawSpoolRecordId {
+            segment,
+            sequence: 0,
+        };
+        let hi = RawSpoolRecordId {
+            segment,
+            sequence: u64::MAX,
+        };
+        self.pending.range(lo..=hi).next().is_some()
+    }
+
+    fn rewrite_checkpoint(&mut self) -> Result<()> {
+        let path = checkpoint_path(&self.dir);
+        let tmp = self.dir.join("checkpoint.log.tmp");
+        let mut contents = String::new();
+        for sequence in &self.completed {
+            contents.push_str(&sequence.to_string());
+            contents.push('\n');
+        }
+        {
+            let mut file = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&tmp)
+                .with_context(|| format!("create raw spool checkpoint temp {}", tmp.display()))?;
+            file.write_all(contents.as_bytes())
+                .context("write compacted raw spool checkpoint")?;
+            file.sync_all()
+                .context("fsync compacted raw spool checkpoint")?;
+        }
+        fs::rename(&tmp, &path)
+            .with_context(|| format!("replace raw spool checkpoint {}", path.display()))?;
+        sync_dir(&self.dir)?;
+        self.checkpoint = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .read(true)
+            .open(&path)
+            .with_context(|| format!("reopen raw spool checkpoint {}", path.display()))?;
+        Ok(())
     }
 
     #[cfg(test)]
@@ -341,7 +439,6 @@ impl RawSpool {
 
     fn rotate(&mut self) -> Result<()> {
         self.active_segment = self.active_segment.saturating_add(1);
-        self.active_len = 0;
         let path = segment_path(&self.dir, self.active_segment);
         self.active = OpenOptions::new()
             .create_new(true)
@@ -349,20 +446,9 @@ impl RawSpool {
             .open(&path)
             .with_context(|| format!("create raw spool segment {}", path.display()))?;
         sync_dir(&self.dir)?;
+        self.segments
+            .insert(self.active_segment, SegmentState::default());
         Ok(())
-    }
-
-    fn segment_bytes(&self) -> Result<u64> {
-        let mut bytes = 0u64;
-        for segment in segment_ids(&self.dir)? {
-            let path = segment_path(&self.dir, segment);
-            bytes = bytes.saturating_add(
-                fs::metadata(&path)
-                    .with_context(|| format!("stat raw spool segment {}", path.display()))?
-                    .len(),
-            );
-        }
-        Ok(bytes)
     }
 }
 
@@ -652,23 +738,34 @@ fn encode_record(sequence: u64, record: &RawSpoolRecord) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct SegmentScan {
+    valid_len: u64,
+    record_count: u64,
+    seq_lo: u64,
+    seq_hi: u64,
+}
+
 fn scan_segment(
     path: &Path,
     segment: u64,
     max_record_bytes: u64,
     completed: &BTreeSet<u64>,
-    max_sequence: &mut u64,
     mut pending: Option<&mut Vec<RecoveredRawSpoolRecord>>,
-) -> Result<u64> {
+) -> Result<SegmentScan> {
     let mut file =
         File::open(path).with_context(|| format!("open raw spool segment {}", path.display()))?;
-    let mut valid_len = 0u64;
+    let mut scan = SegmentScan::default();
     loop {
-        let offset = valid_len;
+        let offset = scan.valid_len;
         match read_record_at(&mut file, max_record_bytes) {
             Ok(Some((sequence, record, bytes_read))) => {
-                valid_len = valid_len.saturating_add(bytes_read);
-                *max_sequence = (*max_sequence).max(sequence);
+                scan.valid_len = scan.valid_len.saturating_add(bytes_read);
+                if scan.record_count == 0 {
+                    scan.seq_lo = sequence;
+                }
+                scan.seq_hi = scan.seq_hi.max(sequence);
+                scan.record_count += 1;
                 if !completed.contains(&sequence) {
                     if let Some(out) = pending.as_deref_mut() {
                         out.push(RecoveredRawSpoolRecord {
@@ -689,7 +786,7 @@ fn scan_segment(
             }
         }
     }
-    Ok(valid_len)
+    Ok(scan)
 }
 
 fn read_record_at(
@@ -971,6 +1068,61 @@ mod tests {
             spool.stats().unwrap().segment_bytes <= 500,
             "committed closed segments should be reclaimed before reporting full"
         );
+    }
+
+    #[test]
+    fn raw_spool_compacts_checkpoint_on_reclaim() {
+        let dir = tempdir().unwrap();
+        let mut opts = options(dir.path());
+        opts.max_segment_bytes = 128;
+        let mut spool = RawSpool::open(opts.clone()).unwrap();
+
+        let first = spool.append(record(b"first-payload")).unwrap();
+        let second = spool.append(record(b"second-payload")).unwrap();
+        assert_ne!(first.segment, second.segment);
+        spool.mark_committed(first).unwrap();
+        spool.mark_committed(second).unwrap();
+        assert_eq!(spool.completed.len(), 2);
+
+        let removed = spool.reclaim_committed_segments().unwrap();
+        assert_eq!(removed, 1);
+
+        // the reclaimed segment's committed sequence is dropped from the in-memory set
+        assert!(!spool.completed.contains(&first.sequence));
+        assert!(spool.completed.contains(&second.sequence));
+
+        // the on-disk checkpoint log is rewritten to match
+        let persisted = read_completed_sequences(&checkpoint_path(dir.path())).unwrap();
+        assert_eq!(persisted, spool.completed);
+
+        let stats = spool.stats().unwrap();
+        assert_eq!(stats.segment_count, 1);
+        assert_eq!(stats.pending_records, 0);
+
+        // reopening reflects the compacted checkpoint without re-recovering pruned records
+        let reopened = RawSpool::open(opts).unwrap();
+        assert_eq!(reopened.completed, spool.completed);
+        assert_eq!(reopened.recover_pending().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn raw_spool_stats_track_pending_incrementally() {
+        let dir = tempdir().unwrap();
+        let mut spool = RawSpool::open(options(dir.path())).unwrap();
+
+        let first = spool.append(record(b"first")).unwrap();
+        let _second = spool.append(record(b"second")).unwrap();
+        let stats = spool.stats().unwrap();
+        assert_eq!(stats.pending_records, 2);
+        assert_eq!(
+            stats.pending_bytes,
+            b"first".len() as u64 + b"second".len() as u64
+        );
+
+        spool.mark_committed(first).unwrap();
+        let stats = spool.stats().unwrap();
+        assert_eq!(stats.pending_records, 1);
+        assert_eq!(stats.pending_bytes, b"second".len() as u64);
     }
 
     #[test]
