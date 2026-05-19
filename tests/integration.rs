@@ -550,6 +550,14 @@ fn admin_ingest_health_includes_raw_spool_backlog() {
             .unwrap()
             > 0
     );
+    assert_eq!(
+        response.json_body()["raw_spool_config"]["group_commit_records"],
+        64
+    );
+    assert_eq!(
+        response.json_body()["raw_spool_config"]["group_commit_ms"],
+        1
+    );
     assert_eq!(response.json_body()["queues"][0]["signal"], "logs");
 }
 
@@ -2729,7 +2737,7 @@ fn admin_endpoints_reject_data_key_and_unauthenticated_requests() {
 }
 
 #[test]
-fn loki_query_range_uses_progressive_ducklake_query_by_default() {
+fn loki_query_range_backward_uses_standard_log_query() {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
     config.local_storage_dir = dir.path().join("storage");
@@ -2781,89 +2789,6 @@ fn loki_query_range_uses_progressive_ducklake_query_by_default() {
     let result = body["data"]["result"].as_array().expect("streams");
     assert_eq!(result.len(), 1, "{body}");
     assert_eq!(result[0]["values"].as_array().unwrap().len(), 1, "{body}");
-
-    let metrics = state.metrics.render_prometheus();
-    assert!(
-        metrics.contains("canardstack_loki_progressive_query_requests_total{status=\"ok\"} 1"),
-        "{metrics}"
-    );
-    assert!(
-        metrics.contains("canardstack_loki_progressive_query_files_scanned 1"),
-        "{metrics}"
-    );
-    assert!(
-        metrics.contains("canardstack_loki_progressive_query_result_rows 1"),
-        "{metrics}"
-    );
-    assert!(
-        !metrics.contains("canardstack_loki_progressive_query_requests_total{status=\"fallback\"}"),
-        "{metrics}"
-    );
-}
-
-#[test]
-fn loki_progressive_query_continues_past_newer_nonmatching_candidates() {
-    let dir = tempdir().unwrap();
-    let mut config = Config::test(dir.path().join("canardstack.duckdb"));
-    config.local_storage_dir = dir.path().join("storage");
-    let state = AppState::new(config).unwrap();
-    let headers = headers(&state);
-    let now = Utc::now();
-
-    let older_checkout = log_fixture((now - Duration::seconds(20)).timestamp_nanos_opt().unwrap());
-    let mut newer_inventory =
-        log_fixture((now - Duration::seconds(5)).timestamp_nanos_opt().unwrap());
-    newer_inventory["resourceLogs"][0]["resource"]["attributes"][0]["value"]["stringValue"] =
-        json!("inventory");
-
-    for body in [older_checkout, newer_inventory] {
-        let ingest = http::route(
-            "POST",
-            "/v1/logs",
-            &HashMap::new(),
-            &headers,
-            body.to_string().as_bytes(),
-            &state,
-        );
-        assert_eq!(ingest.status(), 202, "{}", ingest.json_body());
-        flush_all(&state);
-    }
-
-    let response = http::route(
-        "GET",
-        "/loki/api/v1/query_range",
-        &HashMap::from([
-            (
-                "query".to_string(),
-                r#"{service_name="checkout"}"#.to_string(),
-            ),
-            (
-                "start".to_string(),
-                (now - Duration::minutes(1)).timestamp().to_string(),
-            ),
-            (
-                "end".to_string(),
-                (now + Duration::minutes(1)).timestamp().to_string(),
-            ),
-            ("limit".to_string(), "1".to_string()),
-            ("direction".to_string(), "backward".to_string()),
-        ]),
-        &headers,
-        &[],
-        &state,
-    );
-    assert_eq!(response.status(), 200, "{}", response.json_body());
-    let body = response.json_body();
-    let result = body["data"]["result"].as_array().expect("streams");
-    assert_eq!(result.len(), 1, "{body}");
-    assert_eq!(result[0]["stream"]["service_name"], "checkout");
-    assert_eq!(result[0]["values"].as_array().unwrap().len(), 1, "{body}");
-
-    let metrics = state.metrics.render_prometheus();
-    assert!(
-        metrics.contains("canardstack_loki_progressive_query_files_scanned 2"),
-        "{metrics}"
-    );
 }
 
 #[test]

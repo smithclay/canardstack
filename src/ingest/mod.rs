@@ -746,35 +746,24 @@ impl Ingestor {
     }
 
     fn validate_skew(&self, transformed: &Transformed) -> ApiResult<()> {
-        if let Some(logs) = &transformed.logs {
-            validation::validate_arrow_timestamp_skew(logs, Signal::Logs, &self.config)?;
-        }
-        if let Some(spans) = &transformed.spans {
-            validation::validate_arrow_timestamp_skew(spans, Signal::Spans, &self.config)?;
-        }
-        if let Some(gauge) = &transformed.gauge {
-            validation::validate_arrow_timestamp_skew(gauge, Signal::MetricGauge, &self.config)?;
-        }
-        if let Some(sum) = &transformed.sum {
-            validation::validate_arrow_timestamp_skew(sum, Signal::MetricSum, &self.config)?;
+        for (signal, batch) in transformed.signal_batches() {
+            if let Some(batch) = batch {
+                validation::validate_arrow_timestamp_skew(batch, signal, &self.config)?;
+            }
         }
         Ok(())
     }
 }
 
 fn transformed_rows_by_signal(transformed: &Transformed) -> Vec<(Signal, usize)> {
-    [
-        (Signal::Logs, transformed.logs.as_ref()),
-        (Signal::Spans, transformed.spans.as_ref()),
-        (Signal::MetricGauge, transformed.gauge.as_ref()),
-        (Signal::MetricSum, transformed.sum.as_ref()),
-    ]
-    .into_iter()
-    .filter_map(|(signal, batch)| {
-        let rows = batch.map(|batch| batch.num_rows()).unwrap_or(0);
-        (rows > 0).then_some((signal, rows))
-    })
-    .collect()
+    transformed
+        .signal_batches()
+        .into_iter()
+        .filter_map(|(signal, batch)| {
+            let rows = batch.map(|batch| batch.num_rows()).unwrap_or(0);
+            (rows > 0).then_some((signal, rows))
+        })
+        .collect()
 }
 
 fn pending_batch_totals(batches: &[queue::PendingBatch]) -> BTreeMap<Signal, (usize, usize)> {

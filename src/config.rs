@@ -114,7 +114,7 @@ impl Config {
                 "CANARDSTACK_RUNTIME_MEMORY_LIMIT_BYTES",
             )? {
                 Some(value) => value,
-                None => file.optional_usize(&["ingest", "runtime_memory_limit_bytes"])?,
+                None => file.usize(&["ingest", "runtime_memory_limit_bytes"])?,
             },
             max_rows_per_flush: env_usize("CANARDSTACK_MAX_ROWS_PER_FLUSH")?
                 .or(file.usize(&["ingest", "max_rows_per_flush"])?)
@@ -504,10 +504,6 @@ impl FileConfig {
                     .with_context(|| format!("{} must be an unsigned integer", path.join(".")))
             })
             .transpose()
-    }
-
-    fn optional_usize(&self, path: &[&str]) -> Result<Option<usize>> {
-        self.usize(path)
     }
 
     fn i64(&self, path: &[&str]) -> Result<Option<i64>> {

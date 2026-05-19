@@ -26,6 +26,17 @@ pub struct Transformed {
     pub unsupported_histograms: usize,
 }
 
+impl Transformed {
+    pub fn signal_batches(&self) -> [(Signal, Option<&RecordBatch>); 4] {
+        [
+            (Signal::Logs, self.logs.as_ref()),
+            (Signal::Spans, self.spans.as_ref()),
+            (Signal::MetricGauge, self.gauge.as_ref()),
+            (Signal::MetricSum, self.sum.as_ref()),
+        ]
+    }
+}
+
 pub fn decompress_if_needed(
     headers: &HashMap<String, String>,
     body: &[u8],

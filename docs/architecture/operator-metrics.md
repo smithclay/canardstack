@@ -80,9 +80,11 @@ storage proof phases with `signal` and `phase` labels:
 `storage_insert`. `storage_insert` is retained for flush accounting and
 backward-compatible benchmark parsing.
 
-`/api/admin/health/ingest` returns both queue snapshots and raw-spool stats
-(`segment_count`, `segment_bytes`, `pending_records`, `pending_bytes`) so a
-restart replay backlog can be diagnosed without arbitrary SQL.
+`/api/admin/health/ingest` returns queue snapshots, raw-spool stats
+(`segment_count`, `segment_bytes`, `pending_records`, `pending_bytes`), and the
+active raw-spool group-commit settings. Operators can diagnose replay backlog
+and distinguish queue pressure from fsync/acknowledgement-latency tuning without
+arbitrary SQL.
 
 ## Query Metrics
 

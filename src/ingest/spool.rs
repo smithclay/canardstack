@@ -63,7 +63,7 @@ pub struct RawSpoolStats {
     pub pending_bytes: u64,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct RawSpoolFull {
     pub required_bytes: u64,
     pub max_bytes: u64,
@@ -517,18 +517,11 @@ fn handle_append_batch(
         }
         Err(err) => {
             let message = err.to_string();
-            let is_full = raw_spool_full_info(&err).map(|full| RawSpoolFull {
-                required_bytes: full.required_bytes,
-                max_bytes: full.max_bytes,
-            });
+            let is_full = raw_spool_full_info(&err).copied();
             for command in batch {
-                let reply = if let Some(full) = &is_full {
-                    Err(anyhow::Error::new(RawSpoolFull {
-                        required_bytes: full.required_bytes,
-                        max_bytes: full.max_bytes,
-                    }))
-                } else {
-                    Err(anyhow::anyhow!(message.clone()))
+                let reply = match is_full {
+                    Some(full) => Err(anyhow::Error::new(full)),
+                    None => Err(anyhow::anyhow!(message.clone())),
                 };
                 let _ = command.reply.send(reply);
             }
@@ -988,5 +981,67 @@ mod tests {
         let mut spool = RawSpool::open(opts).unwrap();
         let err = spool.append(record(b"too-large-for-limit")).unwrap_err();
         assert!(raw_spool_full_info(&err).is_some(), "{err:?}");
+    }
+
+    #[test]
+    fn raw_spool_group_commit_collects_until_record_limit() {
+        let (reply, _reply_rx) = mpsc::channel();
+        let first = AppendCommand {
+            record: record(b"first"),
+            reply,
+        };
+        let (tx, rx) = mpsc::sync_channel(4);
+        let (reply, _reply_rx) = mpsc::channel();
+        tx.send(RawSpoolCommand::Append(AppendCommand {
+            record: record(b"second"),
+            reply,
+        }))
+        .unwrap();
+
+        let mut deferred = VecDeque::new();
+        let mut batch = vec![first];
+        collect_batch(
+            &rx,
+            &mut deferred,
+            2,
+            Duration::from_secs(5),
+            &mut batch,
+            |command| match command {
+                RawSpoolCommand::Append(append) => Ok(append),
+                other => Err(other),
+            },
+        );
+
+        assert_eq!(batch.len(), 2);
+        assert!(deferred.is_empty());
+    }
+
+    #[test]
+    fn raw_spool_group_commit_delay_flushes_partial_batch() {
+        let (_tx, rx) = mpsc::sync_channel(4);
+        let (reply, _reply_rx) = mpsc::channel();
+        let first = AppendCommand {
+            record: record(b"first"),
+            reply,
+        };
+        let mut deferred = VecDeque::new();
+        let mut batch = vec![first];
+        let started = Instant::now();
+
+        collect_batch(
+            &rx,
+            &mut deferred,
+            64,
+            Duration::from_millis(10),
+            &mut batch,
+            |command| match command {
+                RawSpoolCommand::Append(append) => Ok(append),
+                other => Err(other),
+            },
+        );
+
+        assert_eq!(batch.len(), 1);
+        assert!(deferred.is_empty());
+        assert!(started.elapsed() >= Duration::from_millis(5));
     }
 }

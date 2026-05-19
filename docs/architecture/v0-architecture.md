@@ -97,7 +97,8 @@ transform. It stores exactly the accepted request unit needed for replay:
 Recovery sequence:
 
 ```text
-open segment -> append record -> fsync record/segment -> return 202
+open segment -> append record on raw-spool writer
+  -> fsync when group-commit count or delay is reached -> return 202
   -> transform/enqueue -> DuckLake storage commit
   -> checkpoint raw-spool record -> segment reclaimable
 ```
@@ -105,6 +106,15 @@ open segment -> append record -> fsync record/segment -> return 202
 Startup replays uncheckpointed fsynced records before scheduler work starts.
 Replay enters the same decode, transform, queue, flush, and DuckLake commit path
 as normal ingest.
+
+The raw-spool writer is on the ingest acknowledgement path. It batches appends
+and checkpoints up to `CANARDSTACK_RAW_SPOOL_GROUP_COMMIT_RECORDS` records, or
+until `CANARDSTACK_RAW_SPOOL_GROUP_COMMIT_MS` elapses from the first record in
+the group. These are capacity knobs, not cosmetic settings: too small and
+storage spends the ingest budget on fsyncs; too large and `202` acknowledgement
+latency rises even when downstream queues are healthy. `0ms` is rejected at
+startup so operators do not accidentally disable batching and return to
+per-request fsync behavior.
 
 Main knobs:
 
@@ -174,10 +184,8 @@ All HTTP compatibility queries go through `QueryEngine`, which applies:
 - DuckDB memory limit
 - query concurrency limits
 
-Prometheus, Loki, and Tempo adapters execute logical SQL against DuckLake
-tables. Backward Loki `query_range` uses DuckLake metadata to derive a bounded
-newest-candidate timestamp window, then executes one logical DuckLake query.
-DuckDB/DuckLake owns physical file planning and reads.
+Prometheus, Loki, and Tempo adapters execute bounded logical SQL against
+DuckLake tables. DuckDB/DuckLake owns physical file planning and reads.
 
 Direct SQL is intentionally outside the normal HTTP API. Operators or users who
 need SQL should use DuckDB CLI, MotherDuck, or another SQL client against the

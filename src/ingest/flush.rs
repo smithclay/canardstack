@@ -249,11 +249,11 @@ impl Ingestor {
         match insert_result {
             Ok(result) => {
                 let mut rows = HashMap::new();
-                if let Some(metrics) = metrics {
-                    for batch in &coalesced {
-                        let batch_rows = batch.batch.num_rows();
+                for batch in &coalesced {
+                    let batch_rows = batch.batch.num_rows();
+                    *rows.entry(batch.table).or_default() += batch_rows;
+                    if let Some(metrics) = metrics {
                         let batch_bytes = batch.batch.get_array_memory_size();
-                        *rows.entry(batch.table).or_default() += batch_rows;
                         metrics.inc(
                             "canardstack_ingest_flush_rows_total",
                             &[("signal", batch.table.as_str())],
@@ -269,10 +269,6 @@ impl Ingestor {
                             &[("signal", batch.table.as_str())],
                             batch_bytes as u64,
                         );
-                    }
-                } else {
-                    for batch in &coalesced {
-                        *rows.entry(batch.table).or_default() += batch.batch.num_rows();
                     }
                 }
                 for timing in result.timings {

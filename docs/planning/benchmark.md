@@ -42,9 +42,9 @@ The MVP gates prove these behaviors:
   `/api/admin/health/ingest` distinguish accepted, raw-spooled, pending replay,
   queued, flushed/sealed, DuckLake-visible, checkpointed, spool full, and
   storage unavailable states.
-- **Query path:** backward Loki `query_range` uses the logical DuckLake
-  candidate-window path. Tempo search/lookup uses bounded logical DuckLake
-  queries. There is no active raw-Parquet shadow mode or custom manifest path.
+- **Query path:** backward Loki `query_range` and Tempo search/lookup use
+  bounded logical DuckLake queries. There is no active raw-Parquet shadow mode
+  or custom manifest path.
 - **Cutover cleanliness:** old memory-only acceptance paths, null-sink storage,
   validation-only/transform-only ingest controls, and raw-spool crash hooks are
   not serving configuration.
@@ -64,7 +64,7 @@ cargo clippy --all-targets --all-features --locked -- -D warnings
 cargo test raw_spool -- --nocapture
 cargo test raw_spool_replays_accepted_unflushed_request_after_restart -- --nocapture
 cargo test admin_ingest_health_includes_raw_spool_backlog -- --nocapture
-cargo test loki_progressive_query -- --nocapture
+cargo test loki_query_range_backward_uses_standard_log_query -- --nocapture
 
 # End-to-end MVP gate
 scripts/raw-spool-promotion-gates.sh
@@ -97,11 +97,18 @@ CANARDSTACK_RAW_SPOOL_GATE_TRACE_TARGET_GB_DAY=500
 CANARDSTACK_RAW_SPOOL_GATE_BACKLOG_RECORDS=10000
 CANARDSTACK_RAW_SPOOL_GATE_BACKLOG_BYTES=134217728
 CANARDSTACK_RAW_SPOOL_GATE_MAX_RUNTIME=3m
+CANARDSTACK_RAW_SPOOL_GROUP_COMMIT_RECORDS=64
+CANARDSTACK_RAW_SPOOL_GROUP_COMMIT_MS=1
 ```
 
 If the local machine cannot afford the default backlog or benchmark duration,
 lower the knobs and record the exact gap in the handoff. Do not call the MVP
 done from a reduced gate.
+
+The group-commit settings are part of the ingest capacity envelope. Record any
+non-default values next to benchmark latency and throughput results because a
+larger batch/delay can improve throughput while directly raising `202`
+acknowledgement latency.
 
 ## Benchmark Harness
 
@@ -142,7 +149,7 @@ Reports include:
 - queue trends
 - raw-spool, transform, enqueue, flush, seal, checkpoint, and storage-visible
   stage throughput
-- Loki candidate-window metrics for log runs
+- Loki query latency for log runs
 - process CPU/RSS samples when `--server-pid` can be sampled
 
 ## Current MVP Envelope
@@ -173,8 +180,7 @@ Logs:
 - Max measured freshness lag: `0.693s`.
 - Measured-window storage-visible rows: `8455 rows/s`.
 - Final logical log rows: `598,272`.
-- Loki candidate window: final query scanned `1/103` candidate files and
-  returned `100` rows.
+- Final Loki query returned `100` rows.
 
 Traces:
 

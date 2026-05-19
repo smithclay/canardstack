@@ -60,7 +60,7 @@ pub(super) fn loki_query_inner(
     range: bool,
 ) -> ApiResult<Value> {
     let plan = loki_plan(params, range)?;
-    let result = execute_loki_log_result(state, &plan, range)?;
+    let result = state.queries.execute_logs(&state.storage, &plan)?;
     let mut streams: BTreeMap<String, (Map<String, Value>, Vec<Value>)> = BTreeMap::new();
     for row in result_rows(&result) {
         let mut labels = Map::new();
@@ -123,103 +123,6 @@ fn loki_plan(params: &HashMap<String, String>, range: bool) -> ApiResult<LogPlan
         },
     };
     parse_loki_query(query, time_bounds, limit, direction)
-}
-
-fn execute_loki_log_result(state: &AppState, plan: &LogPlan, range: bool) -> ApiResult<Value> {
-    if range && !plan.direction.is_forward() {
-        let (result, report) = state
-            .queries
-            .execute_logs_progressive_window(&state.storage, plan)?;
-        record_loki_progressive_query_report(state, "ok", &report);
-        return Ok(result);
-    }
-
-    state.queries.execute_logs(&state.storage, plan)
-}
-
-fn record_loki_progressive_query_report(
-    state: &AppState,
-    status: &str,
-    report: &crate::query::ProgressiveLogQueryReport,
-) {
-    state.metrics.inc(
-        "canardstack_loki_progressive_query_requests_total",
-        &[("status", status)],
-        1,
-    );
-    state.metrics.gauge(
-        "canardstack_loki_progressive_query_candidate_files",
-        &[],
-        report.candidate_files as f64,
-    );
-    state.metrics.gauge(
-        "canardstack_loki_progressive_query_candidate_rows",
-        &[],
-        report.candidate_rows as f64,
-    );
-    state.metrics.gauge(
-        "canardstack_loki_progressive_query_candidate_bytes",
-        &[],
-        report.candidate_bytes as f64,
-    );
-    state.metrics.gauge(
-        "canardstack_loki_progressive_query_batch_size",
-        &[],
-        report.batch_size as f64,
-    );
-    state.metrics.gauge(
-        "canardstack_loki_progressive_query_files_scanned",
-        &[],
-        report.files_scanned as f64,
-    );
-    state.metrics.gauge(
-        "canardstack_loki_progressive_query_batches_scanned",
-        &[],
-        report.batches_scanned as f64,
-    );
-    state.metrics.gauge(
-        "canardstack_loki_progressive_query_rows_scanned",
-        &[],
-        report.rows_scanned as f64,
-    );
-    state.metrics.gauge(
-        "canardstack_loki_progressive_query_bytes_scanned",
-        &[],
-        report.bytes_scanned as f64,
-    );
-    state.metrics.gauge(
-        "canardstack_loki_progressive_query_result_rows",
-        &[],
-        report.result_rows as f64,
-    );
-    state.metrics.gauge(
-        "canardstack_loki_progressive_query_truncated",
-        &[],
-        if report.truncated { 1.0 } else { 0.0 },
-    );
-    state.metrics.gauge(
-        "canardstack_loki_progressive_query_duration_ms",
-        &[],
-        report.query_duration_ms as f64,
-    );
-    state.metrics.observe_phase_seconds(
-        "logs",
-        "loki_progressive_query_candidate_plan",
-        Some("/loki/api/v1/query_range"),
-        report.candidate_plan_seconds,
-    );
-    state.metrics.observe_phase_seconds(
-        "logs",
-        "loki_progressive_query_candidate_execute",
-        Some("/loki/api/v1/query_range"),
-        report.candidate_execute_seconds,
-    );
-    state.metrics.observe_phase_seconds(
-        "logs",
-        "loki_progressive_query_execute",
-        Some("/loki/api/v1/query_range"),
-        report.query_duration_ms as f64 / 1000.0,
-    );
 }
 
 fn loki_success(data: Value) -> Value {

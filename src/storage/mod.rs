@@ -20,7 +20,6 @@ mod immutable_write;
 mod maintenance;
 mod metadata;
 mod metadata_refresh;
-mod planner_metadata;
 mod query_conn;
 mod schema;
 
@@ -31,7 +30,6 @@ use ducklake::{
 };
 pub use immutable::ImmutableFlushOutcome;
 use immutable::ImmutableSegmentBuffer;
-pub use planner_metadata::{DuckLakeLogCandidatePlan, DuckLakeLogCandidateWindow};
 use schema::create_tables_on;
 
 #[derive(Clone, Debug, Serialize)]
