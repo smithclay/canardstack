@@ -55,6 +55,7 @@ Data flow:
 ```text
 OTLP/HTTP (JSON or protobuf, optional gzip)
   -> validation (auth, content type, size, timestamp skew)
+  -> local fsync raw spool
   -> otlp2records -> Arrow RecordBatch grouped by Signal
   -> bounded per-signal in-memory queue
   -> immutable Parquet segment files registered with DuckLake
@@ -89,7 +90,7 @@ Top-level modules map to pipeline stages or boundaries. Subdirectories group hel
 
 - Keep the code synchronous. Do not add `tokio`, `async fn`, gRPC, Kafka, a second binary, or another long-running service unless the task explicitly changes the architecture.
 - Use OS threads plus `Arc<Mutex<_>>`. Prefer `LockExt::lock_or_poisoned()` over `.lock().unwrap()` for shared state.
-- Treat ingest as best-effort: a 2xx response means "accepted into a bounded in-memory queue," not "durably committed." There is no WAL.
+- Treat ingest as at-least-once after local durable spool: a 2xx response means the raw request was fsynced to the local raw spool and accepted for bounded processing. It does not mean the rows are DuckLake-committed or query-visible yet.
 - Preserve pressure behavior: queues return 429 under pressure, and storage/dependency failures surface as 503 where appropriate.
 - Keep query routes bounded by time range, row limit, timeout, DuckDB memory limit, and concurrency caps through `QueryEngine`.
 - Do not expose arbitrary SQL through the compatibility APIs. Direct SQL is intentionally an external DuckDB CLI / MotherDuck path.
@@ -132,4 +133,4 @@ docs: document commit message convention
 
 ## Further Reading
 
-The `docs/` tree is the canonical longer-form reference. Start with `docs/developer.md`; deeper material is under `docs/architecture/`, `docs/planning/`, and `docs/runbooks/`.
+The `docs/` tree is the canonical longer-form reference. Start with `docs/developer.md`; architecture details are under `docs/architecture/`, benchmark gates are in `docs/planning/benchmark.md`, and operator procedures are under `docs/runbooks/`.

@@ -16,7 +16,8 @@ The contract is:
   ≥ 3 (matches `canardstack_maintenance_consecutive_failures{job} >= 3`).
 - `/api/admin/health/queries` → 503 when storage is not ready (queries depend
   on DuckDB).
-- `/api/admin/health/ingest` → always 200; check queue gauges for backpressure.
+- `/api/admin/health/ingest` → always 200; check queue gauges for backpressure
+  and the `raw_spool` object for restart replay backlog.
 
 Where a step below says "check /api/admin/health/...", the expected paging
 status is the HTTP code, not just the body.
@@ -151,6 +152,9 @@ endpoint. Steps 2 and 3 require an operator-driven restart.
 ### Metrics
 
 - `canardstack_ingest_requests_total{status}`.
+- `canardstack_raw_spool_records_total{status="full"}`.
+- `canardstack_raw_spool_pending_records`.
+- `canardstack_raw_spool_pending_bytes`.
 - `canardstack_ingest_queue_bytes{signal}`.
 - `canardstack_ingest_queue_oldest_age_seconds{signal}`.
 - `canardstack_ingest_records_total{signal}`.
@@ -166,8 +170,9 @@ endpoint. Steps 2 and 3 require an operator-driven restart.
 
 ### Safe Degradation
 
-- Prefer `429` when the system is healthy but full.
-- Use `503` when dependencies are unhealthy.
+- Prefer `429` when the system is healthy but full. `raw_spool_full` means the
+  local durable spool hit its configured byte budget before transform.
+- Use `503` when dependencies are unhealthy or the raw spool is unavailable.
 - Do not accept data that would exceed memory bounds.
 
 ### Escalation
@@ -176,7 +181,38 @@ endpoint. Steps 2 and 3 require an operator-driven restart.
 - Increase batch sizes if inserts are too small.
 - Lower retention temporarily only if storage pressure is part of the overload.
 
-## 5. Retention Cleanup Fails And Storage Usage Keeps Growing
+## 5. Restart Replay Backlog Is Draining
+
+### Symptoms
+
+- A process restarts after accepting `202` responses.
+- `/api/admin/health/ingest` shows `raw_spool.pending_records > 0`.
+- `canardstack_raw_spool_replayed_records_total{status="ok"}` increases during startup.
+- Queues may temporarily rise as replayed records re-enter normal admission.
+
+### Metrics
+
+- `canardstack_raw_spool_pending_records`.
+- `canardstack_raw_spool_pending_bytes`.
+- `canardstack_raw_spool_replayed_records_total{status}`.
+- `canardstack_raw_spool_checkpointed_records_total{reason="storage_committed"}`.
+- `canardstack_ingest_queue_rows{signal}`.
+- `canardstack_storage_logical_rows{table}`.
+
+### Immediate Mitigation
+
+1. Check `/api/admin/health/ingest`; `raw_spool.pending_records` should fall after replay and flush.
+2. Check `/metrics` for replay failures. Any `status="failed"` increase is page-worthy.
+3. Trigger `POST /api/admin/maintenance/flush` if the scheduler is disabled or lagging.
+4. Watch `canardstack_storage_logical_rows{table}` and `canardstack_raw_spool_checkpointed_records_total`.
+
+### Safe Degradation
+
+- Keep accepting ingest only if spool and queue pressure remain below configured bounds.
+- Use `429 raw_spool_full` when the durable spool is full.
+- Use `503 raw_spool_unavailable` when the spool cannot be opened, written, or fsynced.
+
+## 6. Retention Cleanup Fails And Storage Usage Keeps Growing
 
 ### Symptoms
 

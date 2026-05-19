@@ -11,38 +11,6 @@ pub struct QueryLane {
     pub memory_limit: String,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum IngestControlMode {
-    Full,
-    ValidationOnly,
-    TransformOnly,
-}
-
-impl IngestControlMode {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Full => "full",
-            Self::ValidationOnly => "validation_only",
-            Self::TransformOnly => "transform_only",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum StorageControlMode {
-    Full,
-    NullSink,
-}
-
-impl StorageControlMode {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Full => "full",
-            Self::NullSink => "null_sink",
-        }
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct Config {
     pub bind: String,
@@ -83,9 +51,14 @@ pub struct Config {
     pub max_concurrent_connections: usize,
     pub socket_read_timeout: Duration,
     pub socket_write_timeout: Duration,
-    pub ingest_control_mode: IngestControlMode,
-    pub storage_control_mode: StorageControlMode,
     pub bench_http_keepalive: bool,
+    pub raw_spool_dir: PathBuf,
+    pub raw_spool_max_segment_bytes: usize,
+    pub raw_spool_max_record_bytes: usize,
+    pub raw_spool_max_total_bytes: usize,
+    pub raw_spool_writer_queue_capacity: usize,
+    pub raw_spool_group_commit_records: usize,
+    pub raw_spool_group_commit_delay: Duration,
 }
 
 impl Config {
@@ -125,11 +98,16 @@ impl Config {
             )?,
             max_rows_per_flush: env_usize("CANARDSTACK_MAX_ROWS_PER_FLUSH", 5_000)?,
             max_bytes_per_flush: env_usize("CANARDSTACK_MAX_BYTES_PER_FLUSH", 4 * 1024 * 1024)?,
-            max_age: Duration::from_secs(env_usize("CANARDSTACK_MAX_FLUSH_AGE_SECS", 10)? as u64),
-            high_pressure_max_age: Duration::from_secs(env_usize(
+            max_age: env_duration_ms_or_secs(
+                "CANARDSTACK_MAX_FLUSH_AGE_MS",
+                "CANARDSTACK_MAX_FLUSH_AGE_SECS",
+                10,
+            )?,
+            high_pressure_max_age: env_duration_ms_or_secs(
+                "CANARDSTACK_HIGH_PRESSURE_FLUSH_AGE_MS",
                 "CANARDSTACK_HIGH_PRESSURE_FLUSH_AGE_SECS",
                 2,
-            )? as u64),
+            )?,
             duckdb_write_memory_limit: env::var("CANARDSTACK_DUCKDB_WRITE_MEMORY_LIMIT")
                 .unwrap_or_else(|_| "1GiB".to_string()),
             late_accept_secs: env_i64("CANARDSTACK_ACCEPT_LATE_SECS", 24 * 60 * 60)?,
@@ -139,10 +117,11 @@ impl Config {
                 "CANARDSTACK_IMMUTABLE_SEGMENT_TARGET_BYTES",
                 64 * 1024 * 1024,
             )?,
-            immutable_segment_max_age: Duration::from_secs(env_usize(
+            immutable_segment_max_age: env_duration_ms_or_secs(
+                "CANARDSTACK_IMMUTABLE_SEGMENT_MAX_AGE_MS",
                 "CANARDSTACK_IMMUTABLE_SEGMENT_MAX_AGE_SECS",
                 10,
-            )? as u64),
+            )?,
             ducklake_data_inlining_row_limit: env_usize(
                 "CANARDSTACK_DUCKLAKE_DATA_INLINING_ROW_LIMIT",
                 0,
@@ -196,9 +175,34 @@ impl Config {
                 "CANARDSTACK_SOCKET_WRITE_TIMEOUT_SECS",
                 30,
             )? as u64),
-            ingest_control_mode: env_ingest_control_mode()?,
-            storage_control_mode: env_storage_control_mode()?,
             bench_http_keepalive: env_bool("CANARDSTACK_BENCH_HTTP_KEEPALIVE", false)?,
+            raw_spool_dir: env::var("CANARDSTACK_RAW_SPOOL_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| data_dir.join("raw-spool")),
+            raw_spool_max_segment_bytes: env_usize(
+                "CANARDSTACK_RAW_SPOOL_MAX_SEGMENT_BYTES",
+                64 * 1024 * 1024,
+            )?,
+            raw_spool_max_record_bytes: env_usize(
+                "CANARDSTACK_RAW_SPOOL_MAX_RECORD_BYTES",
+                8 * 1024 * 1024,
+            )?,
+            raw_spool_max_total_bytes: env_usize(
+                "CANARDSTACK_RAW_SPOOL_MAX_TOTAL_BYTES",
+                1024 * 1024 * 1024,
+            )?,
+            raw_spool_writer_queue_capacity: env_usize(
+                "CANARDSTACK_RAW_SPOOL_WRITER_QUEUE_CAPACITY",
+                1024,
+            )?,
+            raw_spool_group_commit_records: env_usize(
+                "CANARDSTACK_RAW_SPOOL_GROUP_COMMIT_RECORDS",
+                64,
+            )?,
+            raw_spool_group_commit_delay: Duration::from_millis(env_usize(
+                "CANARDSTACK_RAW_SPOOL_GROUP_COMMIT_MS",
+                1,
+            )? as u64),
         })
     }
 
@@ -212,7 +216,7 @@ impl Config {
             api_key: "test-key".to_string(),
             admin_api_key: "test-admin-key".to_string(),
             duckdb_path,
-            local_storage_dir,
+            local_storage_dir: local_storage_dir.clone(),
             duckdb_extension_dir: None,
             postgres_dsn: None,
             ducklake_attach_uri: None,
@@ -254,9 +258,14 @@ impl Config {
             max_concurrent_connections: 64,
             socket_read_timeout: Duration::from_secs(5),
             socket_write_timeout: Duration::from_secs(5),
-            ingest_control_mode: IngestControlMode::Full,
-            storage_control_mode: StorageControlMode::Full,
             bench_http_keepalive: false,
+            raw_spool_dir: local_storage_dir.join("raw-spool"),
+            raw_spool_max_segment_bytes: 64 * 1024 * 1024,
+            raw_spool_max_record_bytes: 8 * 1024 * 1024,
+            raw_spool_max_total_bytes: 1024 * 1024 * 1024,
+            raw_spool_writer_queue_capacity: 1024,
+            raw_spool_group_commit_records: 64,
+            raw_spool_group_commit_delay: Duration::from_millis(1),
         }
     }
 
@@ -292,6 +301,9 @@ impl Config {
         if self.max_rows_per_flush == 0 || self.max_bytes_per_flush == 0 {
             anyhow::bail!("flush thresholds must be > 0");
         }
+        if self.max_age.is_zero() || self.high_pressure_max_age.is_zero() {
+            anyhow::bail!("flush age controls must be > 0");
+        }
         if self.duckdb_write_memory_limit.trim().is_empty() {
             anyhow::bail!("CANARDSTACK_DUCKDB_WRITE_MEMORY_LIMIT must not be empty");
         }
@@ -299,11 +311,11 @@ impl Config {
             anyhow::bail!("CANARDSTACK_IMMUTABLE_SEGMENT_TARGET_BYTES must be > 0");
         }
         if self.immutable_segment_max_age.is_zero() {
-            anyhow::bail!("CANARDSTACK_IMMUTABLE_SEGMENT_MAX_AGE_SECS must be > 0");
+            anyhow::bail!("CANARDSTACK_IMMUTABLE_SEGMENT_MAX_AGE_MS/SECS must be > 0");
         }
         if self.high_pressure_max_age > self.max_age {
             anyhow::bail!(
-                "CANARDSTACK_HIGH_PRESSURE_FLUSH_AGE_SECS must be <= CANARDSTACK_MAX_FLUSH_AGE_SECS"
+                "CANARDSTACK_HIGH_PRESSURE_FLUSH_AGE_MS/SECS must be <= CANARDSTACK_MAX_FLUSH_AGE_MS/SECS"
             );
         }
         if self.logs_retention_days <= 0
@@ -323,6 +335,19 @@ impl Config {
         }
         if self.socket_read_timeout.is_zero() || self.socket_write_timeout.is_zero() {
             anyhow::bail!("socket timeouts must be > 0");
+        }
+        if self.raw_spool_max_segment_bytes == 0
+            || self.raw_spool_max_record_bytes == 0
+            || self.raw_spool_max_total_bytes == 0
+            || self.raw_spool_writer_queue_capacity == 0
+            || self.raw_spool_group_commit_records == 0
+        {
+            anyhow::bail!("raw spool byte limits must be > 0");
+        }
+        if self.raw_spool_max_record_bytes > self.raw_spool_max_total_bytes {
+            anyhow::bail!(
+                "CANARDSTACK_RAW_SPOOL_MAX_RECORD_BYTES must be <= CANARDSTACK_RAW_SPOOL_MAX_TOTAL_BYTES"
+            );
         }
         if self.scheduler_watchdog_interval.is_zero()
             || self.scheduler_flush_interval.is_zero()
@@ -344,6 +369,25 @@ fn env_usize(name: &str, default: usize) -> Result<usize> {
             .with_context(|| format!("{name} must be an unsigned integer")),
         Err(env::VarError::NotPresent) => Ok(default),
         Err(err) => Err(err).with_context(|| format!("read {name}")),
+    }
+}
+
+fn env_duration_ms_or_secs(
+    ms_name: &str,
+    secs_name: &str,
+    default_secs: usize,
+) -> Result<Duration> {
+    match env::var(ms_name) {
+        Ok(value) => {
+            let millis = value
+                .parse::<u64>()
+                .with_context(|| format!("{ms_name} must be an unsigned integer"))?;
+            Ok(Duration::from_millis(millis))
+        }
+        Err(env::VarError::NotPresent) => Ok(Duration::from_secs(
+            env_usize(secs_name, default_secs)? as u64,
+        )),
+        Err(err) => Err(err).with_context(|| format!("read {ms_name}")),
     }
 }
 
@@ -386,35 +430,4 @@ fn env_optional_usize(name: &str) -> Result<Option<usize>> {
         Err(env::VarError::NotPresent) => Ok(None),
         Err(err) => Err(err).with_context(|| format!("invalid {name}")),
     }
-}
-
-fn env_ingest_control_mode() -> Result<IngestControlMode> {
-    match env::var("CANARDSTACK_BENCH_INGEST_CONTROL") {
-        Ok(value) => match normalized_control_value(&value).as_str() {
-            "full" => Ok(IngestControlMode::Full),
-            "validation_only" => Ok(IngestControlMode::ValidationOnly),
-            "transform_only" => Ok(IngestControlMode::TransformOnly),
-            _ => anyhow::bail!(
-                "CANARDSTACK_BENCH_INGEST_CONTROL must be full, validation-only, or transform-only"
-            ),
-        },
-        Err(env::VarError::NotPresent) => Ok(IngestControlMode::Full),
-        Err(err) => Err(err).context("read CANARDSTACK_BENCH_INGEST_CONTROL"),
-    }
-}
-
-fn env_storage_control_mode() -> Result<StorageControlMode> {
-    match env::var("CANARDSTACK_BENCH_STORAGE_CONTROL") {
-        Ok(value) => match normalized_control_value(&value).as_str() {
-            "full" => Ok(StorageControlMode::Full),
-            "null_sink" => Ok(StorageControlMode::NullSink),
-            _ => anyhow::bail!("CANARDSTACK_BENCH_STORAGE_CONTROL must be full or null-sink"),
-        },
-        Err(env::VarError::NotPresent) => Ok(StorageControlMode::Full),
-        Err(err) => Err(err).context("read CANARDSTACK_BENCH_STORAGE_CONTROL"),
-    }
-}
-
-fn normalized_control_value(value: &str) -> String {
-    value.trim().to_ascii_lowercase().replace(['-', ' '], "_")
 }

@@ -1,225 +1,255 @@
 # Canardstack V0 Architecture
 
-Canardstack v0 is an OTLP-to-DuckLake/DuckDB observability backend. It accepts
-OpenTelemetry logs, traces, gauge metrics, and sum metrics; stores normalized
-tables in DuckLake-managed DuckDB storage; and exposes bounded compatibility
-adapters for tools that already understand Prometheus, Loki, and Tempo response
-shapes.
+Canardstack is a single-binary OTLP/HTTP observability backend. It accepts
+OpenTelemetry logs, traces, gauge metrics, and sum metrics; normalizes them with
+`otlp2records`; stores immutable Parquet segments registered in DuckLake; and
+serves bounded Prometheus, Loki, and Tempo compatibility APIs.
 
-Canardstack should not own a bespoke product query protocol in v0. Users and
-agents that need SQL can access the same DuckLake/DuckDB data through DuckDB
-CLI, MotherDuck, or SQL clients.
+## Boundaries
 
-## Product Boundary
+Canardstack keeps these constraints:
 
-The deployment pitch is:
+- One Rust binary named `canardstack`.
+- One synchronous standard-library HTTP server.
+- One DuckDB process with DuckLake attached.
+- OTLP/HTTP JSON and protobuf ingest only.
+- No async runtime, OTLP/gRPC, Kafka, separate hot store, bundled Collector,
+  DataFusion, Vortex, arbitrary SQL HTTP API, or second long-running service.
+
+DuckLake/DuckDB is the source of truth for registered telemetry files and query
+execution. Compatibility APIs must not plan or read raw Parquet files directly,
+and canardstack must not maintain a custom manifest duplicating DuckLake file
+membership.
+
+Metrics are supported for ingest and bounded compatibility behavior, but the
+current sustained MVP performance envelope is only claimed for logs and traces.
+
+## Data Flow
 
 ```text
-one binary, one Postgres, one bucket or local data directory
+OTLP/HTTP (JSON or protobuf, optional gzip)
+  -> request validation
+  -> local fsync raw spool
+  -> inline decode and otlp2records transform
+  -> bounded in-process queues
+  -> immutable Parquet segment files
+  -> ducklake_add_data_files registration
+  -> logical DuckLake SQL compatibility queries
 ```
-
-V0 accepts:
-
-- OTLP/HTTP protobuf and OTLP/HTTP JSON.
-- Logs.
-- Spans/traces.
-- Gauge metrics.
-- Sum metrics.
-
-V0 exposes:
-
-- Prometheus-compatible metric query subset.
-- Loki-compatible log query subset.
-- Tempo-compatible trace lookup/search subset.
-- Provisioned Grafana dashboards over those compatibility endpoints.
-- Direct DuckLake/DuckDB access outside the HTTP product surface.
-
-V0 rejects or defers:
-
-- OTLP/gRPC.
-- Bundled OpenTelemetry Collector.
-- Durable ingest WAL.
-- Kafka, ClickHouse, or separate hot store.
-- Multi-tenancy.
-- Arbitrary user SQL through normal HTTP API routes.
-- Sub-second freshness.
-- Histograms and exponential histograms.
-- Full Prometheus, Loki, Tempo, PromQL, LogQL, or TraceQL semantics.
-- Elasticsearch/OpenSearch `_search` compatibility.
-- Row-level TTL as the primary retention model.
-
-## Core Components
-
-### HTTP API Role
-
-The binary owns OTLP/HTTP ingestion, auth, bounded in-memory buffering,
-compatibility query adapters, admin endpoints, and operator metrics.
-In dev it may also run maintenance. In production, maintenance should be moved
-to a singleton maintenance role.
-
-### DuckLake Catalog
-
-DuckLake is the storage coordinator. It owns table metadata, snapshots, schema
-evolution, inlined data, Parquet registration, snapshot expiration, cleanup, and
-compaction primitives.
-
-Local DuckDB-backed DuckLake is the default development catalog. Postgres is
-the recommended production DuckLake catalog and app metadata database.
-MotherDuck-hosted DuckLake is a supported path for fast experiments.
-
-### Data Store
-
-Data lands in DuckLake-managed tables as immutable Parquet segment files.
-Storage may be local filesystem for dev/small deployments or object storage for
-production.
-
-### Query Engine
-
-DuckDB is the only query engine. User-facing investigation access goes through
-compatibility adapters that impose time range, row limit, timeout, memory limit,
-and concurrency controls. Grafana calls those adapters directly.
-
-## Request Flow
 
 ```mermaid
 flowchart LR
-  A["OTLP/HTTP exporter"] --> B["Canardstack HTTP API"]
-  B --> C["Validate auth, content type, compression, size"]
-  C --> D["Decode OTLP"]
-  D --> E["otlp2records Arrow RecordBatches"]
-  E --> F["Group by signal table"]
-  F --> G["Bounded partitioned in-memory queue (RecordBatch)"]
-  G --> H["Scheduler flush worker"]
-  H --> I["Immutable Parquet segment seal"]
-  I --> J["ducklake_add_data_files registration"]
-  J --> K["DuckDB constrained queries"]
-  K --> L["Prometheus/Loki/Tempo adapter"]
-  L --> M["Grafana, curl, or another compatible client"]
-```
-
-External SQL path:
-
-```text
-DuckDB CLI / MotherDuck / SQL client -> same DuckLake tables
+  A["OTLP/HTTP exporter"] --> B["HTTP parser and auth"]
+  B --> C["Size, content-type, compression, timestamp checks"]
+  C --> D["Fsync raw request to local spool"]
+  D --> E["Decode OTLP and transform with otlp2records"]
+  E --> F["Bounded per-signal queues"]
+  F --> G["Flush worker"]
+  G --> H["Immutable Parquet segment seal"]
+  H --> I["DuckLake registration"]
+  I --> J["Raw spool checkpoint"]
+  I --> K["Logical DuckLake SQL"]
+  K --> L["Prometheus / Loki / Tempo adapters"]
 ```
 
 ## Ingest Semantics
 
-A `2xx` ingest response means:
+A successful ingest response is `202`.
 
-- The API key was accepted.
-- The payload was syntactically valid.
-- The payload was decoded and converted.
-- The resulting records were accepted into the running process.
+`202` means:
 
-A `2xx` does not guarantee:
+- The API key, content type, body size, compression, and timestamp skew passed.
+- The compressed raw request was fsynced into the local raw spool.
+- The request was accepted for at-least-once processing.
 
-- DuckLake commit success.
-- Parquet file creation.
-- Survival of a process, host, or container crash before commit.
+`202` does not mean:
 
-Retryable overload responses:
+- The rows are DuckLake-committed.
+- The rows are query-visible.
+- Exactly-once delivery is guaranteed.
 
-- `429 Too Many Requests` when admission control rejects due to queue pressure,
-  memory pressure, or concurrency pressure.
-- `503 Service Unavailable` when Postgres, DuckLake, or object storage health
-  makes safe acceptance impossible.
+At-least-once duplicate window:
 
-Invalid requests return `400`. Unauthorized requests return `401` or `403`.
+- If the process crashes after DuckLake storage commit but before raw-spool
+  checkpoint, restart replay can duplicate that raw request.
+- Exactly-once or request-id dedupe is post-MVP.
 
-## Batching And Memory Bounds
+Retryable failure behavior:
 
-V0 has four memory guardrails:
+- `429 raw_spool_full` when the durable raw-spool byte budget is exhausted.
+- `429` for queue, process-memory, or runtime-memory pressure.
+- `503 raw_spool_unavailable` when the local spool cannot be opened, written,
+  or fsynced.
+- `503 dependency_unhealthy` when storage is unavailable.
 
-- Request body limit: default 8 MiB compressed payload, configurable.
-- Per-signal queued bytes: default 512 MiB each for logs, spans, gauge
-  metrics, and sum metrics (`CANARDSTACK_PER_SIGNAL_QUEUE_BYTES`).
-- Process ingest memory cap: default 2 GiB
-  (`CANARDSTACK_PROCESS_INGEST_BYTES`). This bounds queued Arrow bytes.
-- Optional runtime RSS admission cap (`CANARDSTACK_RUNTIME_MEMORY_LIMIT_BYTES`).
-  When set, ingest returns `429` before decode/enqueue if process RSS is already
-  at or above the configured limit.
+## Raw Spool
 
-Batch flush triggers:
+The raw spool sits after cheap request validation and before decompression or
+transform. It stores exactly the accepted request unit needed for replay:
 
-- `max_rows_per_flush`: 5,000 rows.
-- `max_bytes_per_flush`: 4 MiB.
-- `max_age`: 10 seconds for normal load, 2 seconds when queue pressure is
-  above 70%.
+- signal route
+- content type
+- optional content encoding
+- accepted timestamp
+- compressed body bytes
+- sequence id and checksum
 
-Flush work is not performed on the HTTP request thread. A successful request
-only admits decoded Arrow batches into process memory and signals the scheduler
-flush worker. The worker drains due queue partitions by row, byte, or age
-threshold. Queue partitions are intentionally low-cardinality in v0: signal table
-plus source encoding (`json` or `protobuf`).
+Recovery sequence:
 
-## DuckLake Insert And Inlining Policy
+```text
+open segment -> append record -> fsync record/segment -> return 202
+  -> transform/enqueue -> DuckLake storage commit
+  -> checkpoint raw-spool record -> segment reclaimable
+```
 
-DuckLake inlining is used as the small-write absorber, not a hot tier.
+Startup replays uncheckpointed fsynced records before scheduler work starts.
+Replay enters the same decode, transform, queue, flush, and DuckLake commit path
+as normal ingest.
 
-Initial policy:
+Main knobs:
 
-- Flush drains process queues into immutable segment buffers.
-- Segment sealing writes Parquet with `otlp2records` and registers files with
-  DuckLake through `ducklake_add_data_files`.
-- `CANARDSTACK_IMMUTABLE_SEGMENT_TARGET_BYTES` defaults to 64 MiB and
-  `CANARDSTACK_IMMUTABLE_SEGMENT_MAX_AGE_SECS` defaults to 10 seconds.
-- `ducklake_flush_inlined_data` remains harmless maintenance, but normal
-  telemetry ingest should produce zero inlined rows.
-- DuckLake adjacent-file compaction is disabled for immutable telemetry
-  segments because earlier query/compaction coexistence testing hit fatal
-  DuckDB invalidation.
-- Track active Parquet files, Parquet rows, inlined rows, and flush failure
-  count per table.
+- `CANARDSTACK_RAW_SPOOL_DIR`
+- `CANARDSTACK_RAW_SPOOL_MAX_SEGMENT_BYTES`
+- `CANARDSTACK_RAW_SPOOL_MAX_RECORD_BYTES`
+- `CANARDSTACK_RAW_SPOOL_MAX_TOTAL_BYTES`
+- `CANARDSTACK_RAW_SPOOL_WRITER_QUEUE_CAPACITY`
+- `CANARDSTACK_RAW_SPOOL_GROUP_COMMIT_RECORDS`
+- `CANARDSTACK_RAW_SPOOL_GROUP_COMMIT_MS`
 
-Operator-facing target:
+## Queues And Flush
 
-- P50 freshness under 30 seconds during healthy load.
-- P95 freshness under 30 seconds during healthy load.
-- Zero inlined telemetry rows during normal ingest.
+Ingest transforms inline on the HTTP request thread, then admits Arrow
+`RecordBatch`es into bounded in-process queues. Queue ownership is intentionally
+low-cardinality: signal plus source encoding.
+
+Memory and queue guardrails:
+
+- `CANARDSTACK_MAX_BODY_BYTES`, default 8 MiB.
+- `CANARDSTACK_PER_SIGNAL_QUEUE_BYTES`, default 512 MiB per signal.
+- `CANARDSTACK_PROCESS_INGEST_BYTES`, default 2 GiB.
+- Optional `CANARDSTACK_RUNTIME_MEMORY_LIMIT_BYTES`.
+
+Flush triggers:
+
+- `CANARDSTACK_MAX_ROWS_PER_FLUSH`, default 5,000 rows.
+- `CANARDSTACK_MAX_BYTES_PER_FLUSH`, default 4 MiB.
+- `CANARDSTACK_MAX_FLUSH_AGE_SECS` or `_MS`, default 10 seconds.
+- `CANARDSTACK_HIGH_PRESSURE_FLUSH_AGE_SECS` or `_MS`, default 2 seconds.
+
+Flush drains queues, coalesces batches, appends them to immutable segment
+buffers, seals due Parquet files, registers those files in DuckLake, and then
+checkpoints the corresponding raw-spool records.
+
+## Storage
+
+DuckLake is the storage coordinator. It owns snapshots, registered data-file
+membership, partition metadata, and table visibility. Canardstack writes
+immutable Parquet segment files and registers them through
+`ducklake_add_data_files`.
+
+Tables:
+
+- `logs`
+- `spans`
+- `metric_gauge`
+- `metric_sum`
+- `metadata_summary`
+
+DuckLake inlined telemetry rows should normally remain zero. Segment sizing is
+controlled by:
+
+- `CANARDSTACK_IMMUTABLE_SEGMENT_TARGET_BYTES`
+- `CANARDSTACK_IMMUTABLE_SEGMENT_MAX_AGE_SECS` or `_MS`
+
+Local DuckLake is the default. Remote DuckLake attach URIs are supported, but
+the core architecture remains the same.
+
+## Query Path
+
+All HTTP compatibility queries go through `QueryEngine`, which applies:
+
+- time-range bounds
+- row/result limits
+- server-owned timeout
+- DuckDB memory limit
+- query concurrency limits
+
+Prometheus, Loki, and Tempo adapters execute logical SQL against DuckLake
+tables. Backward Loki `query_range` uses DuckLake metadata to derive a bounded
+newest-candidate timestamp window, then executes one logical DuckLake query.
+DuckDB/DuckLake owns physical file planning and reads.
+
+Direct SQL is intentionally outside the normal HTTP API. Operators or users who
+need SQL should use DuckDB CLI, MotherDuck, or another SQL client against the
+same DuckLake catalog.
+
+## Operator Surface
+
+Public health:
+
+- `GET /healthz`
+
+Admin health:
+
+- `GET /api/admin/health/storage`
+- `GET /api/admin/health/ingest`
+- `GET /api/admin/health/maintenance`
+- `GET /api/admin/health/queries`
+
+Metrics:
+
+- `GET /metrics`
+
+The operator surface distinguishes:
+
+- accepted requests
+- raw-spooled records and bytes
+- pending replay records and bytes
+- queued rows and bytes
+- flushed and sealed rows
+- DuckLake-visible rows and files
+- checkpointed raw-spool records
+- raw-spool full
+- raw-spool unavailable
+- storage unavailable
+
+See [operator metrics](operator-metrics.md) and
+[failure runbooks](../runbooks/failure-runbooks.md) for the concrete metric and
+endpoint names.
+
+## Maintenance
+
+The API binary starts one in-process scheduler unless
+`CANARDSTACK_SCHEDULER_ENABLED=false`.
+
+Scheduler jobs:
+
+- queue watchdog / due flush
+- metadata refresh
+- operator metric snapshot
+- DuckLake inlined-data flush
+- retention
+- snapshot expiration and cleanup when supported by DuckLake
+
+Maintenance can be paused and resumed through admin endpoints. There is no
+Postgres-backed maintenance lease yet, so assume one in-process scheduler and
+one writer.
 
 ## Retention
 
-Retention is whole-day only.
+Retention is whole-day oriented and bounded by configured horizons:
 
-Default:
+- logs: `CANARDSTACK_LOGS_RETENTION_DAYS`, default 14
+- spans: `CANARDSTACK_SPANS_RETENTION_DAYS`, default 14
+- metrics: `CANARDSTACK_METRICS_RETENTION_DAYS`, default 30
 
-- Logs: 14 days.
-- Spans: 14 days.
-- Metrics: 30 days.
+The current implementation uses bounded table deletes plus DuckLake snapshot
+expiration/cleanup hooks where available. Physical day-table layouts are not
+part of the current MVP.
 
-The target retention design deletes complete day partitions or day tables,
-expires snapshots, and runs cleanup to physically remove old files. The current
-v0 scaffold uses bounded row-level `DELETE` against single tables as a local
-fallback while the physical day-table layout is proven.
+## Compatibility Surface
 
-## Maintenance Role
-
-Maintenance is a first-class subsystem and runs as a background scheduler in
-the API binary.
-
-Responsibilities:
-
-- Queue watchdog.
-- Flush inlined data.
-- Refresh discovery metadata summaries.
-- Snapshot operator metrics.
-- Expire snapshots.
-- Clean old files.
-- Enforce day retention.
-
-Deferred DuckLake maintenance proof gates:
-
-- Delete orphaned files.
-- Merge adjacent small files.
-- Rewrite heavily deleted files if deletes are used.
-
-Maintenance must not starve ingest and queries. It should use bounded DuckDB
-connections and a lower resource class than product queries.
-
-## Compatibility Query Surface
-
-Prometheus metrics:
+Prometheus:
 
 - `GET/POST /api/v1/query`
 - `GET/POST /api/v1/query_range`
@@ -228,7 +258,7 @@ Prometheus metrics:
 - `GET /api/v1/series`
 - `GET /api/v1/metadata`
 
-Loki logs:
+Loki:
 
 - `GET /loki/api/v1/query_range`
 - `GET /loki/api/v1/query`
@@ -236,7 +266,7 @@ Loki logs:
 - `GET /loki/api/v1/label/{name}/values`
 - `GET /loki/api/v1/series`
 
-Tempo traces:
+Tempo:
 
 - `GET /api/v2/traces/{traceID}`
 - `GET /api/traces/{traceID}`
@@ -246,32 +276,9 @@ Tempo traces:
 - `GET /api/v2/search/tags`
 - `GET /api/v2/search/tag/{tag}/values`
 
-Grafana probe shims:
+Grafana probe shim:
 
 - `GET /api/status/buildinfo`
 
-These are subsets, not full protocol implementations. Unsupported query forms
-return compatibility-style error envelopes.
-
-## Query Safety
-
-Every telemetry query path must provide or receive a server-bounded:
-
-- Time range.
-- Result limit.
-- Timeout.
-- Memory limit.
-- Concurrency class.
-
-Default limits:
-
-- Max interactive time range: 24 hours.
-- Max metric range: 30 days.
-- Max returned rows: 1,000 for logs/spans and 20,000 for trace lookup.
-- Query timeout: 15 seconds interactive.
-- DuckDB memory limit: 512 MiB interactive.
-- Global interactive query concurrency: 4 by default.
-
-Admin SQL is acceptable for diagnostics only if separately authenticated,
-audited, timeout-bound, and memory-bound. It is not exposed through the normal
-HTTP compatibility APIs.
+These are compatibility subsets, not complete protocol implementations.
+Unsupported query forms return protocol-shaped error envelopes.

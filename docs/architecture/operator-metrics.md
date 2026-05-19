@@ -30,12 +30,27 @@ Do not label metrics by `service_name`, trace id, query text, API key, or arbitr
 | --- | --- | --- | --- |
 | `canardstack_ingest_requests_total` | Counter | `signal`, `status`, `reason` | Request outcomes. |
 | `canardstack_ingest_request_bytes_total` | Counter | `signal`, `encoding` | Compressed request bytes accepted. |
+| `canardstack_raw_spool_records_total` | Counter | `signal`, `status` | Raw request spool outcomes: `spooled`, `full`, or `error`. `spooled` is the durable accepted-request boundary. |
+| `canardstack_raw_spool_bytes_total` | Counter | `signal` | Compressed raw request bytes fsynced into the local spool. |
+| `canardstack_raw_spool_replayed_records_total` | Counter | `signal`, `status` | Startup replay attempts and outcomes for uncheckpointed raw-spool records. |
+| `canardstack_raw_spool_checkpointed_records_total` | Counter | `signal`, `reason` | Raw-spool records made reclaimable after terminal rejection or DuckLake storage commit. |
+| `canardstack_raw_spool_pending_records` | Gauge | none | Uncheckpointed raw-spool records currently pending replay or storage commit. |
+| `canardstack_raw_spool_pending_bytes` | Gauge | none | Compressed bytes for uncheckpointed raw-spool records. |
+| `canardstack_raw_spool_segment_bytes` | Gauge | none | Total raw-spool segment bytes on disk. |
+| `canardstack_raw_spool_segments` | Gauge | none | Raw-spool segment file count. |
 | `canardstack_ingest_records_total` | Counter | `signal` | Records accepted into the in-process queue. |
+| `canardstack_ingest_transformed_rows_total` | Counter | `signal`, `request_signal` | Rows produced by `otlp2records` before queue admission. |
+| `canardstack_ingest_enqueued_rows_total` | Counter | `signal` | Rows admitted into bounded in-process queues. |
+| `canardstack_ingest_enqueued_bytes_total` | Counter | `signal` | Approximate Arrow bytes admitted into bounded in-process queues. |
 | `canardstack_ingest_queue_rows` | Gauge | `signal` | Current queued records. |
 | `canardstack_ingest_queue_bytes` | Gauge | `signal` | Current queued bytes (approximate). |
 | `canardstack_ingest_queue_oldest_age_seconds` | Gauge | `signal` | Oldest queued record age. |
 | `canardstack_ingest_rejections_total` | Counter | `signal`, `status`, `reason` | Admission-control rejections (subset of `_ingest_requests_total`). |
 | `canardstack_ingest_flush_attempted_bytes_total` | Counter | `signal` | Approximate queued Arrow bytes selected for flush attempts. |
+| `canardstack_ingest_flush_drained_rows_total` | Counter | `signal` | Rows drained from process queues into a flush attempt. |
+| `canardstack_ingest_flush_buffered_rows_total` | Counter | `signal` | Rows appended to immutable segment buffers after coalescing. |
+| `canardstack_immutable_segments_sealed_rows_total` | Counter | `signal` | Rows sealed into immutable Parquet segments. |
+| `canardstack_immutable_segments_sealed_files_total` | Counter | `signal` | Immutable Parquet files written and registered with DuckLake. |
 | `canardstack_ingest_partial_commit_rows_total` | Counter | `signal`, `triggered_by` | Rows durably committed before a mid-batch flush failure; surfaces best-effort durability. |
 
 ## HTTP Metrics
@@ -64,6 +79,10 @@ storage proof phases with `signal` and `phase` labels:
 `storage_ducklake_register`, `storage_ducklake_commit`, and
 `storage_insert`. `storage_insert` is retained for flush accounting and
 backward-compatible benchmark parsing.
+
+`/api/admin/health/ingest` returns both queue snapshots and raw-spool stats
+(`segment_count`, `segment_bytes`, `pending_records`, `pending_bytes`) so a
+restart replay backlog can be diagnosed without arbitrary SQL.
 
 ## Query Metrics
 

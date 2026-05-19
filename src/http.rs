@@ -38,7 +38,7 @@ pub fn serve_until(state: Arc<AppState>, shutdown: &AtomicBool) -> anyhow::Resul
     eprintln!("canardstack listening on http://{addr}/");
     log_startup_storage_mode(&probe);
     eprintln!(
-        "canardstack ingest acknowledgement is best-effort: 2xx means accepted into process memory, not durably committed"
+        "canardstack ingest acknowledgement: 2xx means locally fsynced raw spool acceptance for at-least-once processing"
     );
     let active = Arc::new(AtomicUsize::new(0));
     let max_conns = state.config.max_concurrent_connections;
@@ -376,7 +376,15 @@ pub fn route(
             });
         }
         ("GET", "/api/admin/health/ingest") => admin(headers, state, || {
-            Ok(json!({"queues": state.ingestor.snapshots()}))
+            let raw_spool = state
+                .ingestor
+                .raw_spool_stats()
+                .map(|stats| json!(stats))
+                .unwrap_or_else(|err| json!({"error": err.to_string()}));
+            Ok(json!({
+                "queues": state.ingestor.snapshots(),
+                "raw_spool": raw_spool
+            }))
         }),
         ("GET", "/api/admin/health/maintenance") => {
             return admin_health_response(headers, state, || {
@@ -751,9 +759,8 @@ fn ingest(
 }
 
 fn ingest_response(result: Result<Value, ApiError>) -> HttpResponse {
-    // 202 matches the best-effort acknowledgement the body already advertises
-    // ("accepted_into_process_memory_not_durably_committed") and the metric
-    // label canardstack_ingest_requests_total{status="202"}.
+    // 202 matches the durable local-spool acknowledgement the body advertises
+    // and the metric label canardstack_ingest_requests_total{status="202"}.
     match result {
         Ok(value) => HttpResponse::json(202, value),
         Err(err) => HttpResponse::from_api_error(&err),
@@ -812,6 +819,7 @@ fn record_maintenance_metrics(
 
 pub(crate) fn record_operator_gauges(state: &AppState) {
     state.ingestor.record_queue_metrics(&state.metrics);
+    state.ingestor.record_raw_spool_metrics(&state.metrics);
     let storage = state.storage.health();
     state.metrics.gauge(
         "canardstack_storage_physical_bytes",

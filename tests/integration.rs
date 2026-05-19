@@ -1,5 +1,5 @@
-use canardstack::config::{IngestControlMode, StorageControlMode};
 use canardstack::http;
+use canardstack::ingest::spool::{RawSpool, RawSpoolOptions, RawSpoolRecord};
 use canardstack::ingest::Signal;
 use canardstack::validation;
 use canardstack::{AppState, Config, Scheduler};
@@ -48,6 +48,19 @@ fn admin_headers(state: &AppState) -> HashMap<String, String> {
         "authorization".to_string(),
         format!("Bearer {}", state.config.admin_api_key),
     )])
+}
+
+fn metrics_text(state: &AppState) -> String {
+    let response = http::route(
+        "GET",
+        "/metrics",
+        &HashMap::new(),
+        &HashMap::new(),
+        &[],
+        state,
+    );
+    assert_eq!(response.status(), 200, "{}", response.text_body());
+    response.text_body()
 }
 
 fn flush_all(state: &AppState) -> usize {
@@ -505,6 +518,42 @@ fn healthz_is_cheap_and_unauthenticated() {
 }
 
 #[test]
+fn admin_ingest_health_includes_raw_spool_backlog() {
+    let dir = tempdir().unwrap();
+    let mut config = Config::test(dir.path().join("canardstack.duckdb"));
+    config.raw_spool_dir = dir.path().join("raw-spool");
+    let state = AppState::new(config).unwrap();
+    let body = log_fixture(Utc::now().timestamp_nanos_opt().unwrap()).to_string();
+    let ingest = http::route(
+        "POST",
+        "/v1/logs",
+        &HashMap::new(),
+        &headers(&state),
+        body.as_bytes(),
+        &state,
+    );
+    assert_eq!(ingest.status(), 202, "{}", ingest.json_body());
+
+    let response = http::route(
+        "GET",
+        "/api/admin/health/ingest",
+        &HashMap::new(),
+        &admin_headers(&state),
+        &[],
+        &state,
+    );
+    assert_eq!(response.status(), 200, "{}", response.json_body());
+    assert_eq!(response.json_body()["raw_spool"]["pending_records"], 1);
+    assert!(
+        response.json_body()["raw_spool"]["pending_bytes"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    assert_eq!(response.json_body()["queues"][0]["signal"], "logs");
+}
+
+#[test]
 fn invalid_payload_returns_400() {
     let (_dir, state) = app();
     let response = http::route(
@@ -661,7 +710,7 @@ fn runtime_memory_pressure_returns_429_before_enqueue() {
     );
     assert_eq!(response.status(), 429);
     assert_eq!(response.json_body()["error"], "runtime_memory_full");
-    let metrics = state.metrics.render_prometheus();
+    let metrics = metrics_text(&state);
     assert!(
         metrics.contains(
             "canardstack_ingest_rejections_total{signal=\"logs\",status=\"429\",reason=\"runtime_memory_full\"} 1"
@@ -693,7 +742,7 @@ fn ingest_stage_metrics_separate_transform_enqueue_and_storage_visibility() {
     );
     assert_eq!(response.status(), 202, "{}", response.json_body());
 
-    let metrics = state.metrics.render_prometheus();
+    let metrics = metrics_text(&state);
     assert!(
         metrics.contains(&format!(
             "canardstack_ingest_decoded_bytes_total{{signal=\"logs\",encoding=\"identity\"}} {}",
@@ -721,7 +770,7 @@ fn ingest_stage_metrics_separate_transform_enqueue_and_storage_visibility() {
         &state,
     );
     assert_eq!(flush.status(), 200, "{}", flush.json_body());
-    let metrics = state.metrics.render_prometheus();
+    let metrics = metrics_text(&state);
     assert!(
         metrics.contains("canardstack_ingest_flush_rows_total{signal=\"logs\"} 1"),
         "{metrics}"
@@ -737,10 +786,10 @@ fn ingest_stage_metrics_separate_transform_enqueue_and_storage_visibility() {
 }
 
 #[test]
-fn validation_only_control_accepts_without_transforming_or_enqueueing() {
+fn raw_spool_acknowledges_local_durable_spool_before_storage_commit() {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
-    config.ingest_control_mode = IngestControlMode::ValidationOnly;
+    config.raw_spool_dir = dir.path().join("raw-spool");
     let state = AppState::new(config).unwrap();
     let body = log_fixture(Utc::now().timestamp_nanos_opt().unwrap()).to_string();
     let response = http::route(
@@ -755,122 +804,207 @@ fn validation_only_control_accepts_without_transforming_or_enqueueing() {
     assert_eq!(response.status(), 202, "{}", response.json_body());
     assert_eq!(
         response.json_body()["acknowledgement"],
-        "benchmark_control_validation_only_not_transformed_or_enqueued"
+        "durably_spooled_locally_at_least_once"
     );
-    assert_eq!(
-        state
-            .ingestor
-            .snapshots()
-            .into_iter()
-            .map(|s| s.queued_rows)
-            .sum::<usize>(),
-        0
-    );
-    let metrics = state.metrics.render_prometheus();
+    let metrics = metrics_text(&state);
     assert!(
-        metrics.contains(
-            "canardstack_ingest_control_requests_total{signal=\"logs\",mode=\"validation_only\"} 1"
-        ),
+        metrics
+            .contains("canardstack_raw_spool_records_total{signal=\"logs\",status=\"spooled\"} 1"),
         "{metrics}"
     );
     assert!(
-        !metrics.contains("canardstack_ingest_transformed_rows_total"),
+        metrics.contains("canardstack_raw_spool_pending_records 1.000000"),
         "{metrics}"
     );
-}
-
-#[test]
-fn transform_only_control_transforms_without_enqueueing() {
-    let dir = tempdir().unwrap();
-    let mut config = Config::test(dir.path().join("canardstack.duckdb"));
-    config.ingest_control_mode = IngestControlMode::TransformOnly;
-    let state = AppState::new(config).unwrap();
-    let body = log_fixture(Utc::now().timestamp_nanos_opt().unwrap()).to_string();
-    let response = http::route(
-        "POST",
-        "/v1/logs",
-        &HashMap::new(),
-        &headers(&state),
-        body.as_bytes(),
-        &state,
-    );
-
-    assert_eq!(response.status(), 202, "{}", response.json_body());
-    assert_eq!(
-        response.json_body()["acknowledgement"],
-        "benchmark_control_transformed_not_enqueued_or_durably_committed"
-    );
-    assert_eq!(
-        state
-            .ingestor
-            .snapshots()
-            .into_iter()
-            .map(|s| s.queued_rows)
-            .sum::<usize>(),
-        0
-    );
-    let metrics = state.metrics.render_prometheus();
-    assert!(
-        metrics.contains(
-            "canardstack_ingest_transformed_rows_total{signal=\"logs\",request_signal=\"logs\"} 1"
-        ),
-        "{metrics}"
-    );
-    assert!(
-        metrics.contains(
-            "canardstack_ingest_control_dropped_rows_total{signal=\"logs\",mode=\"transform_only\"} 1"
-        ),
-        "{metrics}"
-    );
-    assert!(
-        !metrics.contains("canardstack_ingest_enqueued_rows_total"),
-        "{metrics}"
-    );
-}
-
-#[test]
-fn null_sink_storage_control_drains_queue_without_storage_visibility() {
-    let dir = tempdir().unwrap();
-    let mut config = Config::test(dir.path().join("canardstack.duckdb"));
-    config.storage_control_mode = StorageControlMode::NullSink;
-    let state = AppState::new(config).unwrap();
-    let body = log_fixture(Utc::now().timestamp_nanos_opt().unwrap()).to_string();
-    let response = http::route(
-        "POST",
-        "/v1/logs",
-        &HashMap::new(),
-        &headers(&state),
-        body.as_bytes(),
-        &state,
-    );
-    assert_eq!(response.status(), 202, "{}", response.json_body());
 
     let flush = http::route(
         "POST",
         "/api/admin/maintenance/flush",
         &HashMap::new(),
         &admin_headers(&state),
-        &[],
+        b"{}",
         &state,
     );
     assert_eq!(flush.status(), 200, "{}", flush.json_body());
+    let metrics = metrics_text(&state);
+    assert!(
+        metrics.contains(
+            "canardstack_raw_spool_checkpointed_records_total{signal=\"logs\",reason=\"storage_committed\"} 1"
+        ),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains("canardstack_raw_spool_pending_records 0.000000"),
+        "{metrics}"
+    );
+}
+
+#[test]
+fn raw_spool_replays_pending_request_on_startup() {
+    let dir = tempdir().unwrap();
+    let mut config = Config::test(dir.path().join("canardstack.duckdb"));
+    config.raw_spool_dir = dir.path().join("raw-spool");
+    let body = log_fixture(Utc::now().timestamp_nanos_opt().unwrap()).to_string();
+    {
+        let mut spool = RawSpool::open(RawSpoolOptions {
+            dir: config.raw_spool_dir.clone(),
+            max_segment_bytes: config.raw_spool_max_segment_bytes as u64,
+            max_record_bytes: config.raw_spool_max_record_bytes as u64,
+            max_total_bytes: config.raw_spool_max_total_bytes as u64,
+        })
+        .unwrap();
+        spool
+            .append(RawSpoolRecord::new(
+                Signal::Logs,
+                "application/json",
+                None,
+                body.as_bytes(),
+            ))
+            .unwrap();
+    }
+
+    let state = AppState::new(config).unwrap();
     assert_eq!(
         state
             .ingestor
             .snapshots()
             .into_iter()
-            .map(|s| s.queued_rows)
-            .sum::<usize>(),
-        0
+            .find(|snapshot| snapshot.signal == Signal::Logs.as_str())
+            .map(|snapshot| snapshot.queued_rows),
+        Some(1)
     );
-    assert_eq!(log_rows(&state), 0);
-    let metrics = state.metrics.render_prometheus();
+    let flush = http::route(
+        "POST",
+        "/api/admin/maintenance/flush",
+        &HashMap::new(),
+        &admin_headers(&state),
+        b"{}",
+        &state,
+    );
+    assert_eq!(flush.status(), 200, "{}", flush.json_body());
+    assert_eq!(log_rows(&state), 1);
+    let metrics = metrics_text(&state);
     assert!(
-        metrics.contains("canardstack_ingest_null_sink_rows_total{signal=\"logs\"} 1"),
+        metrics.contains(
+            "canardstack_raw_spool_replayed_records_total{signal=\"logs\",status=\"ok\"} 1"
+        ),
         "{metrics}"
     );
     assert!(
-        !metrics.contains("canardstack_immutable_segments_sealed_rows_total"),
+        metrics.contains(
+            "canardstack_raw_spool_checkpointed_records_total{signal=\"logs\",reason=\"storage_committed\"} 1"
+        ),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains("canardstack_raw_spool_pending_records 0.000000"),
+        "{metrics}"
+    );
+}
+
+#[test]
+fn raw_spool_replays_accepted_unflushed_request_after_restart() {
+    let dir = tempdir().unwrap();
+    let mut config = Config::test(dir.path().join("canardstack.duckdb"));
+    config.raw_spool_dir = dir.path().join("raw-spool");
+    let body = log_fixture(Utc::now().timestamp_nanos_opt().unwrap()).to_string();
+    {
+        let state = AppState::new(config.clone()).unwrap();
+        let response = http::route(
+            "POST",
+            "/v1/logs",
+            &HashMap::new(),
+            &headers(&state),
+            body.as_bytes(),
+            &state,
+        );
+        assert_eq!(response.status(), 202, "{}", response.json_body());
+        assert_eq!(
+            response.json_body()["acknowledgement"],
+            "durably_spooled_locally_at_least_once"
+        );
+        let metrics = metrics_text(&state);
+        assert!(
+            metrics.contains("canardstack_raw_spool_pending_records 1.000000"),
+            "{metrics}"
+        );
+    }
+
+    let restarted = AppState::new(config).unwrap();
+    assert_eq!(
+        restarted
+            .ingestor
+            .snapshots()
+            .into_iter()
+            .find(|snapshot| snapshot.signal == Signal::Logs.as_str())
+            .map(|snapshot| snapshot.queued_rows),
+        Some(1)
+    );
+    let metrics = metrics_text(&restarted);
+    assert!(
+        metrics.contains(
+            "canardstack_raw_spool_replayed_records_total{signal=\"logs\",status=\"ok\"} 1"
+        ),
+        "{metrics}"
+    );
+    let flush = http::route(
+        "POST",
+        "/api/admin/maintenance/flush",
+        &HashMap::new(),
+        &admin_headers(&restarted),
+        b"{}",
+        &restarted,
+    );
+    assert_eq!(flush.status(), 200, "{}", flush.json_body());
+    assert_eq!(log_rows(&restarted), 1);
+    let metrics = metrics_text(&restarted);
+    assert!(
+        metrics.contains("canardstack_raw_spool_pending_records 0.000000"),
+        "{metrics}"
+    );
+}
+
+#[test]
+fn raw_spool_full_returns_429_before_transform() {
+    let dir = tempdir().unwrap();
+    let mut config = Config::test(dir.path().join("canardstack.duckdb"));
+    config.raw_spool_dir = dir.path().join("raw-spool");
+    config.raw_spool_max_segment_bytes = 16 * 1024;
+    config.raw_spool_max_record_bytes = 16 * 1024;
+    config.raw_spool_max_total_bytes = 900;
+    let state = AppState::new(config).unwrap();
+    let body = log_fixture(Utc::now().timestamp_nanos_opt().unwrap()).to_string();
+
+    let mut saw_full = false;
+    for _ in 0..10 {
+        let response = http::route(
+            "POST",
+            "/v1/logs",
+            &HashMap::new(),
+            &headers(&state),
+            body.as_bytes(),
+            &state,
+        );
+        if response.status() == 429 {
+            assert_eq!(response.json_body()["error"], "raw_spool_full");
+            saw_full = true;
+            break;
+        }
+        assert_eq!(response.status(), 202, "{}", response.json_body());
+    }
+    assert!(
+        saw_full,
+        "raw spool did not fill within the bounded test loop"
+    );
+    let metrics = state.metrics.render_prometheus();
+    assert!(
+        metrics.contains("canardstack_raw_spool_records_total{signal=\"logs\",status=\"full\"} 1"),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains(
+            "canardstack_ingest_rejections_total{signal=\"logs\",status=\"429\",reason=\"raw_spool_full\"} 1"
+        ),
         "{metrics}"
     );
 }
@@ -2806,6 +2940,57 @@ fn config_validate_rejects_zero_scheduler_intervals() {
         assert!(
             config.validate().is_err(),
             "a zero scheduler interval must fail validation"
+        );
+    }
+}
+
+#[test]
+fn config_validate_rejects_zero_flush_freshness_ages() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("canardstack.duckdb");
+    assert!(
+        Config::test(path.clone()).validate().is_ok(),
+        "baseline test config must validate"
+    );
+
+    let mutations: [fn(&mut Config); 3] = [
+        |c| c.max_age = std::time::Duration::ZERO,
+        |c| c.high_pressure_max_age = std::time::Duration::ZERO,
+        |c| c.immutable_segment_max_age = std::time::Duration::ZERO,
+    ];
+    for mutate in mutations {
+        let mut config = Config::test(path.clone());
+        mutate(&mut config);
+        assert!(
+            config.validate().is_err(),
+            "zero flush/freshness age must fail validation"
+        );
+    }
+}
+
+#[test]
+fn config_validate_rejects_invalid_raw_spool_limits() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("canardstack.duckdb");
+    assert!(
+        Config::test(path.clone()).validate().is_ok(),
+        "baseline test config must validate"
+    );
+
+    let mutations: [fn(&mut Config); 6] = [
+        |c| c.raw_spool_max_segment_bytes = 0,
+        |c| c.raw_spool_max_record_bytes = 0,
+        |c| c.raw_spool_max_total_bytes = 0,
+        |c| c.raw_spool_writer_queue_capacity = 0,
+        |c| c.raw_spool_group_commit_records = 0,
+        |c| c.raw_spool_max_record_bytes = c.raw_spool_max_total_bytes + 1,
+    ];
+    for mutate in mutations {
+        let mut config = Config::test(path.clone());
+        mutate(&mut config);
+        assert!(
+            config.validate().is_err(),
+            "invalid raw spool limits must fail validation"
         );
     }
 }

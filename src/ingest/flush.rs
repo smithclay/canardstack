@@ -1,6 +1,5 @@
 use super::queue::{self, QueueKey, QueuedBatch};
 use super::{Ingestor, Signal};
-use crate::config::StorageControlMode;
 use crate::metrics::Metrics;
 use crate::storage::{ArrowBatchInsert, Storage};
 use crate::LockExt;
@@ -245,32 +244,6 @@ impl Ingestor {
                 );
             }
         }
-        if self.config.storage_control_mode == StorageControlMode::NullSink {
-            let mut rows = HashMap::new();
-            if let Some(metrics) = metrics {
-                for batch in &coalesced {
-                    let batch_rows = batch.batch.num_rows();
-                    let batch_bytes = batch.batch.get_array_memory_size();
-                    *rows.entry(batch.table).or_default() += batch_rows;
-                    metrics.inc(
-                        "canardstack_ingest_null_sink_rows_total",
-                        &[("signal", batch.table.as_str())],
-                        batch_rows as u64,
-                    );
-                    metrics.inc(
-                        "canardstack_ingest_null_sink_bytes_total",
-                        &[("signal", batch.table.as_str())],
-                        batch_bytes as u64,
-                    );
-                }
-            } else {
-                for batch in &coalesced {
-                    *rows.entry(batch.table).or_default() += batch.batch.num_rows();
-                }
-            }
-            return Ok(rows);
-        }
-
         let insert_result = storage.insert_arrow_batches(&inserts);
         drop(inserts);
         match insert_result {
@@ -312,6 +285,7 @@ impl Ingestor {
                         );
                     }
                 }
+                self.mark_raw_spool_batches_storage_committed(&sets, metrics)?;
                 Ok(rows)
             }
             Err(err) => {

@@ -20,14 +20,23 @@ pub struct AppState {
 impl AppState {
     pub fn new(config: Config) -> Result<Self> {
         let storage = Storage::open(&config)?;
-        let ingestor = Ingestor::new(config.clone());
+        let ingestor = Ingestor::new(config.clone())?;
+        let metrics = Metrics::default();
+        let replayed = ingestor.replay_raw_spool(&storage, &metrics)?;
+        if replayed > 0 {
+            crate::log_event(
+                "info",
+                "raw_spool_replayed",
+                &[("records", &replayed.to_string())],
+            );
+        }
         Ok(Self {
             storage,
             ingestor,
             queries: QueryEngine::new(&config),
             metadata: Metadata::new(),
             maintenance: Maintenance::new(&config),
-            metrics: Metrics::default(),
+            metrics,
             config,
         })
     }

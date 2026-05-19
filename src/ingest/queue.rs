@@ -1,5 +1,6 @@
 use super::Signal;
 use crate::config::Config;
+use crate::ingest::spool::RawSpoolRecordId;
 use crate::otlp::Transformed;
 use arrow58::record_batch::RecordBatch;
 use serde::Serialize;
@@ -49,6 +50,7 @@ impl BatchPartition {
 pub(super) struct QueuedBatch {
     pub(super) batch: RecordBatch,
     pub(super) source_format: &'static str,
+    pub(super) raw_spool_id: Option<RawSpoolRecordId>,
     accepted_at: Instant,
     pub(super) approx_bytes: usize,
 }
@@ -64,15 +66,18 @@ impl QueuedBatch {
         let rest_bytes = self.approx_bytes.saturating_sub(taken_bytes);
         let accepted_at = self.accepted_at;
         let source_format = self.source_format;
+        let raw_spool_id = self.raw_spool_id;
         let taken = Self {
             batch: self.batch,
             source_format,
+            raw_spool_id,
             accepted_at,
             approx_bytes: taken_bytes,
         };
         let rest = Self {
             batch: rest_batch,
             source_format,
+            raw_spool_id,
             accepted_at,
             approx_bytes: rest_bytes,
         };
@@ -88,6 +93,7 @@ pub(super) struct PendingBatch {
     pub(super) key: QueueKey,
     pub(super) batch: RecordBatch,
     pub(super) source_format: &'static str,
+    pub(super) raw_spool_id: Option<RawSpoolRecordId>,
     pub(super) approx_bytes: usize,
 }
 
@@ -165,6 +171,7 @@ pub(super) fn enqueue_batches(queues: &mut QueueMap, batches: Vec<PendingBatch>)
         queue.batches.push_back(QueuedBatch {
             batch: batch.batch,
             source_format: batch.source_format,
+            raw_spool_id: batch.raw_spool_id,
             accepted_at: Instant::now(),
             approx_bytes: batch.approx_bytes,
         });
@@ -223,7 +230,7 @@ pub(super) fn drain_flush_batches(
         let row_bytes = batch.approx_bytes.div_ceil(original_rows).max(1);
         let rows_by_bytes = (remaining_bytes / row_bytes).max(1);
         let take_rows = original_rows.min(remaining_rows).min(rows_by_bytes);
-        if take_rows == original_rows {
+        if take_rows == original_rows || batch.raw_spool_id.is_some() {
             queue.rows = queue.rows.saturating_sub(original_rows);
             queue.bytes = queue.bytes.saturating_sub(batch.approx_bytes);
             remaining_rows = remaining_rows.saturating_sub(original_rows);
@@ -320,6 +327,7 @@ fn push_pending_arrow(
         key: QueueKey::new(signal, source_format),
         batch,
         source_format,
+        raw_spool_id: None,
         approx_bytes,
     });
 }
@@ -348,6 +356,7 @@ mod tests {
                 key,
                 batch,
                 source_format: "json",
+                raw_spool_id: None,
                 approx_bytes: 50,
             }],
         );

@@ -22,7 +22,7 @@ fn main() -> anyhow::Result<()> {
             let state = Arc::new(AppState::new(config)?);
             if !state.config.scheduler_enabled {
                 eprintln!(
-                    "canardstack scheduler disabled: 202 ingest acknowledgements remain memory-only until admin-triggered flush"
+                    "canardstack scheduler disabled: 202 ingest acknowledgements are durably spooled, but rows remain query-invisible until admin-triggered flush"
                 );
             }
             let _scheduler = state

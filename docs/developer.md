@@ -8,7 +8,8 @@ For a practitioner-focused overview, start with the [README](../README.md).
 ## Architecture
 
 ```text
-OTLP/HTTP JSON or protobuf -> otlp2records -> bounded process queues -> ducklake/duckdb
+OTLP/HTTP -> local fsync raw spool -> otlp2records -> bounded queues
+  -> immutable Parquet segments -> DuckLake registration -> logical queries
 ```
 
 canardstack is currently shaped as:
@@ -16,6 +17,7 @@ canardstack is currently shaped as:
 - One Rust binary, `canardstack`.
 - Synchronous standard-library HTTP server on `CANARDSTACK_BIND`.
 - `otlp2records` for OTLP logs, traces, gauge metrics, and sum metrics.
+- Durable local raw spool for the `202` at-least-once acceptance boundary.
 - Bounded per-signal in-memory queues with row, byte, age, and pressure checks.
 - DuckDB through `duckdb-rs`.
 - DuckLake through DuckDB's official `ducklake` extension SQL surface. The
@@ -210,8 +212,8 @@ Supported ingest response behavior:
   timestamp skew.
 - `401` for missing API key.
 - `403` for bad API key.
-- `429` for retryable queue or process ingest pressure.
-- `503` when storage dependencies are unhealthy.
+- `429` for retryable raw-spool, queue, or process ingest pressure.
+- `503` when the raw spool is unavailable or storage dependencies are unhealthy.
 
 ## Pre-commit Hooks
 
@@ -243,10 +245,11 @@ cargo test
 ```
 
 Coverage currently includes auth, invalid payloads, timestamp skew,
-dependency-unhealthy mode, unauthenticated `/healthz`, queue pressure, query
-limit validation, compatibility auth/error envelopes, ingest-to-query visibility
-through Prometheus/Loki/Tempo subsets, crash semantics, the scheduled queue
-watchdog, removed dashboard/alert routes, and the retention executor.
+dependency-unhealthy mode, unauthenticated `/healthz`, raw-spool replay and
+full-spool rejection, queue pressure, query limit validation, compatibility
+auth/error envelopes, ingest-to-query visibility through Prometheus/Loki/Tempo
+subsets, the scheduled queue watchdog, removed dashboard/alert routes, and the
+retention executor.
 
 Docker-local checks are intentionally outside normal `cargo test`:
 
@@ -308,8 +311,8 @@ maintenance only. The scheduler shuts down cleanly when `serve` exits.
   proof gate.
 - The maintenance singleton lease is in-process; a Postgres-backed lease is
   needed before splitting maintenance into its own role.
-- Benchmarks for 25-100 GB/day and above are not implemented; no throughput
-  claim is made.
+- The sustained MVP benchmark envelope is current for logs and traces. Metrics
+  performance remains TBD.
 
 ## Related Docs
 
@@ -317,5 +320,5 @@ maintenance only. The scheduler shuts down cleanly when `serve` exits.
 - [Storage schema](architecture/storage-schema.md)
 - [Query API](architecture/query-api.md)
 - [Operator metrics](architecture/operator-metrics.md)
-- [Benchmark evidence and proof gates](planning/benchmark.md)
+- [Benchmark gates](planning/benchmark.md)
 - [Failure runbooks](runbooks/failure-runbooks.md)

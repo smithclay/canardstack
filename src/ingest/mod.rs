@@ -1,11 +1,15 @@
-use crate::config::{Config, IngestControlMode};
+use crate::config::Config;
 use crate::metrics::Metrics;
 use crate::otlp::{self, Transformed};
 use crate::storage::Storage;
 use crate::validation::{self, ApiError, ApiResult};
 use crate::LockExt;
+use anyhow::{Context, Result};
 use serde::Serialize;
 use serde_json::{json, Value};
+use spool::{
+    raw_spool_full_info, RawSpoolOptions, RawSpoolRecord, RawSpoolRecordId, RawSpoolWriter,
+};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -15,6 +19,7 @@ use std::time::{Duration, Instant};
 mod admission;
 mod flush;
 mod queue;
+pub mod spool;
 
 pub use flush::{partial_commit_info, PartialFlushError};
 pub use queue::IngestSnapshot;
@@ -54,6 +59,8 @@ pub struct Ingestor {
     flush_lock: Arc<Mutex<()>>,
     flush_signal: Arc<FlushSignal>,
     runtime_memory_reserved_bytes: Arc<AtomicUsize>,
+    raw_spool: RawSpoolWriter,
+    raw_spool_flush_refs: Arc<Mutex<BTreeMap<RawSpoolRecordId, RawSpoolFlushRef>>>,
     config: Config,
 }
 
@@ -63,15 +70,34 @@ struct FlushSignal {
     ready: Condvar,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct RawSpoolFlushRef {
+    signal: Signal,
+    remaining_batches: usize,
+}
+
 impl Ingestor {
-    pub fn new(config: Config) -> Self {
-        Self {
+    pub fn new(config: Config) -> Result<Self> {
+        let raw_spool = RawSpoolWriter::spawn(
+            RawSpoolOptions {
+                dir: config.raw_spool_dir.clone(),
+                max_segment_bytes: config.raw_spool_max_segment_bytes as u64,
+                max_record_bytes: config.raw_spool_max_record_bytes as u64,
+                max_total_bytes: config.raw_spool_max_total_bytes as u64,
+            },
+            config.raw_spool_writer_queue_capacity,
+            config.raw_spool_group_commit_records,
+            config.raw_spool_group_commit_delay,
+        )?;
+        Ok(Self {
             queues: Arc::new(Mutex::new(HashMap::new())),
             flush_lock: Arc::new(Mutex::new(())),
             flush_signal: Arc::new(FlushSignal::default()),
             runtime_memory_reserved_bytes: Arc::new(AtomicUsize::new(0)),
+            raw_spool,
+            raw_spool_flush_refs: Arc::new(Mutex::new(BTreeMap::new())),
             config,
-        }
+        })
     }
 
     pub fn request_flush(&self) {
@@ -114,45 +140,27 @@ impl Ingestor {
             )
             .with_retry_after(10));
         }
+        let raw_spool_id = match self.append_raw_spool(signal, headers, compressed_body, metrics) {
+            Ok(id) => id,
+            Err(err) => {
+                metrics.ingest_request(signal, err.status, err.reason);
+                return Err(err);
+            }
+        };
         let mut runtime_memory_reservation =
             match self.admit_runtime_memory(signal, headers, compressed_body.len(), metrics) {
                 Ok(reservation) => reservation,
                 Err(err) => {
+                    self.checkpoint_raw_spool_terminal(
+                        raw_spool_id,
+                        signal,
+                        "memory_rejected",
+                        metrics,
+                    )?;
                     metrics.ingest_request(signal, err.status, err.reason);
                     return Err(err);
                 }
             };
-        if self.config.ingest_control_mode == IngestControlMode::ValidationOnly {
-            metrics.ingest_request(signal, 202, "bench_validation_only");
-            metrics.inc(
-                "canardstack_ingest_request_bytes_total",
-                &[
-                    ("signal", signal.as_str()),
-                    (
-                        "encoding",
-                        headers
-                            .get("content-encoding")
-                            .map(String::as_str)
-                            .unwrap_or("identity"),
-                    ),
-                ],
-                compressed_body.len() as u64,
-            );
-            metrics.inc(
-                "canardstack_ingest_control_requests_total",
-                &[
-                    ("signal", signal.as_str()),
-                    ("mode", self.config.ingest_control_mode.as_str()),
-                ],
-                1,
-            );
-            return Ok(json!({
-                "accepted": true,
-                "records": 0,
-                "acknowledgement": "benchmark_control_validation_only_not_transformed_or_enqueued",
-                "unsupported_histograms": 0
-            }));
-        }
 
         let started = Instant::now();
         let body_result =
@@ -163,8 +171,27 @@ impl Ingestor {
             None,
             started.elapsed().as_secs_f64(),
         );
-        let body = body_result?;
-        validation::validate_body_size(body.len(), &self.config)?;
+        let body = match body_result {
+            Ok(body) => body,
+            Err(err) => {
+                self.checkpoint_raw_spool_terminal(
+                    raw_spool_id,
+                    signal,
+                    "decompress_rejected",
+                    metrics,
+                )?;
+                return Err(err);
+            }
+        };
+        if let Err(err) = validation::validate_body_size(body.len(), &self.config) {
+            self.checkpoint_raw_spool_terminal(
+                raw_spool_id,
+                signal,
+                "decoded_size_rejected",
+                metrics,
+            )?;
+            return Err(err);
+        }
         let started = Instant::now();
         #[cfg(feature = "otlp2records-observer")]
         let transformed_result = otlp::transform_observed(signal, headers, &body, metrics);
@@ -176,7 +203,18 @@ impl Ingestor {
             None,
             started.elapsed().as_secs_f64(),
         );
-        let transformed = transformed_result?;
+        let transformed = match transformed_result {
+            Ok(transformed) => transformed,
+            Err(err) => {
+                self.checkpoint_raw_spool_terminal(
+                    raw_spool_id,
+                    signal,
+                    "transform_rejected",
+                    metrics,
+                )?;
+                return Err(err);
+            }
+        };
         for (output_signal, rows) in transformed_rows_by_signal(&transformed) {
             metrics.inc(
                 "canardstack_ingest_transformed_rows_total",
@@ -195,74 +233,49 @@ impl Ingestor {
             None,
             started.elapsed().as_secs_f64(),
         );
-        skew_result?;
+        if let Err(err) = skew_result {
+            self.checkpoint_raw_spool_terminal(
+                raw_spool_id,
+                signal,
+                "timestamp_rejected",
+                metrics,
+            )?;
+            return Err(err);
+        }
 
         let request_bytes = compressed_body.len();
         let unsupported_histograms = transformed.unsupported_histograms;
-        let batches = queue::pending_batches(transformed);
+        let mut batches = queue::pending_batches(transformed);
         let enqueued_totals = pending_batch_totals(&batches);
         let pending_bytes = batches.iter().map(|b| b.approx_bytes).sum::<usize>();
         let peak_bytes = request_bytes
             .saturating_add(body.len())
             .saturating_add(pending_bytes);
         if let Err(err) = runtime_memory_reservation.reserve_at_least(peak_bytes, signal, metrics) {
+            self.checkpoint_raw_spool_terminal(raw_spool_id, signal, "memory_rejected", metrics)?;
             metrics.ingest_request(signal, err.status, err.reason);
             return Err(err);
         }
-        if self.config.ingest_control_mode == IngestControlMode::TransformOnly {
-            let transformed_rows = enqueued_totals
-                .values()
-                .map(|(rows, _)| *rows)
-                .sum::<usize>();
-            metrics.ingest_request(signal, 202, "bench_transform_only");
-            self.record_accepted_body_metrics(signal, headers, request_bytes, body.len(), metrics);
-            metrics.inc(
-                "canardstack_ingest_records_total",
-                &[("signal", signal.as_str())],
-                transformed_rows as u64,
-            );
-            metrics.inc(
-                "canardstack_ingest_control_requests_total",
-                &[
-                    ("signal", signal.as_str()),
-                    ("mode", self.config.ingest_control_mode.as_str()),
-                ],
-                1,
-            );
-            for (output_signal, (rows, bytes)) in enqueued_totals {
-                metrics.inc(
-                    "canardstack_ingest_control_dropped_rows_total",
-                    &[
-                        ("signal", output_signal.as_str()),
-                        ("mode", self.config.ingest_control_mode.as_str()),
-                    ],
-                    rows as u64,
-                );
-                metrics.inc(
-                    "canardstack_ingest_control_dropped_bytes_total",
-                    &[
-                        ("signal", output_signal.as_str()),
-                        ("mode", self.config.ingest_control_mode.as_str()),
-                    ],
-                    bytes as u64,
-                );
-            }
-            return Ok(json!({
-                "accepted": true,
-                "records": transformed_rows,
-                "acknowledgement": "benchmark_control_transformed_not_enqueued_or_durably_committed",
-                "unsupported_histograms": unsupported_histograms
-            }));
+        if batches.is_empty() {
+            self.checkpoint_raw_spool_terminal(raw_spool_id, signal, "transform_empty", metrics)?;
+        } else {
+            self.track_raw_spool_batches(raw_spool_id, signal, &mut batches);
         }
         let accepted = match self.enqueue(signal, batches, metrics) {
             Ok(accepted) => accepted,
             Err(err) => {
+                self.untrack_raw_spool_record(raw_spool_id);
+                self.checkpoint_raw_spool_terminal(
+                    raw_spool_id,
+                    signal,
+                    "queue_rejected",
+                    metrics,
+                )?;
                 self.record_queue_metrics(metrics);
                 metrics.ingest_request(signal, err.status, err.reason);
                 return Err(err);
             }
         };
-
         metrics.ingest_request(signal, 202, "accepted");
         self.record_accepted_body_metrics(signal, headers, request_bytes, body.len(), metrics);
         metrics.inc(
@@ -287,9 +300,317 @@ impl Ingestor {
         Ok(json!({
             "accepted": true,
             "records": accepted,
-            "acknowledgement": "accepted_into_process_memory_not_durably_committed",
+            "acknowledgement": "durably_spooled_locally_at_least_once",
             "unsupported_histograms": unsupported_histograms
         }))
+    }
+
+    pub fn replay_raw_spool(&self, storage: &Storage, metrics: &Metrics) -> Result<usize> {
+        let pending = self
+            .raw_spool
+            .recover_pending()
+            .context("recover raw spool pending records")?;
+        let mut replayed = 0usize;
+        for recovered in pending {
+            let mut headers = HashMap::new();
+            headers.insert(
+                "content-type".to_string(),
+                recovered.record.content_type.clone(),
+            );
+            if let Some(encoding) = &recovered.record.content_encoding {
+                headers.insert("content-encoding".to_string(), encoding.clone());
+            }
+            metrics.inc(
+                "canardstack_raw_spool_replayed_records_total",
+                &[
+                    ("signal", recovered.record.signal.as_str()),
+                    ("status", "attempted"),
+                ],
+                1,
+            );
+            match self.ingest_replayed_raw_record(
+                recovered.id,
+                recovered.record.signal,
+                &headers,
+                &recovered.record.compressed_body,
+                storage,
+                metrics,
+            ) {
+                Ok(()) => {
+                    replayed += 1;
+                    metrics.inc(
+                        "canardstack_raw_spool_replayed_records_total",
+                        &[
+                            ("signal", recovered.record.signal.as_str()),
+                            ("status", "ok"),
+                        ],
+                        1,
+                    );
+                }
+                Err(err) => {
+                    metrics.inc(
+                        "canardstack_raw_spool_replayed_records_total",
+                        &[
+                            ("signal", recovered.record.signal.as_str()),
+                            ("status", "failed"),
+                        ],
+                        1,
+                    );
+                    return Err(err).context("replay raw spool record");
+                }
+            }
+        }
+        self.record_raw_spool_metrics(metrics);
+        Ok(replayed)
+    }
+
+    fn ingest_replayed_raw_record(
+        &self,
+        raw_spool_id: RawSpoolRecordId,
+        signal: Signal,
+        headers: &HashMap<String, String>,
+        compressed_body: &[u8],
+        storage: &Storage,
+        metrics: &Metrics,
+    ) -> Result<()> {
+        validation::validate_body_size(compressed_body.len(), &self.config)
+            .map_err(|err| anyhow::anyhow!(err.message.clone()))?;
+        validation::validate_content_type(headers)
+            .map_err(|err| anyhow::anyhow!(err.message.clone()))?;
+        if !storage.accepts_memory_ingest() || self.config.force_dependency_unhealthy {
+            anyhow::bail!("storage dependency is unhealthy");
+        }
+        let mut runtime_memory_reservation = self
+            .admit_runtime_memory(signal, headers, compressed_body.len(), metrics)
+            .map_err(|err| anyhow::anyhow!(err.message.clone()))?;
+        let body = otlp::decompress_if_needed(headers, compressed_body, self.config.max_body_bytes)
+            .map_err(|err| anyhow::anyhow!(err.message.clone()))?;
+        validation::validate_body_size(body.len(), &self.config)
+            .map_err(|err| anyhow::anyhow!(err.message.clone()))?;
+        #[cfg(feature = "otlp2records-observer")]
+        let transformed = otlp::transform_observed(signal, headers, &body, metrics)
+            .map_err(|err| anyhow::anyhow!(err.message.clone()))?;
+        #[cfg(not(feature = "otlp2records-observer"))]
+        let transformed = otlp::transform(signal, headers, &body)
+            .map_err(|err| anyhow::anyhow!(err.message.clone()))?;
+        self.validate_skew(&transformed)
+            .map_err(|err| anyhow::anyhow!(err.message.clone()))?;
+        let request_bytes = compressed_body.len();
+        let mut batches = queue::pending_batches(transformed);
+        let pending_bytes = batches.iter().map(|b| b.approx_bytes).sum::<usize>();
+        let peak_bytes = request_bytes
+            .saturating_add(body.len())
+            .saturating_add(pending_bytes);
+        runtime_memory_reservation
+            .reserve_at_least(peak_bytes, signal, metrics)
+            .map_err(|err| anyhow::anyhow!(err.message.clone()))?;
+        if batches.is_empty() {
+            self.checkpoint_raw_spool(raw_spool_id, signal, "replay_empty", Some(metrics))?;
+            return Ok(());
+        }
+        self.track_raw_spool_batches(raw_spool_id, signal, &mut batches);
+        self.enqueue(signal, batches, metrics).map_err(|err| {
+            self.untrack_raw_spool_record(raw_spool_id);
+            anyhow::anyhow!(err.message.clone())
+        })?;
+        Ok(())
+    }
+
+    fn track_raw_spool_batches(
+        &self,
+        id: RawSpoolRecordId,
+        signal: Signal,
+        batches: &mut [queue::PendingBatch],
+    ) {
+        if batches.is_empty() {
+            return;
+        }
+        for batch in batches.iter_mut() {
+            batch.raw_spool_id = Some(id);
+        }
+        self.raw_spool_flush_refs.lock_or_poisoned().insert(
+            id,
+            RawSpoolFlushRef {
+                signal,
+                remaining_batches: batches.len(),
+            },
+        );
+    }
+
+    fn untrack_raw_spool_record(&self, id: RawSpoolRecordId) {
+        self.raw_spool_flush_refs.lock_or_poisoned().remove(&id);
+    }
+
+    fn mark_raw_spool_batches_storage_committed(
+        &self,
+        sets: &[(queue::QueueKey, Vec<queue::QueuedBatch>)],
+        metrics: Option<&Metrics>,
+    ) -> Result<()> {
+        let mut committed_counts = BTreeMap::<RawSpoolRecordId, usize>::new();
+        for (_, batches) in sets {
+            for batch in batches {
+                if let Some(id) = batch.raw_spool_id {
+                    *committed_counts.entry(id).or_default() += 1;
+                }
+            }
+        }
+        if committed_counts.is_empty() {
+            return Ok(());
+        }
+
+        let mut ready_to_checkpoint = Vec::new();
+        {
+            let mut refs = self.raw_spool_flush_refs.lock_or_poisoned();
+            for (id, committed_batches) in committed_counts {
+                let Some(tracked) = refs.get_mut(&id) else {
+                    continue;
+                };
+                if committed_batches >= tracked.remaining_batches {
+                    ready_to_checkpoint.push((id, tracked.signal));
+                } else {
+                    tracked.remaining_batches -= committed_batches;
+                }
+            }
+        }
+
+        for (id, signal) in &ready_to_checkpoint {
+            self.checkpoint_raw_spool(*id, *signal, "storage_committed", metrics)?;
+        }
+        if !ready_to_checkpoint.is_empty() {
+            let mut refs = self.raw_spool_flush_refs.lock_or_poisoned();
+            for (id, _) in ready_to_checkpoint {
+                refs.remove(&id);
+            }
+        }
+        Ok(())
+    }
+
+    fn append_raw_spool(
+        &self,
+        signal: Signal,
+        headers: &HashMap<String, String>,
+        compressed_body: &[u8],
+        metrics: &Metrics,
+    ) -> ApiResult<RawSpoolRecordId> {
+        let content_type = headers.get("content-type").cloned().unwrap_or_default();
+        let content_encoding = headers.get("content-encoding").cloned();
+        let started = Instant::now();
+        let record = RawSpoolRecord::new(signal, content_type, content_encoding, compressed_body);
+        let result = self.raw_spool.append(record);
+        metrics.observe_phase_seconds(
+            signal.as_str(),
+            "raw_spool_append",
+            None,
+            started.elapsed().as_secs_f64(),
+        );
+        match result {
+            Ok(id) => {
+                metrics.inc(
+                    "canardstack_raw_spool_records_total",
+                    &[("signal", signal.as_str()), ("status", "spooled")],
+                    1,
+                );
+                metrics.inc(
+                    "canardstack_raw_spool_bytes_total",
+                    &[("signal", signal.as_str())],
+                    compressed_body.len() as u64,
+                );
+                Ok(id)
+            }
+            Err(err) => {
+                if raw_spool_full_info(&err).is_some() {
+                    metrics.inc(
+                        "canardstack_raw_spool_records_total",
+                        &[("signal", signal.as_str()), ("status", "full")],
+                        1,
+                    );
+                    Err(ApiError::new(
+                        429,
+                        "raw_spool_full",
+                        "raw ingest spool is full",
+                    ))
+                } else {
+                    metrics.inc(
+                        "canardstack_raw_spool_records_total",
+                        &[("signal", signal.as_str()), ("status", "error")],
+                        1,
+                    );
+                    Err(ApiError::new(
+                        503,
+                        "raw_spool_unavailable",
+                        "raw ingest spool is unavailable",
+                    )
+                    .with_retry_after(10))
+                }
+            }
+        }
+    }
+
+    fn checkpoint_raw_spool_terminal(
+        &self,
+        id: RawSpoolRecordId,
+        signal: Signal,
+        reason: &'static str,
+        metrics: &Metrics,
+    ) -> ApiResult<()> {
+        self.checkpoint_raw_spool(id, signal, reason, Some(metrics))
+            .map_err(|err| {
+                ApiError::new(
+                    503,
+                    "raw_spool_checkpoint_failed",
+                    format!("raw ingest spool checkpoint failed: {err}"),
+                )
+                .with_retry_after(10)
+            })
+    }
+
+    fn checkpoint_raw_spool(
+        &self,
+        id: RawSpoolRecordId,
+        signal: Signal,
+        reason: &'static str,
+        metrics: Option<&Metrics>,
+    ) -> Result<()> {
+        self.raw_spool
+            .mark_committed(id)
+            .context("checkpoint raw spool record")?;
+        if let Some(metrics) = metrics {
+            metrics.inc(
+                "canardstack_raw_spool_checkpointed_records_total",
+                &[("signal", signal.as_str()), ("reason", reason)],
+                1,
+            );
+        }
+        Ok(())
+    }
+
+    pub fn raw_spool_stats(&self) -> Result<spool::RawSpoolStats> {
+        self.raw_spool.stats()
+    }
+
+    pub fn record_raw_spool_metrics(&self, metrics: &Metrics) {
+        if let Ok(stats) = self.raw_spool.stats() {
+            metrics.gauge(
+                "canardstack_raw_spool_segment_bytes",
+                &[],
+                stats.segment_bytes as f64,
+            );
+            metrics.gauge(
+                "canardstack_raw_spool_segments",
+                &[],
+                stats.segment_count as f64,
+            );
+            metrics.gauge(
+                "canardstack_raw_spool_pending_records",
+                &[],
+                stats.pending_records as f64,
+            );
+            metrics.gauge(
+                "canardstack_raw_spool_pending_bytes",
+                &[],
+                stats.pending_bytes as f64,
+            );
+        }
     }
 
     fn admit_runtime_memory(
