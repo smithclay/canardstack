@@ -505,11 +505,28 @@ impl RawSpoolWriter {
     }
 
     pub fn mark_committed(&self, id: RawSpoolRecordId) -> Result<()> {
-        let (reply, rx) = mpsc::channel();
-        self.commands
-            .send(RawSpoolCommand::Checkpoint(CheckpointCommand { id, reply }))
-            .context("send raw spool checkpoint command")?;
-        rx.recv().context("receive raw spool checkpoint result")?
+        self.mark_committed_batch(&[id])
+    }
+
+    pub fn mark_committed_batch(&self, ids: &[RawSpoolRecordId]) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let mut replies = Vec::with_capacity(ids.len());
+        for id in ids {
+            let (reply, rx) = mpsc::channel();
+            self.commands
+                .send(RawSpoolCommand::Checkpoint(CheckpointCommand {
+                    id: *id,
+                    reply,
+                }))
+                .context("send raw spool checkpoint command")?;
+            replies.push(rx);
+        }
+        for rx in replies {
+            rx.recv().context("receive raw spool checkpoint result")??;
+        }
+        Ok(())
     }
 
     pub fn recover_pending(&self) -> Result<Vec<RecoveredRawSpoolRecord>> {
@@ -580,37 +597,68 @@ fn handle_append_batch(
     max_batch_delay: Duration,
 ) {
     let mut batch = vec![first];
-    collect_batch(
+    collect_append_batch(
         receiver,
         deferred,
         max_batch_records,
         max_batch_delay,
         &mut batch,
-        |command| match command {
-            RawSpoolCommand::Append(append) => Ok(append),
-            other => Err(other),
-        },
     );
+    let mut replies = Vec::with_capacity(batch.len());
     let records = batch
-        .iter()
-        .map(|command| command.record.clone())
+        .into_iter()
+        .map(|command| {
+            replies.push(command.reply);
+            command.record
+        })
         .collect::<Vec<_>>();
     match spool.append_batch(records) {
         Ok(ids) => {
-            for (command, id) in batch.into_iter().zip(ids) {
-                let _ = command.reply.send(Ok(id));
+            for (reply, id) in replies.into_iter().zip(ids) {
+                let _ = reply.send(Ok(id));
             }
         }
         Err(err) => {
             let message = err.to_string();
             let is_full = raw_spool_full_info(&err).copied();
-            for command in batch {
-                let reply = match is_full {
+            for reply in replies {
+                let result = match is_full {
                     Some(full) => Err(anyhow::Error::new(full)),
                     None => Err(anyhow::anyhow!(message.clone())),
                 };
-                let _ = command.reply.send(reply);
+                let _ = reply.send(result);
             }
+        }
+    }
+}
+
+fn collect_append_batch(
+    receiver: &Receiver<RawSpoolCommand>,
+    deferred: &mut VecDeque<RawSpoolCommand>,
+    max_batch_records: usize,
+    max_batch_delay: Duration,
+    batch: &mut Vec<AppendCommand>,
+) {
+    let deadline = Instant::now() + max_batch_delay;
+    while batch.len() < max_batch_records {
+        let command = if max_batch_delay.is_zero() {
+            match receiver.try_recv() {
+                Ok(command) => command,
+                Err(_) => break,
+            }
+        } else {
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            match receiver.recv_timeout(deadline - now) {
+                Ok(command) => command,
+                Err(_) => break,
+            }
+        };
+        match command {
+            RawSpoolCommand::Append(append) => batch.push(append),
+            other => deferred.push_back(other),
         }
     }
 }
@@ -1166,6 +1214,42 @@ mod tests {
 
         assert_eq!(batch.len(), 2);
         assert!(deferred.is_empty());
+    }
+
+    #[test]
+    fn raw_spool_append_batch_defers_checkpoint_and_keeps_collecting_appends() {
+        let (reply, _reply_rx) = mpsc::channel();
+        let first = AppendCommand {
+            record: record(b"first"),
+            reply,
+        };
+        let (tx, rx) = mpsc::sync_channel(4);
+        let (checkpoint_reply, _checkpoint_rx) = mpsc::channel();
+        tx.send(RawSpoolCommand::Checkpoint(CheckpointCommand {
+            id: RawSpoolRecordId {
+                segment: 1,
+                sequence: 1,
+            },
+            reply: checkpoint_reply,
+        }))
+        .unwrap();
+        let (reply, _reply_rx) = mpsc::channel();
+        tx.send(RawSpoolCommand::Append(AppendCommand {
+            record: record(b"second"),
+            reply,
+        }))
+        .unwrap();
+
+        let mut deferred = VecDeque::new();
+        let mut batch = vec![first];
+        collect_append_batch(&rx, &mut deferred, 2, Duration::from_secs(5), &mut batch);
+
+        assert_eq!(batch.len(), 2);
+        assert_eq!(deferred.len(), 1);
+        assert!(matches!(
+            deferred.front(),
+            Some(RawSpoolCommand::Checkpoint(_))
+        ));
     }
 
     #[test]

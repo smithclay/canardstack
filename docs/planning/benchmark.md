@@ -94,6 +94,7 @@ CANARDSTACK_RAW_SPOOL_GATE_WARMUP=10s
 CANARDSTACK_RAW_SPOOL_GATE_DURATION=60s
 CANARDSTACK_RAW_SPOOL_GATE_TARGET_GB_DAY=500
 CANARDSTACK_RAW_SPOOL_GATE_TRACE_TARGET_GB_DAY=500
+CANARDSTACK_RAW_SPOOL_GATE_FRESHNESS_SLA=15s
 CANARDSTACK_RAW_SPOOL_GATE_BACKLOG_RECORDS=10000
 CANARDSTACK_RAW_SPOOL_GATE_BACKLOG_BYTES=134217728
 CANARDSTACK_RAW_SPOOL_GATE_MAX_RUNTIME=3m
@@ -130,7 +131,7 @@ Common options:
 - `--ingest-concurrency 16`
 - `--connection-mode close|persistent`
 - `--timestamp-mode fixed|advancing`
-- `--freshness-sla 5s`
+- `--freshness-sla 15s`
 - `--report-dir /private/tmp/canardstack-bench`
 
 Signal-specific mixed-query pressure maps to the current compatibility surface:
@@ -218,6 +219,10 @@ Every future benchmark entry should record:
 - ingest/query latency p50/p95/p99
 - freshness lag
 - status counts and transport errors
+
+Use `15s` as the quick validation freshness SLA and `30s` as the sustained
+multi-hour freshness SLA. Treat a clearly increasing freshness trend as a
+failure even when the maximum stays under the configured SLA.
 
 Do not treat compile success, shadow measurements, or accepted throughput alone
 as architecture proof. The current architecture proof requires replay,

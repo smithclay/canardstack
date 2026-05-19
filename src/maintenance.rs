@@ -1,6 +1,6 @@
 use crate::app::AppState;
 use crate::config::Config;
-use crate::ingest::Ingestor;
+use crate::ingest::{IngestSnapshot, Ingestor};
 use crate::metrics::Metrics;
 use crate::storage::{ArrowBatchInsertTiming, ImmutableFlushOutcome, RetentionPolicy, Storage};
 use crate::LockExt;
@@ -11,6 +11,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+
+const SCHEDULER_METADATA_REFRESH_BUCKET_LIMIT: usize = 1;
+const METADATA_REFRESH_QUEUE_PRESSURE_YIELD: f64 = 0.70;
 
 #[derive(Clone, Debug)]
 struct FailureRecord {
@@ -371,7 +374,17 @@ fn scheduler_loop(state: Arc<AppState>, stop: Arc<AtomicBool>) {
                 if s.maintenance.is_paused() {
                     return Ok(json!({"status": "paused"}));
                 }
-                let buckets = s.storage.refresh_metadata()?;
+                let snapshots = s.ingestor.snapshots();
+                if metadata_refresh_should_yield_to_ingest(&snapshots) {
+                    return Ok(json!({
+                        "status": "skipped",
+                        "reason": "ingest_pressure",
+                        "max_queue_pressure": max_queue_pressure(&snapshots)
+                    }));
+                }
+                let buckets = s
+                    .storage
+                    .refresh_metadata_limited(SCHEDULER_METADATA_REFRESH_BUCKET_LIMIT)?;
                 Ok(json!({"status": "ok", "buckets": buckets}))
             });
             next_metadata = now + next_interval(&state, "metadata_refresh", metadata_every, ok);
@@ -469,6 +482,17 @@ fn next_interval(state: &AppState, job: &str, base: Duration, ok: bool) -> Durat
     backoff.min(Duration::from_secs(300)).max(base)
 }
 
+fn metadata_refresh_should_yield_to_ingest(snapshots: &[IngestSnapshot]) -> bool {
+    max_queue_pressure(snapshots) >= METADATA_REFRESH_QUEUE_PRESSURE_YIELD
+}
+
+fn max_queue_pressure(snapshots: &[IngestSnapshot]) -> f64 {
+    snapshots
+        .iter()
+        .map(|snapshot| snapshot.pressure)
+        .fold(0.0, f64::max)
+}
+
 /// Bounded `reason` label. Most reasons derive from `job` (a static str we
 /// control); only `disk_full` substring-matches OS/DuckDB messages.
 fn classify_job_error(err: &anyhow::Error, job: &str) -> &'static str {
@@ -483,5 +507,36 @@ fn classify_job_error(err: &anyhow::Error, job: &str) -> &'static str {
         "compaction" => "compaction_failed",
         "retention" | "retention_dry_run" => "retention_failed",
         _ => "scheduler_job_failed",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn snapshot(signal: &'static str, pressure: f64) -> IngestSnapshot {
+        IngestSnapshot {
+            signal,
+            queued_rows: 0,
+            queued_bytes: 0,
+            oldest_age_seconds: 0.0,
+            pressure,
+        }
+    }
+
+    #[test]
+    fn metadata_refresh_yields_to_high_queue_pressure() {
+        assert!(metadata_refresh_should_yield_to_ingest(&[
+            snapshot("logs", 0.10),
+            snapshot("spans", METADATA_REFRESH_QUEUE_PRESSURE_YIELD),
+        ]));
+    }
+
+    #[test]
+    fn metadata_refresh_runs_when_queues_are_below_pressure_threshold() {
+        assert!(!metadata_refresh_should_yield_to_ingest(&[
+            snapshot("logs", 0.69),
+            snapshot("spans", 0.10),
+        ]));
     }
 }

@@ -3,10 +3,7 @@ use super::{Ingestor, Signal};
 use crate::metrics::Metrics;
 use crate::storage::{ArrowBatchInsert, Storage};
 use crate::LockExt;
-use anyhow::Context;
-use arrow58::compute::concat_batches;
-use arrow58::record_batch::RecordBatch;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::time::Instant;
 
 /// Flush failed mid-batch. `committed_rows` were accepted by the catalog
@@ -136,35 +133,24 @@ impl Ingestor {
         storage: &Storage,
         metrics: Option<&Metrics>,
     ) -> anyhow::Result<HashMap<Signal, usize>> {
-        let mut flushed = HashMap::new();
-        let mut metric_partitions = HashSet::new();
+        let mut sets = Vec::new();
+        let mut metric_partitions = Vec::new();
         for key in due {
             if key.signal.is_metric() {
-                metric_partitions.insert(key.partition);
+                if !metric_partitions.contains(&key.partition) {
+                    metric_partitions.push(key.partition);
+                }
                 continue;
             }
-            let rows = self.flush_key_observed(key, storage, metrics)?;
-            *flushed.entry(key.signal).or_default() += rows;
+            sets.push((key, self.drain_flush_batches(key)));
         }
         for partition in metric_partitions {
             for signal in [Signal::MetricGauge, Signal::MetricSum] {
                 let key = QueueKey { signal, partition };
-                let rows = self.flush_key_observed(key, storage, metrics)?;
-                *flushed.entry(signal).or_default() += rows;
+                sets.push((key, self.drain_flush_batches(key)));
             }
         }
-        Ok(flushed)
-    }
-
-    fn flush_key_observed(
-        &self,
-        key: QueueKey,
-        storage: &Storage,
-        metrics: Option<&Metrics>,
-    ) -> anyhow::Result<usize> {
-        let batches = self.drain_flush_batches(key);
-        self.insert_drained_batches_observed(vec![(key, batches)], storage, metrics)
-            .map(|rows| rows.get(&key.signal).copied().unwrap_or(0))
+        self.insert_drained_batches_observed(sets, storage, metrics)
     }
 
     fn insert_drained_batches_observed(
@@ -173,16 +159,7 @@ impl Ingestor {
         storage: &Storage,
         metrics: Option<&Metrics>,
     ) -> anyhow::Result<HashMap<Signal, usize>> {
-        let coalesced = coalesce_drained_batches(&sets)?;
-        let inserts: Vec<_> = coalesced
-            .iter()
-            .map(|batch| ArrowBatchInsert {
-                table: batch.table,
-                batch: &batch.batch,
-                source_format: batch.source_format,
-            })
-            .collect();
-        if inserts.is_empty() {
+        if sets.iter().all(|(_, batches)| batches.is_empty()) {
             return Ok(HashMap::new());
         }
         if let Some(metrics) = metrics {
@@ -226,49 +203,72 @@ impl Ingestor {
             }
         }
         if let Some(metrics) = metrics {
-            for batch in &coalesced {
-                metrics.inc(
-                    "canardstack_ingest_flush_coalesced_batches_total",
-                    &[("signal", batch.table.as_str())],
-                    1,
-                );
-                metrics.inc(
-                    "canardstack_ingest_flush_coalesced_rows_total",
-                    &[("signal", batch.table.as_str())],
-                    batch.batch.num_rows() as u64,
-                );
-                metrics.inc(
-                    "canardstack_ingest_flush_coalesced_bytes_total",
-                    &[("signal", batch.table.as_str())],
-                    batch.batch.get_array_memory_size() as u64,
-                );
+            for (key, batches) in &sets {
+                for batch in batches {
+                    if batch.len() == 0 {
+                        continue;
+                    }
+                    metrics.inc(
+                        "canardstack_ingest_flush_coalesced_batches_total",
+                        &[("signal", key.signal.as_str())],
+                        1,
+                    );
+                    metrics.inc(
+                        "canardstack_ingest_flush_coalesced_rows_total",
+                        &[("signal", key.signal.as_str())],
+                        batch.batch.num_rows() as u64,
+                    );
+                    metrics.inc(
+                        "canardstack_ingest_flush_coalesced_bytes_total",
+                        &[("signal", key.signal.as_str())],
+                        batch.batch.get_array_memory_size() as u64,
+                    );
+                }
             }
         }
-        let insert_result = storage.insert_arrow_batches(&inserts);
-        drop(inserts);
+        let insert_result = {
+            let inserts =
+                sets.iter()
+                    .flat_map(|(key, batches)| {
+                        batches.iter().filter(|batch| batch.len() > 0).map(|batch| {
+                            ArrowBatchInsert {
+                                table: key.signal,
+                                batch: &batch.batch,
+                                source_format: batch.source_format,
+                            }
+                        })
+                    })
+                    .collect::<Vec<_>>();
+            storage.insert_arrow_batches(&inserts)
+        };
         match insert_result {
             Ok(result) => {
                 let mut rows = HashMap::new();
-                for batch in &coalesced {
-                    let batch_rows = batch.batch.num_rows();
-                    *rows.entry(batch.table).or_default() += batch_rows;
-                    if let Some(metrics) = metrics {
-                        let batch_bytes = batch.batch.get_array_memory_size();
-                        metrics.inc(
-                            "canardstack_ingest_flush_rows_total",
-                            &[("signal", batch.table.as_str())],
-                            batch_rows as u64,
-                        );
-                        metrics.inc(
-                            "canardstack_ingest_flush_buffered_rows_total",
-                            &[("signal", batch.table.as_str())],
-                            batch_rows as u64,
-                        );
-                        metrics.inc(
-                            "canardstack_ingest_flush_buffered_bytes_total",
-                            &[("signal", batch.table.as_str())],
-                            batch_bytes as u64,
-                        );
+                for (key, batches) in &sets {
+                    for batch in batches {
+                        let batch_rows = batch.batch.num_rows();
+                        if batch_rows == 0 {
+                            continue;
+                        }
+                        *rows.entry(key.signal).or_default() += batch_rows;
+                        if let Some(metrics) = metrics {
+                            let batch_bytes = batch.batch.get_array_memory_size();
+                            metrics.inc(
+                                "canardstack_ingest_flush_rows_total",
+                                &[("signal", key.signal.as_str())],
+                                batch_rows as u64,
+                            );
+                            metrics.inc(
+                                "canardstack_ingest_flush_buffered_rows_total",
+                                &[("signal", key.signal.as_str())],
+                                batch_rows as u64,
+                            );
+                            metrics.inc(
+                                "canardstack_ingest_flush_buffered_bytes_total",
+                                &[("signal", key.signal.as_str())],
+                                batch_bytes as u64,
+                            );
+                        }
                     }
                 }
                 for timing in result.timings {
@@ -358,40 +358,6 @@ impl Ingestor {
         let mut queues = self.queues.lock_or_poisoned();
         queue::restore_batches(&mut queues, key, batches);
     }
-}
-
-struct CoalescedInsert {
-    table: Signal,
-    batch: RecordBatch,
-    source_format: &'static str,
-}
-
-fn coalesce_drained_batches(
-    sets: &[(QueueKey, Vec<QueuedBatch>)],
-) -> anyhow::Result<Vec<CoalescedInsert>> {
-    let mut inserts = Vec::new();
-    for (key, batches) in sets {
-        match batches.as_slice() {
-            [] => {}
-            [batch] => inserts.push(CoalescedInsert {
-                table: key.signal,
-                batch: batch.batch.clone(),
-                source_format: batch.source_format,
-            }),
-            batches => {
-                let schema = batches[0].batch.schema();
-                let refs: Vec<_> = batches.iter().map(|batch| &batch.batch).collect();
-                let batch = concat_batches(&schema, refs)
-                    .with_context(|| format!("coalesce drained {} batches", key.signal))?;
-                inserts.push(CoalescedInsert {
-                    table: key.signal,
-                    batch,
-                    source_format: batches[0].source_format,
-                });
-            }
-        }
-    }
-    Ok(inserts)
 }
 
 fn flush_failure_reason(err: &anyhow::Error) -> &'static str {

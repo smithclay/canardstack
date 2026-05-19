@@ -473,9 +473,7 @@ impl Ingestor {
             }
         }
 
-        for (id, signal) in &ready_to_checkpoint {
-            self.checkpoint_raw_spool(*id, *signal, "storage_committed", metrics)?;
-        }
+        self.checkpoint_raw_spool_batch(&ready_to_checkpoint, "storage_committed", metrics)?;
         if !ready_to_checkpoint.is_empty() {
             let mut refs = self.raw_spool_flush_refs.lock_or_poisoned();
             for (id, _) in ready_to_checkpoint {
@@ -571,15 +569,58 @@ impl Ingestor {
         reason: &'static str,
         metrics: Option<&Metrics>,
     ) -> Result<()> {
+        let started = Instant::now();
         self.raw_spool
             .mark_committed(id)
             .context("checkpoint raw spool record")?;
         if let Some(metrics) = metrics {
+            metrics.observe_phase_seconds(
+                signal.as_str(),
+                "raw_spool_checkpoint",
+                None,
+                started.elapsed().as_secs_f64(),
+            );
             metrics.inc(
                 "canardstack_raw_spool_checkpointed_records_total",
                 &[("signal", signal.as_str()), ("reason", reason)],
                 1,
             );
+        }
+        Ok(())
+    }
+
+    fn checkpoint_raw_spool_batch(
+        &self,
+        records: &[(RawSpoolRecordId, Signal)],
+        reason: &'static str,
+        metrics: Option<&Metrics>,
+    ) -> Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        let ids = records.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+        let started = Instant::now();
+        self.raw_spool
+            .mark_committed_batch(&ids)
+            .context("checkpoint raw spool records")?;
+        if let Some(metrics) = metrics {
+            metrics.observe_phase_seconds(
+                "all",
+                "raw_spool_checkpoint",
+                None,
+                started.elapsed().as_secs_f64(),
+            );
+            let mut by_signal = BTreeMap::<Signal, u64>::new();
+            for (_, signal) in records {
+                *by_signal.entry(*signal).or_default() += 1;
+            }
+            for (signal, count) in by_signal {
+                metrics.inc(
+                    "canardstack_raw_spool_checkpointed_records_total",
+                    &[("signal", signal.as_str()), ("reason", reason)],
+                    count,
+                );
+            }
         }
         Ok(())
     }

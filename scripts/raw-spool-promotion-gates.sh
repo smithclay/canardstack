@@ -11,6 +11,7 @@ BENCH_WARMUP="${CANARDSTACK_RAW_SPOOL_GATE_WARMUP:-10s}"
 BENCH_DURATION="${CANARDSTACK_RAW_SPOOL_GATE_DURATION:-60s}"
 BENCH_TARGET_GB_DAY="${CANARDSTACK_RAW_SPOOL_GATE_TARGET_GB_DAY:-500}"
 TRACE_BENCH_TARGET_GB_DAY="${CANARDSTACK_RAW_SPOOL_GATE_TRACE_TARGET_GB_DAY:-${BENCH_TARGET_GB_DAY}}"
+BENCH_FRESHNESS_SLA="${CANARDSTACK_RAW_SPOOL_GATE_FRESHNESS_SLA:-15s}"
 BENCH_MAX_RUNTIME="${CANARDSTACK_RAW_SPOOL_GATE_MAX_RUNTIME:-3m}"
 BACKLOG_RECORDS_TARGET="${CANARDSTACK_RAW_SPOOL_GATE_BACKLOG_RECORDS:-10000}"
 BACKLOG_BYTES_TARGET="${CANARDSTACK_RAW_SPOOL_GATE_BACKLOG_BYTES:-134217728}"
@@ -259,7 +260,7 @@ CANARDSTACK_API_KEY="${API_KEY}" \
     --trace-attribute-bytes 256 \
     --metric-description-bytes 64 \
     --timestamp-mode advancing \
-    --freshness-sla 5s \
+    --freshness-sla "${BENCH_FRESHNESS_SLA}" \
     --progress-interval 15s \
     --max-runtime "${BENCH_MAX_RUNTIME}" \
     --server-pid "${SERVER_PID}" \
@@ -294,7 +295,7 @@ CANARDSTACK_API_KEY="${API_KEY}" \
     --items-per-batch 256 \
     --trace-attribute-bytes 256 \
     --timestamp-mode advancing \
-    --freshness-sla 5s \
+    --freshness-sla "${BENCH_FRESHNESS_SLA}" \
     --progress-interval 15s \
     --max-runtime "${BENCH_MAX_RUNTIME}" \
     --server-pid "${SERVER_PID}" \
