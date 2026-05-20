@@ -387,7 +387,9 @@ pub fn route(
                 "raw_spool_config": {
                     "writer_queue_capacity": state.config.raw_spool_writer_queue_capacity,
                     "group_commit_records": state.config.raw_spool_group_commit_records,
-                    "group_commit_ms": state.config.raw_spool_group_commit_delay.as_millis()
+                    "group_commit_ms": state.config.raw_spool_group_commit_delay.as_millis(),
+                    "checkpoint_fsync_records": state.config.raw_spool_checkpoint_fsync_records,
+                    "checkpoint_fsync_ms": state.config.raw_spool_checkpoint_fsync_delay.as_millis()
                 }
             }))
         }),

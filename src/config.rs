@@ -61,6 +61,8 @@ pub struct Config {
     pub raw_spool_writer_queue_capacity: usize,
     pub raw_spool_group_commit_records: usize,
     pub raw_spool_group_commit_delay: Duration,
+    pub raw_spool_checkpoint_fsync_records: usize,
+    pub raw_spool_checkpoint_fsync_delay: Duration,
 }
 
 const DEFAULT_CONFIG_PATH: &str = "config.toml";
@@ -275,6 +277,16 @@ impl Config {
                     .or(file.usize(&["raw_spool", "group_commit_ms"])?)
                     .unwrap_or(1) as u64,
             ),
+            raw_spool_checkpoint_fsync_records: env_usize(
+                "CANARDSTACK_RAW_SPOOL_CHECKPOINT_FSYNC_RECORDS",
+            )?
+            .or(file.usize(&["raw_spool", "checkpoint_fsync_records"])?)
+            .unwrap_or(1024),
+            raw_spool_checkpoint_fsync_delay: Duration::from_millis(
+                env_usize("CANARDSTACK_RAW_SPOOL_CHECKPOINT_FSYNC_MS")?
+                    .or(file.usize(&["raw_spool", "checkpoint_fsync_ms"])?)
+                    .unwrap_or(1000) as u64,
+            ),
         })
     }
 
@@ -338,6 +350,8 @@ impl Config {
             raw_spool_writer_queue_capacity: 1024,
             raw_spool_group_commit_records: 64,
             raw_spool_group_commit_delay: Duration::from_millis(1),
+            raw_spool_checkpoint_fsync_records: 1024,
+            raw_spool_checkpoint_fsync_delay: Duration::from_millis(1000),
         }
     }
 
@@ -413,11 +427,15 @@ impl Config {
             || self.raw_spool_max_total_bytes == 0
             || self.raw_spool_writer_queue_capacity == 0
             || self.raw_spool_group_commit_records == 0
+            || self.raw_spool_checkpoint_fsync_records == 0
         {
             anyhow::bail!("raw spool limits must be > 0");
         }
         if self.raw_spool_group_commit_delay.is_zero() {
             anyhow::bail!("CANARDSTACK_RAW_SPOOL_GROUP_COMMIT_MS must be > 0");
+        }
+        if self.raw_spool_checkpoint_fsync_delay.is_zero() {
+            anyhow::bail!("CANARDSTACK_RAW_SPOOL_CHECKPOINT_FSYNC_MS must be > 0");
         }
         if self.raw_spool_max_record_bytes > self.raw_spool_max_total_bytes {
             anyhow::bail!(
@@ -800,6 +818,8 @@ max_total_bytes = 16384
 writer_queue_capacity = 16
 group_commit_records = 8
 group_commit_ms = 3
+checkpoint_fsync_records = 256
+checkpoint_fsync_ms = 750
 
 [bench]
 http_keepalive = true
@@ -836,6 +856,11 @@ http_keepalive = true
         assert_eq!(
             config.raw_spool_group_commit_delay,
             Duration::from_millis(3)
+        );
+        assert_eq!(config.raw_spool_checkpoint_fsync_records, 256);
+        assert_eq!(
+            config.raw_spool_checkpoint_fsync_delay,
+            Duration::from_millis(750)
         );
         assert!(config.bench_http_keepalive);
     }

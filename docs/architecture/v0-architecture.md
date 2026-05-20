@@ -98,23 +98,30 @@ Recovery sequence:
 
 ```text
 open segment -> append record on raw-spool writer
-  -> fsync when group-commit count or delay is reached -> return 202
+  -> fsync append batch when group-commit count or delay is reached -> return 202
   -> transform/enqueue -> DuckLake storage commit
-  -> checkpoint raw-spool record -> segment reclaimable
+  -> checkpoint raw-spool record -> delayed checkpoint fsync -> segment reclaimable
 ```
 
 Startup replays uncheckpointed fsynced records before scheduler work starts.
 Replay enters the same decode, transform, queue, flush, and DuckLake commit path
 as normal ingest.
 
-The raw-spool writer is on the ingest acknowledgement path. It batches appends
-and checkpoints up to `CANARDSTACK_RAW_SPOOL_GROUP_COMMIT_RECORDS` records, or
-until `CANARDSTACK_RAW_SPOOL_GROUP_COMMIT_MS` elapses from the first record in
-the group. These are capacity knobs, not cosmetic settings: too small and
-storage spends the ingest budget on fsyncs; too large and `202` acknowledgement
-latency rises even when downstream queues are healthy. `0ms` is rejected at
-startup so operators do not accidentally disable batching and return to
-per-request fsync behavior.
+The raw-spool writer is on the ingest acknowledgement path. It batches appends up
+to `CANARDSTACK_RAW_SPOOL_GROUP_COMMIT_RECORDS` records, or until
+`CANARDSTACK_RAW_SPOOL_GROUP_COMMIT_MS` elapses from the first record in the
+group. These are capacity knobs, not cosmetic settings: too small and storage
+spends the ingest budget on fsyncs; too large and `202` acknowledgement latency
+rises even when downstream queues are healthy. `0ms` is rejected at startup so
+operators do not accidentally disable batching and return to per-request fsync
+behavior.
+
+Checkpoint durability is intentionally weaker than append durability. A lost
+append would violate the `202` contract, but a lost checkpoint only causes
+duplicate replay of data already accepted into storage. Checkpoint log writes
+therefore acknowledge after the local write and fsync on the looser
+`CANARDSTACK_RAW_SPOOL_CHECKPOINT_FSYNC_RECORDS` /
+`CANARDSTACK_RAW_SPOOL_CHECKPOINT_FSYNC_MS` thresholds, plus writer shutdown.
 
 Main knobs:
 
@@ -125,6 +132,8 @@ Main knobs:
 - `CANARDSTACK_RAW_SPOOL_WRITER_QUEUE_CAPACITY`
 - `CANARDSTACK_RAW_SPOOL_GROUP_COMMIT_RECORDS`
 - `CANARDSTACK_RAW_SPOOL_GROUP_COMMIT_MS`
+- `CANARDSTACK_RAW_SPOOL_CHECKPOINT_FSYNC_RECORDS`
+- `CANARDSTACK_RAW_SPOOL_CHECKPOINT_FSYNC_MS`
 
 ## Queues And Flush
 

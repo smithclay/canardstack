@@ -916,6 +916,8 @@ fn raw_spool_replays_pending_request_on_startup() {
             max_segment_bytes: config.raw_spool_max_segment_bytes as u64,
             max_record_bytes: config.raw_spool_max_record_bytes as u64,
             max_total_bytes: config.raw_spool_max_total_bytes as u64,
+            checkpoint_fsync_records: config.raw_spool_checkpoint_fsync_records,
+            checkpoint_fsync_delay: config.raw_spool_checkpoint_fsync_delay,
         })
         .unwrap();
         spool
@@ -2959,13 +2961,15 @@ fn config_validate_rejects_invalid_raw_spool_limits() {
         "baseline test config must validate"
     );
 
-    let mutations: [fn(&mut Config); 7] = [
+    let mutations: [fn(&mut Config); 9] = [
         |c| c.raw_spool_max_segment_bytes = 0,
         |c| c.raw_spool_max_record_bytes = 0,
         |c| c.raw_spool_max_total_bytes = 0,
         |c| c.raw_spool_writer_queue_capacity = 0,
         |c| c.raw_spool_group_commit_records = 0,
         |c| c.raw_spool_group_commit_delay = std::time::Duration::ZERO,
+        |c| c.raw_spool_checkpoint_fsync_records = 0,
+        |c| c.raw_spool_checkpoint_fsync_delay = std::time::Duration::ZERO,
         |c| c.raw_spool_max_record_bytes = c.raw_spool_max_total_bytes + 1,
     ];
     for mutate in mutations {

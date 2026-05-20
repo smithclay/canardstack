@@ -32,6 +32,12 @@ Do not label metrics by `service_name`, trace id, query text, API key, or arbitr
 | `canardstack_ingest_request_bytes_total` | Counter | `signal`, `encoding` | Compressed request bytes accepted. |
 | `canardstack_raw_spool_records_total` | Counter | `signal`, `status` | Raw request spool outcomes: `spooled`, `full`, or `error`. `spooled` is the durable accepted-request boundary. |
 | `canardstack_raw_spool_bytes_total` | Counter | `signal` | Compressed raw request bytes fsynced into the local spool. |
+| `canardstack_raw_spool_append_batches_total` | Counter | none | Raw-spool append batches fsynced by the writer. |
+| `canardstack_raw_spool_append_batch_records_total` | Counter | none | Raw-spool records included in append batches. |
+| `canardstack_raw_spool_append_batch_encoded_bytes_total` | Counter | none | Encoded raw-spool bytes included in append batches. |
+| `canardstack_raw_spool_append_batch_fsyncs_total` | Counter | none | Raw-spool append fsync calls, including pre-rotate syncs. |
+| `canardstack_raw_spool_append_batch_records` | Gauge | `stat` | Last and max records per raw-spool append batch. |
+| `canardstack_raw_spool_append_batch_encoded_bytes` | Gauge | `stat` | Last and max encoded bytes per raw-spool append batch. |
 | `canardstack_raw_spool_replayed_records_total` | Counter | `signal`, `status` | Startup replay attempts and outcomes for uncheckpointed raw-spool records. |
 | `canardstack_raw_spool_checkpointed_records_total` | Counter | `signal`, `reason` | Raw-spool records made reclaimable after terminal rejection or DuckLake storage commit. |
 | `canardstack_raw_spool_pending_records` | Gauge | none | Uncheckpointed raw-spool records currently pending replay or storage commit. |
@@ -85,6 +91,12 @@ backward-compatible benchmark parsing.
 active raw-spool group-commit settings. Operators can diagnose replay backlog
 and distinguish queue pressure from fsync/acknowledgement-latency tuning without
 arbitrary SQL.
+
+The shared phase metric `canardstack_phase_duration_seconds` splits
+request-visible `raw_spool_append` latency from raw-spool writer internals:
+`raw_spool_append_batch_wait` is time spent collecting a group-commit batch,
+`raw_spool_append_write` is file write time, and `raw_spool_append_fsync` is
+append durability sync time.
 
 ## Query Metrics
 

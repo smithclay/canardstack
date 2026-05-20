@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -36,12 +36,35 @@ pub struct RecoveredRawSpoolRecord {
     pub record: RawSpoolRecord,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct RawSpoolAppendBatchStats {
+    pub records: usize,
+    pub encoded_bytes: u64,
+    pub wait_seconds: f64,
+    pub write_seconds: f64,
+    pub fsync_seconds: f64,
+    pub fsync_count: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct RawSpoolAppendAck {
+    pub id: RawSpoolRecordId,
+    pub batch_stats: Option<RawSpoolAppendBatchStats>,
+}
+
+pub struct RawSpoolAppendBatch {
+    pub ids: Vec<RawSpoolRecordId>,
+    pub stats: RawSpoolAppendBatchStats,
+}
+
 #[derive(Clone, Debug)]
 pub struct RawSpoolOptions {
     pub dir: PathBuf,
     pub max_segment_bytes: u64,
     pub max_record_bytes: u64,
     pub max_total_bytes: u64,
+    pub checkpoint_fsync_records: usize,
+    pub checkpoint_fsync_delay: Duration,
 }
 
 impl RawSpoolOptions {
@@ -51,6 +74,8 @@ impl RawSpoolOptions {
             max_segment_bytes: DEFAULT_MAX_SEGMENT_BYTES,
             max_record_bytes: DEFAULT_MAX_RECORD_BYTES,
             max_total_bytes: 1024 * 1024 * 1024,
+            checkpoint_fsync_records: 1024,
+            checkpoint_fsync_delay: Duration::from_millis(1000),
         }
     }
 }
@@ -102,6 +127,10 @@ pub struct RawSpool {
     active_segment: u64,
     active: File,
     checkpoint: File,
+    checkpoint_fsync_records: usize,
+    checkpoint_fsync_delay: Duration,
+    checkpoint_dirty_records: usize,
+    checkpoint_last_sync: Instant,
     next_sequence: u64,
 }
 
@@ -110,6 +139,8 @@ impl RawSpool {
         let max_segment_bytes = options.max_segment_bytes.max(RECORD_HEADER_BYTES + 1);
         let max_record_bytes = options.max_record_bytes.max(1);
         let max_total_bytes = options.max_total_bytes.max(1);
+        let checkpoint_fsync_records = options.checkpoint_fsync_records.max(1);
+        let checkpoint_fsync_delay = options.checkpoint_fsync_delay.max(Duration::from_millis(1));
         fs::create_dir_all(&options.dir)
             .with_context(|| format!("create raw spool dir {}", options.dir.display()))?;
         sync_dir(&options.dir)?;
@@ -203,17 +234,37 @@ impl RawSpool {
             active_segment,
             active,
             checkpoint,
+            checkpoint_fsync_records,
+            checkpoint_fsync_delay,
+            checkpoint_dirty_records: 0,
+            checkpoint_last_sync: Instant::now(),
             next_sequence: max_sequence.saturating_add(1).max(1),
         })
     }
 
     pub fn append(&mut self, record: RawSpoolRecord) -> Result<RawSpoolRecordId> {
-        self.append_batch(vec![record]).map(|mut ids| ids.remove(0))
+        self.append_batch(vec![record]).map(|batch| {
+            batch
+                .ids
+                .into_iter()
+                .next()
+                .expect("single append returns id")
+        })
     }
 
-    pub fn append_batch(&mut self, records: Vec<RawSpoolRecord>) -> Result<Vec<RawSpoolRecordId>> {
+    pub fn append_batch(&mut self, records: Vec<RawSpoolRecord>) -> Result<RawSpoolAppendBatch> {
         if records.is_empty() {
-            return Ok(Vec::new());
+            return Ok(RawSpoolAppendBatch {
+                ids: Vec::new(),
+                stats: RawSpoolAppendBatchStats {
+                    records: 0,
+                    encoded_bytes: 0,
+                    wait_seconds: 0.0,
+                    write_seconds: 0.0,
+                    fsync_seconds: 0.0,
+                    fsync_count: 0,
+                },
+            });
         }
         let mut encoded = Vec::with_capacity(records.len());
         let mut encoded_bytes = 0u64;
@@ -250,6 +301,9 @@ impl RawSpool {
 
         let mut ids = Vec::with_capacity(encoded.len());
         let mut active_dirty = false;
+        let mut write_seconds = 0.0;
+        let mut fsync_seconds = 0.0;
+        let mut fsync_count = 0u64;
         for (sequence, bytes, body_len) in encoded {
             let active_bytes = self
                 .segments
@@ -259,9 +313,12 @@ impl RawSpool {
                 && active_bytes.saturating_add(bytes.len() as u64) > self.max_segment_bytes
             {
                 if active_dirty {
+                    let started = Instant::now();
                     self.active
                         .sync_data()
                         .context("fsync raw spool record batch before rotate")?;
+                    fsync_seconds += started.elapsed().as_secs_f64();
+                    fsync_count += 1;
                 }
                 self.rotate()?;
             }
@@ -269,9 +326,11 @@ impl RawSpool {
                 segment: self.active_segment,
                 sequence,
             };
+            let started = Instant::now();
             self.active
                 .write_all(&bytes)
                 .context("append raw spool record")?;
+            write_seconds += started.elapsed().as_secs_f64();
             let written = bytes.len() as u64;
             let state = self
                 .segments
@@ -291,11 +350,24 @@ impl RawSpool {
             ids.push(id);
         }
         if active_dirty {
+            let started = Instant::now();
             self.active
                 .sync_data()
                 .context("fsync raw spool record batch")?;
+            fsync_seconds += started.elapsed().as_secs_f64();
+            fsync_count += 1;
         }
-        Ok(ids)
+        Ok(RawSpoolAppendBatch {
+            stats: RawSpoolAppendBatchStats {
+                records: ids.len(),
+                encoded_bytes,
+                wait_seconds: 0.0,
+                write_seconds,
+                fsync_seconds,
+                fsync_count,
+            },
+            ids,
+        })
     }
 
     pub fn stats(&self) -> Result<RawSpoolStats> {
@@ -327,7 +399,6 @@ impl RawSpool {
     }
 
     pub fn mark_committed_batch(&mut self, ids: Vec<RawSpoolRecordId>) -> Result<()> {
-        let mut wrote = false;
         for id in ids {
             if !self.completed.insert(id.sequence) {
                 continue;
@@ -336,14 +407,34 @@ impl RawSpool {
                 self.total_pending_bytes = self.total_pending_bytes.saturating_sub(body_len);
             }
             writeln!(self.checkpoint, "{}", id.sequence).context("append raw spool checkpoint")?;
-            wrote = true;
+            self.checkpoint_dirty_records += 1;
         }
-        if wrote {
+        self.sync_checkpoint_if_due(false)?;
+        Ok(())
+    }
+
+    fn sync_checkpoint_if_due(&mut self, force: bool) -> Result<()> {
+        if self.checkpoint_dirty_records == 0 {
+            return Ok(());
+        }
+        if force
+            || self.checkpoint_dirty_records >= self.checkpoint_fsync_records
+            || self.checkpoint_last_sync.elapsed() >= self.checkpoint_fsync_delay
+        {
             self.checkpoint
                 .sync_data()
                 .context("fsync raw spool checkpoint batch")?;
+            self.checkpoint_dirty_records = 0;
+            self.checkpoint_last_sync = Instant::now();
         }
         Ok(())
+    }
+
+    fn checkpoint_sync_due_in(&self) -> Option<Duration> {
+        (self.checkpoint_dirty_records > 0).then(|| {
+            self.checkpoint_fsync_delay
+                .saturating_sub(self.checkpoint_last_sync.elapsed())
+        })
     }
 
     pub fn reclaim_committed_segments(&mut self) -> Result<usize> {
@@ -429,6 +520,8 @@ impl RawSpool {
             .read(true)
             .open(&path)
             .with_context(|| format!("reopen raw spool checkpoint {}", path.display()))?;
+        self.checkpoint_dirty_records = 0;
+        self.checkpoint_last_sync = Instant::now();
         Ok(())
     }
 
@@ -459,7 +552,7 @@ pub struct RawSpoolWriter {
 
 struct AppendCommand {
     record: RawSpoolRecord,
-    reply: mpsc::Sender<Result<RawSpoolRecordId>>,
+    reply: mpsc::Sender<Result<RawSpoolAppendAck>>,
 }
 
 struct CheckpointCommand {
@@ -496,7 +589,7 @@ impl RawSpoolWriter {
         Ok(Self { commands })
     }
 
-    pub fn append(&self, record: RawSpoolRecord) -> Result<RawSpoolRecordId> {
+    pub fn append(&self, record: RawSpoolRecord) -> Result<RawSpoolAppendAck> {
         let (reply, rx) = mpsc::channel();
         self.commands
             .send(RawSpoolCommand::Append(AppendCommand { record, reply }))
@@ -556,9 +649,25 @@ fn run_raw_spool_writer(
     loop {
         let command = match deferred.pop_front() {
             Some(command) => command,
-            None => match receiver.recv() {
-                Ok(command) => command,
-                Err(_) => break,
+            None => match spool.checkpoint_sync_due_in() {
+                None => match receiver.recv() {
+                    Ok(command) => command,
+                    Err(_) => {
+                        let _ = spool.sync_checkpoint_if_due(true);
+                        break;
+                    }
+                },
+                Some(sync_due_in) => match receiver.recv_timeout(sync_due_in) {
+                    Ok(command) => command,
+                    Err(RecvTimeoutError::Timeout) => {
+                        let _ = spool.sync_checkpoint_if_due(false);
+                        continue;
+                    }
+                    Err(RecvTimeoutError::Disconnected) => {
+                        let _ = spool.sync_checkpoint_if_due(true);
+                        break;
+                    }
+                },
             },
         };
         match command {
@@ -597,6 +706,7 @@ fn handle_append_batch(
     max_batch_delay: Duration,
 ) {
     let mut batch = vec![first];
+    let collect_started = Instant::now();
     collect_append_batch(
         receiver,
         deferred,
@@ -612,10 +722,16 @@ fn handle_append_batch(
             command.record
         })
         .collect::<Vec<_>>();
+    let wait_seconds = collect_started.elapsed().as_secs_f64();
     match spool.append_batch(records) {
-        Ok(ids) => {
-            for (reply, id) in replies.into_iter().zip(ids) {
-                let _ = reply.send(Ok(id));
+        Ok(mut appended) => {
+            appended.stats.wait_seconds = wait_seconds;
+            let mut stats = Some(appended.stats);
+            for (reply, id) in replies.into_iter().zip(appended.ids) {
+                let _ = reply.send(Ok(RawSpoolAppendAck {
+                    id,
+                    batch_stats: stats.take(),
+                }));
             }
         }
         Err(err) => {
@@ -1007,6 +1123,8 @@ mod tests {
             max_segment_bytes: 256,
             max_record_bytes: 1024,
             max_total_bytes: 1024 * 1024,
+            checkpoint_fsync_records: 1,
+            checkpoint_fsync_delay: Duration::from_millis(1),
         }
     }
 
@@ -1035,6 +1153,57 @@ mod tests {
     }
 
     #[test]
+    fn raw_spool_append_batch_reports_write_and_fsync_stats() {
+        let dir = tempdir().unwrap();
+        let mut spool = RawSpool::open(options(dir.path())).unwrap();
+        let appended = spool
+            .append_batch(vec![record(b"first"), record(b"second")])
+            .unwrap();
+
+        assert_eq!(appended.ids.len(), 2);
+        assert_eq!(appended.stats.records, 2);
+        assert!(appended.stats.encoded_bytes > 0);
+        assert!(appended.stats.write_seconds >= 0.0);
+        assert!(appended.stats.fsync_seconds >= 0.0);
+        assert!(appended.stats.fsync_count >= 1);
+    }
+
+    #[test]
+    fn raw_spool_writer_reports_batch_wait_stats_once() {
+        let dir = tempdir().unwrap();
+        let mut spool = RawSpool::open(options(dir.path())).unwrap();
+        let (first_reply, first_rx) = mpsc::channel();
+        let first = AppendCommand {
+            record: record(b"first"),
+            reply: first_reply,
+        };
+        let (tx, rx) = mpsc::sync_channel(4);
+        let (second_reply, second_rx) = mpsc::channel();
+        tx.send(RawSpoolCommand::Append(AppendCommand {
+            record: record(b"second"),
+            reply: second_reply,
+        }))
+        .unwrap();
+        let mut deferred = VecDeque::new();
+
+        handle_append_batch(
+            &mut spool,
+            first,
+            &rx,
+            &mut deferred,
+            2,
+            Duration::from_secs(5),
+        );
+
+        let first_ack = first_rx.recv().unwrap().unwrap();
+        let second_ack = second_rx.recv().unwrap().unwrap();
+        let stats = first_ack.batch_stats.unwrap();
+        assert_eq!(stats.records, 2);
+        assert!(stats.wait_seconds >= 0.0);
+        assert!(second_ack.batch_stats.is_none());
+    }
+
+    #[test]
     fn raw_spool_checkpoint_skips_committed_records() {
         let dir = tempdir().unwrap();
         let mut spool = RawSpool::open(options(dir.path())).unwrap();
@@ -1048,6 +1217,39 @@ mod tests {
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].id, second);
         assert_eq!(pending[0].record.compressed_body, b"second");
+    }
+
+    #[test]
+    fn raw_spool_checkpoint_fsync_can_be_delayed_until_record_threshold() {
+        let dir = tempdir().unwrap();
+        let mut opts = options(dir.path());
+        opts.checkpoint_fsync_records = 2;
+        opts.checkpoint_fsync_delay = Duration::from_secs(60);
+        let mut spool = RawSpool::open(opts).unwrap();
+        let first = spool.append(record(b"first")).unwrap();
+        let second = spool.append(record(b"second")).unwrap();
+
+        spool.mark_committed(first).unwrap();
+        assert_eq!(spool.checkpoint_dirty_records, 1);
+
+        spool.mark_committed(second).unwrap();
+        assert_eq!(spool.checkpoint_dirty_records, 0);
+    }
+
+    #[test]
+    fn raw_spool_checkpoint_fsync_can_be_forced_on_shutdown() {
+        let dir = tempdir().unwrap();
+        let mut opts = options(dir.path());
+        opts.checkpoint_fsync_records = 1024;
+        opts.checkpoint_fsync_delay = Duration::from_secs(60);
+        let mut spool = RawSpool::open(opts).unwrap();
+        let first = spool.append(record(b"first")).unwrap();
+
+        spool.mark_committed(first).unwrap();
+        assert_eq!(spool.checkpoint_dirty_records, 1);
+
+        spool.sync_checkpoint_if_due(true).unwrap();
+        assert_eq!(spool.checkpoint_dirty_records, 0);
     }
 
     #[test]

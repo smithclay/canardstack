@@ -8,7 +8,8 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 use serde_json::{json, Value};
 use spool::{
-    raw_spool_full_info, RawSpoolOptions, RawSpoolRecord, RawSpoolRecordId, RawSpoolWriter,
+    raw_spool_full_info, RawSpoolAppendBatchStats, RawSpoolOptions, RawSpoolRecord,
+    RawSpoolRecordId, RawSpoolWriter,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
@@ -84,6 +85,8 @@ impl Ingestor {
                 max_segment_bytes: config.raw_spool_max_segment_bytes as u64,
                 max_record_bytes: config.raw_spool_max_record_bytes as u64,
                 max_total_bytes: config.raw_spool_max_total_bytes as u64,
+                checkpoint_fsync_records: config.raw_spool_checkpoint_fsync_records,
+                checkpoint_fsync_delay: config.raw_spool_checkpoint_fsync_delay,
             },
             config.raw_spool_writer_queue_capacity,
             config.raw_spool_group_commit_records,
@@ -502,7 +505,10 @@ impl Ingestor {
             started.elapsed().as_secs_f64(),
         );
         match result {
-            Ok(id) => {
+            Ok(ack) => {
+                if let Some(stats) = ack.batch_stats {
+                    Self::record_raw_spool_append_batch_metrics(metrics, stats);
+                }
                 metrics.inc(
                     "canardstack_raw_spool_records_total",
                     &[("signal", signal.as_str()), ("status", "spooled")],
@@ -513,7 +519,7 @@ impl Ingestor {
                     &[("signal", signal.as_str())],
                     compressed_body.len() as u64,
                 );
-                Ok(id)
+                Ok(ack.id)
             }
             Err(err) => {
                 if raw_spool_full_info(&err).is_some() {
@@ -542,6 +548,53 @@ impl Ingestor {
                 }
             }
         }
+    }
+
+    fn record_raw_spool_append_batch_metrics(metrics: &Metrics, stats: RawSpoolAppendBatchStats) {
+        metrics.inc("canardstack_raw_spool_append_batches_total", &[], 1);
+        metrics.inc(
+            "canardstack_raw_spool_append_batch_records_total",
+            &[],
+            stats.records as u64,
+        );
+        metrics.inc(
+            "canardstack_raw_spool_append_batch_encoded_bytes_total",
+            &[],
+            stats.encoded_bytes,
+        );
+        metrics.inc(
+            "canardstack_raw_spool_append_batch_fsyncs_total",
+            &[],
+            stats.fsync_count,
+        );
+        metrics.gauge(
+            "canardstack_raw_spool_append_batch_records",
+            &[("stat", "last")],
+            stats.records as f64,
+        );
+        metrics.gauge_max(
+            "canardstack_raw_spool_append_batch_records",
+            &[("stat", "max")],
+            stats.records as f64,
+        );
+        metrics.gauge(
+            "canardstack_raw_spool_append_batch_encoded_bytes",
+            &[("stat", "last")],
+            stats.encoded_bytes as f64,
+        );
+        metrics.gauge_max(
+            "canardstack_raw_spool_append_batch_encoded_bytes",
+            &[("stat", "max")],
+            stats.encoded_bytes as f64,
+        );
+        metrics.observe_phase_seconds(
+            "all",
+            "raw_spool_append_batch_wait",
+            None,
+            stats.wait_seconds,
+        );
+        metrics.observe_phase_seconds("all", "raw_spool_append_write", None, stats.write_seconds);
+        metrics.observe_phase_seconds("all", "raw_spool_append_fsync", None, stats.fsync_seconds);
     }
 
     fn checkpoint_raw_spool_terminal(

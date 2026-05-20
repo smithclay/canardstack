@@ -78,6 +78,8 @@ max_total_bytes = 1073741824
 writer_queue_capacity = 1024
 group_commit_records = 64
 group_commit_ms = 1
+checkpoint_fsync_records = 1024
+checkpoint_fsync_ms = 1000
 
 [health]
 force_dependency_unhealthy = false
