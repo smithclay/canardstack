@@ -2,8 +2,8 @@ use super::codec::{
     checkpoint_path, encode_record, prepare_append_records, read_completed_sequences,
 };
 use super::writer::{
-    collect_append_batch, collect_batch, handle_append_batch, AppendCommand, CheckpointCommand,
-    RawSpoolCommand,
+    collect_append_batch, collect_batch, handle_append_batch, handle_checkpoint_batch,
+    AppendCommand, CheckpointCommand, RawSpoolCommand,
 };
 use super::*;
 use std::collections::VecDeque;
@@ -47,6 +47,23 @@ fn append_command(
     (
         AppendCommand {
             record,
+            queued_at: Instant::now(),
+            reply,
+        },
+        rx,
+    )
+}
+
+fn checkpoint_command(
+    ids: Vec<RawSpoolRecordId>,
+) -> (
+    CheckpointCommand,
+    mpsc::Receiver<Result<RawSpoolCheckpointBatchStats>>,
+) {
+    let (reply, rx) = mpsc::channel();
+    (
+        CheckpointCommand {
+            ids,
             queued_at: Instant::now(),
             reply,
         },
@@ -115,6 +132,37 @@ fn raw_spool_writer_reports_batch_wait_stats_once() {
     assert!(stats.wait_seconds >= 0.0);
     assert!(second_ack.batch_stats.is_none());
     assert_eq!(spool.stats().unwrap().append_syncs_total, 0);
+}
+
+#[test]
+fn raw_spool_writer_batches_checkpoint_commands_and_reports_stats_once() {
+    let dir = tempdir().unwrap();
+    let mut spool = RawSpool::open(options(dir.path())).unwrap();
+    let first = spool.append(record(b"first")).unwrap();
+    let second = spool.append(record(b"second")).unwrap();
+    let (first_command, first_rx) = checkpoint_command(vec![first]);
+    let (second_command, second_rx) = checkpoint_command(vec![second]);
+    let (tx, rx) = mpsc::sync_channel(4);
+    tx.send(RawSpoolCommand::Checkpoint(second_command))
+        .unwrap();
+    let mut deferred = VecDeque::new();
+
+    handle_checkpoint_batch(
+        &mut spool,
+        first_command,
+        &rx,
+        &mut deferred,
+        2,
+        Duration::from_secs(5),
+    );
+
+    let first_stats = first_rx.recv().unwrap().unwrap();
+    let second_stats = second_rx.recv().unwrap().unwrap();
+    assert_eq!(first_stats.records, 2);
+    assert_eq!(first_stats.commands, 2);
+    assert!(first_stats.wait_seconds >= 0.0);
+    assert_eq!(second_stats.records, 0);
+    assert_eq!(spool.recover_pending().unwrap().len(), 0);
 }
 
 #[test]
@@ -413,10 +461,11 @@ fn raw_spool_append_batch_defers_checkpoint_and_keeps_collecting_appends() {
     let (tx, rx) = mpsc::sync_channel(4);
     let (checkpoint_reply, _checkpoint_rx) = mpsc::channel();
     tx.send(RawSpoolCommand::Checkpoint(CheckpointCommand {
-        id: RawSpoolRecordId {
+        ids: vec![RawSpoolRecordId {
             segment: 1,
             sequence: 1,
-        },
+        }],
+        queued_at: Instant::now(),
         reply: checkpoint_reply,
     }))
     .unwrap();

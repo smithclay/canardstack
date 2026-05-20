@@ -1,6 +1,6 @@
 use super::spool::{
-    self, raw_spool_full_info, RawSpoolAppendBatchStats, RawSpoolRecord, RawSpoolRecordId,
-    RawSpoolWriter,
+    self, raw_spool_full_info, RawSpoolAppendBatchStats, RawSpoolCheckpointBatchStats,
+    RawSpoolRecord, RawSpoolRecordId, RawSpoolWriter,
 };
 use super::{admission, all_signals, queue, Ingestor, Signal};
 use crate::metrics::Metrics;
@@ -365,6 +365,44 @@ impl Ingestor {
         );
     }
 
+    fn record_raw_spool_checkpoint_batch_metrics(
+        metrics: &Metrics,
+        signal: Signal,
+        stats: RawSpoolCheckpointBatchStats,
+    ) {
+        if stats.records == 0 {
+            return;
+        }
+        metrics.inc(
+            "canardstack_raw_spool_checkpoint_batches_total",
+            &[("signal", signal.as_str())],
+            1,
+        );
+        metrics.inc(
+            "canardstack_raw_spool_checkpoint_batch_records_total",
+            &[("signal", signal.as_str())],
+            stats.records as u64,
+        );
+        metrics.inc(
+            "canardstack_raw_spool_checkpoint_batch_commands_total",
+            &[("signal", signal.as_str())],
+            stats.commands as u64,
+        );
+        metrics.observe_phase_seconds_n(
+            signal.as_str(),
+            "raw_spool_checkpoint_queue_wait",
+            None,
+            stats.records as u64,
+            stats.queue_seconds,
+        );
+        metrics.observe_phase_seconds(
+            signal.as_str(),
+            "raw_spool_checkpoint_batch_wait",
+            None,
+            stats.wait_seconds,
+        );
+    }
+
     pub(super) fn checkpoint_raw_spool_terminal(
         &self,
         raw_spool_ref: RawSpoolAppendRef,
@@ -391,10 +429,12 @@ impl Ingestor {
         metrics: Option<&Metrics>,
     ) -> Result<()> {
         let started = Instant::now();
-        self.raw_spool_for(raw_spool_ref.lane)?
+        let stats = self
+            .raw_spool_for(raw_spool_ref.lane)?
             .mark_committed(raw_spool_ref.id)
             .context("checkpoint raw spool record")?;
         if let Some(metrics) = metrics {
+            Self::record_raw_spool_checkpoint_batch_metrics(metrics, raw_spool_ref.lane, stats);
             metrics.observe_phase_seconds(
                 signal.as_str(),
                 "raw_spool_checkpoint",
@@ -428,9 +468,13 @@ impl Ingestor {
                 .push(raw_spool_ref.id);
         }
         for (signal, ids) in by_signal_ids {
-            self.raw_spool_for(signal)?
+            let stats = self
+                .raw_spool_for(signal)?
                 .mark_committed_batch(&ids)
                 .with_context(|| format!("checkpoint {signal} raw spool records"))?;
+            if let Some(metrics) = metrics {
+                Self::record_raw_spool_checkpoint_batch_metrics(metrics, signal, stats);
+            }
         }
         if let Some(metrics) = metrics {
             metrics.observe_phase_seconds(

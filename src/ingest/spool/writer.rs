@@ -1,7 +1,7 @@
 use super::codec::{prepare_append_records, PreparedRawSpoolRecord};
 use super::{
-    raw_spool_full_info, RawSpool, RawSpoolAppendAck, RawSpoolOptions, RawSpoolRecord,
-    RawSpoolRecordId, RawSpoolStats, RecoveredRawSpoolRecord,
+    raw_spool_full_info, RawSpool, RawSpoolAppendAck, RawSpoolCheckpointBatchStats,
+    RawSpoolOptions, RawSpoolRecord, RawSpoolRecordId, RawSpoolStats, RecoveredRawSpoolRecord,
 };
 use anyhow::{Context, Result};
 use std::collections::VecDeque;
@@ -22,8 +22,9 @@ pub(super) struct AppendCommand {
 }
 
 pub(super) struct CheckpointCommand {
-    pub(super) id: RawSpoolRecordId,
-    pub(super) reply: mpsc::Sender<Result<()>>,
+    pub(super) ids: Vec<RawSpoolRecordId>,
+    pub(super) queued_at: Instant,
+    pub(super) reply: mpsc::Sender<Result<RawSpoolCheckpointBatchStats>>,
 }
 
 pub(super) enum RawSpoolCommand {
@@ -78,31 +79,28 @@ impl RawSpoolWriter {
         rx.recv().context("receive raw spool append result")?
     }
 
-    pub fn mark_committed(&self, id: RawSpoolRecordId) -> Result<()> {
+    pub fn mark_committed(&self, id: RawSpoolRecordId) -> Result<RawSpoolCheckpointBatchStats> {
         self.mark_committed_batch(&[id])
     }
 
-    pub fn mark_committed_batch(&self, ids: &[RawSpoolRecordId]) -> Result<()> {
+    pub fn mark_committed_batch(
+        &self,
+        ids: &[RawSpoolRecordId],
+    ) -> Result<RawSpoolCheckpointBatchStats> {
         if ids.is_empty() {
-            return Ok(());
+            return Ok(RawSpoolCheckpointBatchStats::default());
         }
-        let mut replies = Vec::with_capacity(ids.len());
-        for id in ids {
-            let (reply, rx) = mpsc::channel();
-            self.commands
-                .as_ref()
-                .context("raw spool writer is stopped")?
-                .send(RawSpoolCommand::Checkpoint(CheckpointCommand {
-                    id: *id,
-                    reply,
-                }))
-                .context("send raw spool checkpoint command")?;
-            replies.push(rx);
-        }
-        for rx in replies {
-            rx.recv().context("receive raw spool checkpoint result")??;
-        }
-        Ok(())
+        let (reply, rx) = mpsc::channel();
+        self.commands
+            .as_ref()
+            .context("raw spool writer is stopped")?
+            .send(RawSpoolCommand::Checkpoint(CheckpointCommand {
+                ids: ids.to_vec(),
+                queued_at: Instant::now(),
+                reply,
+            }))
+            .context("send raw spool checkpoint command")?;
+        rx.recv().context("receive raw spool checkpoint result")?
     }
 
     pub fn recover_pending(&self) -> Result<Vec<RecoveredRawSpoolRecord>> {
@@ -306,6 +304,7 @@ pub(super) fn handle_checkpoint_batch(
     max_batch_delay: Duration,
 ) {
     let mut batch = vec![first];
+    let collect_started = Instant::now();
     collect_batch(
         receiver,
         deferred,
@@ -317,11 +316,27 @@ pub(super) fn handle_checkpoint_batch(
             other => Err(other),
         },
     );
-    let ids = batch.iter().map(|command| command.id).collect::<Vec<_>>();
+    let mut ids = Vec::new();
+    let mut queue_seconds = 0.0;
+    let records = batch.iter().map(|command| command.ids.len()).sum::<usize>();
+    for command in &batch {
+        queue_seconds += collect_started
+            .saturating_duration_since(command.queued_at)
+            .as_secs_f64()
+            * command.ids.len() as f64;
+        ids.extend(command.ids.iter().copied());
+    }
+    let stats = RawSpoolCheckpointBatchStats {
+        records,
+        commands: batch.len(),
+        queue_seconds,
+        wait_seconds: collect_started.elapsed().as_secs_f64(),
+    };
     match spool.mark_committed_batch(ids) {
         Ok(()) => {
+            let mut stats = Some(stats);
             for command in batch {
-                let _ = command.reply.send(Ok(()));
+                let _ = command.reply.send(Ok(stats.take().unwrap_or_default()));
             }
         }
         Err(err) => {

@@ -58,6 +58,14 @@ pub struct RawSpoolAppendBatchStats {
     pub fsync_count: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RawSpoolCheckpointBatchStats {
+    pub records: usize,
+    pub commands: usize,
+    pub queue_seconds: f64,
+    pub wait_seconds: f64,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct RawSpoolAppendAck {
     pub id: RawSpoolRecordId,
