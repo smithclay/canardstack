@@ -68,9 +68,10 @@ impl Maintenance {
 
     pub fn is_ready(&self) -> bool {
         let failures = self.last_failures.lock_or_poisoned();
-        failures
-            .values()
-            .all(|r| r.consecutive < Self::CONSECUTIVE_FAILURE_PAGE_THRESHOLD)
+        failures.iter().all(|(job, r)| {
+            !failure_affects_readiness(job)
+                || r.consecutive < Self::CONSECUTIVE_FAILURE_PAGE_THRESHOLD
+        })
     }
 
     pub fn health(&self) -> Value {
@@ -98,7 +99,7 @@ impl Maintenance {
                 "spans": self.retention.spans_days,
                 "metrics": self.retention.metrics_days
             },
-            "priority_order": ["queue_watchdog", "flush_inlined_data", "merge_adjacent_files", "retention"]
+            "scheduler_jobs": ["watchdog", "flush", "metadata_refresh", "metrics_snapshot", "retention"]
         })
     }
 
@@ -109,9 +110,6 @@ impl Maintenance {
         metrics: &Metrics,
         options: FlushOptions<'_>,
     ) -> Result<Value> {
-        if self.is_paused() {
-            return Ok(json!({"status": "paused"}));
-        }
         let started = Instant::now();
         let process_rows = ingestor.flush_all_with_metrics(storage, Some(metrics))?;
         let immutable = storage.flush_immutable_segments(options.force_immutable_segments)?;
@@ -134,51 +132,7 @@ impl Maintenance {
         }))
     }
 
-    pub fn run_compaction(
-        &self,
-        storage: &Storage,
-        table: Option<&str>,
-        metrics: &Metrics,
-    ) -> Result<Value> {
-        if self.is_paused() {
-            return Ok(json!({"status": "paused"}));
-        }
-        let started = Instant::now();
-        let decision = storage.compaction_decision(table)?;
-        if !decision
-            .get("should_compact")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-        {
-            self.record_run("compaction");
-            return Ok(json!({
-                "status": "skipped",
-                "reason": decision.get("status").and_then(Value::as_str).unwrap_or("not_needed"),
-                "decision": decision,
-                "duration_ms": started.elapsed().as_millis()
-            }));
-        }
-
-        let compaction_started = Instant::now();
-        let compaction = storage.merge_adjacent_files(table)?;
-        metrics.observe_seconds(
-            "canardstack_ducklake_compaction_duration_seconds",
-            &[("table", table.unwrap_or("all"))],
-            compaction_started.elapsed().as_secs_f64(),
-        );
-        self.record_run("compaction");
-        Ok(json!({
-            "status": "ok",
-            "decision": decision,
-            "compaction": compaction,
-            "duration_ms": started.elapsed().as_millis()
-        }))
-    }
-
     pub fn retention(&self, storage: &Storage, dry_run: bool) -> Result<Value> {
-        if self.is_paused() {
-            return Ok(json!({"status": "paused"}));
-        }
         let started = Instant::now();
         let retention = storage.enforce_retention(&self.retention, dry_run)?;
         let snapshot_expiration = if dry_run {
@@ -208,9 +162,6 @@ impl Maintenance {
         storage: &Storage,
         metrics: &Metrics,
     ) -> Result<Value> {
-        if self.is_paused() {
-            return Ok(json!({"status": "paused"}));
-        }
         let started = Instant::now();
         let flushed = ingestor.flush_due(storage, Some(metrics))?;
         let immutable = storage.flush_immutable_segments(false)?;
@@ -327,7 +278,6 @@ fn scheduler_loop(state: Arc<AppState>, stop: Arc<AtomicBool>) {
     let flush_every = state.config.scheduler_flush_interval;
     let metadata_every = state.config.scheduler_metadata_interval;
     let metrics_every = state.config.scheduler_metrics_interval;
-    let compaction_every = state.config.scheduler_compaction_interval;
     let retention_every = state.config.scheduler_retention_interval;
     let tick = watchdog_every
         .min(Duration::from_millis(500))
@@ -336,7 +286,6 @@ fn scheduler_loop(state: Arc<AppState>, stop: Arc<AtomicBool>) {
     let mut next_flush = Instant::now();
     let mut next_metadata = Instant::now() + metadata_every;
     let mut next_metrics = Instant::now() + metrics_every;
-    let mut next_compaction = Instant::now() + compaction_every;
     let mut next_retention = Instant::now() + retention_every;
 
     loop {
@@ -348,6 +297,10 @@ fn scheduler_loop(state: Arc<AppState>, stop: Arc<AtomicBool>) {
             return;
         }
         let now = Instant::now();
+
+        if state.maintenance.is_paused() {
+            continue;
+        }
 
         if flush_requested || now >= next_watchdog {
             let ok = run_job(&state, "watchdog", |s| {
@@ -371,9 +324,6 @@ fn scheduler_loop(state: Arc<AppState>, stop: Arc<AtomicBool>) {
 
         if now >= next_metadata {
             let ok = run_job(&state, "metadata_refresh", |s| {
-                if s.maintenance.is_paused() {
-                    return Ok(json!({"status": "paused"}));
-                }
                 let snapshots = s.ingestor.snapshots();
                 if metadata_refresh_should_yield_to_ingest(&snapshots) {
                     return Ok(json!({
@@ -397,13 +347,6 @@ fn scheduler_loop(state: Arc<AppState>, stop: Arc<AtomicBool>) {
                 Ok(json!({"status": "ok", "rows": rows}))
             });
             next_metrics = now + next_interval(&state, "metrics_snapshot", metrics_every, ok);
-        }
-
-        if now >= next_compaction {
-            let ok = run_job(&state, "compaction", |s| {
-                s.maintenance.run_compaction(&s.storage, None, &s.metrics)
-            });
-            next_compaction = now + next_interval(&state, "compaction", compaction_every, ok);
         }
 
         if now >= next_retention {
@@ -470,6 +413,10 @@ where
     ok
 }
 
+fn failure_affects_readiness(job: &str) -> bool {
+    !matches!(job, "metrics_snapshot")
+}
+
 fn next_interval(state: &AppState, job: &str, base: Duration, ok: bool) -> Duration {
     if ok {
         return base;
@@ -504,7 +451,6 @@ fn classify_job_error(err: &anyhow::Error, job: &str) -> &'static str {
         "flush" | "watchdog" => "flush_failed",
         "metadata_refresh" => "metadata_refresh_failed",
         "metrics_snapshot" => "metrics_snapshot_failed",
-        "compaction" => "compaction_failed",
         "retention" | "retention_dry_run" => "retention_failed",
         _ => "scheduler_job_failed",
     }

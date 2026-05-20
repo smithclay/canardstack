@@ -2731,7 +2731,6 @@ fn admin_endpoints_reject_data_key_and_unauthenticated_requests() {
         ("POST", "/api/admin/maintenance/pause"),
         ("POST", "/api/admin/maintenance/resume"),
         ("POST", "/api/admin/maintenance/flush"),
-        ("POST", "/api/admin/maintenance/compaction/run"),
         ("POST", "/api/admin/maintenance/retention/dry-run"),
         ("POST", "/api/admin/maintenance/retention/run"),
     ];
@@ -2860,39 +2859,31 @@ fn admin_flush_records_ducklake_inlined_flush_metrics() {
             .contains("canardstack_ducklake_flush_inlined_duration_seconds_count{table=\"all\"} 1"),
         "{metrics}"
     );
-    assert!(
-        !metrics.contains("canardstack_ducklake_compaction_duration_seconds_count"),
-        "{metrics}"
-    );
 }
 
 #[test]
-fn admin_compaction_is_a_separate_maintenance_job() {
+fn pause_does_not_block_manual_flush() {
     let (_dir, state) = app();
-    let response = http::route(
+    let pause = http::route(
         "POST",
-        "/api/admin/maintenance/compaction/run",
+        "/api/admin/maintenance/pause",
         &HashMap::new(),
         &admin_headers(&state),
         &[],
         &state,
     );
-    assert_eq!(response.status(), 200, "{}", response.json_body());
-    assert_eq!(response.json_body()["status"], "skipped");
-    assert_eq!(response.json_body()["decision"]["supported"], true);
-    assert_eq!(response.json_body()["decision"]["status"], "disabled");
-    assert_eq!(
-        response.json_body()["decision"]["reason"],
-        "immutable_segments"
-    );
+    assert_eq!(pause.status(), 200, "{}", pause.json_body());
 
-    let metrics = state.metrics.render_prometheus();
-    assert!(
-        metrics.contains(
-            "canardstack_maintenance_runs_total{job=\"compaction\",status=\"ok\",reason=\"ok\"} 1"
-        ),
-        "{metrics}"
+    let flush = http::route(
+        "POST",
+        "/api/admin/maintenance/flush",
+        &HashMap::new(),
+        &admin_headers(&state),
+        &[],
+        &state,
     );
+    assert_eq!(flush.status(), 200, "{}", flush.json_body());
+    assert_eq!(flush.json_body()["status"], "ok");
 }
 
 #[test]
@@ -2958,12 +2949,11 @@ fn config_validate_rejects_zero_scheduler_intervals() {
         "baseline test config must validate"
     );
 
-    let mutations: [fn(&mut Config); 6] = [
+    let mutations: [fn(&mut Config); 5] = [
         |c| c.scheduler_watchdog_interval = std::time::Duration::ZERO,
         |c| c.scheduler_flush_interval = std::time::Duration::ZERO,
         |c| c.scheduler_metadata_interval = std::time::Duration::ZERO,
         |c| c.scheduler_metrics_interval = std::time::Duration::ZERO,
-        |c| c.scheduler_compaction_interval = std::time::Duration::ZERO,
         |c| c.scheduler_retention_interval = std::time::Duration::ZERO,
     ];
     for mutate in mutations {

@@ -135,15 +135,6 @@ pub fn route(
             record_maintenance_metrics(state, "flush", &result, started);
             result
         }),
-        ("POST", "/api/admin/maintenance/compaction/run") => admin(headers, state, || {
-            run_maintenance_job(state, "compaction", || {
-                state.maintenance.run_compaction(
-                    &state.storage,
-                    query.get("table").map(String::as_str),
-                    &state.metrics,
-                )
-            })
-        }),
         ("POST", "/api/admin/maintenance/retention/dry-run") => admin(headers, state, || {
             run_maintenance_job(state, "retention", || {
                 state.maintenance.retention(&state.storage, true)

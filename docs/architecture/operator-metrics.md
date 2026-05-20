@@ -17,7 +17,7 @@ Labels stay low-cardinality:
 - `table`: `logs`, `spans`, `metric_gauge`, `metric_sum`, or `all`.
 - `status`: HTTP status code or grouped class.
 - `reason`: bounded rejection or failure reason.
-- `job`: maintenance job name (`watchdog`, `flush`, `metadata_refresh`, `metrics_snapshot`, `compaction`, `retention`).
+- `job`: maintenance job name (`watchdog`, `flush`, `metadata_refresh`, `metrics_snapshot`, `retention`).
 - `query_class`: route path (e.g. `/api/v1/query_range`).
 - `encoding`: `identity`, `gzip`.
 - `triggered_by`: who initiated a partial-commit flush.
@@ -80,7 +80,6 @@ Do not label metrics by `service_name`, trace id, query text, API key, or arbitr
 | `canardstack_ducklake_parquet_rows` | Gauge | `table` | Active rows stored in DuckLake Parquet data files per table. |
 | `canardstack_ducklake_inlined_rows` | Gauge | `table` | Rows currently held in DuckLake inlined-data tables per table. |
 | `canardstack_ducklake_flush_inlined_duration_seconds` | Histogram (`_count` / `_sum`) | `table` | Time spent in DuckLake inlined-data flush during maintenance. |
-| `canardstack_ducklake_compaction_duration_seconds` | Histogram (`_count` / `_sum`) | `table` | Time spent in DuckLake adjacent-file compaction during maintenance. Immutable telemetry disables this path, so this should normally remain flat. |
 
 The shared phase metric `canardstack_phase_duration_seconds` also records
 storage proof phases with `signal` and `phase` labels:
@@ -120,9 +119,9 @@ part of `202` latency.
 | --- | --- | --- | --- |
 | `canardstack_maintenance_runs_total` | Counter | `job`, `status`, `reason` | Job outcomes (`status=ok` or `status=error`). |
 | `canardstack_maintenance_duration_seconds` | Histogram (`_count` / `_sum`) | `job`, `table=all` | Job runtime. |
-| `canardstack_maintenance_failures_total` | Counter | `job`, `reason` | Failures only, broken out by classified reason. Bounded reason set: `disk_full`, `flush_failed`, `metadata_refresh_failed`, `metrics_snapshot_failed`, `compaction_failed`, `retention_failed`, `scheduler_job_failed`. Reasons derive from the job name where possible (so dependency wording changes do not silently re-route alerts); only `disk_full` substring-matches OS / DuckDB errors. |
+| `canardstack_maintenance_failures_total` | Counter | `job`, `reason` | Failures only, broken out by classified reason. Bounded reason set: `disk_full`, `flush_failed`, `metadata_refresh_failed`, `metrics_snapshot_failed`, `retention_failed`, `scheduler_job_failed`. Reasons derive from the job name where possible (so dependency wording changes do not silently re-route alerts); only `disk_full` substring-matches OS / DuckDB errors. |
 | `canardstack_maintenance_consecutive_failures` | Gauge | `job` | Consecutive failure count; resets to 0 on success. Drives exponential backoff. |
-| `canardstack_maintenance_paused` | Gauge | none | `1` when paused. |
+| `canardstack_maintenance_paused` | Gauge | none | `1` when scheduled maintenance is paused. |
 
 ## Freshness Metrics
 

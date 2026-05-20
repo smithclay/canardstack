@@ -40,7 +40,6 @@ impl Storage {
                 inlined_flush: self.ducklake_managed_maintenance,
                 snapshot_expiration: self.ducklake_managed_maintenance,
                 cleanup_old_files: self.ducklake_managed_maintenance,
-                merge_adjacent_files: false,
                 whole_day_retention: true,
             },
             freshness_watermarks: self

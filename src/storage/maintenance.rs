@@ -29,35 +29,6 @@ impl Storage {
         Ok(json!({"supported": true, "status": "ok"}))
     }
 
-    pub fn compaction_decision(&self, table: Option<&str>) -> Result<Value> {
-        if !self.ducklake_managed_maintenance {
-            return Ok(
-                json!({"supported": false, "reason": "ducklake maintenance is not managed by this process"}),
-            );
-        }
-        Ok(json!({
-            "supported": true,
-            "status": "disabled",
-            "should_compact": false,
-            "table": table,
-            "reason": "immutable_segments"
-        }))
-    }
-
-    pub fn merge_adjacent_files(&self, table: Option<&str>) -> Result<Value> {
-        if !self.ducklake_managed_maintenance {
-            return Ok(
-                json!({"supported": false, "reason": "ducklake maintenance is not managed by this process"}),
-            );
-        }
-        Ok(json!({
-            "supported": true,
-            "status": "disabled",
-            "table": table,
-            "reason": "immutable_segments"
-        }))
-    }
-
     pub fn cleanup_old_files(&self, dry_run: bool) -> Result<Value> {
         if !self.ducklake_managed_maintenance {
             return Ok(

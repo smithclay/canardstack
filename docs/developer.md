@@ -299,11 +299,13 @@ loop without operator action:
 - A periodic flush drains process queues to DuckLake and triggers DuckLake's
   inlined-data flush.
 - DuckLake adjacent-file compaction is disabled for immutable telemetry
-  segments; segment sizing is controlled by immutable target bytes and max age.
+  segments and is not exposed as a v0 maintenance control; segment sizing is
+  controlled by immutable target bytes and max age.
 - A retention pass enforces the configured retention days, expires DuckLake
   snapshots, and cleans old files.
 
-All jobs respect `POST /api/admin/maintenance/pause`. The base cadence is
+`POST /api/admin/maintenance/pause` pauses scheduled jobs only; manual flush and
+retention endpoints remain available for repair workflows. The base cadence is
 configurable as `scheduler.maintenance_interval_secs` in `config.toml` or via
 `CANARDSTACK_MAINTENANCE_INTERVAL_SECS`.
 Set `scheduler.enabled = false` or `CANARDSTACK_SCHEDULER_ENABLED=false` to

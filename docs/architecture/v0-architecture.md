@@ -262,7 +262,8 @@ Scheduler jobs:
 
 Maintenance can be paused and resumed through admin endpoints. There is no
 Postgres-backed maintenance lease yet, so assume one in-process scheduler and
-one writer.
+one writer. Pause applies to scheduled jobs only; manual repair endpoints such
+as flush and retention remain available.
 
 ## Retention
 

@@ -48,7 +48,6 @@ pub struct Config {
     pub scheduler_flush_interval: Duration,
     pub scheduler_metadata_interval: Duration,
     pub scheduler_metrics_interval: Duration,
-    pub scheduler_compaction_interval: Duration,
     pub scheduler_retention_interval: Duration,
     pub max_concurrent_connections: usize,
     pub socket_read_timeout: Duration,
@@ -196,7 +195,6 @@ impl Config {
             scheduler_flush_interval: maintenance_interval,
             scheduler_metadata_interval: maintenance_interval,
             scheduler_metrics_interval: maintenance_interval.saturating_mul(2),
-            scheduler_compaction_interval: maintenance_interval.saturating_mul(10),
             scheduler_retention_interval: maintenance_interval.saturating_mul(120),
             max_concurrent_connections: env_usize("CANARDSTACK_MAX_CONNECTIONS")?
                 .or(file.usize(&["server", "max_connections"])?)
@@ -285,7 +283,6 @@ impl Config {
             scheduler_flush_interval: Duration::from_millis(200),
             scheduler_metadata_interval: Duration::from_millis(200),
             scheduler_metrics_interval: Duration::from_millis(200),
-            scheduler_compaction_interval: Duration::from_secs(300),
             scheduler_retention_interval: Duration::from_secs(3_600),
             max_concurrent_connections: 64,
             socket_read_timeout: Duration::from_secs(5),
@@ -400,7 +397,6 @@ impl Config {
             || self.scheduler_flush_interval.is_zero()
             || self.scheduler_metadata_interval.is_zero()
             || self.scheduler_metrics_interval.is_zero()
-            || self.scheduler_compaction_interval.is_zero()
             || self.scheduler_retention_interval.is_zero()
         {
             anyhow::bail!("scheduler intervals must be > 0");
@@ -781,10 +777,6 @@ http_keepalive = true
         assert_eq!(config.scheduler_flush_interval, Duration::from_secs(40));
         assert_eq!(config.scheduler_metadata_interval, Duration::from_secs(40));
         assert_eq!(config.scheduler_metrics_interval, Duration::from_secs(80));
-        assert_eq!(
-            config.scheduler_compaction_interval,
-            Duration::from_secs(400)
-        );
         assert_eq!(
             config.scheduler_retention_interval,
             Duration::from_secs(4800)

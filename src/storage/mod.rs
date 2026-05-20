@@ -76,7 +76,6 @@ pub struct StorageCapabilities {
     pub inlined_flush: bool,
     pub snapshot_expiration: bool,
     pub cleanup_old_files: bool,
-    pub merge_adjacent_files: bool,
     pub whole_day_retention: bool,
 }
 
