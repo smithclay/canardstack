@@ -17,6 +17,7 @@ pub struct RawSpoolWriter {
 
 pub(super) struct AppendCommand {
     pub(super) record: PreparedRawSpoolRecord,
+    pub(super) queued_at: Instant,
     pub(super) reply: mpsc::Sender<Result<RawSpoolAppendAck>>,
 }
 
@@ -68,7 +69,11 @@ impl RawSpoolWriter {
         self.commands
             .as_ref()
             .context("raw spool writer is stopped")?
-            .send(RawSpoolCommand::Append(AppendCommand { record, reply }))
+            .send(RawSpoolCommand::Append(AppendCommand {
+                record,
+                queued_at: Instant::now(),
+                reply,
+            }))
             .context("send raw spool append command")?;
         rx.recv().context("receive raw spool append result")?
     }
@@ -219,6 +224,14 @@ pub(super) fn handle_append_batch(
         &mut batch,
     );
     let mut replies = Vec::with_capacity(batch.len());
+    let queue_seconds = batch
+        .iter()
+        .map(|command| {
+            collect_started
+                .saturating_duration_since(command.queued_at)
+                .as_secs_f64()
+        })
+        .sum::<f64>();
     let records = batch
         .into_iter()
         .map(|command| {
@@ -229,6 +242,7 @@ pub(super) fn handle_append_batch(
     let wait_seconds = collect_started.elapsed().as_secs_f64();
     match spool.append_prepared_batch(records) {
         Ok(mut appended) => {
+            appended.stats.queue_seconds = queue_seconds;
             appended.stats.wait_seconds = wait_seconds;
             let mut stats = Some(appended.stats);
             for (reply, id) in replies.into_iter().zip(appended.ids) {

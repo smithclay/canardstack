@@ -50,7 +50,9 @@ pub struct RecoveredRawSpoolRecord {
 pub struct RawSpoolAppendBatchStats {
     pub records: usize,
     pub encoded_bytes: u64,
+    pub queue_seconds: f64,
     pub wait_seconds: f64,
+    pub encode_seconds: f64,
     pub write_seconds: f64,
     pub fsync_seconds: f64,
     pub fsync_count: u64,
@@ -327,8 +329,11 @@ impl RawSpool {
         records: Vec<PreparedRawSpoolRecord>,
     ) -> Result<RawSpoolAppendBatch> {
         let base_sequence = self.next_sequence;
+        let encode_started = Instant::now();
         let encoded = encode_prepared_records(records, base_sequence)?;
-        let appended = self.append_encoded_batch(encoded)?;
+        let encode_seconds = encode_started.elapsed().as_secs_f64();
+        let mut appended = self.append_encoded_batch(encoded)?;
+        appended.stats.encode_seconds = encode_seconds;
         self.next_sequence = base_sequence.saturating_add(appended.ids.len() as u64);
         Ok(appended)
     }
@@ -344,7 +349,9 @@ impl RawSpool {
                 stats: RawSpoolAppendBatchStats {
                     records: 0,
                     encoded_bytes: 0,
+                    queue_seconds: 0.0,
                     wait_seconds: 0.0,
+                    encode_seconds: 0.0,
                     write_seconds: 0.0,
                     fsync_seconds: 0.0,
                     fsync_count: 0,
@@ -402,7 +409,9 @@ impl RawSpool {
             stats: RawSpoolAppendBatchStats {
                 records: ids.len(),
                 encoded_bytes,
+                queue_seconds: 0.0,
                 wait_seconds: 0.0,
+                encode_seconds: 0.0,
                 write_seconds,
                 fsync_seconds: 0.0,
                 fsync_count: 0,

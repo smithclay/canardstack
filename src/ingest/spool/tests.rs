@@ -44,7 +44,14 @@ fn append_command(
         .into_iter()
         .next()
         .unwrap();
-    (AppendCommand { record, reply }, rx)
+    (
+        AppendCommand {
+            record,
+            queued_at: Instant::now(),
+            reply,
+        },
+        rx,
+    )
 }
 
 #[test]

@@ -332,11 +332,24 @@ impl Ingestor {
             &[("signal", signal.as_str()), ("stat", "max")],
             stats.encoded_bytes as f64,
         );
+        metrics.observe_phase_seconds_n(
+            signal.as_str(),
+            "raw_spool_append_queue_wait",
+            None,
+            stats.records as u64,
+            stats.queue_seconds,
+        );
         metrics.observe_phase_seconds(
             signal.as_str(),
             "raw_spool_append_batch_wait",
             None,
             stats.wait_seconds,
+        );
+        metrics.observe_phase_seconds(
+            signal.as_str(),
+            "raw_spool_append_encode",
+            None,
+            stats.encode_seconds,
         );
         metrics.observe_phase_seconds(
             signal.as_str(),
