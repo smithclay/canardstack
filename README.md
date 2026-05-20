@@ -249,6 +249,12 @@ canardstack is experimental and not production-ready.
 
 Known v0 limits:
 
+- Current single-node throughput is bounded by raw-spool append/backlog
+  behavior. On May 20, 2026, the highest clean 10-minute mixed-signal run was
+  `2000 GB/day` with `--ingest-concurrency 64` (`23.1 MB/s` accepted decoded
+  throughput, no `429`/`503` or query failures). A `2500 GB/day` mixed run
+  reached Vector-like log event rates briefly, but failed the 10-minute guardrail
+  with `429` queue-pressure responses after roughly eight minutes.
 - No fully durable ingest acknowledgement. A process crash should generally
   replay written raw-spool records, but OS crashes, VM crashes, power loss, and
   disk/controller failures may lose records accepted since the most recent

@@ -200,6 +200,19 @@ Metrics:
 - Existing metric ingest/query behavior remains covered by tests and smoke, but
   no current sustained mixed-pressure metric envelope is claimed.
 
+Recent single-node throughput scout, May 20 2026: the highest clean 10-minute
+mixed-signal run was `2000 GB/day` at ingest concurrency `64`, with
+`23.1 MB/s` accepted decoded throughput, `111.4/120.8 ms` ingest p95/p99, no
+`429`/`503` responses, no query failures, max queue oldest age `8.7s`, and max
+measured freshness lag `1.6s`
+(`/private/tmp/canardstack-single-node-confirm-2000-c64-default-10m/report/20260520T033432Z/report.json`).
+Higher targets are not currently sustainable under the guardrails: `2500 GB/day`
+failed the 10-minute run with `429` queue-pressure responses after roughly
+eight minutes, while `3000 GB/day` passed only a 4-minute screen with visible
+backlog drift. The dominant measured cost was raw-spool append time, so the
+current performance limit is ingest durability/backlog handling rather than
+DuckLake registration or query visibility.
+
 ## Evidence Rules
 
 Every future benchmark entry should record:
