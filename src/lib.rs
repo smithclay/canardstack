@@ -6,6 +6,7 @@ mod db;
 pub mod http;
 pub mod ingest;
 pub mod log_query;
+pub mod logging;
 pub mod maintenance;
 pub mod memory;
 pub mod metadata;
@@ -22,23 +23,8 @@ pub mod validation;
 
 pub use app::AppState;
 pub use config::Config;
+pub use logging::init_logging;
 pub use maintenance::Scheduler;
-
-/// Logfmt-style structured event to stderr. Values containing whitespace,
-/// `=`, or `"` are quoted with `\"` escaping.
-pub fn log_event(level: &str, event: &str, fields: &[(&str, &str)]) {
-    use std::fmt::Write;
-    let mut buf = format!("level={level} event={event}");
-    for (k, v) in fields {
-        if v.is_empty() || v.chars().any(|c| c.is_whitespace() || c == '=' || c == '"') {
-            let escaped = v.replace('\\', "\\\\").replace('"', "\\\"");
-            let _ = write!(&mut buf, " {k}=\"{escaped}\"");
-        } else {
-            let _ = write!(&mut buf, " {k}={v}");
-        }
-    }
-    eprintln!("{buf}");
-}
 
 /// Lock a `Mutex`, proceeding past `PoisonError` rather than re-panicking.
 /// Stops a single poisoned lock from cascading every request into a panic.

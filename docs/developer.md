@@ -52,6 +52,10 @@ clear optional string/path settings such as
 `CANARDSTACK_DUCKDB_EXTENSION_DIR`, and
 `CANARDSTACK_PROCESS_MEMORY_LIMIT_BYTES`.
 
+Runtime diagnostics are emitted to stderr as logfmt-style structured events.
+Set `CANARDSTACK_LOG` or `RUST_LOG` to `error`, `warn`, `info`, `debug`,
+`trace`, or `off`; the default level is `info`.
+
 ## Local DuckLake Mode
 
 Compose stores local metadata and files in the `canardstack-data` named volume

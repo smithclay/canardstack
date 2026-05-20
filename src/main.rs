@@ -1,11 +1,12 @@
 use canardstack::cli::{healthcheck, smoke, smoke_http};
-use canardstack::{http, storage, AppState, Config, Scheduler};
+use canardstack::{http, init_logging, storage, AppState, Config, Scheduler};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 fn main() -> anyhow::Result<()> {
+    init_logging();
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
         Some("smoke") => smoke::run(),
@@ -21,8 +22,9 @@ fn main() -> anyhow::Result<()> {
             config.validate()?;
             let state = Arc::new(AppState::new(config)?);
             if !state.config.scheduler_enabled {
-                eprintln!(
-                    "canardstack scheduler disabled: 202 ingest acknowledgements are locally spooled pending periodic append sync, but rows remain query-invisible until admin-triggered flush"
+                tracing::warn!(
+                    event = "scheduler_disabled",
+                    "202 ingest acknowledgements are locally spooled pending periodic append sync, but rows remain query-invisible until admin-triggered flush"
                 );
             }
             let _scheduler = state

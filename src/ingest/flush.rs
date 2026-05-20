@@ -313,21 +313,15 @@ impl Ingestor {
                             restored_rows as u64,
                         );
                     }
-                    let restored_str = restored_rows.to_string();
-                    let restored_bytes_str = restored_bytes.to_string();
-                    let err_str = err.to_string();
-                    crate::log_event(
-                        "error",
-                        "ingest_flush_failed",
-                        &[
-                            ("signal", key.signal.as_str()),
-                            ("partition", key.partition.as_str()),
-                            ("committed_rows", "0"),
-                            ("restored_rows", &restored_str),
-                            ("restored_bytes", &restored_bytes_str),
-                            ("reason", flush_failure_reason(&err)),
-                            ("error", &err_str),
-                        ],
+                    tracing::error!(
+                        event = "ingest_flush_failed",
+                        signal = key.signal.as_str(),
+                        partition = key.partition.as_str(),
+                        committed_rows = 0,
+                        restored_rows,
+                        restored_bytes,
+                        reason = flush_failure_reason(&err),
+                        error = %err
                     );
                     self.restore_batches(key, batches);
                 }

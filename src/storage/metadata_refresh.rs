@@ -50,10 +50,9 @@ pub(super) fn refresh_metadata_summaries_on(
             // A failed ROLLBACK can leave the shared writer connection with a
             // dangling transaction; surface it so a wedged refresh path is
             // observable instead of silently cascading into later appends.
-            crate::log_event(
-                "error",
-                "metadata_refresh_rollback_failed",
-                &[("error", &rollback_err.to_string())],
+            tracing::error!(
+                event = "metadata_refresh_rollback_failed",
+                error = %rollback_err
             );
         }
     }

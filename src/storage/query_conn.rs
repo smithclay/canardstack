@@ -53,7 +53,7 @@ impl Storage {
         let timed_out = match timer.join() {
             Ok(fired) => fired,
             Err(_) => {
-                crate::log_event("warn", "query_timer_panicked", &[]);
+                tracing::warn!(event = "query_timer_panicked");
                 false
             }
         };

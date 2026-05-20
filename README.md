@@ -54,6 +54,8 @@ Docker Compose runs canardstack on `http://localhost:4318` and Grafana on
 For host runs, copy `config/example.toml` to `config.toml` and edit the
 structured config there. Environment variables override the file; set
 `CANARDSTACK_CONFIG=/path/to/config.toml` to use a different location.
+Diagnostics are logfmt-style structured events on stderr; set
+`CANARDSTACK_LOG=debug` or use `RUST_LOG` to adjust verbosity.
 
 Seed representative telemetry through the running service:
 

@@ -272,18 +272,12 @@ impl QueueCreditLedger {
                 let was_closed = state.closed;
                 state.closed = true;
                 if !was_closed {
-                    let reserved_str = state.reserved_bytes.to_string();
-                    let incoming_str = delta.to_string();
-                    let high_str = state.high_watermark_bytes.to_string();
-                    crate::log_event(
-                        "warn",
-                        "ingest_queue_credit_full",
-                        &[
-                            ("signal", signal.as_str()),
-                            ("reserved_bytes", &reserved_str),
-                            ("incoming_bytes", &incoming_str),
-                            ("high_watermark_bytes", &high_str),
-                        ],
+                    tracing::warn!(
+                        event = "ingest_queue_credit_full",
+                        signal = signal.as_str(),
+                        reserved_bytes = state.reserved_bytes,
+                        incoming_bytes = delta,
+                        high_watermark_bytes = state.high_watermark_bytes
                     );
                 }
                 return Err(ApiError::new(
@@ -345,17 +339,11 @@ pub(super) fn admit_and_enqueue(
     let process_bytes = queue::process_bytes(queues);
     let added_process_bytes = queue::added_process_bytes(&batches);
     if process_bytes + added_process_bytes > config.process_ingest_bytes {
-        let process_str = process_bytes.to_string();
-        let added_str = added_process_bytes.to_string();
-        let cap_str = config.process_ingest_bytes.to_string();
-        crate::log_event(
-            "warn",
-            "ingest_process_memory_full",
-            &[
-                ("process_bytes", &process_str),
-                ("incoming_bytes", &added_str),
-                ("cap_bytes", &cap_str),
-            ],
+        tracing::warn!(
+            event = "ingest_process_memory_full",
+            process_bytes,
+            incoming_bytes = added_process_bytes,
+            cap_bytes = config.process_ingest_bytes
         );
         return Err(ApiError::new(
             429,

@@ -21,9 +21,10 @@ const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 static NEVER_SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
 fn log_startup_storage_mode(probe: &crate::storage::StorageProbe) {
-    eprintln!(
-        "canardstack storage mode=ducklake ({}); telemetry lands in immutable DuckLake data files.",
-        probe.mode
+    tracing::info!(
+        event = "storage_mode",
+        mode = probe.mode,
+        "telemetry lands in immutable DuckLake data files"
     );
 }
 
@@ -36,10 +37,11 @@ pub fn serve_until(state: Arc<AppState>, shutdown: &AtomicBool) -> anyhow::Resul
     listener.set_nonblocking(true)?;
     let addr = listener.local_addr()?;
     let probe = state.storage.probe();
-    eprintln!("canardstack listening on http://{addr}/");
+    tracing::info!(event = "server_listening", addr = %addr);
     log_startup_storage_mode(&probe);
-    eprintln!(
-        "canardstack ingest acknowledgement: 2xx means written to the local raw spool and pending periodic append sync"
+    tracing::info!(
+        event = "ingest_acknowledgement",
+        "2xx means written to the local raw spool and pending periodic append sync"
     );
     let active = Arc::new(AtomicUsize::new(0));
     let max_conns = state.config.max_concurrent_connections;
@@ -70,14 +72,10 @@ pub fn serve_until(state: Arc<AppState>, shutdown: &AtomicBool) -> anyhow::Resul
                 &[("reason", "max_connections_exceeded")],
                 1,
             );
-            let max_conns_str = max_conns.to_string();
-            crate::log_event(
-                "warn",
-                "http_connection_overflow",
-                &[
-                    ("reason", "max_connections_exceeded"),
-                    ("max_concurrent_connections", &max_conns_str),
-                ],
+            tracing::warn!(
+                event = "http_connection_overflow",
+                reason = "max_connections_exceeded",
+                max_concurrent_connections = max_conns
             );
             let err = ApiError::new(
                 503,
@@ -102,16 +100,18 @@ pub fn serve_until(state: Arc<AppState>, shutdown: &AtomicBool) -> anyhow::Resul
                     &[("reason", reason)],
                     1,
                 );
-                let err_str = err.to_string();
-                crate::log_event(
-                    "warn",
-                    "http_request_failed",
-                    &[("reason", reason), ("error", &err_str)],
+                tracing::warn!(
+                    event = "http_request_failed",
+                    reason,
+                    error = %err
                 );
             }
         });
     }
-    eprintln!("canardstack shutdown requested; stopped accepting new connections");
+    tracing::info!(
+        event = "shutdown_requested",
+        "stopped accepting new connections"
+    );
     drain_active_connections(&active);
     Ok(())
 }
@@ -123,13 +123,12 @@ fn drain_active_connections(active: &AtomicUsize) {
     }
     let remaining = active.load(Ordering::SeqCst);
     if remaining > 0 {
-        crate::log_event(
-            "warn",
-            "shutdown_drain_timeout",
-            &[("active_connections", &remaining.to_string())],
+        tracing::warn!(
+            event = "shutdown_drain_timeout",
+            active_connections = remaining
         );
     } else {
-        eprintln!("canardstack shutdown complete; active connections drained");
+        tracing::info!(event = "shutdown_complete", "active connections drained");
     }
 }
 

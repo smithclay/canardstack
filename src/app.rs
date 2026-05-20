@@ -24,11 +24,7 @@ impl AppState {
         let metrics = Metrics::default();
         let replayed = ingestor.replay_raw_spool(&storage, &metrics)?;
         if replayed > 0 {
-            crate::log_event(
-                "info",
-                "raw_spool_replayed",
-                &[("records", &replayed.to_string())],
-            );
+            tracing::info!(event = "raw_spool_replayed", records = replayed);
         }
         Ok(Self {
             storage,

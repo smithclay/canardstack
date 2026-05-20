@@ -382,17 +382,12 @@ where
             }
             let reason = classify_job_error(&err, job);
             let consecutive = state.maintenance.record_failure(job, reason);
-            let consecutive_str = consecutive.to_string();
-            let err_str = err.to_string();
-            crate::log_event(
-                "error",
-                "scheduler_job_failed",
-                &[
-                    ("job", job),
-                    ("reason", reason),
-                    ("consecutive", &consecutive_str),
-                    ("error", &err_str),
-                ],
+            tracing::error!(
+                event = "scheduler_job_failed",
+                job,
+                reason,
+                consecutive,
+                error = %err
             );
             state
                 .metrics
