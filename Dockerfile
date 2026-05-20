@@ -45,8 +45,6 @@ COPY --from=builder /opt/duckdb/extensions /usr/local/lib/duckdb/extensions
 ENV HOME=/var/lib/canardstack \
     CANARDSTACK_BIND=0.0.0.0:4318 \
     CANARDSTACK_DATA_DIR=/var/lib/canardstack \
-    CANARDSTACK_DUCKDB_PATH=/var/lib/canardstack/canardstack.duckdb \
-    CANARDSTACK_STORAGE_DIR=/var/lib/canardstack/storage \
     CANARDSTACK_DUCKDB_EXTENSION_DIR=/usr/local/lib/duckdb/extensions
 
 USER 10001:10001

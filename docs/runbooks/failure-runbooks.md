@@ -83,10 +83,10 @@ All query lane knobs are env vars applied at boot — there is no hot-reload
 endpoint. Steps 2 and 3 require an operator-driven restart.
 
 1. Restart query role if supervisor has not already done so.
-2. Lower query memory by 50%: set `CANARDSTACK_QUERY_INTERACTIVE_MEMORY_LIMIT`
+2. Lower query memory by 50%: set `CANARDSTACK_QUERY_MEMORY_LIMIT`
    (e.g. `256MiB`) and restart.
 3. Lower global query concurrency: set
-   `CANARDSTACK_QUERY_INTERACTIVE_CONCURRENCY=1` and restart.
+   `CANARDSTACK_QUERY_CONCURRENCY=1` and restart.
 4. Reduce compatibility query traffic from Grafana or other clients.
 
 ### Safe Degradation

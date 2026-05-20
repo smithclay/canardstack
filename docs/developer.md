@@ -44,12 +44,12 @@ exists; otherwise the defaults are used.
 
 Start from `config/example.toml` for a full structured config grouped by
 operator concern: server, auth, paths, DuckDB, DuckLake, ingest, query,
-retention, scheduler, raw spool, health, and bench. Every TOML setting has a
-matching `CANARDSTACK_*` environment variable, and env vars always win. Empty
-env vars clear optional string/path settings such as
+retention, scheduler, and raw spool. Every public TOML setting has a matching
+`CANARDSTACK_*` environment variable, and env vars always win. Empty env vars
+clear optional string/path settings such as
 `CANARDSTACK_DUCKLAKE_ATTACH_URI`, `CANARDSTACK_POSTGRES_DSN`,
 `CANARDSTACK_DUCKDB_EXTENSION_DIR`, and
-`CANARDSTACK_RUNTIME_MEMORY_LIMIT_BYTES`.
+`CANARDSTACK_PROCESS_MEMORY_LIMIT_BYTES`.
 
 ## Local DuckLake Mode
 
@@ -62,20 +62,18 @@ config file:
 ```text
 CANARDSTACK_BIND=0.0.0.0:4318
 CANARDSTACK_DATA_DIR=/var/lib/canardstack
-CANARDSTACK_DUCKDB_PATH=/var/lib/canardstack/canardstack.duckdb
-CANARDSTACK_STORAGE_DIR=/var/lib/canardstack/storage
 CANARDSTACK_DUCKDB_EXTENSION_DIR=/usr/local/lib/duckdb/extensions
 ```
 
 With no `CANARDSTACK_POSTGRES_DSN`, DuckLake uses a local DuckDB-backed catalog
-file beside `CANARDSTACK_DUCKDB_PATH` and local file storage under
-`CANARDSTACK_STORAGE_DIR`. Postgres catalogs and object storage are later
+under `CANARDSTACK_DATA_DIR` and local file storage under
+`CANARDSTACK_DATA_DIR/storage`. Postgres catalogs and object storage are later
 deployment modes, not required for the Docker quickstart.
 
 Default v0 writes buffer prepared Arrow batches, seal immutable Parquet segment
 files with `otlp2records`, and register sealed files with
-`ducklake_add_data_files`. `CANARDSTACK_IMMUTABLE_SEGMENT_TARGET_BYTES`
-defaults to 64 MiB and `CANARDSTACK_IMMUTABLE_SEGMENT_MAX_AGE_SECS` defaults to
+`ducklake_add_data_files`. `CANARDSTACK_SEGMENT_TARGET_BYTES` defaults to 64
+MiB and `CANARDSTACK_SEGMENT_MAX_AGE_SECS` defaults to
 10 seconds. Managed DuckLake adjacent-file compaction is disabled for immutable
 segments.
 
@@ -114,8 +112,8 @@ USE canardlake;
 ```
 
 and then creates or reuses the standard telemetry tables in that remote
-database. The local `CANARDSTACK_DUCKDB_PATH` still exists as the client-side
-DuckDB file used to load extensions and establish query connections.
+database. The local DuckDB file under `CANARDSTACK_DATA_DIR` still exists as
+the client-side file used to load extensions and establish query connections.
 
 Run the live remote DuckLake smoke test with credentials loaded:
 
@@ -158,7 +156,7 @@ export CANARDSTACK_POSTGRES_DSN='dbname=ducklake_catalog host=localhost user=pos
 ```
 
 If `CANARDSTACK_POSTGRES_DSN` is unset, DuckLake uses a local DuckDB metadata
-catalog file beside `CANARDSTACK_DUCKDB_PATH`.
+catalog file under `CANARDSTACK_DATA_DIR`.
 
 Startup fails fast if DuckLake cannot attach; there is no non-DuckLake ingest
 fallback.
@@ -304,8 +302,9 @@ loop without operator action:
 - A retention pass enforces the configured retention days, expires DuckLake
   snapshots, and cleans old files.
 
-All four respect `POST /api/admin/maintenance/pause`. Cadences are configurable
-under `[scheduler]` in `config.toml` or via `CANARDSTACK_SCHEDULER_*` env vars.
+All jobs respect `POST /api/admin/maintenance/pause`. The base cadence is
+configurable as `scheduler.maintenance_interval_secs` in `config.toml` or via
+`CANARDSTACK_MAINTENANCE_INTERVAL_SECS`.
 Set `scheduler.enabled = false` or `CANARDSTACK_SCHEDULER_ENABLED=false` to
 fall back to operator-triggered maintenance only. The scheduler shuts down
 cleanly when `serve` exits.

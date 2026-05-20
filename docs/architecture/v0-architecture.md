@@ -107,33 +107,24 @@ Startup replays uncheckpointed fsynced records before scheduler work starts.
 Replay enters the same decode, transform, queue, flush, and DuckLake commit path
 as normal ingest.
 
-The raw-spool writer is on the ingest acknowledgement path. It batches appends up
-to `CANARDSTACK_RAW_SPOOL_GROUP_COMMIT_RECORDS` records, or until
-`CANARDSTACK_RAW_SPOOL_GROUP_COMMIT_MS` elapses from the first record in the
-group. These are capacity knobs, not cosmetic settings: too small and storage
-spends the ingest budget on fsyncs; too large and `202` acknowledgement latency
-rises even when downstream queues are healthy. `0ms` is rejected at startup so
-operators do not accidentally disable batching and return to per-request fsync
-behavior.
+The raw-spool writer is on the ingest acknowledgement path. It batches appends
+internally up to 64 records, or until `CANARDSTACK_RAW_SPOOL_GROUP_COMMIT_MS`
+elapses from the first record in the group. This is a capacity knob, not a
+cosmetic setting: too small and storage spends the ingest budget on fsyncs; too
+large and `202` acknowledgement latency rises even when downstream queues are
+healthy. `0ms` is rejected at startup so operators do not accidentally disable
+batching and return to per-request fsync behavior.
 
 Checkpoint durability is intentionally weaker than append durability. A lost
 append would violate the `202` contract, but a lost checkpoint only causes
 duplicate replay of data already accepted into storage. Checkpoint log writes
-therefore acknowledge after the local write and fsync on the looser
-`CANARDSTACK_RAW_SPOOL_CHECKPOINT_FSYNC_RECORDS` /
-`CANARDSTACK_RAW_SPOOL_CHECKPOINT_FSYNC_MS` thresholds, plus writer shutdown.
+therefore acknowledge after the local write and fsync on looser internal
+thresholds, plus writer shutdown.
 
 Main knobs:
 
-- `CANARDSTACK_RAW_SPOOL_DIR`
-- `CANARDSTACK_RAW_SPOOL_MAX_SEGMENT_BYTES`
-- `CANARDSTACK_RAW_SPOOL_MAX_RECORD_BYTES`
-- `CANARDSTACK_RAW_SPOOL_MAX_TOTAL_BYTES`
-- `CANARDSTACK_RAW_SPOOL_WRITER_QUEUE_CAPACITY`
-- `CANARDSTACK_RAW_SPOOL_GROUP_COMMIT_RECORDS`
+- `CANARDSTACK_RAW_SPOOL_CAPACITY_BYTES`
 - `CANARDSTACK_RAW_SPOOL_GROUP_COMMIT_MS`
-- `CANARDSTACK_RAW_SPOOL_CHECKPOINT_FSYNC_RECORDS`
-- `CANARDSTACK_RAW_SPOOL_CHECKPOINT_FSYNC_MS`
 
 ## Queues And Flush
 
@@ -144,16 +135,15 @@ low-cardinality: signal plus source encoding.
 Memory and queue guardrails:
 
 - `CANARDSTACK_MAX_BODY_BYTES`, default 8 MiB.
-- `CANARDSTACK_PER_SIGNAL_QUEUE_BYTES`, default 512 MiB per signal.
-- `CANARDSTACK_PROCESS_INGEST_BYTES`, default 2 GiB.
-- Optional `CANARDSTACK_RUNTIME_MEMORY_LIMIT_BYTES`.
+- `CANARDSTACK_INGEST_MEMORY_BYTES`, default 2 GiB. Per-signal queues derive
+  from this total budget.
+- Optional `CANARDSTACK_PROCESS_MEMORY_LIMIT_BYTES`.
 
 Flush triggers:
 
-- `CANARDSTACK_MAX_ROWS_PER_FLUSH`, default 5,000 rows.
-- `CANARDSTACK_MAX_BYTES_PER_FLUSH`, default 4 MiB.
-- `CANARDSTACK_MAX_FLUSH_AGE_SECS` or `_MS`, default 10 seconds.
-- `CANARDSTACK_HIGH_PRESSURE_FLUSH_AGE_SECS` or `_MS`, default 2 seconds.
+- `CANARDSTACK_FLUSH_TARGET_BYTES`, default 4 MiB.
+- `CANARDSTACK_FLUSH_MAX_AGE_SECS` or `_MS`, default 10 seconds. The
+  high-pressure age is derived from this value.
 
 Flush drains queues, coalesces batches, appends them to immutable segment
 buffers, seals due Parquet files, registers those files in DuckLake, and then
@@ -177,8 +167,8 @@ Tables:
 DuckLake inlined telemetry rows should normally remain zero. Segment sizing is
 controlled by:
 
-- `CANARDSTACK_IMMUTABLE_SEGMENT_TARGET_BYTES`
-- `CANARDSTACK_IMMUTABLE_SEGMENT_MAX_AGE_SECS` or `_MS`
+- `CANARDSTACK_SEGMENT_TARGET_BYTES`
+- `CANARDSTACK_SEGMENT_MAX_AGE_SECS` or `_MS`
 
 Local DuckLake is the default. Remote DuckLake attach URIs are supported, but
 the core architecture remains the same.
@@ -237,7 +227,8 @@ endpoint names.
 ## Maintenance
 
 The API binary starts one in-process scheduler unless
-`CANARDSTACK_SCHEDULER_ENABLED=false`.
+`CANARDSTACK_SCHEDULER_ENABLED=false`. `CANARDSTACK_MAINTENANCE_INTERVAL_SECS`
+sets the base cadence; individual job cadences are derived from it.
 
 Scheduler jobs:
 
@@ -254,11 +245,8 @@ one writer.
 
 ## Retention
 
-Retention is whole-day oriented and bounded by configured horizons:
-
-- logs: `CANARDSTACK_LOGS_RETENTION_DAYS`, default 14
-- spans: `CANARDSTACK_SPANS_RETENTION_DAYS`, default 14
-- metrics: `CANARDSTACK_METRICS_RETENTION_DAYS`, default 30
+Retention is whole-day oriented and bounded by `CANARDSTACK_RETENTION_DAYS`,
+default 14.
 
 The current implementation uses bounded table deletes plus DuckLake snapshot
 expiration/cleanup hooks where available. Physical day-table layouts are not

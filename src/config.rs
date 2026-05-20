@@ -74,6 +74,46 @@ impl Config {
         let data_dir = env_path("CANARDSTACK_DATA_DIR")?
             .or(file.path(&["paths", "data_dir"])?)
             .unwrap_or_else(|| PathBuf::from(".canardstack"));
+        let max_body_bytes = env_usize("CANARDSTACK_MAX_BODY_BYTES")?
+            .or(file.usize(&["ingest", "max_body_bytes"])?)
+            .unwrap_or(8 * 1024 * 1024);
+        let ingest_memory_bytes = env_usize("CANARDSTACK_INGEST_MEMORY_BYTES")?
+            .or(file.usize(&["ingest", "memory_bytes"])?)
+            .unwrap_or(2 * 1024 * 1024 * 1024);
+        let flush_target_bytes = env_usize("CANARDSTACK_FLUSH_TARGET_BYTES")?
+            .or(file.usize(&["ingest", "flush_target_bytes"])?)
+            .unwrap_or(4 * 1024 * 1024);
+        let flush_max_age = duration_ms_or_secs(
+            &file,
+            &["ingest", "flush_max_age_ms"],
+            &["ingest", "flush_max_age_secs"],
+            "CANARDSTACK_FLUSH_MAX_AGE_MS",
+            "CANARDSTACK_FLUSH_MAX_AGE_SECS",
+            10,
+        )?;
+        let query_concurrency = env_usize("CANARDSTACK_QUERY_CONCURRENCY")?
+            .or(file.usize(&["query", "concurrency"])?)
+            .unwrap_or(4);
+        let query_timeout_secs = env_usize("CANARDSTACK_QUERY_TIMEOUT_SECS")?
+            .or(file.usize(&["query", "timeout_secs"])?)
+            .unwrap_or(15) as u64;
+        let query_memory_limit = env_string("CANARDSTACK_QUERY_MEMORY_LIMIT")?
+            .or(file.string(&["query", "memory_limit"])?)
+            .unwrap_or_else(|| "1GiB".to_string());
+        let retention_days = env_i64("CANARDSTACK_RETENTION_DAYS")?
+            .or(file.i64(&["retention", "days"])?)
+            .unwrap_or(14);
+        let maintenance_interval = duration_ms_or_secs(
+            &file,
+            &["scheduler", "maintenance_interval_ms"],
+            &["scheduler", "maintenance_interval_secs"],
+            "CANARDSTACK_MAINTENANCE_INTERVAL_MS",
+            "CANARDSTACK_MAINTENANCE_INTERVAL_SECS",
+            30,
+        )?;
+        let raw_spool_capacity_bytes = env_usize("CANARDSTACK_RAW_SPOOL_CAPACITY_BYTES")?
+            .or(file.usize(&["raw_spool", "capacity_bytes"])?)
+            .unwrap_or(1024 * 1024 * 1024);
 
         Ok(Self {
             bind: env_string("CANARDSTACK_BIND")?
@@ -85,12 +125,8 @@ impl Config {
             admin_api_key: env_string("CANARDSTACK_ADMIN_API_KEY")?
                 .or(file.string(&["auth", "admin_api_key"])?)
                 .unwrap_or_else(|| "dev-canardstack-admin-key".to_string()),
-            duckdb_path: env_path("CANARDSTACK_DUCKDB_PATH")?
-                .or(file.path(&["paths", "duckdb_path"])?)
-                .unwrap_or_else(|| data_dir.join("canardstack.duckdb")),
-            local_storage_dir: env_path("CANARDSTACK_STORAGE_DIR")?
-                .or(file.path(&["paths", "storage_dir"])?)
-                .unwrap_or_else(|| data_dir.join("storage")),
+            duckdb_path: data_dir.join("canardstack.duckdb"),
+            local_storage_dir: data_dir.join("storage"),
             duckdb_extension_dir: match env_optional_path("CANARDSTACK_DUCKDB_EXTENSION_DIR")? {
                 Some(value) => value,
                 None => file.optional_path(&["paths", "duckdb_extension_dir"])?,
@@ -103,45 +139,21 @@ impl Config {
                 Some(value) => value,
                 None => file.optional_string(&["ducklake", "attach_uri"])?,
             },
-            max_body_bytes: env_usize("CANARDSTACK_MAX_BODY_BYTES")?
-                .or(file.usize(&["ingest", "max_body_bytes"])?)
-                .unwrap_or(8 * 1024 * 1024),
-            per_signal_queue_bytes: env_usize("CANARDSTACK_PER_SIGNAL_QUEUE_BYTES")?
-                .or(file.usize(&["ingest", "per_signal_queue_bytes"])?)
-                .unwrap_or(512 * 1024 * 1024),
-            process_ingest_bytes: env_usize("CANARDSTACK_PROCESS_INGEST_BYTES")?
-                .or(file.usize(&["ingest", "process_ingest_bytes"])?)
-                .unwrap_or(2 * 1024 * 1024 * 1024),
+            max_body_bytes,
+            per_signal_queue_bytes: (ingest_memory_bytes / 4).max(max_body_bytes),
+            process_ingest_bytes: ingest_memory_bytes,
             runtime_memory_limit_bytes: match env_optional_usize(
-                "CANARDSTACK_RUNTIME_MEMORY_LIMIT_BYTES",
+                "CANARDSTACK_PROCESS_MEMORY_LIMIT_BYTES",
             )? {
                 Some(value) => value,
-                None => file.usize(&["ingest", "runtime_memory_limit_bytes"])?,
+                None => file.usize(&["ingest", "process_memory_limit_bytes"])?,
             },
-            max_rows_per_flush: env_usize("CANARDSTACK_MAX_ROWS_PER_FLUSH")?
-                .or(file.usize(&["ingest", "max_rows_per_flush"])?)
-                .unwrap_or(5_000),
-            max_bytes_per_flush: env_usize("CANARDSTACK_MAX_BYTES_PER_FLUSH")?
-                .or(file.usize(&["ingest", "max_bytes_per_flush"])?)
-                .unwrap_or(4 * 1024 * 1024),
-            max_age: duration_ms_or_secs(
-                &file,
-                &["ingest", "max_flush_age_ms"],
-                &["ingest", "max_flush_age_secs"],
-                "CANARDSTACK_MAX_FLUSH_AGE_MS",
-                "CANARDSTACK_MAX_FLUSH_AGE_SECS",
-                10,
-            )?,
-            high_pressure_max_age: duration_ms_or_secs(
-                &file,
-                &["ingest", "high_pressure_flush_age_ms"],
-                &["ingest", "high_pressure_flush_age_secs"],
-                "CANARDSTACK_HIGH_PRESSURE_FLUSH_AGE_MS",
-                "CANARDSTACK_HIGH_PRESSURE_FLUSH_AGE_SECS",
-                2,
-            )?,
-            duckdb_write_memory_limit: env_string("CANARDSTACK_DUCKDB_WRITE_MEMORY_LIMIT")?
-                .or(file.string(&["duckdb", "write_memory_limit"])?)
+            max_rows_per_flush: 5_000,
+            max_bytes_per_flush: flush_target_bytes,
+            max_age: flush_max_age,
+            high_pressure_max_age: (flush_max_age / 5).max(Duration::from_millis(100)),
+            duckdb_write_memory_limit: env_string("CANARDSTACK_DUCKDB_MEMORY_LIMIT")?
+                .or(file.string(&["duckdb", "memory_limit"])?)
                 .unwrap_or_else(|| "1GiB".to_string()),
             late_accept_secs: env_i64("CANARDSTACK_ACCEPT_LATE_SECS")?
                 .or(file.i64(&["validation", "accept_late_secs"])?)
@@ -149,91 +161,41 @@ impl Config {
             future_accept_secs: env_i64("CANARDSTACK_ACCEPT_FUTURE_SECS")?
                 .or(file.i64(&["validation", "accept_future_secs"])?)
                 .unwrap_or(10 * 60),
-            force_dependency_unhealthy: env_bool("CANARDSTACK_FORCE_DEPENDENCY_UNHEALTHY")?
-                .or(file.bool(&["health", "force_dependency_unhealthy"])?)
-                .unwrap_or(false),
-            immutable_segment_target_bytes: env_usize(
-                "CANARDSTACK_IMMUTABLE_SEGMENT_TARGET_BYTES",
-            )?
-            .or(file.usize(&["immutable_segments", "target_bytes"])?)
-            .unwrap_or(64 * 1024 * 1024),
+            force_dependency_unhealthy: false,
+            immutable_segment_target_bytes: env_usize("CANARDSTACK_SEGMENT_TARGET_BYTES")?
+                .or(file.usize(&["storage", "segment_target_bytes"])?)
+                .unwrap_or(64 * 1024 * 1024),
             immutable_segment_max_age: duration_ms_or_secs(
                 &file,
-                &["immutable_segments", "max_age_ms"],
-                &["immutable_segments", "max_age_secs"],
-                "CANARDSTACK_IMMUTABLE_SEGMENT_MAX_AGE_MS",
-                "CANARDSTACK_IMMUTABLE_SEGMENT_MAX_AGE_SECS",
+                &["storage", "segment_max_age_ms"],
+                &["storage", "segment_max_age_secs"],
+                "CANARDSTACK_SEGMENT_MAX_AGE_MS",
+                "CANARDSTACK_SEGMENT_MAX_AGE_SECS",
                 10,
             )?,
-            ducklake_data_inlining_row_limit: env_usize(
-                "CANARDSTACK_DUCKLAKE_DATA_INLINING_ROW_LIMIT",
-            )?
-            .or(file.usize(&["ducklake", "data_inlining_row_limit"])?)
-            .unwrap_or(0),
+            ducklake_data_inlining_row_limit: 0,
             query_interactive: QueryLane {
-                concurrency: env_usize("CANARDSTACK_QUERY_INTERACTIVE_CONCURRENCY")?
-                    .or(file.usize(&["query", "interactive", "concurrency"])?)
-                    .unwrap_or(4),
-                timeout_secs: env_usize("CANARDSTACK_QUERY_INTERACTIVE_TIMEOUT_SECS")?
-                    .or(file.usize(&["query", "interactive", "timeout_secs"])?)
-                    .unwrap_or(15) as u64,
-                memory_limit: env_string("CANARDSTACK_QUERY_INTERACTIVE_MEMORY_LIMIT")?
-                    .or(file.string(&["query", "interactive", "memory_limit"])?)
-                    .unwrap_or_else(|| "1GiB".to_string()),
+                concurrency: query_concurrency,
+                timeout_secs: query_timeout_secs,
+                memory_limit: query_memory_limit.clone(),
             },
             query_background: QueryLane {
-                concurrency: env_usize("CANARDSTACK_QUERY_BACKGROUND_CONCURRENCY")?
-                    .or(file.usize(&["query", "background", "concurrency"])?)
-                    .unwrap_or(2),
-                timeout_secs: env_usize("CANARDSTACK_QUERY_BACKGROUND_TIMEOUT_SECS")?
-                    .or(file.usize(&["query", "background", "timeout_secs"])?)
-                    .unwrap_or(60) as u64,
-                memory_limit: env_string("CANARDSTACK_QUERY_BACKGROUND_MEMORY_LIMIT")?
-                    .or(file.string(&["query", "background", "memory_limit"])?)
-                    .unwrap_or_else(|| "1GiB".to_string()),
+                concurrency: (query_concurrency / 2).max(1),
+                timeout_secs: query_timeout_secs.saturating_mul(4).max(query_timeout_secs),
+                memory_limit: query_memory_limit,
             },
-            logs_retention_days: env_i64("CANARDSTACK_LOGS_RETENTION_DAYS")?
-                .or(file.i64(&["retention", "logs_days"])?)
-                .unwrap_or(14),
-            spans_retention_days: env_i64("CANARDSTACK_SPANS_RETENTION_DAYS")?
-                .or(file.i64(&["retention", "spans_days"])?)
-                .unwrap_or(14),
-            metrics_retention_days: env_i64("CANARDSTACK_METRICS_RETENTION_DAYS")?
-                .or(file.i64(&["retention", "metrics_days"])?)
-                .unwrap_or(30),
+            logs_retention_days: retention_days,
+            spans_retention_days: retention_days,
+            metrics_retention_days: retention_days,
             scheduler_enabled: env_bool("CANARDSTACK_SCHEDULER_ENABLED")?
                 .or(file.bool(&["scheduler", "enabled"])?)
                 .unwrap_or(true),
-            scheduler_watchdog_interval: Duration::from_millis(
-                env_usize("CANARDSTACK_SCHEDULER_WATCHDOG_MS")?
-                    .or(file.usize(&["scheduler", "watchdog_ms"])?)
-                    .unwrap_or(1_000) as u64,
-            ),
-            scheduler_flush_interval: Duration::from_secs(
-                env_usize("CANARDSTACK_SCHEDULER_FLUSH_SECS")?
-                    .or(file.usize(&["scheduler", "flush_secs"])?)
-                    .unwrap_or(30) as u64,
-            ),
-            scheduler_metadata_interval: Duration::from_secs(
-                env_usize("CANARDSTACK_SCHEDULER_METADATA_SECS")?
-                    .or(file.usize(&["scheduler", "metadata_secs"])?)
-                    .unwrap_or(30) as u64,
-            ),
-            scheduler_metrics_interval: Duration::from_secs(
-                env_usize("CANARDSTACK_SCHEDULER_METRICS_SECS")?
-                    .or(file.usize(&["scheduler", "metrics_secs"])?)
-                    .unwrap_or(60) as u64,
-            ),
-            scheduler_compaction_interval: Duration::from_secs(
-                env_usize("CANARDSTACK_SCHEDULER_COMPACTION_SECS")?
-                    .or(file.usize(&["scheduler", "compaction_secs"])?)
-                    .unwrap_or(300) as u64,
-            ),
-            scheduler_retention_interval: Duration::from_secs(
-                env_usize("CANARDSTACK_SCHEDULER_RETENTION_SECS")?
-                    .or(file.usize(&["scheduler", "retention_secs"])?)
-                    .unwrap_or(3_600) as u64,
-            ),
+            scheduler_watchdog_interval: Duration::from_secs(1),
+            scheduler_flush_interval: maintenance_interval,
+            scheduler_metadata_interval: maintenance_interval,
+            scheduler_metrics_interval: maintenance_interval.saturating_mul(2),
+            scheduler_compaction_interval: maintenance_interval.saturating_mul(10),
+            scheduler_retention_interval: maintenance_interval.saturating_mul(120),
             max_concurrent_connections: env_usize("CANARDSTACK_MAX_CONNECTIONS")?
                 .or(file.usize(&["server", "max_connections"])?)
                 .unwrap_or(1024),
@@ -250,43 +212,19 @@ impl Config {
             bench_http_keepalive: env_bool("CANARDSTACK_BENCH_HTTP_KEEPALIVE")?
                 .or(file.bool(&["bench", "http_keepalive"])?)
                 .unwrap_or(false),
-            raw_spool_dir: env_path("CANARDSTACK_RAW_SPOOL_DIR")?
-                .or(file.path(&["paths", "raw_spool_dir"])?)
-                .unwrap_or_else(|| data_dir.join("raw-spool")),
-            raw_spool_max_segment_bytes: env_usize("CANARDSTACK_RAW_SPOOL_MAX_SEGMENT_BYTES")?
-                .or(file.usize(&["raw_spool", "max_segment_bytes"])?)
-                .unwrap_or(64 * 1024 * 1024),
-            raw_spool_max_record_bytes: env_usize("CANARDSTACK_RAW_SPOOL_MAX_RECORD_BYTES")?
-                .or(file.usize(&["raw_spool", "max_record_bytes"])?)
-                .unwrap_or(8 * 1024 * 1024),
-            raw_spool_max_total_bytes: env_usize("CANARDSTACK_RAW_SPOOL_MAX_TOTAL_BYTES")?
-                .or(file.usize(&["raw_spool", "max_total_bytes"])?)
-                .unwrap_or(1024 * 1024 * 1024),
-            raw_spool_writer_queue_capacity: env_usize(
-                "CANARDSTACK_RAW_SPOOL_WRITER_QUEUE_CAPACITY",
-            )?
-            .or(file.usize(&["raw_spool", "writer_queue_capacity"])?)
-            .unwrap_or(1024),
-            raw_spool_group_commit_records: env_usize(
-                "CANARDSTACK_RAW_SPOOL_GROUP_COMMIT_RECORDS",
-            )?
-            .or(file.usize(&["raw_spool", "group_commit_records"])?)
-            .unwrap_or(64),
+            raw_spool_dir: data_dir.join("raw-spool"),
+            raw_spool_max_segment_bytes: (64 * 1024 * 1024).min(raw_spool_capacity_bytes),
+            raw_spool_max_record_bytes: max_body_bytes,
+            raw_spool_max_total_bytes: raw_spool_capacity_bytes,
+            raw_spool_writer_queue_capacity: 1024,
+            raw_spool_group_commit_records: 64,
             raw_spool_group_commit_delay: Duration::from_millis(
                 env_usize("CANARDSTACK_RAW_SPOOL_GROUP_COMMIT_MS")?
                     .or(file.usize(&["raw_spool", "group_commit_ms"])?)
                     .unwrap_or(1) as u64,
             ),
-            raw_spool_checkpoint_fsync_records: env_usize(
-                "CANARDSTACK_RAW_SPOOL_CHECKPOINT_FSYNC_RECORDS",
-            )?
-            .or(file.usize(&["raw_spool", "checkpoint_fsync_records"])?)
-            .unwrap_or(1024),
-            raw_spool_checkpoint_fsync_delay: Duration::from_millis(
-                env_usize("CANARDSTACK_RAW_SPOOL_CHECKPOINT_FSYNC_MS")?
-                    .or(file.usize(&["raw_spool", "checkpoint_fsync_ms"])?)
-                    .unwrap_or(1000) as u64,
-            ),
+            raw_spool_checkpoint_fsync_records: 1024,
+            raw_spool_checkpoint_fsync_delay: Duration::from_millis(1000),
         })
     }
 
@@ -370,7 +308,7 @@ impl Config {
         }
         if self.per_signal_queue_bytes > self.process_ingest_bytes {
             anyhow::bail!(
-                "CANARDSTACK_PER_SIGNAL_QUEUE_BYTES ({}) must be <= CANARDSTACK_PROCESS_INGEST_BYTES ({})",
+                "derived per-signal ingest queue bytes ({}) must be <= CANARDSTACK_INGEST_MEMORY_BYTES ({})",
                 self.per_signal_queue_bytes,
                 self.process_ingest_bytes
             );
@@ -382,7 +320,7 @@ impl Config {
             anyhow::bail!("ingest memory caps must be > 0");
         }
         if matches!(self.runtime_memory_limit_bytes, Some(0)) {
-            anyhow::bail!("CANARDSTACK_RUNTIME_MEMORY_LIMIT_BYTES must be > 0 when set");
+            anyhow::bail!("CANARDSTACK_PROCESS_MEMORY_LIMIT_BYTES must be > 0 when set");
         }
         if self.max_rows_per_flush == 0 || self.max_bytes_per_flush == 0 {
             anyhow::bail!("flush thresholds must be > 0");
@@ -391,17 +329,17 @@ impl Config {
             anyhow::bail!("flush age controls must be > 0");
         }
         if self.duckdb_write_memory_limit.trim().is_empty() {
-            anyhow::bail!("CANARDSTACK_DUCKDB_WRITE_MEMORY_LIMIT must not be empty");
+            anyhow::bail!("CANARDSTACK_DUCKDB_MEMORY_LIMIT must not be empty");
         }
         if self.immutable_segment_target_bytes == 0 {
-            anyhow::bail!("CANARDSTACK_IMMUTABLE_SEGMENT_TARGET_BYTES must be > 0");
+            anyhow::bail!("CANARDSTACK_SEGMENT_TARGET_BYTES must be > 0");
         }
         if self.immutable_segment_max_age.is_zero() {
-            anyhow::bail!("CANARDSTACK_IMMUTABLE_SEGMENT_MAX_AGE_MS/SECS must be > 0");
+            anyhow::bail!("CANARDSTACK_SEGMENT_MAX_AGE_MS/SECS must be > 0");
         }
         if self.high_pressure_max_age > self.max_age {
             anyhow::bail!(
-                "CANARDSTACK_HIGH_PRESSURE_FLUSH_AGE_MS/SECS must be <= CANARDSTACK_MAX_FLUSH_AGE_MS/SECS"
+                "derived high-pressure flush age must be <= CANARDSTACK_FLUSH_MAX_AGE_MS/SECS"
             );
         }
         if self.logs_retention_days <= 0
@@ -435,11 +373,11 @@ impl Config {
             anyhow::bail!("CANARDSTACK_RAW_SPOOL_GROUP_COMMIT_MS must be > 0");
         }
         if self.raw_spool_checkpoint_fsync_delay.is_zero() {
-            anyhow::bail!("CANARDSTACK_RAW_SPOOL_CHECKPOINT_FSYNC_MS must be > 0");
+            anyhow::bail!("raw spool checkpoint fsync delay must be > 0");
         }
         if self.raw_spool_max_record_bytes > self.raw_spool_max_total_bytes {
             anyhow::bail!(
-                "CANARDSTACK_RAW_SPOOL_MAX_RECORD_BYTES must be <= CANARDSTACK_RAW_SPOOL_MAX_TOTAL_BYTES"
+                "CANARDSTACK_MAX_BODY_BYTES must be <= CANARDSTACK_RAW_SPOOL_CAPACITY_BYTES"
             );
         }
         if self.scheduler_watchdog_interval.is_zero()
@@ -652,55 +590,33 @@ mod tests {
         "CANARDSTACK_API_KEY",
         "CANARDSTACK_ADMIN_API_KEY",
         "CANARDSTACK_DATA_DIR",
-        "CANARDSTACK_DUCKDB_PATH",
-        "CANARDSTACK_STORAGE_DIR",
         "CANARDSTACK_DUCKDB_EXTENSION_DIR",
         "CANARDSTACK_POSTGRES_DSN",
         "CANARDSTACK_DUCKLAKE_ATTACH_URI",
         "CANARDSTACK_MAX_BODY_BYTES",
-        "CANARDSTACK_PER_SIGNAL_QUEUE_BYTES",
-        "CANARDSTACK_PROCESS_INGEST_BYTES",
-        "CANARDSTACK_RUNTIME_MEMORY_LIMIT_BYTES",
-        "CANARDSTACK_MAX_ROWS_PER_FLUSH",
-        "CANARDSTACK_MAX_BYTES_PER_FLUSH",
-        "CANARDSTACK_MAX_FLUSH_AGE_MS",
-        "CANARDSTACK_MAX_FLUSH_AGE_SECS",
-        "CANARDSTACK_HIGH_PRESSURE_FLUSH_AGE_MS",
-        "CANARDSTACK_HIGH_PRESSURE_FLUSH_AGE_SECS",
-        "CANARDSTACK_DUCKDB_WRITE_MEMORY_LIMIT",
+        "CANARDSTACK_INGEST_MEMORY_BYTES",
+        "CANARDSTACK_PROCESS_MEMORY_LIMIT_BYTES",
+        "CANARDSTACK_FLUSH_TARGET_BYTES",
+        "CANARDSTACK_FLUSH_MAX_AGE_MS",
+        "CANARDSTACK_FLUSH_MAX_AGE_SECS",
+        "CANARDSTACK_DUCKDB_MEMORY_LIMIT",
         "CANARDSTACK_ACCEPT_LATE_SECS",
         "CANARDSTACK_ACCEPT_FUTURE_SECS",
-        "CANARDSTACK_FORCE_DEPENDENCY_UNHEALTHY",
-        "CANARDSTACK_IMMUTABLE_SEGMENT_TARGET_BYTES",
-        "CANARDSTACK_IMMUTABLE_SEGMENT_MAX_AGE_MS",
-        "CANARDSTACK_IMMUTABLE_SEGMENT_MAX_AGE_SECS",
-        "CANARDSTACK_DUCKLAKE_DATA_INLINING_ROW_LIMIT",
-        "CANARDSTACK_QUERY_INTERACTIVE_CONCURRENCY",
-        "CANARDSTACK_QUERY_INTERACTIVE_TIMEOUT_SECS",
-        "CANARDSTACK_QUERY_INTERACTIVE_MEMORY_LIMIT",
-        "CANARDSTACK_QUERY_BACKGROUND_CONCURRENCY",
-        "CANARDSTACK_QUERY_BACKGROUND_TIMEOUT_SECS",
-        "CANARDSTACK_QUERY_BACKGROUND_MEMORY_LIMIT",
-        "CANARDSTACK_LOGS_RETENTION_DAYS",
-        "CANARDSTACK_SPANS_RETENTION_DAYS",
-        "CANARDSTACK_METRICS_RETENTION_DAYS",
+        "CANARDSTACK_SEGMENT_TARGET_BYTES",
+        "CANARDSTACK_SEGMENT_MAX_AGE_MS",
+        "CANARDSTACK_SEGMENT_MAX_AGE_SECS",
+        "CANARDSTACK_QUERY_CONCURRENCY",
+        "CANARDSTACK_QUERY_TIMEOUT_SECS",
+        "CANARDSTACK_QUERY_MEMORY_LIMIT",
+        "CANARDSTACK_RETENTION_DAYS",
         "CANARDSTACK_SCHEDULER_ENABLED",
-        "CANARDSTACK_SCHEDULER_WATCHDOG_MS",
-        "CANARDSTACK_SCHEDULER_FLUSH_SECS",
-        "CANARDSTACK_SCHEDULER_METADATA_SECS",
-        "CANARDSTACK_SCHEDULER_METRICS_SECS",
-        "CANARDSTACK_SCHEDULER_COMPACTION_SECS",
-        "CANARDSTACK_SCHEDULER_RETENTION_SECS",
+        "CANARDSTACK_MAINTENANCE_INTERVAL_MS",
+        "CANARDSTACK_MAINTENANCE_INTERVAL_SECS",
         "CANARDSTACK_MAX_CONNECTIONS",
         "CANARDSTACK_SOCKET_READ_TIMEOUT_SECS",
         "CANARDSTACK_SOCKET_WRITE_TIMEOUT_SECS",
         "CANARDSTACK_BENCH_HTTP_KEEPALIVE",
-        "CANARDSTACK_RAW_SPOOL_DIR",
-        "CANARDSTACK_RAW_SPOOL_MAX_SEGMENT_BYTES",
-        "CANARDSTACK_RAW_SPOOL_MAX_RECORD_BYTES",
-        "CANARDSTACK_RAW_SPOOL_MAX_TOTAL_BYTES",
-        "CANARDSTACK_RAW_SPOOL_WRITER_QUEUE_CAPACITY",
-        "CANARDSTACK_RAW_SPOOL_GROUP_COMMIT_RECORDS",
+        "CANARDSTACK_RAW_SPOOL_CAPACITY_BYTES",
         "CANARDSTACK_RAW_SPOOL_GROUP_COMMIT_MS",
     ];
 
@@ -763,63 +679,41 @@ data_dir = "file-data"
 duckdb_extension_dir = "/opt/duckdb/extensions"
 
 [duckdb]
-write_memory_limit = "2GiB"
+memory_limit = "2GiB"
 
 [ducklake]
 attach_uri = "md:file"
-data_inlining_row_limit = 9
 
 [ingest]
 max_body_bytes = 12345
-per_signal_queue_bytes = 2000000
-process_ingest_bytes = 3000000
-runtime_memory_limit_bytes = 4000000
-max_rows_per_flush = 321
-max_bytes_per_flush = 654321
-max_flush_age_secs = 11
-high_pressure_flush_age_ms = 250
+memory_bytes = 3000000
+process_memory_limit_bytes = 4000000
+flush_target_bytes = 654321
+flush_max_age_secs = 11
 
 [validation]
 accept_late_secs = 100
 accept_future_secs = 20
 
-[immutable_segments]
-target_bytes = 777
-max_age_secs = 12
+[storage]
+segment_target_bytes = 777
+segment_max_age_secs = 12
 
-[query.interactive]
+[query]
 concurrency = 6
 timeout_secs = 7
 memory_limit = "384MiB"
 
-[query.background]
-concurrency = 3
-timeout_secs = 70
-memory_limit = "768MiB"
-
 [retention]
-logs_days = 5
-spans_days = 6
-metrics_days = 7
+days = 5
 
 [scheduler]
 enabled = false
-watchdog_ms = 500
-flush_secs = 40
-metadata_secs = 41
-metrics_secs = 42
-compaction_secs = 43
-retention_secs = 44
+maintenance_interval_secs = 40
 
 [raw_spool]
-max_segment_bytes = 8192
-max_record_bytes = 4096
-max_total_bytes = 16384
-writer_queue_capacity = 16
-group_commit_records = 8
+capacity_bytes = 16384
 group_commit_ms = 3
-checkpoint_fsync_records = 256
-checkpoint_fsync_ms = 750
 
 [bench]
 http_keepalive = true
@@ -830,7 +724,7 @@ http_keepalive = true
         unsafe {
             env::set_var(CONFIG_PATH_ENV, &config_path);
             env::set_var("CANARDSTACK_BIND", "127.0.0.1:4319");
-            env::set_var("CANARDSTACK_MAX_FLUSH_AGE_MS", "125");
+            env::set_var("CANARDSTACK_FLUSH_MAX_AGE_MS", "125");
             env::set_var("CANARDSTACK_DUCKLAKE_ATTACH_URI", "");
         }
 
@@ -849,18 +743,45 @@ http_keepalive = true
         );
         assert_eq!(config.ducklake_attach_uri, None);
         assert_eq!(config.max_body_bytes, 12345);
+        assert_eq!(config.process_ingest_bytes, 3_000_000);
+        assert_eq!(config.per_signal_queue_bytes, 750_000);
+        assert_eq!(config.runtime_memory_limit_bytes, Some(4_000_000));
+        assert_eq!(config.max_bytes_per_flush, 654_321);
         assert_eq!(config.max_age, Duration::from_millis(125));
-        assert_eq!(config.high_pressure_max_age, Duration::from_millis(250));
+        assert_eq!(config.high_pressure_max_age, Duration::from_millis(100));
+        assert_eq!(config.duckdb_write_memory_limit, "2GiB");
+        assert_eq!(config.immutable_segment_target_bytes, 777);
+        assert_eq!(config.immutable_segment_max_age, Duration::from_secs(12));
         assert_eq!(config.query_interactive.concurrency, 6);
+        assert_eq!(config.query_interactive.timeout_secs, 7);
+        assert_eq!(config.query_interactive.memory_limit, "384MiB");
+        assert_eq!(config.query_background.concurrency, 3);
+        assert_eq!(config.query_background.timeout_secs, 28);
+        assert_eq!(config.logs_retention_days, 5);
+        assert_eq!(config.metrics_retention_days, 5);
         assert!(!config.scheduler_enabled);
+        assert_eq!(config.scheduler_flush_interval, Duration::from_secs(40));
+        assert_eq!(config.scheduler_metadata_interval, Duration::from_secs(40));
+        assert_eq!(config.scheduler_metrics_interval, Duration::from_secs(80));
+        assert_eq!(
+            config.scheduler_compaction_interval,
+            Duration::from_secs(400)
+        );
+        assert_eq!(
+            config.scheduler_retention_interval,
+            Duration::from_secs(4800)
+        );
+        assert_eq!(config.raw_spool_max_total_bytes, 16_384);
+        assert_eq!(config.raw_spool_max_segment_bytes, 16_384);
+        assert_eq!(config.raw_spool_max_record_bytes, 12_345);
         assert_eq!(
             config.raw_spool_group_commit_delay,
             Duration::from_millis(3)
         );
-        assert_eq!(config.raw_spool_checkpoint_fsync_records, 256);
+        assert_eq!(config.raw_spool_checkpoint_fsync_records, 1024);
         assert_eq!(
             config.raw_spool_checkpoint_fsync_delay,
-            Duration::from_millis(750)
+            Duration::from_millis(1000)
         );
         assert!(config.bench_http_keepalive);
     }

@@ -4,7 +4,7 @@
 
 The canardstack process exposes Prometheus-text metrics at `GET /metrics`. The
 scheduler also writes a snapshot of those same samples every
-`CANARDSTACK_SCHEDULER_METRICS_SECS` seconds with `service_name="canardstack"`:
+the derived metrics-snapshot maintenance cadence with `service_name="canardstack"`:
 counters land in `metric_sum`, and gauges land in `metric_gauge`. Grafana can
 query canardstack's own monitoring data through the normal Prometheus-compatible
 datastore path. The names below are the implemented contract: only metrics that

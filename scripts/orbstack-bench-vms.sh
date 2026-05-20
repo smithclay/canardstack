@@ -185,8 +185,6 @@ export CANARDSTACK_CACHE_DIR="${machine_cache}"
 export CARGO_TARGET_DIR="${machine_cache}/target"
 export CANARDSTACK_BIND="0.0.0.0:${bench_port}"
 export CANARDSTACK_DATA_DIR="${machine_cache}/data"
-export CANARDSTACK_DUCKDB_PATH="${machine_cache}/canardstack.duckdb"
-export CANARDSTACK_STORAGE_DIR="${machine_cache}/storage"
 export TMPDIR="${machine_cache}/tmp"
 export PATH="\${HOME}/.cargo/bin:\${PATH}"
 cd "${source_dir}"
@@ -301,14 +299,16 @@ reset_profile_data() {
   orb -m "${machine}" bash -lc '
     set -euo pipefail
     . "${HOME}/.canardstack-bench-env"
-    ducklake_catalog="$(dirname "${CANARDSTACK_DUCKDB_PATH}")/canardstack.ducklake"
+    duckdb_path="${CANARDSTACK_DATA_DIR}/canardstack.duckdb"
+    storage_dir="${CANARDSTACK_DATA_DIR}/storage"
+    ducklake_catalog="${CANARDSTACK_DATA_DIR}/canardstack.ducklake"
     rm -rf \
       "${CANARDSTACK_DATA_DIR}" \
-      "${CANARDSTACK_STORAGE_DIR}" \
-      "${CANARDSTACK_DUCKDB_PATH}" \
+      "${storage_dir}" \
+      "${duckdb_path}" \
       "${ducklake_catalog}" \
       "${TMPDIR}"
-    mkdir -p "${CANARDSTACK_DATA_DIR}" "${CANARDSTACK_STORAGE_DIR}" "${TMPDIR}"
+    mkdir -p "${CANARDSTACK_DATA_DIR}" "${storage_dir}" "${TMPDIR}"
     printf "reset %s\n" "${CANARDSTACK_CACHE_DIR}"
   '
 }
