@@ -305,6 +305,7 @@ pub(super) fn handle_checkpoint_batch(
 ) {
     let mut batch = vec![first];
     let collect_started = Instant::now();
+    drain_deferred_checkpoints(deferred, max_batch_records, &mut batch);
     collect_batch(
         receiver,
         deferred,
@@ -345,6 +346,22 @@ pub(super) fn handle_checkpoint_batch(
                 let _ = command.reply.send(Err(anyhow::anyhow!(message.clone())));
             }
         }
+    }
+}
+
+fn drain_deferred_checkpoints(
+    deferred: &mut VecDeque<RawSpoolCommand>,
+    max_batch_records: usize,
+    batch: &mut Vec<CheckpointCommand>,
+) {
+    while batch.len() < max_batch_records {
+        let Some(RawSpoolCommand::Checkpoint(_)) = deferred.front() else {
+            break;
+        };
+        let Some(RawSpoolCommand::Checkpoint(checkpoint)) = deferred.pop_front() else {
+            unreachable!("front matched checkpoint");
+        };
+        batch.push(checkpoint);
     }
 }
 

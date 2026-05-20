@@ -10,7 +10,8 @@ use super::{
     ImmutableSegmentBuffer, PreparedArrowBatch, Signal, Storage, TimingPhase,
 };
 use crate::LockExt;
-use anyhow::Result;
+use anyhow::{Context, Result};
+use arrow58::compute::concat_batches;
 use arrow58::record_batch::RecordBatch;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -58,25 +59,32 @@ impl Storage {
         let mut prepared = Vec::new();
         let mut prepare_timings = Vec::new();
         let mut attempted_rows = 0;
+        let mut grouped = BTreeMap::<(Signal, &str), Vec<&RecordBatch>>::new();
         for batch in batches {
             if batch.batch.num_rows() == 0 {
                 continue;
             }
-            let rows = batch.batch.num_rows();
+            attempted_rows += batch.batch.num_rows();
+            grouped
+                .entry((batch.table, batch.source_format))
+                .or_default()
+                .push(batch.batch);
+        }
+        for ((table, source_format), batches) in grouped {
+            let rows = batches.iter().map(|batch| batch.num_rows()).sum();
             let prepare_started = Instant::now();
-            let prepared_batch =
-                storage_duckdb_batch(batch.table, batch.batch, batch.source_format)?;
+            let batch = coalesce_storage_batches(table, &batches)?;
+            let prepared_batch = storage_duckdb_batch(table, &batch, source_format)?;
             let timestamp_days = batch_timestamp_days(&prepared_batch)?;
             let prepare_seconds = prepare_started.elapsed().as_secs_f64();
-            attempted_rows += rows;
             prepared.push(PreparedArrowBatch {
-                table: batch.table,
+                table,
                 batch: prepared_batch,
                 rows,
                 timestamp_days,
             });
             prepare_timings.push(ArrowBatchInsertTiming {
-                table: batch.table,
+                table,
                 phase: TimingPhase::Prepare,
                 rows,
                 seconds: prepare_seconds,
@@ -294,6 +302,18 @@ impl Storage {
     }
 }
 
+fn coalesce_storage_batches(table: Signal, batches: &[&RecordBatch]) -> Result<RecordBatch> {
+    match batches {
+        [] => anyhow::bail!("cannot coalesce empty {table} storage batch group"),
+        [batch] => Ok((*batch).clone()),
+        [first, ..] => {
+            let schema = first.schema();
+            concat_batches(&schema, batches.iter().copied())
+                .with_context(|| format!("coalesce {table} storage batches"))
+        }
+    }
+}
+
 fn seal_immutable_buffer(
     storage_dir: &Path,
     table: Signal,
@@ -335,6 +355,24 @@ mod tests {
     use arrow58::datatypes::{DataType, Field, Schema, TimeUnit};
     use std::sync::Arc;
     use tempfile::tempdir;
+
+    #[test]
+    fn coalesce_storage_batches_concats_rows() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
+        let first =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![1, 2]))])
+                .unwrap();
+        let second =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![3]))]).unwrap();
+
+        let coalesced = coalesce_storage_batches(Signal::MetricGauge, &[&first, &second]).unwrap();
+
+        assert_eq!(coalesced.num_rows(), 3);
+    }
 
     #[test]
     fn seal_immutable_buffer_writes_segments_and_tracks_days() {

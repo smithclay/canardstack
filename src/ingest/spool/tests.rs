@@ -166,6 +166,42 @@ fn raw_spool_writer_batches_checkpoint_commands_and_reports_stats_once() {
 }
 
 #[test]
+fn raw_spool_writer_batches_deferred_checkpoint_commands() {
+    let dir = tempdir().unwrap();
+    let mut spool = RawSpool::open(options(dir.path())).unwrap();
+    let first = spool.append(record(b"first")).unwrap();
+    let second = spool.append(record(b"second")).unwrap();
+    let third = spool.append(record(b"third")).unwrap();
+    let (first_command, first_rx) = checkpoint_command(vec![first]);
+    let (second_command, second_rx) = checkpoint_command(vec![second]);
+    let (third_command, third_rx) = checkpoint_command(vec![third]);
+    let mut deferred = VecDeque::from([
+        RawSpoolCommand::Checkpoint(second_command),
+        RawSpoolCommand::Checkpoint(third_command),
+    ]);
+    let (_tx, rx) = mpsc::sync_channel(4);
+
+    handle_checkpoint_batch(
+        &mut spool,
+        first_command,
+        &rx,
+        &mut deferred,
+        64,
+        Duration::from_millis(1),
+    );
+
+    let first_stats = first_rx.recv().unwrap().unwrap();
+    let second_stats = second_rx.recv().unwrap().unwrap();
+    let third_stats = third_rx.recv().unwrap().unwrap();
+    assert_eq!(first_stats.records, 3);
+    assert_eq!(first_stats.commands, 3);
+    assert_eq!(second_stats.records, 0);
+    assert_eq!(third_stats.records, 0);
+    assert!(deferred.is_empty());
+    assert_eq!(spool.recover_pending().unwrap().len(), 0);
+}
+
+#[test]
 fn raw_spool_periodic_append_sync_clears_unsynced_accounting() {
     let dir = tempdir().unwrap();
     let mut opts = options(dir.path());

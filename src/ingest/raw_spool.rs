@@ -434,13 +434,18 @@ impl Ingestor {
             .mark_committed(raw_spool_ref.id)
             .context("checkpoint raw spool record")?;
         if let Some(metrics) = metrics {
+            let seconds = started.elapsed().as_secs_f64();
             Self::record_raw_spool_checkpoint_batch_metrics(metrics, raw_spool_ref.lane, stats);
-            metrics.observe_phase_seconds(
-                signal.as_str(),
-                "raw_spool_checkpoint",
-                None,
-                started.elapsed().as_secs_f64(),
+            metrics.observe_seconds(
+                "canardstack_phase_duration_seconds",
+                &[
+                    ("signal", signal.as_str()),
+                    ("phase", "raw_spool_terminal_checkpoint"),
+                    ("reason", reason),
+                ],
+                seconds,
             );
+            metrics.observe_phase_seconds(signal.as_str(), "raw_spool_checkpoint", None, seconds);
             metrics.inc(
                 "canardstack_raw_spool_checkpointed_records_total",
                 &[("signal", signal.as_str()), ("reason", reason)],

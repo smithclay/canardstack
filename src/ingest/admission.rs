@@ -179,8 +179,12 @@ impl QueueCreditLedger {
         compressed_body_bytes: usize,
         max_body_bytes: usize,
     ) -> ApiResult<QueueCreditReservation> {
-        let bytes = queue_credit_estimate_bytes(headers, compressed_body_bytes, max_body_bytes);
-        self.reserve_exact(BTreeMap::from([(signal, bytes)]))
+        self.reserve_exact(queue_credit_estimate_by_signal(
+            signal,
+            headers,
+            compressed_body_bytes,
+            max_body_bytes,
+        ))
     }
 
     pub(super) fn reserve_exact(
@@ -402,6 +406,42 @@ fn queue_credit_estimate_bytes(
     }
 }
 
+fn queue_credit_estimate_by_signal(
+    signal: Signal,
+    headers: &HashMap<String, String>,
+    compressed_body_bytes: usize,
+    max_body_bytes: usize,
+) -> BTreeMap<Signal, usize> {
+    let bytes = if signal.is_metric() {
+        metric_queue_credit_estimate_bytes(headers, compressed_body_bytes, max_body_bytes)
+    } else {
+        queue_credit_estimate_bytes(headers, compressed_body_bytes, max_body_bytes)
+    };
+    if signal.is_metric() {
+        BTreeMap::from([(Signal::MetricGauge, bytes), (Signal::MetricSum, bytes)])
+    } else {
+        BTreeMap::from([(signal, bytes)])
+    }
+}
+
+fn metric_queue_credit_estimate_bytes(
+    headers: &HashMap<String, String>,
+    compressed_body_bytes: usize,
+    max_body_bytes: usize,
+) -> usize {
+    let compressed_body_bytes = compressed_body_bytes.max(1);
+    match headers
+        .get("content-encoding")
+        .map(|value| value.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("gzip") => compressed_body_bytes
+            .saturating_mul(12)
+            .min(max_body_bytes.saturating_mul(4)),
+        _ => compressed_body_bytes.saturating_mul(6),
+    }
+}
+
 fn normalized_credit_bytes(bytes_by_signal: BTreeMap<Signal, usize>) -> BTreeMap<Signal, usize> {
     bytes_by_signal
         .into_iter()
@@ -411,4 +451,27 @@ fn normalized_credit_bytes(bytes_by_signal: BTreeMap<Signal, usize>) -> BTreeMap
 
 fn watermark_bytes(capacity: usize, numerator: usize) -> usize {
     capacity.saturating_mul(numerator) / WATERMARK_DENOMINATOR
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn metric_queue_credit_estimate_reserves_both_metric_signals() {
+        let estimate =
+            queue_credit_estimate_by_signal(Signal::MetricGauge, &HashMap::new(), 100, 1_000);
+
+        assert_eq!(estimate.get(&Signal::MetricGauge), Some(&600));
+        assert_eq!(estimate.get(&Signal::MetricSum), Some(&600));
+        assert_eq!(estimate.len(), 2);
+    }
+
+    #[test]
+    fn non_metric_queue_credit_estimate_reserves_request_signal_only() {
+        let estimate = queue_credit_estimate_by_signal(Signal::Logs, &HashMap::new(), 100, 1_000);
+
+        assert_eq!(estimate.get(&Signal::Logs), Some(&400));
+        assert_eq!(estimate.len(), 1);
+    }
 }
