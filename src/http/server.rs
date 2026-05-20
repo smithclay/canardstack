@@ -16,7 +16,7 @@ use super::parser::{
 use super::response::{write_response, write_response_with_connection, HttpResponse};
 use super::router::route;
 
-const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 static NEVER_SHUTDOWN: AtomicBool = AtomicBool::new(false);
 

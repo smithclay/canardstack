@@ -54,3 +54,6 @@ days = 14
 [scheduler]
 enabled = true
 maintenance_interval_secs = 30
+
+[bench]
+http_keepalive = true

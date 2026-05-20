@@ -211,7 +211,7 @@ impl Config {
             ),
             bench_http_keepalive: env_bool("CANARDSTACK_BENCH_HTTP_KEEPALIVE")?
                 .or(file.bool(&["bench", "http_keepalive"])?)
-                .unwrap_or(false),
+                .unwrap_or(true),
             raw_spool_dir: data_dir.join("raw-spool"),
             raw_spool_max_segment_bytes: (64 * 1024 * 1024).min(raw_spool_capacity_bytes),
             raw_spool_max_record_bytes: max_body_bytes,
@@ -798,6 +798,16 @@ http_keepalive = true
             config.raw_spool_checkpoint_fsync_delay,
             Duration::from_millis(1000)
         );
+        assert!(config.bench_http_keepalive);
+    }
+
+    #[test]
+    fn http_keepalive_defaults_on_for_http11_clients() {
+        let _guard = env_lock().lock().unwrap();
+        let _snapshot = EnvSnapshot::capture_and_clear();
+
+        let config = Config::from_env().unwrap();
+
         assert!(config.bench_http_keepalive);
     }
 
