@@ -544,6 +544,14 @@ fn admin_ingest_health_includes_raw_spool_backlog() {
     );
     assert_eq!(response.status(), 200, "{}", response.json_body());
     assert_eq!(response.json_body()["raw_spool"]["pending_records"], 1);
+    assert_eq!(
+        response.json_body()["raw_spool_by_signal"]["logs"]["pending_records"],
+        1
+    );
+    assert_eq!(
+        response.json_body()["raw_spool_by_signal"]["spans"]["pending_records"],
+        0
+    );
     assert!(
         response.json_body()["raw_spool"]["pending_bytes"]
             .as_u64()
@@ -699,6 +707,11 @@ fn queue_pressure_returns_429() {
         &state,
     );
     assert_eq!(response.status(), 429);
+    assert_eq!(
+        state.ingestor.raw_spool_stats().unwrap().pending_records,
+        0,
+        "queue credit rejection should happen before durable raw spool append"
+    );
     assert_eq!(
         state
             .ingestor
@@ -925,7 +938,7 @@ fn raw_spool_replays_pending_request_on_startup() {
     let body = log_fixture(Utc::now().timestamp_nanos_opt().unwrap()).to_string();
     {
         let mut spool = RawSpool::open(RawSpoolOptions {
-            dir: config.raw_spool_dir.clone(),
+            dir: config.raw_spool_dir.join(Signal::Logs.as_str()),
             max_segment_bytes: config.raw_spool_max_segment_bytes as u64,
             max_record_bytes: config.raw_spool_max_record_bytes as u64,
             max_total_bytes: config.raw_spool_max_total_bytes as u64,
@@ -955,6 +968,17 @@ fn raw_spool_replays_pending_request_on_startup() {
             .map(|snapshot| snapshot.queued_rows),
         Some(1)
     );
+    assert!(
+        state
+            .ingestor
+            .snapshots()
+            .into_iter()
+            .find(|snapshot| snapshot.signal == Signal::Logs.as_str())
+            .map(|snapshot| snapshot.queue_credit_reserved_bytes)
+            .unwrap_or_default()
+            > 0,
+        "replayed batches should hold queue credits until storage commit"
+    );
     let flush = http::route(
         "POST",
         "/api/admin/maintenance/flush",
@@ -965,6 +989,15 @@ fn raw_spool_replays_pending_request_on_startup() {
     );
     assert_eq!(flush.status(), 200, "{}", flush.json_body());
     assert_eq!(log_rows(&state), 1);
+    assert_eq!(
+        state
+            .ingestor
+            .snapshots()
+            .into_iter()
+            .find(|snapshot| snapshot.signal == Signal::Logs.as_str())
+            .map(|snapshot| snapshot.queue_credit_reserved_bytes),
+        Some(0)
+    );
     let metrics = metrics_text(&state);
     assert!(
         metrics.contains(

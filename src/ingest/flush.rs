@@ -281,6 +281,7 @@ impl Ingestor {
                         );
                     }
                 }
+                self.release_queue_credits_for_batches(&sets);
                 self.mark_raw_spool_batches_storage_committed(&sets, metrics)?;
                 Ok(rows)
             }

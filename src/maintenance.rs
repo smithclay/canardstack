@@ -519,6 +519,11 @@ mod tests {
             signal,
             queued_rows: 0,
             queued_bytes: 0,
+            queue_credit_reserved_bytes: 0,
+            queue_credit_available_bytes: 0,
+            queue_credit_capacity_bytes: 0,
+            queue_credit_closed: false,
+            flush_debt_seconds: 0.0,
             oldest_age_seconds: 0.0,
             pressure,
         }

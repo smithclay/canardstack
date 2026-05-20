@@ -51,8 +51,10 @@ pub(super) struct QueuedBatch {
     pub(super) batch: RecordBatch,
     pub(super) source_format: &'static str,
     pub(super) raw_spool_id: Option<RawSpoolRecordId>,
+    pub(super) raw_spool_lane: Option<Signal>,
     accepted_at: Instant,
     pub(super) approx_bytes: usize,
+    pub(super) credit_bytes: usize,
 }
 
 impl QueuedBatch {
@@ -64,22 +66,29 @@ impl QueuedBatch {
         self.batch = self.batch.slice(0, take_rows);
         let taken_bytes = proportional_bytes(self.approx_bytes, take_rows, original_rows);
         let rest_bytes = self.approx_bytes.saturating_sub(taken_bytes);
+        let taken_credit_bytes = proportional_bytes(self.credit_bytes, take_rows, original_rows);
+        let rest_credit_bytes = self.credit_bytes.saturating_sub(taken_credit_bytes);
         let accepted_at = self.accepted_at;
         let source_format = self.source_format;
         let raw_spool_id = self.raw_spool_id;
+        let raw_spool_lane = self.raw_spool_lane;
         let taken = Self {
             batch: self.batch,
             source_format,
             raw_spool_id,
+            raw_spool_lane,
             accepted_at,
             approx_bytes: taken_bytes,
+            credit_bytes: taken_credit_bytes,
         };
         let rest = Self {
             batch: rest_batch,
             source_format,
             raw_spool_id,
+            raw_spool_lane,
             accepted_at,
             approx_bytes: rest_bytes,
+            credit_bytes: rest_credit_bytes,
         };
         (taken, rest)
     }
@@ -94,7 +103,9 @@ pub(super) struct PendingBatch {
     pub(super) batch: RecordBatch,
     pub(super) source_format: &'static str,
     pub(super) raw_spool_id: Option<RawSpoolRecordId>,
+    pub(super) raw_spool_lane: Option<Signal>,
     pub(super) approx_bytes: usize,
+    pub(super) credit_bytes: usize,
 }
 
 #[derive(Default, Clone)]
@@ -109,6 +120,11 @@ pub struct IngestSnapshot {
     pub signal: &'static str,
     pub queued_rows: usize,
     pub queued_bytes: usize,
+    pub queue_credit_reserved_bytes: usize,
+    pub queue_credit_available_bytes: usize,
+    pub queue_credit_capacity_bytes: usize,
+    pub queue_credit_closed: bool,
+    pub flush_debt_seconds: f64,
     pub oldest_age_seconds: f64,
     pub pressure: f64,
 }
@@ -138,28 +154,12 @@ pub(super) fn pending_batches(transformed: Transformed) -> Vec<PendingBatch> {
     batches
 }
 
-pub(super) fn queued_bytes_for_signal(queues: &QueueMap, signal: Signal) -> usize {
-    queues
-        .iter()
-        .filter(|(key, _)| key.signal == signal)
-        .map(|(_, queue)| queue.bytes)
-        .sum()
-}
-
 pub(super) fn process_bytes(queues: &QueueMap) -> usize {
     queues.values().map(|q| q.bytes).sum()
 }
 
 pub(super) fn added_process_bytes(batches: &[PendingBatch]) -> usize {
     batches.iter().map(|b| b.approx_bytes).sum()
-}
-
-pub(super) fn added_bytes_by_signal(batches: &[PendingBatch]) -> HashMap<Signal, usize> {
-    let mut added_by_signal = HashMap::new();
-    for batch in batches {
-        *added_by_signal.entry(batch.key.signal).or_default() += batch.approx_bytes;
-    }
-    added_by_signal
 }
 
 pub(super) fn enqueue_batches(queues: &mut QueueMap, batches: Vec<PendingBatch>) -> usize {
@@ -172,8 +172,10 @@ pub(super) fn enqueue_batches(queues: &mut QueueMap, batches: Vec<PendingBatch>)
             batch: batch.batch,
             source_format: batch.source_format,
             raw_spool_id: batch.raw_spool_id,
+            raw_spool_lane: batch.raw_spool_lane,
             accepted_at: Instant::now(),
             approx_bytes: batch.approx_bytes,
+            credit_bytes: batch.credit_bytes,
         });
     }
     accepted
@@ -287,6 +289,11 @@ pub(super) fn snapshots(queues: &QueueMap, config: &Config) -> Vec<IngestSnapsho
             signal: signal.as_str(),
             queued_rows: rows,
             queued_bytes: bytes,
+            queue_credit_reserved_bytes: 0,
+            queue_credit_available_bytes: config.per_signal_queue_bytes,
+            queue_credit_capacity_bytes: config.per_signal_queue_bytes,
+            queue_credit_closed: false,
+            flush_debt_seconds: 0.0,
             oldest_age_seconds,
             pressure: bytes as f64 / config.per_signal_queue_bytes as f64,
         }
@@ -328,7 +335,9 @@ fn push_pending_arrow(
         batch,
         source_format,
         raw_spool_id: None,
+        raw_spool_lane: None,
         approx_bytes,
+        credit_bytes: approx_bytes,
     });
 }
 
@@ -357,7 +366,9 @@ mod tests {
                 batch,
                 source_format: "json",
                 raw_spool_id: None,
+                raw_spool_lane: None,
                 approx_bytes: 50,
+                credit_bytes: 50,
             }],
         );
         assert_queue_totals(&queues, &config, 5, 50);

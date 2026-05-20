@@ -381,9 +381,15 @@ pub fn route(
                 .raw_spool_stats()
                 .map(|stats| json!(stats))
                 .unwrap_or_else(|err| json!({"error": err.to_string()}));
+            let raw_spool_by_signal = state
+                .ingestor
+                .raw_spool_stats_by_signal()
+                .map(|stats| json!(stats))
+                .unwrap_or_else(|err| json!({"error": err.to_string()}));
             Ok(json!({
                 "queues": state.ingestor.snapshots(),
                 "raw_spool": raw_spool,
+                "raw_spool_by_signal": raw_spool_by_signal,
                 "raw_spool_config": {
                     "writer_queue_capacity": state.config.raw_spool_writer_queue_capacity,
                     "group_commit_records": state.config.raw_spool_group_commit_records,

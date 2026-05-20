@@ -5,12 +5,10 @@ use crate::storage::Storage;
 use crate::validation::{self, ApiError, ApiResult};
 use crate::LockExt;
 use anyhow::{Context, Result};
+use raw_spool::RawSpoolFlushRef;
 use serde::Serialize;
 use serde_json::{json, Value};
-use spool::{
-    raw_spool_full_info, RawSpoolAppendBatchStats, RawSpoolOptions, RawSpoolRecord,
-    RawSpoolRecordId, RawSpoolWriter,
-};
+use spool::{RawSpoolOptions, RawSpoolRecordId, RawSpoolWriter};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -20,6 +18,7 @@ use std::time::{Duration, Instant};
 mod admission;
 mod flush;
 mod queue;
+mod raw_spool;
 pub mod spool;
 
 pub use flush::{partial_commit_info, PartialFlushError};
@@ -34,6 +33,13 @@ pub enum Signal {
 }
 
 impl Signal {
+    pub const ALL: [Signal; 4] = [
+        Signal::Logs,
+        Signal::Spans,
+        Signal::MetricGauge,
+        Signal::MetricSum,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Signal::Logs => "logs",
@@ -59,8 +65,10 @@ pub struct Ingestor {
     flush_lock: Arc<Mutex<()>>,
     flush_signal: Arc<FlushSignal>,
     runtime_memory_reserved_bytes: Arc<AtomicUsize>,
-    raw_spool: RawSpoolWriter,
-    raw_spool_flush_refs: Arc<Mutex<BTreeMap<RawSpoolRecordId, RawSpoolFlushRef>>>,
+    queue_credits: Arc<Mutex<admission::QueueCreditLedger>>,
+    raw_spools: BTreeMap<Signal, RawSpoolWriter>,
+    metric_raw_spool_next: AtomicUsize,
+    raw_spool_flush_refs: Arc<Mutex<BTreeMap<(Signal, RawSpoolRecordId), RawSpoolFlushRef>>>,
     config: Config,
 }
 
@@ -70,35 +78,20 @@ struct FlushSignal {
     ready: Condvar,
 }
 
-#[derive(Clone, Copy, Debug)]
-struct RawSpoolFlushRef {
-    signal: Signal,
-    remaining_rows: usize,
-}
-
 impl Ingestor {
     pub fn new(config: Config) -> Result<Self> {
-        let raw_spool = RawSpoolWriter::spawn(
-            RawSpoolOptions {
-                dir: config.raw_spool_dir.clone(),
-                max_segment_bytes: config.raw_spool_max_segment_bytes as u64,
-                max_record_bytes: config.raw_spool_max_record_bytes as u64,
-                max_total_bytes: config.raw_spool_max_total_bytes as u64,
-                append_sync_interval: config.raw_spool_append_sync_interval,
-                append_sync_bytes: config.raw_spool_append_sync_bytes as u64,
-                checkpoint_fsync_records: config.raw_spool_checkpoint_fsync_records,
-                checkpoint_fsync_delay: config.raw_spool_checkpoint_fsync_delay,
-            },
-            config.raw_spool_writer_queue_capacity,
-            config.raw_spool_group_commit_records,
-            config.raw_spool_group_commit_delay,
-        )?;
+        let mut raw_spools = BTreeMap::new();
+        for signal in all_signals() {
+            raw_spools.insert(signal, spawn_raw_spool_writer(&config, signal)?);
+        }
         Ok(Self {
             queues: Arc::new(Mutex::new(HashMap::new())),
             flush_lock: Arc::new(Mutex::new(())),
             flush_signal: Arc::new(FlushSignal::default()),
             runtime_memory_reserved_bytes: Arc::new(AtomicUsize::new(0)),
-            raw_spool,
+            queue_credits: Arc::new(Mutex::new(admission::QueueCreditLedger::new(&config))),
+            raw_spools,
+            metric_raw_spool_next: AtomicUsize::new(0),
             raw_spool_flush_refs: Arc::new(Mutex::new(BTreeMap::new())),
             config,
         })
@@ -144,9 +137,25 @@ impl Ingestor {
             )
             .with_retry_after(10));
         }
-        let raw_spool_id = match self.append_raw_spool(signal, headers, compressed_body, metrics) {
+        let mut queue_credit_reservation =
+            match self.reserve_queue_credit_estimate(signal, headers, compressed_body.len()) {
+                Ok(reservation) => reservation,
+                Err(err) => {
+                    self.request_flush();
+                    metrics.inc(
+                        "canardstack_ingest_flush_requests_total",
+                        &[("triggered_by", signal.as_str())],
+                        1,
+                    );
+                    self.record_queue_metrics(metrics);
+                    metrics.ingest_request(signal, err.status, err.reason);
+                    return Err(err);
+                }
+            };
+        let raw_spool_ref = match self.append_raw_spool(signal, headers, compressed_body, metrics) {
             Ok(id) => id,
             Err(err) => {
+                self.release_queue_credit_reservation(&mut queue_credit_reservation);
                 metrics.ingest_request(signal, err.status, err.reason);
                 return Err(err);
             }
@@ -155,8 +164,9 @@ impl Ingestor {
             match self.admit_runtime_memory(signal, headers, compressed_body.len(), metrics) {
                 Ok(reservation) => reservation,
                 Err(err) => {
+                    self.release_queue_credit_reservation(&mut queue_credit_reservation);
                     self.checkpoint_raw_spool_terminal(
-                        raw_spool_id,
+                        raw_spool_ref,
                         signal,
                         "memory_rejected",
                         metrics,
@@ -178,8 +188,9 @@ impl Ingestor {
         let body = match body_result {
             Ok(body) => body,
             Err(err) => {
+                self.release_queue_credit_reservation(&mut queue_credit_reservation);
                 self.checkpoint_raw_spool_terminal(
-                    raw_spool_id,
+                    raw_spool_ref,
                     signal,
                     "decompress_rejected",
                     metrics,
@@ -188,8 +199,9 @@ impl Ingestor {
             }
         };
         if let Err(err) = validation::validate_body_size(body.len(), &self.config) {
+            self.release_queue_credit_reservation(&mut queue_credit_reservation);
             self.checkpoint_raw_spool_terminal(
-                raw_spool_id,
+                raw_spool_ref,
                 signal,
                 "decoded_size_rejected",
                 metrics,
@@ -210,8 +222,9 @@ impl Ingestor {
         let transformed = match transformed_result {
             Ok(transformed) => transformed,
             Err(err) => {
+                self.release_queue_credit_reservation(&mut queue_credit_reservation);
                 self.checkpoint_raw_spool_terminal(
-                    raw_spool_id,
+                    raw_spool_ref,
                     signal,
                     "transform_rejected",
                     metrics,
@@ -238,8 +251,9 @@ impl Ingestor {
             started.elapsed().as_secs_f64(),
         );
         if let Err(err) = skew_result {
+            self.release_queue_credit_reservation(&mut queue_credit_reservation);
             self.checkpoint_raw_spool_terminal(
-                raw_spool_id,
+                raw_spool_ref,
                 signal,
                 "timestamp_rejected",
                 metrics,
@@ -251,26 +265,45 @@ impl Ingestor {
         let unsupported_histograms = transformed.unsupported_histograms;
         let mut batches = queue::pending_batches(transformed);
         let enqueued_totals = pending_batch_totals(&batches);
+        let exact_queue_credits = admission::credit_bytes_by_signal(&batches);
+        if let Err(err) =
+            self.adjust_queue_credit_reservation(&mut queue_credit_reservation, exact_queue_credits)
+        {
+            self.release_queue_credit_reservation(&mut queue_credit_reservation);
+            self.checkpoint_raw_spool_terminal(raw_spool_ref, signal, "queue_rejected", metrics)?;
+            self.request_flush();
+            metrics.inc(
+                "canardstack_ingest_flush_requests_total",
+                &[("triggered_by", signal.as_str())],
+                1,
+            );
+            self.record_queue_metrics(metrics);
+            metrics.ingest_request(signal, err.status, err.reason);
+            return Err(err);
+        }
         let pending_bytes = batches.iter().map(|b| b.approx_bytes).sum::<usize>();
         let peak_bytes = request_bytes
             .saturating_add(body.len())
             .saturating_add(pending_bytes);
         if let Err(err) = runtime_memory_reservation.reserve_at_least(peak_bytes, signal, metrics) {
-            self.checkpoint_raw_spool_terminal(raw_spool_id, signal, "memory_rejected", metrics)?;
+            self.release_queue_credit_reservation(&mut queue_credit_reservation);
+            self.checkpoint_raw_spool_terminal(raw_spool_ref, signal, "memory_rejected", metrics)?;
             metrics.ingest_request(signal, err.status, err.reason);
             return Err(err);
         }
         if batches.is_empty() {
-            self.checkpoint_raw_spool_terminal(raw_spool_id, signal, "transform_empty", metrics)?;
+            self.release_queue_credit_reservation(&mut queue_credit_reservation);
+            self.checkpoint_raw_spool_terminal(raw_spool_ref, signal, "transform_empty", metrics)?;
         } else {
-            self.track_raw_spool_batches(raw_spool_id, signal, &mut batches);
+            self.track_raw_spool_batches(raw_spool_ref, signal, &mut batches);
         }
         let accepted = match self.enqueue(signal, batches, metrics) {
             Ok(accepted) => accepted,
             Err(err) => {
-                self.untrack_raw_spool_record(raw_spool_id);
+                self.untrack_raw_spool_record(raw_spool_ref);
+                self.release_queue_credit_reservation(&mut queue_credit_reservation);
                 self.checkpoint_raw_spool_terminal(
-                    raw_spool_id,
+                    raw_spool_ref,
                     signal,
                     "queue_rejected",
                     metrics,
@@ -280,6 +313,7 @@ impl Ingestor {
                 return Err(err);
             }
         };
+        queue_credit_reservation.commit_to_queue();
         metrics.ingest_request(signal, 202, "accepted");
         self.record_accepted_body_metrics(signal, headers, request_bytes, body.len(), metrics);
         metrics.inc(
@@ -309,438 +343,64 @@ impl Ingestor {
         }))
     }
 
-    pub fn replay_raw_spool(&self, storage: &Storage, metrics: &Metrics) -> Result<usize> {
-        let pending = self
-            .raw_spool
-            .recover_pending()
-            .context("recover raw spool pending records")?;
-        let mut replayed = 0usize;
-        for recovered in pending {
-            let mut headers = HashMap::new();
-            headers.insert(
-                "content-type".to_string(),
-                recovered.record.content_type.clone(),
-            );
-            if let Some(encoding) = &recovered.record.content_encoding {
-                headers.insert("content-encoding".to_string(), encoding.clone());
-            }
-            metrics.inc(
-                "canardstack_raw_spool_replayed_records_total",
-                &[
-                    ("signal", recovered.record.signal.as_str()),
-                    ("status", "attempted"),
-                ],
-                1,
-            );
-            match self.ingest_replayed_raw_record(
-                recovered.id,
-                recovered.record.signal,
-                &headers,
-                &recovered.record.compressed_body,
-                storage,
-                metrics,
-            ) {
-                Ok(()) => {
-                    replayed += 1;
-                    metrics.inc(
-                        "canardstack_raw_spool_replayed_records_total",
-                        &[
-                            ("signal", recovered.record.signal.as_str()),
-                            ("status", "ok"),
-                        ],
-                        1,
-                    );
-                }
-                Err(err) => {
-                    metrics.inc(
-                        "canardstack_raw_spool_replayed_records_total",
-                        &[
-                            ("signal", recovered.record.signal.as_str()),
-                            ("status", "failed"),
-                        ],
-                        1,
-                    );
-                    return Err(err).context("replay raw spool record");
-                }
-            }
-        }
-        self.record_raw_spool_metrics(metrics);
-        Ok(replayed)
-    }
-
-    fn ingest_replayed_raw_record(
+    fn reserve_queue_credit_estimate(
         &self,
-        raw_spool_id: RawSpoolRecordId,
         signal: Signal,
         headers: &HashMap<String, String>,
-        compressed_body: &[u8],
-        storage: &Storage,
-        metrics: &Metrics,
-    ) -> Result<()> {
-        validation::validate_body_size(compressed_body.len(), &self.config)
-            .map_err(|err| anyhow::anyhow!(err.message.clone()))?;
-        validation::validate_content_type(headers)
-            .map_err(|err| anyhow::anyhow!(err.message.clone()))?;
-        if !storage.accepts_memory_ingest() || self.config.force_dependency_unhealthy {
-            anyhow::bail!("storage dependency is unhealthy");
-        }
-        let mut runtime_memory_reservation = self
-            .admit_runtime_memory(signal, headers, compressed_body.len(), metrics)
-            .map_err(|err| anyhow::anyhow!(err.message.clone()))?;
-        let body = otlp::decompress_if_needed(headers, compressed_body, self.config.max_body_bytes)
-            .map_err(|err| anyhow::anyhow!(err.message.clone()))?;
-        validation::validate_body_size(body.len(), &self.config)
-            .map_err(|err| anyhow::anyhow!(err.message.clone()))?;
-        #[cfg(feature = "otlp2records-observer")]
-        let transformed = otlp::transform_observed(signal, headers, &body, metrics)
-            .map_err(|err| anyhow::anyhow!(err.message.clone()))?;
-        #[cfg(not(feature = "otlp2records-observer"))]
-        let transformed = otlp::transform(signal, headers, &body)
-            .map_err(|err| anyhow::anyhow!(err.message.clone()))?;
-        self.validate_skew(&transformed)
-            .map_err(|err| anyhow::anyhow!(err.message.clone()))?;
-        let request_bytes = compressed_body.len();
-        let mut batches = queue::pending_batches(transformed);
-        let pending_bytes = batches.iter().map(|b| b.approx_bytes).sum::<usize>();
-        let peak_bytes = request_bytes
-            .saturating_add(body.len())
-            .saturating_add(pending_bytes);
-        runtime_memory_reservation
-            .reserve_at_least(peak_bytes, signal, metrics)
-            .map_err(|err| anyhow::anyhow!(err.message.clone()))?;
-        if batches.is_empty() {
-            self.checkpoint_raw_spool(raw_spool_id, signal, "replay_empty", Some(metrics))?;
-            return Ok(());
-        }
-        self.track_raw_spool_batches(raw_spool_id, signal, &mut batches);
-        self.enqueue(signal, batches, metrics).map_err(|err| {
-            self.untrack_raw_spool_record(raw_spool_id);
-            anyhow::anyhow!(err.message.clone())
-        })?;
-        Ok(())
+        compressed_body_bytes: usize,
+    ) -> ApiResult<admission::QueueCreditReservation> {
+        self.queue_credits.lock_or_poisoned().reserve_estimate(
+            signal,
+            headers,
+            compressed_body_bytes,
+            self.config.max_body_bytes,
+        )
     }
 
-    fn track_raw_spool_batches(
+    fn reserve_queue_credit_exact(
         &self,
-        id: RawSpoolRecordId,
-        signal: Signal,
-        batches: &mut [queue::PendingBatch],
+        bytes_by_signal: BTreeMap<Signal, usize>,
+    ) -> ApiResult<admission::QueueCreditReservation> {
+        self.queue_credits
+            .lock_or_poisoned()
+            .reserve_exact(bytes_by_signal)
+    }
+
+    fn adjust_queue_credit_reservation(
+        &self,
+        reservation: &mut admission::QueueCreditReservation,
+        desired: BTreeMap<Signal, usize>,
+    ) -> ApiResult<()> {
+        self.queue_credits
+            .lock_or_poisoned()
+            .adjust_reservation(reservation, desired)
+    }
+
+    fn release_queue_credit_reservation(
+        &self,
+        reservation: &mut admission::QueueCreditReservation,
     ) {
-        if batches.is_empty() {
-            return;
-        }
-        for batch in batches.iter_mut() {
-            batch.raw_spool_id = Some(id);
-        }
-        self.raw_spool_flush_refs.lock_or_poisoned().insert(
-            id,
-            RawSpoolFlushRef {
-                signal,
-                remaining_rows: batches.iter().map(|batch| batch.batch.num_rows()).sum(),
-            },
-        );
+        self.queue_credits
+            .lock_or_poisoned()
+            .release_reservation(reservation);
     }
 
-    fn untrack_raw_spool_record(&self, id: RawSpoolRecordId) {
-        self.raw_spool_flush_refs.lock_or_poisoned().remove(&id);
-    }
-
-    fn mark_raw_spool_batches_storage_committed(
+    fn release_queue_credits_for_batches(
         &self,
         sets: &[(queue::QueueKey, Vec<queue::QueuedBatch>)],
-        metrics: Option<&Metrics>,
-    ) -> Result<()> {
-        let mut committed_counts = BTreeMap::<RawSpoolRecordId, usize>::new();
-        for (_, batches) in sets {
+    ) {
+        let mut bytes_by_signal = BTreeMap::<Signal, usize>::new();
+        for (key, batches) in sets {
             for batch in batches {
-                if let Some(id) = batch.raw_spool_id {
-                    *committed_counts.entry(id).or_default() += batch.len();
+                if batch.len() > 0 {
+                    *bytes_by_signal.entry(key.signal).or_default() += batch.credit_bytes;
                 }
             }
         }
-        if committed_counts.is_empty() {
-            return Ok(());
-        }
-
-        let mut ready_to_checkpoint = Vec::new();
-        {
-            let mut refs = self.raw_spool_flush_refs.lock_or_poisoned();
-            for (id, committed_rows) in committed_counts {
-                let Some(tracked) = refs.get_mut(&id) else {
-                    continue;
-                };
-                if committed_rows >= tracked.remaining_rows {
-                    ready_to_checkpoint.push((id, tracked.signal));
-                } else {
-                    tracked.remaining_rows -= committed_rows;
-                }
-            }
-        }
-
-        self.checkpoint_raw_spool_batch(&ready_to_checkpoint, "storage_committed", metrics)?;
-        if !ready_to_checkpoint.is_empty() {
-            let mut refs = self.raw_spool_flush_refs.lock_or_poisoned();
-            for (id, _) in ready_to_checkpoint {
-                refs.remove(&id);
-            }
-        }
-        Ok(())
-    }
-
-    fn append_raw_spool(
-        &self,
-        signal: Signal,
-        headers: &HashMap<String, String>,
-        compressed_body: &[u8],
-        metrics: &Metrics,
-    ) -> ApiResult<RawSpoolRecordId> {
-        let content_type = headers.get("content-type").cloned().unwrap_or_default();
-        let content_encoding = headers.get("content-encoding").cloned();
-        let started = Instant::now();
-        let record = RawSpoolRecord::new(signal, content_type, content_encoding, compressed_body);
-        let result = self.raw_spool.append(record);
-        metrics.observe_phase_seconds(
-            signal.as_str(),
-            "raw_spool_append",
-            None,
-            started.elapsed().as_secs_f64(),
-        );
-        match result {
-            Ok(ack) => {
-                if let Some(stats) = ack.batch_stats {
-                    Self::record_raw_spool_append_batch_metrics(metrics, stats);
-                }
-                metrics.inc(
-                    "canardstack_raw_spool_records_total",
-                    &[("signal", signal.as_str()), ("status", "spooled")],
-                    1,
-                );
-                metrics.inc(
-                    "canardstack_raw_spool_bytes_total",
-                    &[("signal", signal.as_str())],
-                    compressed_body.len() as u64,
-                );
-                Ok(ack.id)
-            }
-            Err(err) => {
-                if raw_spool_full_info(&err).is_some() {
-                    metrics.inc(
-                        "canardstack_raw_spool_records_total",
-                        &[("signal", signal.as_str()), ("status", "full")],
-                        1,
-                    );
-                    Err(ApiError::new(
-                        429,
-                        "raw_spool_full",
-                        "raw ingest spool is full",
-                    ))
-                } else {
-                    metrics.inc(
-                        "canardstack_raw_spool_records_total",
-                        &[("signal", signal.as_str()), ("status", "error")],
-                        1,
-                    );
-                    Err(ApiError::new(
-                        503,
-                        "raw_spool_unavailable",
-                        "raw ingest spool is unavailable",
-                    )
-                    .with_retry_after(10))
-                }
-            }
-        }
-    }
-
-    fn record_raw_spool_append_batch_metrics(metrics: &Metrics, stats: RawSpoolAppendBatchStats) {
-        metrics.inc("canardstack_raw_spool_append_batches_total", &[], 1);
-        metrics.inc(
-            "canardstack_raw_spool_append_batch_records_total",
-            &[],
-            stats.records as u64,
-        );
-        metrics.inc(
-            "canardstack_raw_spool_append_batch_encoded_bytes_total",
-            &[],
-            stats.encoded_bytes,
-        );
-        metrics.inc(
-            "canardstack_raw_spool_append_syncs_total",
-            &[],
-            stats.fsync_count,
-        );
-        metrics.gauge(
-            "canardstack_raw_spool_append_batch_records",
-            &[("stat", "last")],
-            stats.records as f64,
-        );
-        metrics.gauge_max(
-            "canardstack_raw_spool_append_batch_records",
-            &[("stat", "max")],
-            stats.records as f64,
-        );
-        metrics.gauge(
-            "canardstack_raw_spool_append_batch_encoded_bytes",
-            &[("stat", "last")],
-            stats.encoded_bytes as f64,
-        );
-        metrics.gauge_max(
-            "canardstack_raw_spool_append_batch_encoded_bytes",
-            &[("stat", "max")],
-            stats.encoded_bytes as f64,
-        );
-        metrics.observe_phase_seconds(
-            "all",
-            "raw_spool_append_batch_wait",
-            None,
-            stats.wait_seconds,
-        );
-        metrics.observe_phase_seconds("all", "raw_spool_append_write", None, stats.write_seconds);
-        metrics.observe_phase_seconds("all", "raw_spool_append_fsync", None, stats.fsync_seconds);
-    }
-
-    fn checkpoint_raw_spool_terminal(
-        &self,
-        id: RawSpoolRecordId,
-        signal: Signal,
-        reason: &'static str,
-        metrics: &Metrics,
-    ) -> ApiResult<()> {
-        self.checkpoint_raw_spool(id, signal, reason, Some(metrics))
-            .map_err(|err| {
-                ApiError::new(
-                    503,
-                    "raw_spool_checkpoint_failed",
-                    format!("raw ingest spool checkpoint failed: {err}"),
-                )
-                .with_retry_after(10)
-            })
-    }
-
-    fn checkpoint_raw_spool(
-        &self,
-        id: RawSpoolRecordId,
-        signal: Signal,
-        reason: &'static str,
-        metrics: Option<&Metrics>,
-    ) -> Result<()> {
-        let started = Instant::now();
-        self.raw_spool
-            .mark_committed(id)
-            .context("checkpoint raw spool record")?;
-        if let Some(metrics) = metrics {
-            metrics.observe_phase_seconds(
-                signal.as_str(),
-                "raw_spool_checkpoint",
-                None,
-                started.elapsed().as_secs_f64(),
-            );
-            metrics.inc(
-                "canardstack_raw_spool_checkpointed_records_total",
-                &[("signal", signal.as_str()), ("reason", reason)],
-                1,
-            );
-        }
-        Ok(())
-    }
-
-    fn checkpoint_raw_spool_batch(
-        &self,
-        records: &[(RawSpoolRecordId, Signal)],
-        reason: &'static str,
-        metrics: Option<&Metrics>,
-    ) -> Result<()> {
-        if records.is_empty() {
-            return Ok(());
-        }
-        let ids = records.iter().map(|(id, _)| *id).collect::<Vec<_>>();
-        let started = Instant::now();
-        self.raw_spool
-            .mark_committed_batch(&ids)
-            .context("checkpoint raw spool records")?;
-        if let Some(metrics) = metrics {
-            metrics.observe_phase_seconds(
-                "all",
-                "raw_spool_checkpoint",
-                None,
-                started.elapsed().as_secs_f64(),
-            );
-            let mut by_signal = BTreeMap::<Signal, u64>::new();
-            for (_, signal) in records {
-                *by_signal.entry(*signal).or_default() += 1;
-            }
-            for (signal, count) in by_signal {
-                metrics.inc(
-                    "canardstack_raw_spool_checkpointed_records_total",
-                    &[("signal", signal.as_str()), ("reason", reason)],
-                    count,
-                );
-            }
-        }
-        Ok(())
-    }
-
-    pub fn raw_spool_stats(&self) -> Result<spool::RawSpoolStats> {
-        self.raw_spool.stats()
-    }
-
-    pub fn record_raw_spool_metrics(&self, metrics: &Metrics) {
-        if let Ok(stats) = self.raw_spool.stats() {
-            metrics.gauge(
-                "canardstack_raw_spool_segment_bytes",
-                &[],
-                stats.segment_bytes as f64,
-            );
-            metrics.gauge(
-                "canardstack_raw_spool_segments",
-                &[],
-                stats.segment_count as f64,
-            );
-            metrics.gauge(
-                "canardstack_raw_spool_pending_records",
-                &[],
-                stats.pending_records as f64,
-            );
-            metrics.gauge(
-                "canardstack_raw_spool_pending_bytes",
-                &[],
-                stats.pending_bytes as f64,
-            );
-            metrics.gauge(
-                "canardstack_raw_spool_unsynced_records",
-                &[],
-                stats.unsynced_records as f64,
-            );
-            metrics.gauge(
-                "canardstack_raw_spool_unsynced_bytes",
-                &[],
-                stats.unsynced_bytes as f64,
-            );
-            metrics.gauge(
-                "canardstack_raw_spool_unsynced_age_seconds",
-                &[],
-                stats.unsynced_age_seconds,
-            );
-            metrics.gauge(
-                "canardstack_raw_spool_healthy",
-                &[],
-                if stats.healthy { 1.0 } else { 0.0 },
-            );
-            metrics.set_counter(
-                "canardstack_raw_spool_append_syncs_total",
-                &[],
-                stats.append_syncs_total,
-            );
-            metrics.set_counter(
-                "canardstack_raw_spool_append_sync_failures_total",
-                &[],
-                stats.append_sync_failures_total,
-            );
-            metrics.set_observation(
-                "canardstack_phase_duration_seconds",
-                &[("signal", "all"), ("phase", "raw_spool_append_fsync")],
-                stats.append_syncs_total,
-                stats.append_sync_seconds_total,
-            );
+        if !bytes_by_signal.is_empty() {
+            self.queue_credits
+                .lock_or_poisoned()
+                .release_bytes(&bytes_by_signal);
         }
     }
 
@@ -772,7 +432,29 @@ impl Ingestor {
 
     pub fn snapshots(&self) -> Vec<IngestSnapshot> {
         let queues = self.queues.lock_or_poisoned();
-        queue::snapshots(&queues, &self.config)
+        let mut snapshots = queue::snapshots(&queues, &self.config);
+        drop(queues);
+
+        let credit_snapshots = self.queue_credits.lock_or_poisoned().snapshots();
+        for snapshot in &mut snapshots {
+            let Some((_, credit)) = credit_snapshots
+                .iter()
+                .find(|(signal, _)| signal.as_str() == snapshot.signal)
+            else {
+                continue;
+            };
+            snapshot.queue_credit_reserved_bytes = credit.reserved_bytes;
+            snapshot.queue_credit_available_bytes = credit.available_bytes;
+            snapshot.queue_credit_capacity_bytes = credit.capacity_bytes;
+            snapshot.queue_credit_closed = credit.closed;
+            snapshot.flush_debt_seconds = credit.flush_debt_seconds;
+            snapshot.pressure = if credit.capacity_bytes == 0 {
+                0.0
+            } else {
+                credit.reserved_bytes as f64 / credit.capacity_bytes as f64
+            };
+        }
+        snapshots
     }
 
     pub fn record_queue_metrics(&self, metrics: &Metrics) {
@@ -816,6 +498,35 @@ impl Ingestor {
                 "canardstack_ingest_queue_pressure_max",
                 &[("signal", snapshot.signal)],
                 snapshot.pressure,
+            );
+            metrics.gauge(
+                "canardstack_ingest_queue_credit_reserved_bytes",
+                &[("signal", snapshot.signal)],
+                snapshot.queue_credit_reserved_bytes as f64,
+            );
+            metrics.gauge(
+                "canardstack_ingest_queue_credit_available_bytes",
+                &[("signal", snapshot.signal)],
+                snapshot.queue_credit_available_bytes as f64,
+            );
+            metrics.gauge(
+                "canardstack_ingest_queue_credit_capacity_bytes",
+                &[("signal", snapshot.signal)],
+                snapshot.queue_credit_capacity_bytes as f64,
+            );
+            metrics.gauge(
+                "canardstack_ingest_queue_credit_closed",
+                &[("signal", snapshot.signal)],
+                if snapshot.queue_credit_closed {
+                    1.0
+                } else {
+                    0.0
+                },
+            );
+            metrics.gauge(
+                "canardstack_ingest_flush_debt_seconds",
+                &[("signal", snapshot.signal)],
+                snapshot.flush_debt_seconds,
             );
         }
     }
@@ -895,6 +606,29 @@ fn transformed_rows_by_signal(transformed: &Transformed) -> Vec<(Signal, usize)>
             (rows > 0).then_some((signal, rows))
         })
         .collect()
+}
+
+fn all_signals() -> [Signal; 4] {
+    Signal::ALL
+}
+
+fn spawn_raw_spool_writer(config: &Config, signal: Signal) -> Result<RawSpoolWriter> {
+    RawSpoolWriter::spawn(
+        RawSpoolOptions {
+            dir: config.raw_spool_dir.join(signal.as_str()),
+            max_segment_bytes: config.raw_spool_max_segment_bytes as u64,
+            max_record_bytes: config.raw_spool_max_record_bytes as u64,
+            max_total_bytes: config.raw_spool_max_total_bytes as u64,
+            append_sync_interval: config.raw_spool_append_sync_interval,
+            append_sync_bytes: config.raw_spool_append_sync_bytes as u64,
+            checkpoint_fsync_records: config.raw_spool_checkpoint_fsync_records,
+            checkpoint_fsync_delay: config.raw_spool_checkpoint_fsync_delay,
+        },
+        config.raw_spool_writer_queue_capacity,
+        config.raw_spool_group_commit_records,
+        config.raw_spool_group_commit_delay,
+    )
+    .with_context(|| format!("spawn {signal} raw spool writer"))
 }
 
 fn pending_batch_totals(batches: &[queue::PendingBatch]) -> BTreeMap<Signal, (usize, usize)> {
