@@ -142,6 +142,11 @@ Main knobs:
 - `CANARDSTACK_RAW_SPOOL_APPEND_SYNC_MS`
 - `CANARDSTACK_RAW_SPOOL_APPEND_SYNC_BYTES`
 
+`CANARDSTACK_RAW_SPOOL_CAPACITY_BYTES` applies to each raw-spool lane. The
+current lanes are logs, spans, metric gauge, and metric sum, so worst-case
+aggregate raw-spool disk use can reach roughly four times the configured value.
+Size the local data directory for the aggregate budget, not just one lane.
+
 ## Queues And Flush
 
 Ingest transforms inline on the HTTP request thread, then admits Arrow
