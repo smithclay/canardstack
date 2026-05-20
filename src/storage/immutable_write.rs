@@ -3,7 +3,7 @@ use super::ducklake::configure_write_connection;
 use super::immutable::{
     distribute_commit_seconds, distributed_segment_timing, immutable_buffer_snapshot,
     register_ducklake_data_file, split_batch_by_immutable_partition, write_immutable_segment,
-    ImmutableFlushOutcome, ImmutableSealResult,
+    ImmutableFlushOutcome, ImmutableSealResult, SealedSegment,
 };
 use super::{
     ArrowBatchInsert, ArrowBatchInsertResult, ArrowBatchInsertTiming, ImmutableBufferMetric,
@@ -12,8 +12,16 @@ use super::{
 use crate::LockExt;
 use anyhow::Result;
 use arrow58::record_batch::RecordBatch;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
+use std::thread;
 use std::time::Instant;
+
+struct SealedBuffer {
+    segments: Vec<SealedSegment>,
+    timings: Vec<ArrowBatchInsertTiming>,
+    affected_days: BTreeSet<String>,
+}
 
 impl Storage {
     pub fn immutable_buffer_metrics(&self) -> Vec<ImmutableBufferMetric> {
@@ -186,29 +194,42 @@ impl Storage {
         let mut sealed = Vec::with_capacity(buffers.len());
         let mut affected = BTreeMap::new();
 
+        let mut handles = Vec::with_capacity(buffers.len());
         for (&table, buffer) in buffers {
-            let batch = buffer.record_batch(table)?;
-            let started = Instant::now();
-            let partitions = split_batch_by_immutable_partition(&batch)?;
-            timings.push(ArrowBatchInsertTiming {
+            let storage_dir = self.local_storage_dir.clone();
+            let buffer = buffer.clone();
+            handles.push((
                 table,
-                phase: TimingPhase::PartitionSplit,
-                rows: buffer.rows,
-                seconds: started.elapsed().as_secs_f64(),
-            });
-            for (partition, batch) in partitions {
-                let write =
-                    write_immutable_segment(&self.local_storage_dir, table, partition, &batch)?;
-                timings.extend(write.timings);
-                sealed.push(write.segment);
+                thread::spawn(move || seal_immutable_buffer(&storage_dir, table, &buffer)),
+            ));
+        }
+
+        let mut seal_error = None;
+        for (table, handle) in handles {
+            match handle.join() {
+                Ok(Ok(buffer)) => {
+                    if seal_error.is_none() {
+                        timings.extend(buffer.timings);
+                        sealed.extend(buffer.segments);
+                        affected.insert(table, buffer.affected_days);
+                    }
+                }
+                Ok(Err(err)) => {
+                    if seal_error.is_none() {
+                        seal_error = Some(err);
+                    }
+                }
+                Err(_) => {
+                    if seal_error.is_none() {
+                        seal_error = Some(anyhow::anyhow!(
+                            "immutable segment writer panicked for {table}"
+                        ));
+                    }
+                }
             }
-            timings.push(ArrowBatchInsertTiming {
-                table,
-                phase: TimingPhase::ParquetWrite,
-                rows: buffer.rows,
-                seconds: started.elapsed().as_secs_f64(),
-            });
-            affected.insert(table, buffer.timestamp_days.clone());
+        }
+        if let Some(err) = seal_error {
+            return Err(err);
         }
 
         let conn = self.writer.lock_or_poisoned();
@@ -270,5 +291,101 @@ impl Storage {
             }
             buffers.insert(table, detached_buffer);
         }
+    }
+}
+
+fn seal_immutable_buffer(
+    storage_dir: &Path,
+    table: Signal,
+    buffer: &ImmutableSegmentBuffer,
+) -> Result<SealedBuffer> {
+    let batch = buffer.record_batch(table)?;
+    let started = Instant::now();
+    let partitions = split_batch_by_immutable_partition(&batch)?;
+    let mut timings = vec![ArrowBatchInsertTiming {
+        table,
+        phase: TimingPhase::PartitionSplit,
+        rows: buffer.rows,
+        seconds: started.elapsed().as_secs_f64(),
+    }];
+    let mut segments = Vec::with_capacity(partitions.len());
+    for (partition, batch) in partitions {
+        let write = write_immutable_segment(storage_dir, table, partition, &batch)?;
+        timings.extend(write.timings);
+        segments.push(write.segment);
+    }
+    timings.push(ArrowBatchInsertTiming {
+        table,
+        phase: TimingPhase::ParquetWrite,
+        rows: buffer.rows,
+        seconds: started.elapsed().as_secs_f64(),
+    });
+
+    Ok(SealedBuffer {
+        segments,
+        timings,
+        affected_days: buffer.timestamp_days.clone(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow58::array::{Int64Array, TimestampMicrosecondArray};
+    use arrow58::datatypes::{DataType, Field, Schema, TimeUnit};
+    use std::sync::Arc;
+    use tempfile::tempdir;
+
+    #[test]
+    fn seal_immutable_buffer_writes_segments_and_tracks_days() {
+        let dir = tempdir().unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                false,
+            ),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(TimestampMicrosecondArray::from(vec![1_000_000, 2_000_000])),
+                Arc::new(Int64Array::from(vec![10, 20])),
+            ],
+        )
+        .unwrap();
+        let mut buffer = ImmutableSegmentBuffer::new(Instant::now());
+        buffer.push(PreparedArrowBatch {
+            table: Signal::MetricGauge,
+            batch,
+            rows: 2,
+            timestamp_days: vec!["1970-01-01".to_string()],
+        });
+
+        let sealed = seal_immutable_buffer(dir.path(), Signal::MetricGauge, &buffer).unwrap();
+
+        assert_eq!(sealed.segments.len(), 1);
+        assert_eq!(sealed.segments[0].table, Signal::MetricGauge);
+        assert_eq!(sealed.segments[0].rows, 2);
+        assert!(sealed.segments[0].path.exists());
+        assert!(sealed.affected_days.contains("1970-01-01"));
+
+        let phases = sealed
+            .timings
+            .iter()
+            .map(|timing| timing.phase)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            phases,
+            vec![
+                TimingPhase::PartitionSplit,
+                TimingPhase::ParquetEncode,
+                TimingPhase::FileWrite,
+                TimingPhase::FileFsync,
+                TimingPhase::FileRename,
+                TimingPhase::ParquetWrite,
+            ]
+        );
     }
 }
