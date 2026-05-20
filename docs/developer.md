@@ -8,7 +8,7 @@ For a practitioner-focused overview, start with the [README](../README.md).
 ## Architecture
 
 ```text
-OTLP/HTTP -> local fsync raw spool -> otlp2records -> bounded queues
+OTLP/HTTP -> local raw spool write, periodic append sync -> otlp2records -> bounded queues
   -> immutable Parquet segments -> DuckLake registration -> logical queries
 ```
 
@@ -17,7 +17,8 @@ canardstack is currently shaped as:
 - One Rust binary, `canardstack`.
 - Synchronous standard-library HTTP server on `CANARDSTACK_BIND`.
 - `otlp2records` for OTLP logs, traces, gauge metrics, and sum metrics.
-- Durable local raw spool for the `202` at-least-once acceptance boundary.
+- Local raw spool for the `202` acceptance boundary, with append fsync handled
+  by periodic or byte-threshold sync.
 - Bounded per-signal in-memory queues with row, byte, age, and pressure checks.
 - DuckDB through `duckdb-rs`.
 - DuckLake through DuckDB's official `ducklake` extension SQL surface. The

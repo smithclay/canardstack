@@ -236,7 +236,7 @@ MotherDuck, or SQL clients.
 | Process model | One synchronous Rust binary, one DuckDB process, no async runtime. |
 | Ingest | OTLP/HTTP JSON and protobuf for logs, traces, gauge metrics, and sum metrics. |
 | Backpressure | Bounded queues return `429` under pressure. Storage dependency failures surface as `503`. |
-| Durability | A `2xx` ingest response means accepted into bounded process memory. It does not mean committed to DuckLake. |
+| Durability | A `2xx` ingest response means written to the local raw spool and accepted into bounded processing. It does not mean fsynced, committed to DuckLake, or query-visible. |
 | Storage | DuckLake-backed DuckDB tables by default. Local DuckLake is the quickstart path; MotherDuck and Postgres-catalog DuckLake are supported paths. |
 | Query | Prometheus, Loki, and Tempo compatibility subsets with server-side time range, row limit, timeout, memory, and concurrency guards. |
 | SQL | Direct SQL is intentionally outside the HTTP product surface. Use DuckDB CLI, MotherDuck, or another SQL client. |
@@ -249,7 +249,10 @@ canardstack is experimental and not production-ready.
 
 Known v0 limits:
 
-- No durable ingest WAL. A crash can lose accepted but unflushed telemetry.
+- No fully durable ingest acknowledgement. A process crash should generally
+  replay written raw-spool records, but OS crashes, VM crashes, power loss, and
+  disk/controller failures may lose records accepted since the most recent
+  append sync.
 - No OTLP/gRPC endpoint. Use an OpenTelemetry Collector if your clients need
   gRPC.
 - No histograms or exponential histograms.

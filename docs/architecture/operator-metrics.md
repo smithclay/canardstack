@@ -30,18 +30,23 @@ Do not label metrics by `service_name`, trace id, query text, API key, or arbitr
 | --- | --- | --- | --- |
 | `canardstack_ingest_requests_total` | Counter | `signal`, `status`, `reason` | Request outcomes. |
 | `canardstack_ingest_request_bytes_total` | Counter | `signal`, `encoding` | Compressed request bytes accepted. |
-| `canardstack_raw_spool_records_total` | Counter | `signal`, `status` | Raw request spool outcomes: `spooled`, `full`, or `error`. `spooled` is the durable accepted-request boundary. |
-| `canardstack_raw_spool_bytes_total` | Counter | `signal` | Compressed raw request bytes fsynced into the local spool. |
-| `canardstack_raw_spool_append_batches_total` | Counter | none | Raw-spool append batches fsynced by the writer. |
+| `canardstack_raw_spool_records_total` | Counter | `signal`, `status` | Raw request spool outcomes: `spooled`, `full`, or `error`. `spooled` means written to the local raw-spool file, possibly pending append sync. |
+| `canardstack_raw_spool_bytes_total` | Counter | `signal` | Compressed raw request bytes written into the local spool. |
+| `canardstack_raw_spool_append_batches_total` | Counter | none | Raw-spool append batches written by the writer. |
 | `canardstack_raw_spool_append_batch_records_total` | Counter | none | Raw-spool records included in append batches. |
 | `canardstack_raw_spool_append_batch_encoded_bytes_total` | Counter | none | Encoded raw-spool bytes included in append batches. |
-| `canardstack_raw_spool_append_batch_fsyncs_total` | Counter | none | Raw-spool append fsync calls, including pre-rotate syncs. |
+| `canardstack_raw_spool_append_syncs_total` | Counter | none | Successful periodic or byte-threshold raw-spool append sync cycles. |
+| `canardstack_raw_spool_append_sync_failures_total` | Counter | none | Failed raw-spool append sync cycles. Any increase should make the raw spool unhealthy and subsequent ingest return `503`. |
 | `canardstack_raw_spool_append_batch_records` | Gauge | `stat` | Last and max records per raw-spool append batch. |
 | `canardstack_raw_spool_append_batch_encoded_bytes` | Gauge | `stat` | Last and max encoded bytes per raw-spool append batch. |
 | `canardstack_raw_spool_replayed_records_total` | Counter | `signal`, `status` | Startup replay attempts and outcomes for uncheckpointed raw-spool records. |
 | `canardstack_raw_spool_checkpointed_records_total` | Counter | `signal`, `reason` | Raw-spool records made reclaimable after terminal rejection or DuckLake storage commit. |
 | `canardstack_raw_spool_pending_records` | Gauge | none | Uncheckpointed raw-spool records currently pending replay or storage commit. |
 | `canardstack_raw_spool_pending_bytes` | Gauge | none | Compressed bytes for uncheckpointed raw-spool records. |
+| `canardstack_raw_spool_unsynced_records` | Gauge | none | Written raw-spool records not yet covered by a successful append sync. |
+| `canardstack_raw_spool_unsynced_bytes` | Gauge | none | Encoded raw-spool bytes not yet covered by a successful append sync. |
+| `canardstack_raw_spool_unsynced_age_seconds` | Gauge | none | Age of the oldest unsynced append data, or `0` when fully synced. |
+| `canardstack_raw_spool_healthy` | Gauge | none | `1` when the writer is accepting appends; `0` after a fatal append sync failure. |
 | `canardstack_raw_spool_segment_bytes` | Gauge | none | Total raw-spool segment bytes on disk. |
 | `canardstack_raw_spool_segments` | Gauge | none | Raw-spool segment file count. |
 | `canardstack_ingest_records_total` | Counter | `signal` | Records accepted into the in-process queue. |
@@ -87,16 +92,18 @@ storage proof phases with `signal` and `phase` labels:
 backward-compatible benchmark parsing.
 
 `/api/admin/health/ingest` returns queue snapshots, raw-spool stats
-(`segment_count`, `segment_bytes`, `pending_records`, `pending_bytes`), and the
-active raw-spool group-commit settings. Operators can diagnose replay backlog
-and distinguish queue pressure from fsync/acknowledgement-latency tuning without
-arbitrary SQL.
+(`segment_count`, `segment_bytes`, `pending_records`, `pending_bytes`,
+`unsynced_records`, `unsynced_bytes`, `unsynced_age_seconds`, `healthy`, and
+`error` when unhealthy), and the active raw-spool group-commit and append-sync
+settings. Operators can diagnose replay backlog, unsynced append exposure, and
+queue pressure without arbitrary SQL.
 
 The shared phase metric `canardstack_phase_duration_seconds` splits
 request-visible `raw_spool_append` latency from raw-spool writer internals:
 `raw_spool_append_batch_wait` is time spent collecting a group-commit batch,
 `raw_spool_append_write` is file write time, and `raw_spool_append_fsync` is
-append durability sync time.
+periodic or threshold append sync time. `raw_spool_append_fsync` is no longer
+part of `202` latency.
 
 ## Query Metrics
 

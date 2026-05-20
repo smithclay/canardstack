@@ -29,7 +29,7 @@ current sustained MVP performance envelope is only claimed for logs and traces.
 ```text
 OTLP/HTTP (JSON or protobuf, optional gzip)
   -> request validation
-  -> local fsync raw spool
+  -> local raw spool write, pending periodic append sync
   -> inline decode and otlp2records transform
   -> bounded in-process queues
   -> immutable Parquet segment files
@@ -41,7 +41,7 @@ OTLP/HTTP (JSON or protobuf, optional gzip)
 flowchart LR
   A["OTLP/HTTP exporter"] --> B["HTTP parser and auth"]
   B --> C["Size, content-type, compression, timestamp checks"]
-  C --> D["Fsync raw request to local spool"]
+  C --> D["Write raw request to local spool"]
   D --> E["Decode OTLP and transform with otlp2records"]
   E --> F["Bounded per-signal queues"]
   F --> G["Flush worker"]
@@ -59,14 +59,27 @@ A successful ingest response is `202`.
 `202` means:
 
 - The API key, content type, body size, compression, and timestamp skew passed.
-- The compressed raw request was fsynced into the local raw spool.
-- The request was accepted for at-least-once processing.
+- The compressed raw request was accepted by the local raw-spool writer and
+  written to the active spool file.
+- The append may still be pending the next periodic or byte-threshold append
+  sync.
 
 `202` does not mean:
 
 - The rows are DuckLake-committed.
 - The rows are query-visible.
+- The raw-spool append has been fsynced.
 - Exactly-once delivery is guaranteed.
+
+Crash behavior:
+
+- A process crash should generally replay written raw-spool records if the OS
+  page cache and file contents survive.
+- An OS crash, VM crash, power loss, or disk/controller failure may lose records
+  accepted since the most recent successful append sync.
+- If a periodic append sync fails after records have received `202`,
+  canardstack marks the raw spool unhealthy and rejects subsequent ingest with
+  `503 raw_spool_unavailable`.
 
 At-least-once duplicate window:
 
@@ -76,10 +89,10 @@ At-least-once duplicate window:
 
 Retryable failure behavior:
 
-- `429 raw_spool_full` when the durable raw-spool byte budget is exhausted.
+- `429 raw_spool_full` when the raw-spool byte budget is exhausted.
 - `429` for queue, process-memory, or runtime-memory pressure.
 - `503 raw_spool_unavailable` when the local spool cannot be opened, written,
-  or fsynced.
+  or append-synced.
 - `503 dependency_unhealthy` when storage is unavailable.
 
 ## Raw Spool
@@ -98,33 +111,36 @@ Recovery sequence:
 
 ```text
 open segment -> append record on raw-spool writer
-  -> fsync append batch when group-commit count or delay is reached -> return 202
+  -> write append batch -> return 202
+  -> periodic or byte-threshold append sync
   -> transform/enqueue -> DuckLake storage commit
   -> checkpoint raw-spool record -> delayed checkpoint fsync -> segment reclaimable
 ```
 
-Startup replays uncheckpointed fsynced records before scheduler work starts.
+Startup replays uncheckpointed records found by checksummed segment scanning
+before scheduler work starts.
 Replay enters the same decode, transform, queue, flush, and DuckLake commit path
 as normal ingest.
 
-The raw-spool writer is on the ingest acknowledgement path. It batches appends
-internally up to 64 records, or until `CANARDSTACK_RAW_SPOOL_GROUP_COMMIT_MS`
-elapses from the first record in the group. This is a capacity knob, not a
-cosmetic setting: too small and storage spends the ingest budget on fsyncs; too
-large and `202` acknowledgement latency rises even when downstream queues are
-healthy. `0ms` is rejected at startup so operators do not accidentally disable
-batching and return to per-request fsync behavior.
+The raw-spool writer is on the ingest acknowledgement path only through local
+file writes. It batches channel receives and writes internally up to 64 records,
+or until `CANARDSTACK_RAW_SPOOL_GROUP_COMMIT_MS` elapses from the first record
+in the group. Append sync is decoupled from `202` and runs every
+`CANARDSTACK_RAW_SPOOL_APPEND_SYNC_MS` milliseconds, or earlier when
+`CANARDSTACK_RAW_SPOOL_APPEND_SYNC_BYTES` dirty encoded bytes accumulate. Both
+append sync knobs reject zero values at startup.
 
-Checkpoint durability is intentionally weaker than append durability. A lost
-append would violate the `202` contract, but a lost checkpoint only causes
-duplicate replay of data already accepted into storage. Checkpoint log writes
-therefore acknowledge after the local write and fsync on looser internal
+Checkpoint durability remains weaker than append sync. A lost checkpoint only
+causes duplicate replay of data already accepted into storage. Checkpoint log
+writes therefore acknowledge after the local write and fsync on looser internal
 thresholds, plus writer shutdown.
 
 Main knobs:
 
 - `CANARDSTACK_RAW_SPOOL_CAPACITY_BYTES`
 - `CANARDSTACK_RAW_SPOOL_GROUP_COMMIT_MS`
+- `CANARDSTACK_RAW_SPOOL_APPEND_SYNC_MS`
+- `CANARDSTACK_RAW_SPOOL_APPEND_SYNC_BYTES`
 
 ## Queues And Flush
 

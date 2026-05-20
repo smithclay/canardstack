@@ -73,6 +73,13 @@ impl Metrics {
         *inner.counters.entry(key(name, labels)).or_default() += by;
     }
 
+    pub fn set_counter(&self, name: &str, labels: &[(&str, &str)], value: u64) {
+        self.inner
+            .lock_or_poisoned()
+            .counters
+            .insert(key(name, labels), value);
+    }
+
     pub fn gauge(&self, name: &str, labels: &[(&str, &str)], value: f64) {
         self.inner
             .lock_or_poisoned()
@@ -103,6 +110,16 @@ impl Metrics {
         let sum_key = key(&format!("{name}_sum"), labels);
         let current = inner.gauges.get(&sum_key).copied().unwrap_or(0.0);
         inner.gauges.insert(sum_key, current + seconds);
+    }
+
+    pub fn set_observation(&self, name: &str, labels: &[(&str, &str)], count: u64, seconds: f64) {
+        let mut inner = self.inner.lock_or_poisoned();
+        inner
+            .counters
+            .insert(key(&format!("{name}_count"), labels), count);
+        inner
+            .gauges
+            .insert(key(&format!("{name}_sum"), labels), seconds);
     }
 
     pub fn observe_phase_seconds(

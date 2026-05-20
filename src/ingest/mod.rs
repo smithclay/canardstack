@@ -54,7 +54,6 @@ impl fmt::Display for Signal {
     }
 }
 
-#[derive(Clone)]
 pub struct Ingestor {
     queues: Arc<Mutex<queue::QueueMap>>,
     flush_lock: Arc<Mutex<()>>,
@@ -85,6 +84,8 @@ impl Ingestor {
                 max_segment_bytes: config.raw_spool_max_segment_bytes as u64,
                 max_record_bytes: config.raw_spool_max_record_bytes as u64,
                 max_total_bytes: config.raw_spool_max_total_bytes as u64,
+                append_sync_interval: config.raw_spool_append_sync_interval,
+                append_sync_bytes: config.raw_spool_append_sync_bytes as u64,
                 checkpoint_fsync_records: config.raw_spool_checkpoint_fsync_records,
                 checkpoint_fsync_delay: config.raw_spool_checkpoint_fsync_delay,
             },
@@ -303,7 +304,7 @@ impl Ingestor {
         Ok(json!({
             "accepted": true,
             "records": accepted,
-            "acknowledgement": "durably_spooled_locally_at_least_once",
+            "acknowledgement": "locally_spooled_pending_periodic_sync",
             "unsupported_histograms": unsupported_histograms
         }))
     }
@@ -563,7 +564,7 @@ impl Ingestor {
             stats.encoded_bytes,
         );
         metrics.inc(
-            "canardstack_raw_spool_append_batch_fsyncs_total",
+            "canardstack_raw_spool_append_syncs_total",
             &[],
             stats.fsync_count,
         );
@@ -703,6 +704,42 @@ impl Ingestor {
                 "canardstack_raw_spool_pending_bytes",
                 &[],
                 stats.pending_bytes as f64,
+            );
+            metrics.gauge(
+                "canardstack_raw_spool_unsynced_records",
+                &[],
+                stats.unsynced_records as f64,
+            );
+            metrics.gauge(
+                "canardstack_raw_spool_unsynced_bytes",
+                &[],
+                stats.unsynced_bytes as f64,
+            );
+            metrics.gauge(
+                "canardstack_raw_spool_unsynced_age_seconds",
+                &[],
+                stats.unsynced_age_seconds,
+            );
+            metrics.gauge(
+                "canardstack_raw_spool_healthy",
+                &[],
+                if stats.healthy { 1.0 } else { 0.0 },
+            );
+            metrics.set_counter(
+                "canardstack_raw_spool_append_syncs_total",
+                &[],
+                stats.append_syncs_total,
+            );
+            metrics.set_counter(
+                "canardstack_raw_spool_append_sync_failures_total",
+                &[],
+                stats.append_sync_failures_total,
+            );
+            metrics.set_observation(
+                "canardstack_phase_duration_seconds",
+                &[("signal", "all"), ("phase", "raw_spool_append_fsync")],
+                stats.append_syncs_total,
+                stats.append_sync_seconds_total,
             );
         }
     }

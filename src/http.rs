@@ -38,7 +38,7 @@ pub fn serve_until(state: Arc<AppState>, shutdown: &AtomicBool) -> anyhow::Resul
     eprintln!("canardstack listening on http://{addr}/");
     log_startup_storage_mode(&probe);
     eprintln!(
-        "canardstack ingest acknowledgement: 2xx means locally fsynced raw spool acceptance for at-least-once processing"
+        "canardstack ingest acknowledgement: 2xx means written to the local raw spool and pending periodic append sync"
     );
     let active = Arc::new(AtomicUsize::new(0));
     let max_conns = state.config.max_concurrent_connections;
@@ -388,6 +388,8 @@ pub fn route(
                     "writer_queue_capacity": state.config.raw_spool_writer_queue_capacity,
                     "group_commit_records": state.config.raw_spool_group_commit_records,
                     "group_commit_ms": state.config.raw_spool_group_commit_delay.as_millis(),
+                    "append_sync_ms": state.config.raw_spool_append_sync_interval.as_millis(),
+                    "append_sync_bytes": state.config.raw_spool_append_sync_bytes,
                     "checkpoint_fsync_records": state.config.raw_spool_checkpoint_fsync_records,
                     "checkpoint_fsync_ms": state.config.raw_spool_checkpoint_fsync_delay.as_millis()
                 }
@@ -766,7 +768,7 @@ fn ingest(
 }
 
 fn ingest_response(result: Result<Value, ApiError>) -> HttpResponse {
-    // 202 matches the durable local-spool acknowledgement the body advertises
+    // 202 matches the local-spool write acknowledgement the body advertises
     // and the metric label canardstack_ingest_requests_total{status="202"}.
     match result {
         Ok(value) => HttpResponse::json(202, value),

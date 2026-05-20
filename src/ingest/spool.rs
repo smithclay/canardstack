@@ -7,7 +7,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 const RECORD_MAGIC: &[u8; 8] = b"CSRAW01\n";
@@ -57,12 +57,20 @@ pub struct RawSpoolAppendBatch {
     pub stats: RawSpoolAppendBatchStats,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RawSpoolAppendSyncStats {
+    pub seconds: f64,
+    pub file_count: u64,
+}
+
 #[derive(Clone, Debug)]
 pub struct RawSpoolOptions {
     pub dir: PathBuf,
     pub max_segment_bytes: u64,
     pub max_record_bytes: u64,
     pub max_total_bytes: u64,
+    pub append_sync_interval: Duration,
+    pub append_sync_bytes: u64,
     pub checkpoint_fsync_records: usize,
     pub checkpoint_fsync_delay: Duration,
 }
@@ -74,18 +82,30 @@ impl RawSpoolOptions {
             max_segment_bytes: DEFAULT_MAX_SEGMENT_BYTES,
             max_record_bytes: DEFAULT_MAX_RECORD_BYTES,
             max_total_bytes: 1024 * 1024 * 1024,
+            append_sync_interval: Duration::from_millis(500),
+            append_sync_bytes: 16 * 1024 * 1024,
             checkpoint_fsync_records: 1024,
             checkpoint_fsync_delay: Duration::from_millis(1000),
         }
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct RawSpoolStats {
     pub segment_count: usize,
     pub segment_bytes: u64,
     pub pending_records: usize,
     pub pending_bytes: u64,
+    pub unsynced_records: usize,
+    pub unsynced_bytes: u64,
+    pub unsynced_age_seconds: f64,
+    pub append_syncs_total: u64,
+    pub append_sync_failures_total: u64,
+    pub append_sync_seconds_total: f64,
+    pub append_sync_file_fsyncs_total: u64,
+    pub healthy: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -127,11 +147,24 @@ pub struct RawSpool {
     active_segment: u64,
     active: File,
     checkpoint: File,
+    append_sync_interval: Duration,
+    append_sync_bytes: u64,
+    append_dirty_records: usize,
+    append_dirty_bytes: u64,
+    append_dirty_since: Option<Instant>,
+    append_dirty_segments: BTreeSet<u64>,
+    append_syncs_total: u64,
+    append_sync_failures_total: u64,
+    append_sync_seconds_total: f64,
+    append_sync_file_fsyncs_total: u64,
+    fatal_error: Option<String>,
     checkpoint_fsync_records: usize,
     checkpoint_fsync_delay: Duration,
     checkpoint_dirty_records: usize,
     checkpoint_last_sync: Instant,
     next_sequence: u64,
+    #[cfg(test)]
+    fail_next_append_sync: bool,
 }
 
 impl RawSpool {
@@ -139,6 +172,8 @@ impl RawSpool {
         let max_segment_bytes = options.max_segment_bytes.max(RECORD_HEADER_BYTES + 1);
         let max_record_bytes = options.max_record_bytes.max(1);
         let max_total_bytes = options.max_total_bytes.max(1);
+        let append_sync_interval = options.append_sync_interval.max(Duration::from_millis(1));
+        let append_sync_bytes = options.append_sync_bytes.max(1);
         let checkpoint_fsync_records = options.checkpoint_fsync_records.max(1);
         let checkpoint_fsync_delay = options.checkpoint_fsync_delay.max(Duration::from_millis(1));
         fs::create_dir_all(&options.dir)
@@ -234,11 +269,24 @@ impl RawSpool {
             active_segment,
             active,
             checkpoint,
+            append_sync_interval,
+            append_sync_bytes,
+            append_dirty_records: 0,
+            append_dirty_bytes: 0,
+            append_dirty_since: None,
+            append_dirty_segments: BTreeSet::new(),
+            append_syncs_total: 0,
+            append_sync_failures_total: 0,
+            append_sync_seconds_total: 0.0,
+            append_sync_file_fsyncs_total: 0,
+            fatal_error: None,
             checkpoint_fsync_records,
             checkpoint_fsync_delay,
             checkpoint_dirty_records: 0,
             checkpoint_last_sync: Instant::now(),
             next_sequence: max_sequence.saturating_add(1).max(1),
+            #[cfg(test)]
+            fail_next_append_sync: false,
         })
     }
 
@@ -253,6 +301,7 @@ impl RawSpool {
     }
 
     pub fn append_batch(&mut self, records: Vec<RawSpoolRecord>) -> Result<RawSpoolAppendBatch> {
+        self.ensure_healthy()?;
         if records.is_empty() {
             return Ok(RawSpoolAppendBatch {
                 ids: Vec::new(),
@@ -300,10 +349,7 @@ impl RawSpool {
         }
 
         let mut ids = Vec::with_capacity(encoded.len());
-        let mut active_dirty = false;
         let mut write_seconds = 0.0;
-        let mut fsync_seconds = 0.0;
-        let mut fsync_count = 0u64;
         for (sequence, bytes, body_len) in encoded {
             let active_bytes = self
                 .segments
@@ -312,14 +358,6 @@ impl RawSpool {
             if active_bytes > 0
                 && active_bytes.saturating_add(bytes.len() as u64) > self.max_segment_bytes
             {
-                if active_dirty {
-                    let started = Instant::now();
-                    self.active
-                        .sync_data()
-                        .context("fsync raw spool record batch before rotate")?;
-                    fsync_seconds += started.elapsed().as_secs_f64();
-                    fsync_count += 1;
-                }
                 self.rotate()?;
             }
             let id = RawSpoolRecordId {
@@ -345,17 +383,9 @@ impl RawSpool {
             self.total_segment_bytes = self.total_segment_bytes.saturating_add(written);
             self.pending.insert(id, body_len);
             self.total_pending_bytes = self.total_pending_bytes.saturating_add(body_len);
+            self.mark_append_dirty(written);
             self.next_sequence = self.next_sequence.saturating_add(1);
-            active_dirty = true;
             ids.push(id);
-        }
-        if active_dirty {
-            let started = Instant::now();
-            self.active
-                .sync_data()
-                .context("fsync raw spool record batch")?;
-            fsync_seconds += started.elapsed().as_secs_f64();
-            fsync_count += 1;
         }
         Ok(RawSpoolAppendBatch {
             stats: RawSpoolAppendBatchStats {
@@ -363,8 +393,8 @@ impl RawSpool {
                 encoded_bytes,
                 wait_seconds: 0.0,
                 write_seconds,
-                fsync_seconds,
-                fsync_count,
+                fsync_seconds: 0.0,
+                fsync_count: 0,
             },
             ids,
         })
@@ -376,6 +406,18 @@ impl RawSpool {
             segment_bytes: self.total_segment_bytes,
             pending_records: self.pending.len(),
             pending_bytes: self.total_pending_bytes,
+            unsynced_records: self.append_dirty_records,
+            unsynced_bytes: self.append_dirty_bytes,
+            unsynced_age_seconds: self
+                .append_dirty_since
+                .map(|started| started.elapsed().as_secs_f64())
+                .unwrap_or(0.0),
+            append_syncs_total: self.append_syncs_total,
+            append_sync_failures_total: self.append_sync_failures_total,
+            append_sync_seconds_total: self.append_sync_seconds_total,
+            append_sync_file_fsyncs_total: self.append_sync_file_fsyncs_total,
+            healthy: self.fatal_error.is_none(),
+            error: self.fatal_error.clone(),
         })
     }
 
@@ -399,6 +441,7 @@ impl RawSpool {
     }
 
     pub fn mark_committed_batch(&mut self, ids: Vec<RawSpoolRecordId>) -> Result<()> {
+        self.ensure_healthy()?;
         for id in ids {
             if !self.completed.insert(id.sequence) {
                 continue;
@@ -435,6 +478,94 @@ impl RawSpool {
             self.checkpoint_fsync_delay
                 .saturating_sub(self.checkpoint_last_sync.elapsed())
         })
+    }
+
+    fn append_sync_due_in(&self) -> Option<Duration> {
+        if self.append_dirty_records == 0 {
+            return None;
+        }
+        if self.append_dirty_bytes >= self.append_sync_bytes {
+            return Some(Duration::ZERO);
+        }
+        self.append_dirty_since
+            .map(|started| self.append_sync_interval.saturating_sub(started.elapsed()))
+    }
+
+    fn sync_append_if_due(&mut self, force: bool) -> Result<Option<RawSpoolAppendSyncStats>> {
+        if self.append_dirty_records == 0 {
+            return Ok(None);
+        }
+        if force
+            || self.append_dirty_bytes >= self.append_sync_bytes
+            || self
+                .append_dirty_since
+                .map(|started| started.elapsed() >= self.append_sync_interval)
+                .unwrap_or(false)
+        {
+            return self.sync_append().map(Some);
+        }
+        Ok(None)
+    }
+
+    fn sync_append(&mut self) -> Result<RawSpoolAppendSyncStats> {
+        self.ensure_healthy()?;
+        if self.append_dirty_records == 0 {
+            return Ok(RawSpoolAppendSyncStats::default());
+        }
+        let started = Instant::now();
+        let dirty_segments = self
+            .append_dirty_segments
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        let mut file_count = 0u64;
+        let result = (|| -> Result<()> {
+            #[cfg(test)]
+            if self.fail_next_append_sync {
+                self.fail_next_append_sync = false;
+                bail!("injected raw spool append sync failure");
+            }
+            for segment in dirty_segments {
+                if segment == self.active_segment {
+                    self.active
+                        .sync_data()
+                        .context("fsync active raw spool append segment")?;
+                } else {
+                    OpenOptions::new()
+                        .write(true)
+                        .read(true)
+                        .open(segment_path(&self.dir, segment))
+                        .with_context(|| format!("open raw spool segment {segment} for fsync"))?
+                        .sync_data()
+                        .with_context(|| format!("fsync raw spool segment {segment}"))?;
+                }
+                file_count += 1;
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                self.append_dirty_records = 0;
+                self.append_dirty_bytes = 0;
+                self.append_dirty_since = None;
+                self.append_dirty_segments.clear();
+                self.append_syncs_total = self.append_syncs_total.saturating_add(1);
+                self.append_sync_seconds_total += started.elapsed().as_secs_f64();
+                self.append_sync_file_fsyncs_total = self
+                    .append_sync_file_fsyncs_total
+                    .saturating_add(file_count);
+                Ok(RawSpoolAppendSyncStats {
+                    seconds: started.elapsed().as_secs_f64(),
+                    file_count,
+                })
+            }
+            Err(err) => {
+                self.append_sync_failures_total = self.append_sync_failures_total.saturating_add(1);
+                let message = err.to_string();
+                self.fatal_error = Some(message.clone());
+                Err(anyhow::anyhow!(message))
+            }
+        }
     }
 
     pub fn reclaim_committed_segments(&mut self) -> Result<usize> {
@@ -543,11 +674,30 @@ impl RawSpool {
             .insert(self.active_segment, SegmentState::default());
         Ok(())
     }
+
+    fn mark_append_dirty(&mut self, bytes: u64) {
+        self.append_dirty_records += 1;
+        self.append_dirty_bytes = self.append_dirty_bytes.saturating_add(bytes);
+        self.append_dirty_since.get_or_insert_with(Instant::now);
+        self.append_dirty_segments.insert(self.active_segment);
+    }
+
+    fn ensure_healthy(&self) -> Result<()> {
+        if let Some(error) = &self.fatal_error {
+            bail!("raw spool append sync failed: {error}");
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn fail_next_append_sync(&mut self) {
+        self.fail_next_append_sync = true;
+    }
 }
 
-#[derive(Clone)]
 pub struct RawSpoolWriter {
-    commands: SyncSender<RawSpoolCommand>,
+    commands: Option<SyncSender<RawSpoolCommand>>,
+    handle: Option<JoinHandle<()>>,
 }
 
 struct AppendCommand {
@@ -580,18 +730,23 @@ impl RawSpoolWriter {
     ) -> Result<Self> {
         let spool = RawSpool::open(options)?;
         let (commands, receiver) = mpsc::sync_channel(queue_capacity.max(1));
-        thread::Builder::new()
+        let handle = thread::Builder::new()
             .name("canardstack-raw-spool-writer".to_string())
             .spawn(move || {
                 run_raw_spool_writer(spool, receiver, max_batch_records.max(1), max_batch_delay)
             })
             .context("spawn raw spool writer thread")?;
-        Ok(Self { commands })
+        Ok(Self {
+            commands: Some(commands),
+            handle: Some(handle),
+        })
     }
 
     pub fn append(&self, record: RawSpoolRecord) -> Result<RawSpoolAppendAck> {
         let (reply, rx) = mpsc::channel();
         self.commands
+            .as_ref()
+            .context("raw spool writer is stopped")?
             .send(RawSpoolCommand::Append(AppendCommand { record, reply }))
             .context("send raw spool append command")?;
         rx.recv().context("receive raw spool append result")?
@@ -609,6 +764,8 @@ impl RawSpoolWriter {
         for id in ids {
             let (reply, rx) = mpsc::channel();
             self.commands
+                .as_ref()
+                .context("raw spool writer is stopped")?
                 .send(RawSpoolCommand::Checkpoint(CheckpointCommand {
                     id: *id,
                     reply,
@@ -625,6 +782,8 @@ impl RawSpoolWriter {
     pub fn recover_pending(&self) -> Result<Vec<RecoveredRawSpoolRecord>> {
         let (reply, rx) = mpsc::channel();
         self.commands
+            .as_ref()
+            .context("raw spool writer is stopped")?
             .send(RawSpoolCommand::RecoverPending { reply })
             .context("send raw spool recovery command")?;
         rx.recv().context("receive raw spool recovery result")?
@@ -633,9 +792,20 @@ impl RawSpoolWriter {
     pub fn stats(&self) -> Result<RawSpoolStats> {
         let (reply, rx) = mpsc::channel();
         self.commands
+            .as_ref()
+            .context("raw spool writer is stopped")?
             .send(RawSpoolCommand::Stats { reply })
             .context("send raw spool stats command")?;
         rx.recv().context("receive raw spool stats result")?
+    }
+}
+
+impl Drop for RawSpoolWriter {
+    fn drop(&mut self) {
+        self.commands.take();
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
     }
 }
 
@@ -649,10 +819,11 @@ fn run_raw_spool_writer(
     loop {
         let command = match deferred.pop_front() {
             Some(command) => command,
-            None => match spool.checkpoint_sync_due_in() {
+            None => match next_writer_timeout(&spool) {
                 None => match receiver.recv() {
                     Ok(command) => command,
                     Err(_) => {
+                        let _ = spool.sync_append_if_due(true);
                         let _ = spool.sync_checkpoint_if_due(true);
                         break;
                     }
@@ -660,10 +831,12 @@ fn run_raw_spool_writer(
                 Some(sync_due_in) => match receiver.recv_timeout(sync_due_in) {
                     Ok(command) => command,
                     Err(RecvTimeoutError::Timeout) => {
+                        let _ = spool.sync_append_if_due(false);
                         let _ = spool.sync_checkpoint_if_due(false);
                         continue;
                     }
                     Err(RecvTimeoutError::Disconnected) => {
+                        let _ = spool.sync_append_if_due(true);
                         let _ = spool.sync_checkpoint_if_due(true);
                         break;
                     }
@@ -694,6 +867,16 @@ fn run_raw_spool_writer(
                 let _ = reply.send(spool.stats());
             }
         }
+        let _ = spool.sync_append_if_due(false);
+    }
+}
+
+fn next_writer_timeout(spool: &RawSpool) -> Option<Duration> {
+    match (spool.append_sync_due_in(), spool.checkpoint_sync_due_in()) {
+        (Some(append), Some(checkpoint)) => Some(append.min(checkpoint)),
+        (Some(append), None) => Some(append),
+        (None, Some(checkpoint)) => Some(checkpoint),
+        (None, None) => None,
     }
 }
 
@@ -1123,6 +1306,8 @@ mod tests {
             max_segment_bytes: 256,
             max_record_bytes: 1024,
             max_total_bytes: 1024 * 1024,
+            append_sync_interval: Duration::from_millis(500),
+            append_sync_bytes: 16 * 1024 * 1024,
             checkpoint_fsync_records: 1,
             checkpoint_fsync_delay: Duration::from_millis(1),
         }
@@ -1139,7 +1324,7 @@ mod tests {
     }
 
     #[test]
-    fn raw_spool_recovers_fsynced_uncommitted_records() {
+    fn raw_spool_recovers_written_uncommitted_records() {
         let dir = tempdir().unwrap();
         let mut spool = RawSpool::open(options(dir.path())).unwrap();
         let id = spool.append(record(b"request-body")).unwrap();
@@ -1153,7 +1338,7 @@ mod tests {
     }
 
     #[test]
-    fn raw_spool_append_batch_reports_write_and_fsync_stats() {
+    fn raw_spool_append_batch_reports_write_stats_without_fsyncing() {
         let dir = tempdir().unwrap();
         let mut spool = RawSpool::open(options(dir.path())).unwrap();
         let appended = spool
@@ -1164,8 +1349,12 @@ mod tests {
         assert_eq!(appended.stats.records, 2);
         assert!(appended.stats.encoded_bytes > 0);
         assert!(appended.stats.write_seconds >= 0.0);
-        assert!(appended.stats.fsync_seconds >= 0.0);
-        assert!(appended.stats.fsync_count >= 1);
+        assert_eq!(appended.stats.fsync_seconds, 0.0);
+        assert_eq!(appended.stats.fsync_count, 0);
+        let stats = spool.stats().unwrap();
+        assert_eq!(stats.unsynced_records, 2);
+        assert!(stats.unsynced_bytes > 0);
+        assert_eq!(stats.append_syncs_total, 0);
     }
 
     #[test]
@@ -1199,8 +1388,93 @@ mod tests {
         let second_ack = second_rx.recv().unwrap().unwrap();
         let stats = first_ack.batch_stats.unwrap();
         assert_eq!(stats.records, 2);
+        assert_eq!(stats.fsync_count, 0);
         assert!(stats.wait_seconds >= 0.0);
         assert!(second_ack.batch_stats.is_none());
+        assert_eq!(spool.stats().unwrap().append_syncs_total, 0);
+    }
+
+    #[test]
+    fn raw_spool_periodic_append_sync_clears_unsynced_accounting() {
+        let dir = tempdir().unwrap();
+        let mut opts = options(dir.path());
+        opts.append_sync_interval = Duration::from_millis(500);
+        opts.append_sync_bytes = 1024 * 1024;
+        let mut spool = RawSpool::open(opts).unwrap();
+
+        spool.append(record(b"first")).unwrap();
+        spool.append_dirty_since = Some(Instant::now() - Duration::from_secs(1));
+        let sync = spool.sync_append_if_due(false).unwrap().unwrap();
+
+        assert!(sync.file_count >= 1);
+        assert!(sync.seconds >= 0.0);
+        let stats = spool.stats().unwrap();
+        assert_eq!(stats.unsynced_records, 0);
+        assert_eq!(stats.unsynced_bytes, 0);
+        assert_eq!(stats.append_syncs_total, 1);
+        assert_eq!(stats.append_sync_failures_total, 0);
+        assert!(stats.healthy);
+    }
+
+    #[test]
+    fn raw_spool_append_sync_byte_threshold_clears_unsynced_accounting() {
+        let dir = tempdir().unwrap();
+        let mut opts = options(dir.path());
+        opts.append_sync_interval = Duration::from_secs(60);
+        opts.append_sync_bytes = 1;
+        let mut spool = RawSpool::open(opts).unwrap();
+
+        spool.append(record(b"first")).unwrap();
+        let sync = spool.sync_append_if_due(false).unwrap().unwrap();
+
+        assert!(sync.file_count >= 1);
+        let stats = spool.stats().unwrap();
+        assert_eq!(stats.unsynced_records, 0);
+        assert_eq!(stats.unsynced_bytes, 0);
+        assert_eq!(stats.append_syncs_total, 1);
+    }
+
+    #[test]
+    fn raw_spool_forced_append_sync_on_shutdown_clears_unsynced_accounting() {
+        let dir = tempdir().unwrap();
+        let mut opts = options(dir.path());
+        opts.append_sync_interval = Duration::from_secs(60);
+        opts.append_sync_bytes = 1024 * 1024;
+        let mut spool = RawSpool::open(opts).unwrap();
+
+        spool.append(record(b"first")).unwrap();
+        assert_eq!(spool.stats().unwrap().unsynced_records, 1);
+        spool.sync_append_if_due(true).unwrap();
+
+        let stats = spool.stats().unwrap();
+        assert_eq!(stats.unsynced_records, 0);
+        assert_eq!(stats.unsynced_bytes, 0);
+        assert_eq!(stats.append_syncs_total, 1);
+    }
+
+    #[test]
+    fn raw_spool_append_sync_failure_marks_unhealthy_and_blocks_appends() {
+        let dir = tempdir().unwrap();
+        let mut spool = RawSpool::open(options(dir.path())).unwrap();
+
+        spool.append(record(b"first")).unwrap();
+        spool.fail_next_append_sync();
+        let err = spool.sync_append_if_due(true).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("injected raw spool append sync failure"));
+
+        let stats = spool.stats().unwrap();
+        assert_eq!(stats.unsynced_records, 1);
+        assert_eq!(stats.append_sync_failures_total, 1);
+        assert!(!stats.healthy);
+        assert!(stats
+            .error
+            .unwrap()
+            .contains("injected raw spool append sync failure"));
+
+        let err = spool.append(record(b"second")).unwrap_err();
+        assert!(err.to_string().contains("raw spool append sync failed"));
     }
 
     #[test]

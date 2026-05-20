@@ -171,7 +171,7 @@ endpoint. Steps 2 and 3 require an operator-driven restart.
 ### Safe Degradation
 
 - Prefer `429` when the system is healthy but full. `raw_spool_full` means the
-  local durable spool hit its configured byte budget before transform.
+  local raw spool hit its configured byte budget before transform.
 - Use `503` when dependencies are unhealthy or the raw spool is unavailable.
 - Do not accept data that would exceed memory bounds.
 
@@ -209,8 +209,9 @@ endpoint. Steps 2 and 3 require an operator-driven restart.
 ### Safe Degradation
 
 - Keep accepting ingest only if spool and queue pressure remain below configured bounds.
-- Use `429 raw_spool_full` when the durable spool is full.
-- Use `503 raw_spool_unavailable` when the spool cannot be opened, written, or fsynced.
+- Use `429 raw_spool_full` when the raw spool is full.
+- Use `503 raw_spool_unavailable` when the spool cannot be opened, written, or
+  append-synced.
 
 ## 6. Retention Cleanup Fails And Storage Usage Keeps Growing
 

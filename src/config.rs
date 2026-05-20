@@ -61,6 +61,8 @@ pub struct Config {
     pub raw_spool_writer_queue_capacity: usize,
     pub raw_spool_group_commit_records: usize,
     pub raw_spool_group_commit_delay: Duration,
+    pub raw_spool_append_sync_interval: Duration,
+    pub raw_spool_append_sync_bytes: usize,
     pub raw_spool_checkpoint_fsync_records: usize,
     pub raw_spool_checkpoint_fsync_delay: Duration,
 }
@@ -223,6 +225,14 @@ impl Config {
                     .or(file.usize(&["raw_spool", "group_commit_ms"])?)
                     .unwrap_or(1) as u64,
             ),
+            raw_spool_append_sync_interval: Duration::from_millis(
+                env_usize("CANARDSTACK_RAW_SPOOL_APPEND_SYNC_MS")?
+                    .or(file.usize(&["raw_spool", "append_sync_ms"])?)
+                    .unwrap_or(500) as u64,
+            ),
+            raw_spool_append_sync_bytes: env_usize("CANARDSTACK_RAW_SPOOL_APPEND_SYNC_BYTES")?
+                .or(file.usize(&["raw_spool", "append_sync_bytes"])?)
+                .unwrap_or(16 * 1024 * 1024),
             raw_spool_checkpoint_fsync_records: 1024,
             raw_spool_checkpoint_fsync_delay: Duration::from_millis(1000),
         })
@@ -288,6 +298,8 @@ impl Config {
             raw_spool_writer_queue_capacity: 1024,
             raw_spool_group_commit_records: 64,
             raw_spool_group_commit_delay: Duration::from_millis(1),
+            raw_spool_append_sync_interval: Duration::from_millis(500),
+            raw_spool_append_sync_bytes: 16 * 1024 * 1024,
             raw_spool_checkpoint_fsync_records: 1024,
             raw_spool_checkpoint_fsync_delay: Duration::from_millis(1000),
         }
@@ -365,12 +377,16 @@ impl Config {
             || self.raw_spool_max_total_bytes == 0
             || self.raw_spool_writer_queue_capacity == 0
             || self.raw_spool_group_commit_records == 0
+            || self.raw_spool_append_sync_bytes == 0
             || self.raw_spool_checkpoint_fsync_records == 0
         {
             anyhow::bail!("raw spool limits must be > 0");
         }
         if self.raw_spool_group_commit_delay.is_zero() {
             anyhow::bail!("CANARDSTACK_RAW_SPOOL_GROUP_COMMIT_MS must be > 0");
+        }
+        if self.raw_spool_append_sync_interval.is_zero() {
+            anyhow::bail!("CANARDSTACK_RAW_SPOOL_APPEND_SYNC_MS must be > 0");
         }
         if self.raw_spool_checkpoint_fsync_delay.is_zero() {
             anyhow::bail!("raw spool checkpoint fsync delay must be > 0");
@@ -714,6 +730,8 @@ maintenance_interval_secs = 40
 [raw_spool]
 capacity_bytes = 16384
 group_commit_ms = 3
+append_sync_ms = 250
+append_sync_bytes = 8192
 
 [bench]
 http_keepalive = true
@@ -778,6 +796,11 @@ http_keepalive = true
             config.raw_spool_group_commit_delay,
             Duration::from_millis(3)
         );
+        assert_eq!(
+            config.raw_spool_append_sync_interval,
+            Duration::from_millis(250)
+        );
+        assert_eq!(config.raw_spool_append_sync_bytes, 8192);
         assert_eq!(config.raw_spool_checkpoint_fsync_records, 1024);
         assert_eq!(
             config.raw_spool_checkpoint_fsync_delay,

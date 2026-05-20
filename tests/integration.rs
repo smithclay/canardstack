@@ -558,6 +558,15 @@ fn admin_ingest_health_includes_raw_spool_backlog() {
         response.json_body()["raw_spool_config"]["group_commit_ms"],
         1
     );
+    assert_eq!(
+        response.json_body()["raw_spool_config"]["append_sync_ms"],
+        500
+    );
+    assert_eq!(
+        response.json_body()["raw_spool_config"]["append_sync_bytes"],
+        16 * 1024 * 1024
+    );
+    assert_eq!(response.json_body()["raw_spool"]["healthy"], true);
     assert_eq!(response.json_body()["queues"][0]["signal"], "logs");
 }
 
@@ -794,7 +803,7 @@ fn ingest_stage_metrics_separate_transform_enqueue_and_storage_visibility() {
 }
 
 #[test]
-fn raw_spool_acknowledges_local_durable_spool_before_storage_commit() {
+fn raw_spool_acknowledges_local_spool_write_before_storage_commit() {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
     config.raw_spool_dir = dir.path().join("raw-spool");
@@ -812,7 +821,7 @@ fn raw_spool_acknowledges_local_durable_spool_before_storage_commit() {
     assert_eq!(response.status(), 202, "{}", response.json_body());
     assert_eq!(
         response.json_body()["acknowledgement"],
-        "durably_spooled_locally_at_least_once"
+        "locally_spooled_pending_periodic_sync"
     );
     let metrics = metrics_text(&state);
     assert!(
@@ -822,6 +831,10 @@ fn raw_spool_acknowledges_local_durable_spool_before_storage_commit() {
     );
     assert!(
         metrics.contains("canardstack_raw_spool_pending_records 1.000000"),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains("canardstack_raw_spool_unsynced_records 1.000000"),
         "{metrics}"
     );
 
@@ -916,6 +929,8 @@ fn raw_spool_replays_pending_request_on_startup() {
             max_segment_bytes: config.raw_spool_max_segment_bytes as u64,
             max_record_bytes: config.raw_spool_max_record_bytes as u64,
             max_total_bytes: config.raw_spool_max_total_bytes as u64,
+            append_sync_interval: config.raw_spool_append_sync_interval,
+            append_sync_bytes: config.raw_spool_append_sync_bytes as u64,
             checkpoint_fsync_records: config.raw_spool_checkpoint_fsync_records,
             checkpoint_fsync_delay: config.raw_spool_checkpoint_fsync_delay,
         })
@@ -988,7 +1003,7 @@ fn raw_spool_replays_accepted_unflushed_request_after_restart() {
         assert_eq!(response.status(), 202, "{}", response.json_body());
         assert_eq!(
             response.json_body()["acknowledgement"],
-            "durably_spooled_locally_at_least_once"
+            "locally_spooled_pending_periodic_sync"
         );
         let metrics = metrics_text(&state);
         assert!(
@@ -2961,13 +2976,15 @@ fn config_validate_rejects_invalid_raw_spool_limits() {
         "baseline test config must validate"
     );
 
-    let mutations: [fn(&mut Config); 9] = [
+    let mutations: [fn(&mut Config); 11] = [
         |c| c.raw_spool_max_segment_bytes = 0,
         |c| c.raw_spool_max_record_bytes = 0,
         |c| c.raw_spool_max_total_bytes = 0,
         |c| c.raw_spool_writer_queue_capacity = 0,
         |c| c.raw_spool_group_commit_records = 0,
         |c| c.raw_spool_group_commit_delay = std::time::Duration::ZERO,
+        |c| c.raw_spool_append_sync_interval = std::time::Duration::ZERO,
+        |c| c.raw_spool_append_sync_bytes = 0,
         |c| c.raw_spool_checkpoint_fsync_records = 0,
         |c| c.raw_spool_checkpoint_fsync_delay = std::time::Duration::ZERO,
         |c| c.raw_spool_max_record_bytes = c.raw_spool_max_total_bytes + 1,

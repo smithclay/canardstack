@@ -9,7 +9,7 @@ old scout runs.
 The current MVP architecture is:
 
 ```text
-OTLP/HTTP -> local fsync raw spool -> inline transform/admission
+OTLP/HTTP -> local raw spool write, periodic append sync -> inline transform/admission
   -> bounded in-process queues -> immutable Parquet segments
   -> DuckLake registration -> logical DuckLake SQL compatibility APIs
 ```
@@ -22,9 +22,9 @@ Current product constraints:
 - DuckDB/DuckLake for storage and query execution.
 - No async runtime, gRPC, Kafka, DataFusion, Vortex, Postgres requirement,
   second service, or arbitrary SQL over compatibility APIs.
-- `202` means the raw request was fsynced into the local raw spool and accepted
-  for at-least-once processing. It does not mean rows are committed or
-  query-visible.
+- `202` means the raw request was written to the local raw spool and accepted
+  for processing, pending periodic or byte-threshold append sync. It does not
+  mean the append is fsynced, rows are committed, or rows are query-visible.
 - QueryEngine and compatibility APIs read registered logical DuckLake tables,
   not raw Parquet file paths.
 - Metrics performance is TBD. The current MVP envelope is for logs and traces.
