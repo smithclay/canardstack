@@ -15,9 +15,10 @@ The contract is:
 - `/api/admin/health/maintenance` → 503 when any job has consecutive failures
   ≥ 3 (matches `canardstack_maintenance_consecutive_failures{job} >= 3`).
 - `/api/admin/health/queries` → 503 when storage is not ready (queries depend
-  on DuckDB).
+  on DuckDB). Body includes lane state.
 - `/api/admin/health/ingest` → always 200; check queue gauges for backpressure
-  and the `raw_spool` object for restart replay backlog.
+  and the `raw_spool` object for restart replay backlog. Body includes the
+  lane freshness projection.
 
 Where a step below says "check /api/admin/health/...", the expected paging
 status is the HTTP code, not just the body.
@@ -39,6 +40,8 @@ status is the HTTP code, not just the body.
 - `canardstack_ingest_queue_bytes{signal}`.
 - `canardstack_ingest_queue_oldest_age_seconds{signal}`.
 - `canardstack_ingest_to_query_lag_seconds{table}`.
+- `canardstack_projected_visibility_seconds`.
+- `canardstack_flush_ewma_bytes_per_second`.
 - `canardstack_storage_physical_bytes{table="all"}`.
 
 ### Immediate Mitigation
@@ -53,7 +56,9 @@ status is the HTTP code, not just the body.
 
 - Keep existing queries available if they do not increase storage pressure.
 - Prefer `429` over accepting more data into full queues.
-- Temporarily lower configured query concurrency and restart if query load contends with flush.
+- Heavy query lane admission should degrade before flush is starved. If query
+  load still contends with flush, lower `CANARDSTACK_QUERY_CONCURRENCY` while
+  preserving at least one heavy slot after flush and cheap-query reservations.
 
 ### Escalation
 
@@ -75,7 +80,9 @@ status is the HTTP code, not just the body.
 - `canardstack_query_requests_total{status="503"}`.
 - `canardstack_query_timeouts_total`.
 - `canardstack_query_rejections_total`.
-- `/api/admin/health/queries` for active and limit counts.
+- `/api/admin/health/queries` for active, limit, and lane counts.
+- `canardstack_query_lane_rejections_total`.
+- `canardstack_query_lane_reductions_total`.
 
 ### Immediate Mitigation
 
@@ -85,9 +92,12 @@ endpoint. Steps 2 and 3 require an operator-driven restart.
 1. Restart query role if supervisor has not already done so.
 2. Lower query memory by 50%: set `CANARDSTACK_QUERY_MEMORY_LIMIT`
    (e.g. `256MiB`) and restart.
-3. Lower global query concurrency: set
-   `CANARDSTACK_QUERY_CONCURRENCY=1` and restart.
-4. Reduce compatibility query traffic from Grafana or other clients.
+3. Lower global query concurrency, keeping it greater than
+   `CANARDSTACK_FLUSH_LANE_CAPACITY + CANARDSTACK_CHEAP_QUERY_LANE_CAPACITY`;
+   with defaults, use `CANARDSTACK_QUERY_CONCURRENCY=3` or higher.
+4. Lower heavy degraded capacity only if needed:
+   `CANARDSTACK_HEAVY_QUERY_DEGRADED_CAPACITY=1`.
+5. Reduce compatibility query traffic from Grafana or other clients.
 
 ### Safe Degradation
 
@@ -119,6 +129,7 @@ endpoint. Steps 2 and 3 require an operator-driven restart.
 - `canardstack_ingest_requests_total{status="503"}`.
 - `canardstack_ingest_queue_bytes{signal}`.
 - `canardstack_ingest_to_query_lag_seconds{table}`.
+- `canardstack_projected_visibility_seconds`.
 
 ### Immediate Mitigation
 
@@ -157,21 +168,27 @@ endpoint. Steps 2 and 3 require an operator-driven restart.
 - `canardstack_raw_spool_pending_bytes`.
 - `canardstack_ingest_queue_bytes{signal}`.
 - `canardstack_ingest_queue_oldest_age_seconds{signal}`.
+- `canardstack_ingest_freshness_budget_rejections_total`.
+- `canardstack_projected_visibility_seconds`.
 - `canardstack_ingest_records_total{signal}`.
 - `canardstack_http_connection_errors_total`.
 
 ### Immediate Mitigation
 
-1. Identify the limiting resource: CPU, memory, catalog, object storage, or maintenance backlog.
+1. Identify the limiting resource: CPU, memory, catalog, object storage, freshness debt, or maintenance backlog.
 2. Increase exporter batch interval or reduce exporter concurrency if controlled by the operator.
 3. Temporarily drop lower-priority signals upstream if configured in the exporter or Collector.
 4. Increase process memory or add a larger instance if CPU/memory bound.
-5. Keep returning retryable failures until queues return below 70%.
+5. If `freshness_budget_exceeded` rises, prioritize flush recovery before
+   increasing ingest limits.
+6. Keep returning retryable failures until queues return below 70%.
 
 ### Safe Degradation
 
 - Prefer `429` when the system is healthy but full. `raw_spool_full` means the
   local raw spool hit its configured byte budget before transform.
+- `freshness_budget_exceeded` means the request was rejected before raw-spool
+  append to protect query visibility.
 - Use `503` when dependencies are unhealthy or the raw spool is unavailable.
 - Do not accept data that would exceed memory bounds.
 

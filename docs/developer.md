@@ -20,6 +20,8 @@ canardstack is currently shaped as:
 - Local raw spool for the `202` acceptance boundary, with append fsync handled
   by periodic or byte-threshold sync.
 - Bounded per-signal in-memory queues with row, byte, age, and pressure checks.
+- Logical lanes for freshness-budget ingest admission, protected flush, cheap
+  query, heavy query, and operator/control traffic.
 - DuckDB through `duckdb-rs`.
 - DuckLake through DuckDB's official `ducklake` extension SQL surface. The
   default local mode is a local DuckLake catalog and local immutable data files.
@@ -44,7 +46,7 @@ file. If `CANARDSTACK_CONFIG` is unset, `./config.toml` is loaded when it
 exists; otherwise the defaults are used.
 
 Start from `config/example.toml` for a full structured config grouped by
-operator concern: server, auth, paths, DuckDB, DuckLake, ingest, query,
+operator concern: server, auth, paths, DuckDB, DuckLake, ingest, query, lanes,
 retention, scheduler, and raw spool. Every public TOML setting has a matching
 `CANARDSTACK_*` environment variable, and env vars always win. Empty env vars
 clear optional string/path settings such as
@@ -174,6 +176,20 @@ cargo test
 cargo run -- serve
 ```
 
+`serve` defaults to the all-in-one role. Route-only modes are available for
+split-process preparation:
+
+```bash
+cargo run -- serve --role all
+cargo run -- serve --role ingest
+cargo run -- serve --role query
+```
+
+`--role ingest` serves ingest and operator/control endpoints but not
+compatibility query routes. `--role query` serves query and operator/control
+endpoints but not ingest or maintenance mutation routes. The scheduler runs only
+in `all` and `ingest` roles.
+
 Then open:
 
 ```text
@@ -233,6 +249,8 @@ Supported ingest response behavior:
 - `401` for missing API key.
 - `403` for bad API key.
 - `429` for retryable raw-spool, queue, or process ingest pressure.
+- `429 freshness_budget_exceeded` before raw-spool append when projected flush
+  visibility exceeds the configured freshness SLA.
 - `503` when the raw spool is unavailable or storage dependencies are unhealthy.
 
 ## Pre-commit Hooks
@@ -316,6 +334,22 @@ Set `scheduler.enabled = false` or `CANARDSTACK_SCHEDULER_ENABLED=false` to
 fall back to operator-triggered maintenance only. The scheduler shuts down
 cleanly when `serve` exits.
 
+## Lane Controller
+
+`src/lanes.rs` owns the logical lane counters and flush-throughput EWMA. It is
+intentionally not a generic scheduler. The request path asks it one direct
+question before raw-spool append: will the projected queue visibility stay
+within `CANARDSTACK_FRESHNESS_SLA_SECS` or `_MS`?
+
+Flush jobs reserve the flush lane before doing DuckDB/DuckLake work and record
+successful queue-byte drain into the EWMA. Compatibility routes reserve either
+the cheap lane (labels, metadata, probe, instant-ish queries) or the heavy lane
+(range/search/trace lookups). Heavy query capacity is reduced first under
+freshness debt and then rejected with the normal protocol error envelope when
+freshness is at risk. The controller also consumes cached query-visible
+freshness lag from operator gauge refreshes; ingest request threads never query
+DuckDB for admission.
+
 ## V0 Gaps
 
 - The standard-library HTTP server is intentionally minimal.
@@ -335,6 +369,8 @@ cleanly when `serve` exits.
   proof gate.
 - The maintenance singleton lease is in-process; a Postgres-backed lease is
   needed before splitting maintenance into its own role.
+- Query-only mode still uses the same binary and storage configuration; separate
+  writer/reader DuckDB processes remain a future proof gate.
 - The sustained MVP benchmark envelope is current for logs and traces. Metrics
   performance remains TBD.
 

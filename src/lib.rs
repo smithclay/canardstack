@@ -5,6 +5,7 @@ pub mod config;
 mod db;
 pub mod http;
 pub mod ingest;
+pub mod lanes;
 pub mod log_query;
 pub mod logging;
 pub mod maintenance;

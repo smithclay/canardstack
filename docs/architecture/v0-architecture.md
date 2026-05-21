@@ -12,6 +12,8 @@ Canardstack keeps these constraints:
 - One Rust binary named `canardstack`.
 - One synchronous standard-library HTTP server.
 - One DuckDB process with DuckLake attached.
+- One binary can be launched as `serve --role all`, `serve --role ingest`, or
+  `serve --role query`; this is route partitioning, not a second service.
 - OTLP/HTTP JSON and protobuf ingest only.
 - No async runtime, OTLP/gRPC, Kafka, separate hot store, bundled Collector,
   DataFusion, Vortex, arbitrary SQL HTTP API, or second long-running service.
@@ -90,7 +92,7 @@ At-least-once duplicate window:
 Retryable failure behavior:
 
 - `429 raw_spool_full` when the raw-spool byte budget is exhausted.
-- `429` for queue, process-memory, or runtime-memory pressure.
+- `429` for freshness-budget, queue, process-memory, or runtime-memory pressure.
 - `503 raw_spool_unavailable` when the local spool cannot be opened, written,
   or append-synced.
 - `503 dependency_unhealthy` when storage is unavailable.
@@ -170,6 +172,47 @@ Flush drains queues, coalesces batches, appends them to immutable segment
 buffers, seals due Parquet files, registers those files in DuckLake, and then
 checkpoints the corresponding raw-spool records.
 
+Freshness-budget admission happens before raw-spool append. The request path
+uses queue-credit bytes, oldest queue age, cached query-visible freshness lag,
+query pressure, and the lane controller's EWMA flush bytes/sec to estimate:
+
+```text
+projected_flush_seconds = queued_bytes / ewma_flush_bytes_per_sec
+projected_visibility_seconds =
+  max(cached_freshness_lag_seconds, oldest_queue_age_seconds + projected_flush_seconds)
+```
+
+If the projected visibility exceeds `CANARDSTACK_FRESHNESS_SLA_SECS` or `_MS`,
+the request returns retryable `429 freshness_budget_exceeded` and does not write
+the raw spool. Queue, process-memory, and runtime-memory pressure remain bounded
+and retryable.
+
+## Resource Lanes
+
+The process has logical lanes, implemented by one small in-process controller:
+
+- ingest admission lane: checks queue credit and freshness budget before
+  durable raw-spool append.
+- flush lane: reserves capacity for watchdog, scheduled flush, and manual
+  flush before query capacity is considered.
+- query lane: splits compatibility routes into cheap and heavy classes.
+- operator/control lane: keeps health, metrics, and admin health available in
+  every serve role.
+
+Heavy range/search/trace queries consume only the remaining query capacity after
+the flush and cheap-query reservations. When projected visibility debt reaches
+half of the freshness SLA, heavy query capacity degrades to
+`CANARDSTACK_HEAVY_QUERY_DEGRADED_CAPACITY`. At the SLA, heavy queries return a
+protocol-compatible `429 freshness_debt` envelope. Cheap metadata, label,
+probe, and instant-ish routes retain `CANARDSTACK_CHEAP_QUERY_LANE_CAPACITY`.
+
+Lane knobs:
+
+- `CANARDSTACK_FLUSH_LANE_CAPACITY`, default `1`.
+- `CANARDSTACK_CHEAP_QUERY_LANE_CAPACITY`, default `1`.
+- `CANARDSTACK_HEAVY_QUERY_DEGRADED_CAPACITY`, default `1`.
+- `CANARDSTACK_FRESHNESS_SLA_SECS` or `_MS`, default `15s`.
+
 ## Storage
 
 DuckLake is the storage coordinator. It owns snapshots, registered data-file
@@ -206,6 +249,9 @@ All HTTP compatibility queries go through `QueryEngine`, which applies:
 
 Prometheus, Loki, and Tempo adapters execute bounded logical SQL against
 DuckLake tables. DuckDB/DuckLake owns physical file planning and reads.
+Route-level lane admission runs before `QueryEngine`: cheap discovery and
+instant-ish routes reserve the protected cheap lane, while range/search/trace
+routes reserve the heavy lane.
 
 Direct SQL is intentionally outside the normal HTTP API. Operators or users who
 need SQL should use DuckDB CLI, MotherDuck, or another SQL client against the
@@ -264,6 +310,12 @@ Maintenance can be paused and resumed through admin endpoints. There is no
 Postgres-backed maintenance lease yet, so assume one in-process scheduler and
 one writer. Pause applies to scheduled jobs only; manual repair endpoints such
 as flush and retention remain available.
+
+In `serve --role query`, ingest routes and maintenance mutation routes are not
+served. Public health, `/metrics`, and admin health endpoints stay available.
+In `serve --role ingest`, ingest and maintenance mutation routes are served,
+but compatibility query routes are not. The default `serve --role all` preserves
+the previous all-in-one behavior.
 
 ## Retention
 

@@ -74,6 +74,13 @@ fn route_inner(
     body: RequestBody<'_>,
     state: &AppState,
 ) -> HttpResponse {
+    if is_query_route(method, path) && !state.config.serve_role.serves_queries() {
+        return HttpResponse::from_api_error(&ApiError::new(
+            404,
+            "not_found",
+            "query routes are disabled for this serve role",
+        ));
+    }
     if let Some(response) = route_compat(method, path, query, headers, body.as_slice(), state) {
         return response;
     }
@@ -99,12 +106,33 @@ fn route_inner(
             );
         }
         ("POST", "/v1/logs") => {
+            if !state.config.serve_role.accepts_ingest() {
+                return HttpResponse::from_api_error(&ApiError::new(
+                    404,
+                    "not_found",
+                    "ingest routes are disabled for this serve role",
+                ));
+            }
             return ingest_response(ingest(Signal::Logs, headers, body.into_vec(), state));
         }
         ("POST", "/v1/traces") => {
+            if !state.config.serve_role.accepts_ingest() {
+                return HttpResponse::from_api_error(&ApiError::new(
+                    404,
+                    "not_found",
+                    "ingest routes are disabled for this serve role",
+                ));
+            }
             return ingest_response(ingest(Signal::Spans, headers, body.into_vec(), state));
         }
         ("POST", "/v1/metrics") => {
+            if !state.config.serve_role.accepts_ingest() {
+                return HttpResponse::from_api_error(&ApiError::new(
+                    404,
+                    "not_found",
+                    "ingest routes are disabled for this serve role",
+                ));
+            }
             return ingest_response(ingest(Signal::MetricGauge, headers, body.into_vec(), state));
         }
         ("GET", "/api/admin/health/storage") => {
@@ -126,6 +154,7 @@ fn route_inner(
                 .unwrap_or_else(|err| json!({"error": err.to_string()}));
             Ok(json!({
                 "queues": state.ingestor.snapshots(),
+                "lanes": state.lanes.snapshot_for(state.ingestor.lane_freshness_inputs()),
                 "raw_spool": raw_spool,
                 "raw_spool_by_signal": raw_spool_by_signal,
                 "raw_spool_config": {
@@ -148,56 +177,45 @@ fn route_inner(
             return admin_health_response(headers, state, || {
                 // Queries are only as healthy as DuckDB; 200 here while
                 // storage is wedged would mislead the runbook step.
-                (state.storage.probe().is_ready(), state.queries.health())
+                let mut health = state.queries.health();
+                health["lanes"] = json!(state
+                    .lanes
+                    .snapshot_for(state.ingestor.lane_freshness_inputs()));
+                (state.storage.probe().is_ready(), health)
             });
         }
         ("POST", "/api/admin/maintenance/pause") => admin(headers, state, || {
+            ensure_maintenance_allowed(state)?;
             state.maintenance.pause();
             Ok(json!({"paused": true}))
         }),
         ("POST", "/api/admin/maintenance/resume") => admin(headers, state, || {
+            ensure_maintenance_allowed(state)?;
             state.maintenance.resume();
             Ok(json!({"paused": false}))
         }),
         ("POST", "/api/admin/maintenance/flush") => admin(headers, state, || {
+            ensure_maintenance_allowed(state)?;
             let started = Instant::now();
-            let result = state
-                .maintenance
-                .run_flush(
-                    &state.ingestor,
-                    &state.storage,
-                    &state.metrics,
-                    crate::maintenance::FlushOptions {
-                        table: query.get("table").map(String::as_str),
-                        force_immutable_segments: true,
-                    },
-                )
-                .map_err(|err| {
-                    if let Some((partial_signal, committed)) =
-                        crate::ingest::partial_commit_info(&err)
-                    {
-                        if committed > 0 {
-                            state.metrics.inc(
-                                "canardstack_ingest_partial_commit_rows_total",
-                                &[
-                                    ("signal", partial_signal.as_str()),
-                                    ("triggered_by", "admin_flush"),
-                                ],
-                                committed as u64,
-                            );
-                        }
-                    }
-                    storage_error(err)
-                });
+            let result = run_flush_with_lane(
+                state,
+                "admin_flush",
+                crate::maintenance::FlushOptions {
+                    table: query.get("table").map(String::as_str),
+                    force_immutable_segments: true,
+                },
+            );
             record_maintenance_metrics(state, "flush", &result, started);
             result
         }),
         ("POST", "/api/admin/maintenance/retention/dry-run") => admin(headers, state, || {
+            ensure_maintenance_allowed(state)?;
             run_maintenance_job(state, "retention", || {
                 state.maintenance.retention(&state.storage, true)
             })
         }),
         ("POST", "/api/admin/maintenance/retention/run") => admin(headers, state, || {
+            ensure_maintenance_allowed(state)?;
             run_maintenance_job(state, "retention", || {
                 state.maintenance.retention(&state.storage, false)
             })
@@ -218,9 +236,14 @@ fn ingest(
     state: &AppState,
 ) -> Result<Value, ApiError> {
     validation::validate_api_key(headers, &state.config, false)?;
-    state
-        .ingestor
-        .ingest(signal, headers, body, &state.storage, &state.metrics)
+    state.ingestor.ingest(
+        signal,
+        headers,
+        body,
+        &state.storage,
+        &state.lanes,
+        &state.metrics,
+    )
 }
 
 fn ingest_response(result: Result<Value, ApiError>) -> HttpResponse {
@@ -258,6 +281,78 @@ fn run_maintenance_job(
     let result = run().map_err(storage_error);
     record_maintenance_metrics(state, job, &result, started);
     result
+}
+
+fn run_flush_with_lane(
+    state: &AppState,
+    triggered_by: &'static str,
+    options: crate::maintenance::FlushOptions<'_>,
+) -> Result<Value, ApiError> {
+    let before = state.ingestor.total_reserved_queue_bytes();
+    let mut guard = state.lanes.reserve_flush(&state.metrics)?;
+    let result = state
+        .maintenance
+        .run_flush(&state.ingestor, &state.storage, &state.metrics, options)
+        .map_err(|err| {
+            if let Some((partial_signal, committed)) = crate::ingest::partial_commit_info(&err) {
+                if committed > 0 {
+                    state.metrics.inc(
+                        "canardstack_ingest_partial_commit_rows_total",
+                        &[
+                            ("signal", partial_signal.as_str()),
+                            ("triggered_by", triggered_by),
+                        ],
+                        committed as u64,
+                    );
+                }
+            }
+            storage_error(err)
+        });
+    let after = state.ingestor.total_reserved_queue_bytes();
+    if result.is_ok() {
+        guard.record_bytes(before.saturating_sub(after));
+    }
+    guard.finish(&state.metrics);
+    result
+}
+
+fn ensure_maintenance_allowed(state: &AppState) -> Result<(), ApiError> {
+    if state.config.serve_role.allows_maintenance_mutation() {
+        Ok(())
+    } else {
+        Err(ApiError::new(
+            404,
+            "not_found",
+            "maintenance mutations are disabled for this serve role",
+        ))
+    }
+}
+
+fn is_query_route(method: &str, path: &str) -> bool {
+    if method != "GET" && method != "POST" {
+        return false;
+    }
+    matches!(
+        path,
+        "/api/v1/query"
+            | "/api/v1/query_range"
+            | "/api/v1/labels"
+            | "/api/v1/series"
+            | "/api/v1/metadata"
+            | "/loki/api/v1/query"
+            | "/loki/api/v1/query_range"
+            | "/loki/api/v1/labels"
+            | "/loki/api/v1/series"
+            | "/api/search"
+            | "/api/search/tags"
+            | "/api/v2/search/tags"
+            | "/api/status/buildinfo"
+    ) || path.starts_with("/api/v1/label/")
+        || path.starts_with("/loki/api/v1/label/")
+        || path.starts_with("/api/v2/traces/")
+        || path.starts_with("/api/traces/")
+        || path.starts_with("/api/search/tag/")
+        || path.starts_with("/api/v2/search/tag/")
 }
 
 fn record_maintenance_metrics(
@@ -354,6 +449,7 @@ pub(crate) fn record_operator_gauges(state: &AppState) {
             }
         }
     }
+    let mut max_freshness_lag = 0.0f64;
     if let Some(watermarks) = storage.freshness_watermarks.as_object() {
         for (table, value) in watermarks {
             if let Some(epoch) = value.get("epoch_seconds").and_then(Value::as_f64) {
@@ -364,6 +460,7 @@ pub(crate) fn record_operator_gauges(state: &AppState) {
                 );
             }
             if let Some(lag) = value.get("lag_seconds").and_then(Value::as_f64) {
+                max_freshness_lag = max_freshness_lag.max(lag.max(0.0));
                 state.metrics.gauge(
                     "canardstack_ingest_to_query_lag_seconds",
                     &[("table", table.as_str())],
@@ -372,6 +469,9 @@ pub(crate) fn record_operator_gauges(state: &AppState) {
             }
         }
     }
+    state
+        .lanes
+        .record_observed_freshness_lag(max_freshness_lag, &state.metrics);
     let maintenance = state.maintenance.health();
     let paused = maintenance
         .get("paused")

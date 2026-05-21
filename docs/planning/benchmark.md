@@ -10,7 +10,8 @@ The current MVP architecture is:
 
 ```text
 OTLP/HTTP -> local raw spool write, periodic append sync -> inline transform/admission
-  -> bounded in-process queues -> immutable Parquet segments
+  -> freshness-budget admission -> bounded in-process queues -> protected flush lane
+  -> immutable Parquet segments
   -> DuckLake registration -> logical DuckLake SQL compatibility APIs
 ```
 
@@ -27,6 +28,9 @@ Current product constraints:
   mean the append is fsynced, rows are committed, or rows are query-visible.
 - QueryEngine and compatibility APIs read registered logical DuckLake tables,
   not raw Parquet file paths.
+- Logical lane admission reserves flush capacity before query capacity. Cheap
+  discovery/probe/instant-ish queries retain a protected lane; heavy range/search
+  queries degrade or reject first under freshness debt.
 - Metrics performance is TBD. The current MVP envelope is for logs and traces.
 
 ## What Must Stay True
@@ -149,6 +153,8 @@ Reports include:
 - queue trends
 - raw-spool, transform, enqueue, flush, seal, checkpoint, and storage-visible
   stage throughput
+- lane capacity/in-use, projected flush seconds, projected visibility seconds,
+  freshness-budget rejections, and heavy-query lane reductions when emitted
 - Loki query latency for log runs
 - process CPU/RSS samples when `--server-pid` can be sampled
 
@@ -196,9 +202,17 @@ Traces:
 
 Metrics:
 
-- TBD for MVP performance envelope.
-- Existing metric ingest/query behavior remains covered by tests and smoke, but
-  no current sustained mixed-pressure metric envelope is claimed.
+- Sustained mixed-query metric performance remains exploratory. Keep the latest
+  comparable report path with any lane or query-admission change.
+- The closest pre-lane 10-minute metrics mixed-query baseline for the
+  freshness-first lane work is
+  `/private/tmp/canardstack-fireforget-baseline-current/report/20260521T030914Z/report.json`.
+  It targeted `4000 GB/day`, `metrics`, `mixed-query`,
+  `ingest_concurrency=64`, persistent connections, `30s` warmup, and `601s`
+  measured duration. It accepted `10.58 MB/s`, returned `1,013,925` `202`s,
+  `1,474,970` `429`s, `14` `503`s, had `14/144` query failures, max queue
+  bytes `509,995,784`, max queue oldest age `16.91s`, and max measured
+  freshness lag `4.53s`.
 
 Recent single-node throughput scout, May 20 2026: the highest clean 10-minute
 mixed-signal run was `2000 GB/day` at ingest concurrency `64`, with
@@ -231,6 +245,7 @@ Every future benchmark entry should record:
 - ingest/query latency p50/p95/p99
 - freshness lag
 - status counts and transport errors
+- lane projected visibility, freshness-budget rejections, and query lane reductions/rejections when relevant
 
 Use `15s` as the quick validation freshness SLA and `30s` as the sustained
 multi-hour freshness SLA. Treat a clearly increasing freshness trend as a

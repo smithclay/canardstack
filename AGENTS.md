@@ -33,6 +33,8 @@ prek run --all-files
 # Local server workflow
 cp config/example.env .env && set -a && . ./.env && set +a
 cargo run -- serve              # serves on CANARDSTACK_BIND, default 127.0.0.1:4318
+cargo run -- serve --role ingest # ingest routes plus operator endpoints; no query routes
+cargo run -- serve --role query  # query routes plus operator endpoints; no ingest routes
 cargo run -- smoke              # in-process smoke: starts app, ingests fixtures, queries, prints health
 cargo run -- smoke-http <url>   # smoke against an already-running server
 cargo run -- healthcheck <url>  # used as the Docker healthcheck
@@ -76,6 +78,7 @@ Top-level modules map to pipeline stages or boundaries. Subdirectories group hel
 - `src/validation.rs` - auth, content-type, size, compression, timestamp-skew checks, `ApiError`, and error envelopes.
 - `src/otlp.rs` - OTLP JSON/protobuf decode and `Transformed` payload construction.
 - `src/ingest/` - request flow, admission, queue accounting, flush orchestration, and `PartialFlushError`.
+- `src/lanes.rs` - minimal logical lane controller for flush reservation, freshness-budget ingest admission, and cheap/heavy query admission.
 - `src/storage/` - DuckDB lifecycle, DuckLake `ATTACH`, extension install, immutable segment writes, `StorageProbe`, retention, and maintenance SQL.
 - `src/query/` - bounded query helpers, shared query plans, and Prometheus/Loki/Tempo selector parsing.
 - `src/compat/` - Prometheus/Loki/Tempo route adapters and the v0 public query surface.
@@ -92,6 +95,8 @@ Top-level modules map to pipeline stages or boundaries. Subdirectories group hel
 - Use OS threads plus `Arc<Mutex<_>>`. Prefer `LockExt::lock_or_poisoned()` over `.lock().unwrap()` for shared state.
 - Treat ingest as at-least-once after local durable spool: a 2xx response means the raw request was fsynced to the local raw spool and accepted for bounded processing. It does not mean the rows are DuckLake-committed or query-visible yet.
 - Preserve pressure behavior: queues return 429 under pressure, and storage/dependency failures surface as 503 where appropriate.
+- Preserve freshness-first admission: request-path checks may reject with 429 before raw-spool append when projected flush visibility exceeds the configured freshness SLA.
+- Preserve flush/query lane priority: flush capacity is reserved before query capacity; cheap metadata/probe/discovery/instant-ish queries keep a protected lane, and heavy range/search queries degrade or reject first under freshness debt.
 - Keep query routes bounded by time range, row limit, timeout, DuckDB memory limit, and concurrency caps through `QueryEngine`.
 - Do not expose arbitrary SQL through the compatibility APIs. Direct SQL is intentionally an external DuckDB CLI / MotherDuck path.
 - Preserve the Prometheus/Loki error envelope shape: `{"status":"error","errorType":"...","error":"..."}`.

@@ -187,6 +187,35 @@ impl QueueCreditLedger {
         ))
     }
 
+    pub(super) fn estimate_for_request(
+        &self,
+        signal: Signal,
+        headers: &HashMap<String, String>,
+        compressed_body_bytes: usize,
+        max_body_bytes: usize,
+    ) -> BTreeMap<Signal, usize> {
+        queue_credit_estimate_by_signal(signal, headers, compressed_body_bytes, max_body_bytes)
+    }
+
+    pub(super) fn projected_reserved_total_bytes(
+        &self,
+        desired_delta: &BTreeMap<Signal, usize>,
+    ) -> usize {
+        let current = self
+            .signals
+            .values()
+            .map(|state| state.reserved_bytes)
+            .sum::<usize>();
+        current.saturating_add(desired_delta.values().sum::<usize>())
+    }
+
+    pub(super) fn total_reserved_bytes(&self) -> usize {
+        self.signals
+            .values()
+            .map(|state| state.reserved_bytes)
+            .sum()
+    }
+
     pub(super) fn reserve_exact(
         &mut self,
         bytes_by_signal: BTreeMap<Signal, usize>,

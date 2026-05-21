@@ -1,4 +1,5 @@
 use canardstack::cli::{healthcheck, smoke, smoke_http};
+use canardstack::config::ServeRole;
 use canardstack::{http, init_logging, storage, AppState, Config, Scheduler};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -18,7 +19,9 @@ fn main() -> anyhow::Result<()> {
         }
         Some("serve") | None => {
             install_shutdown_signal_handlers();
-            let config = Config::from_env()?;
+            let role = parse_serve_role(args)?;
+            let mut config = Config::from_env()?;
+            config.serve_role = role;
             config.validate()?;
             let state = Arc::new(AppState::new(config)?);
             if !state.config.scheduler_enabled {
@@ -30,11 +33,39 @@ fn main() -> anyhow::Result<()> {
             let _scheduler = state
                 .config
                 .scheduler_enabled
-                .then(|| Scheduler::spawn(state.clone()));
+                .then_some(())
+                .filter(|_| state.config.serve_role.runs_scheduler())
+                .map(|_| Scheduler::spawn(state.clone()));
             http::serve_until(state, &SHUTDOWN_REQUESTED)
         }
         Some(other) => anyhow::bail!("unknown command {other}; use serve, smoke, smoke-http, healthcheck, or install-ducklake-extension"),
     }
+}
+
+fn parse_serve_role(mut args: impl Iterator<Item = String>) -> anyhow::Result<ServeRole> {
+    let mut role = ServeRole::All;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--role" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--role requires all, ingest, or query"))?;
+                role = ServeRole::parse(&value)?;
+            }
+            "--role=all" => role = ServeRole::All,
+            "--role=ingest" => role = ServeRole::Ingest,
+            "--role=query" => role = ServeRole::Query,
+            "--help" | "-h" => {
+                anyhow::bail!("usage: canardstack serve [--role all|ingest|query]");
+            }
+            other => {
+                anyhow::bail!(
+                    "unknown serve option {other}; usage: canardstack serve [--role all|ingest|query]"
+                );
+            }
+        }
+    }
+    Ok(role)
 }
 
 extern "C" fn request_shutdown(_signal: i32) {

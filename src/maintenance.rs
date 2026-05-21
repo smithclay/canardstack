@@ -303,21 +303,13 @@ fn scheduler_loop(state: Arc<AppState>, stop: Arc<AtomicBool>) {
         }
 
         if flush_requested || now >= next_watchdog {
-            let ok = run_job(&state, "watchdog", |s| {
-                s.maintenance
-                    .run_watchdog(&s.ingestor, &s.storage, &s.metrics)
-            });
+            let ok = run_job(&state, "watchdog", run_watchdog_with_lane);
             next_watchdog = now + next_interval(&state, "watchdog", watchdog_every, ok);
         }
 
         if now >= next_flush {
             let ok = run_job(&state, "flush", |s| {
-                s.maintenance.run_flush(
-                    &s.ingestor,
-                    &s.storage,
-                    &s.metrics,
-                    FlushOptions::default(),
-                )
+                run_flush_with_lane(s, FlushOptions::default())
             });
             next_flush = now + next_interval(&state, "flush", flush_every, ok);
         }
@@ -356,6 +348,41 @@ fn scheduler_loop(state: Arc<AppState>, stop: Arc<AtomicBool>) {
             next_retention = now + next_interval(&state, "retention", retention_every, ok);
         }
     }
+}
+
+fn run_flush_with_lane(state: &AppState, options: FlushOptions<'_>) -> Result<Value> {
+    let before = state.ingestor.total_reserved_queue_bytes();
+    let mut guard = state
+        .lanes
+        .reserve_flush(&state.metrics)
+        .map_err(|err| anyhow::anyhow!("{}: {}", err.reason, err.message))?;
+    let result =
+        state
+            .maintenance
+            .run_flush(&state.ingestor, &state.storage, &state.metrics, options);
+    if result.is_ok() {
+        let after = state.ingestor.total_reserved_queue_bytes();
+        guard.record_bytes(before.saturating_sub(after));
+    }
+    guard.finish(&state.metrics);
+    result
+}
+
+fn run_watchdog_with_lane(state: &AppState) -> Result<Value> {
+    let before = state.ingestor.total_reserved_queue_bytes();
+    let mut guard = state
+        .lanes
+        .reserve_flush(&state.metrics)
+        .map_err(|err| anyhow::anyhow!("{}: {}", err.reason, err.message))?;
+    let result = state
+        .maintenance
+        .run_watchdog(&state.ingestor, &state.storage, &state.metrics);
+    if result.is_ok() {
+        let after = state.ingestor.total_reserved_queue_bytes();
+        guard.record_bytes(before.saturating_sub(after));
+    }
+    guard.finish(&state.metrics);
+    result
 }
 
 fn run_job<F>(state: &AppState, job: &'static str, f: F) -> bool

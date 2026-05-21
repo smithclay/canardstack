@@ -1,3 +1,4 @@
+use canardstack::config::ServeRole;
 use canardstack::http;
 use canardstack::ingest::spool::{RawSpool, RawSpoolOptions, RawSpoolRecord};
 use canardstack::ingest::Signal;
@@ -724,6 +725,34 @@ fn queue_pressure_returns_429() {
 }
 
 #[test]
+fn freshness_budget_rejects_before_raw_spool_append() {
+    let dir = tempdir().unwrap();
+    let mut config = Config::test(dir.path().join("canardstack.duckdb"));
+    config.raw_spool_dir = dir.path().join("raw-spool");
+    config.lane_freshness_sla = StdDuration::from_millis(1);
+    config.max_age = StdDuration::from_secs(1);
+    config.max_bytes_per_flush = 1_000;
+    let state = AppState::new(config).unwrap();
+    let body = log_fixture(Utc::now().timestamp_nanos_opt().unwrap()).to_string();
+    let response = http::route(
+        "POST",
+        "/v1/logs",
+        &HashMap::new(),
+        &headers(&state),
+        body.as_bytes(),
+        &state,
+    );
+
+    assert_eq!(response.status(), 429, "{}", response.json_body());
+    assert_eq!(response.json_body()["error"], "freshness_budget_exceeded");
+    assert_eq!(
+        state.ingestor.raw_spool_stats().unwrap().pending_records,
+        0,
+        "freshness-budget rejection must happen before durable raw spool append"
+    );
+}
+
+#[test]
 fn runtime_memory_pressure_returns_429_before_enqueue() {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
@@ -756,6 +785,56 @@ fn runtime_memory_pressure_returns_429_before_enqueue() {
             .sum::<usize>(),
         0
     );
+}
+
+#[test]
+fn serve_roles_partition_ingest_and_query_routes() {
+    let dir = tempdir().unwrap();
+    let mut ingest_config = Config::test(dir.path().join("ingest.duckdb"));
+    ingest_config.serve_role = ServeRole::Ingest;
+    let ingest_state = AppState::new(ingest_config).unwrap();
+    let query = http::route(
+        "GET",
+        "/api/status/buildinfo",
+        &HashMap::new(),
+        &headers(&ingest_state),
+        &[],
+        &ingest_state,
+    );
+    assert_eq!(query.status(), 404, "{}", query.json_body());
+    let health = http::route(
+        "GET",
+        "/healthz",
+        &HashMap::new(),
+        &HashMap::new(),
+        &[],
+        &ingest_state,
+    );
+    assert_eq!(health.status(), 200);
+
+    let dir = tempdir().unwrap();
+    let mut query_config = Config::test(dir.path().join("query.duckdb"));
+    query_config.serve_role = ServeRole::Query;
+    let query_state = AppState::new(query_config).unwrap();
+    let body = log_fixture(Utc::now().timestamp_nanos_opt().unwrap()).to_string();
+    let ingest = http::route(
+        "POST",
+        "/v1/logs",
+        &HashMap::new(),
+        &headers(&query_state),
+        body.as_bytes(),
+        &query_state,
+    );
+    assert_eq!(ingest.status(), 404, "{}", ingest.json_body());
+    let maintenance = http::route(
+        "POST",
+        "/api/admin/maintenance/flush",
+        &HashMap::new(),
+        &admin_headers(&query_state),
+        b"{}",
+        &query_state,
+    );
+    assert_eq!(maintenance.status(), 404, "{}", maintenance.json_body());
 }
 
 #[test]

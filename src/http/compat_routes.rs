@@ -1,4 +1,5 @@
 use crate::compat;
+use crate::lanes::QueryClass;
 use crate::validation::ApiError;
 use crate::AppState;
 use serde_json::{json, Value};
@@ -25,53 +26,95 @@ pub(super) fn route_compat(
     let (query_class, result) = match (method, path) {
         ("GET", "/api/v1/query") | ("POST", "/api/v1/query") => (
             "/api/v1/query",
-            api_auth(headers, state, || compat::prometheus_query(state, &params)),
+            api_auth(headers, state, || {
+                with_query_lane(state, QueryClass::Cheap, || {
+                    compat::prometheus_query(state, &params)
+                })
+            }),
         ),
         ("GET", "/api/v1/query_range") | ("POST", "/api/v1/query_range") => (
             "/api/v1/query_range",
             api_auth(headers, state, || {
-                compat::prometheus_query_range(state, &params)
+                with_query_lane(state, QueryClass::Heavy, || {
+                    compat::prometheus_query_range(state, &params)
+                })
             }),
         ),
         ("GET", "/api/v1/labels") => (
             "/api/v1/labels",
-            api_auth(headers, state, || compat::prometheus_labels(state, &params)),
+            api_auth(headers, state, || {
+                with_query_lane(state, QueryClass::Cheap, || {
+                    compat::prometheus_labels(state, &params)
+                })
+            }),
         ),
         ("GET", "/api/v1/series") => (
             "/api/v1/series",
-            api_auth(headers, state, || compat::prometheus_series(state, &params)),
+            api_auth(headers, state, || {
+                with_query_lane(state, QueryClass::Cheap, || {
+                    compat::prometheus_series(state, &params)
+                })
+            }),
         ),
         ("GET", "/api/v1/metadata") => (
             "/api/v1/metadata",
-            api_auth(headers, state, || compat::prometheus_metadata(state)),
+            api_auth(headers, state, || {
+                with_query_lane(state, QueryClass::Cheap, || {
+                    compat::prometheus_metadata(state)
+                })
+            }),
         ),
         ("GET", "/loki/api/v1/query") => (
             "/loki/api/v1/query",
-            api_auth(headers, state, || compat::loki_query(state, &params)),
+            api_auth(headers, state, || {
+                with_query_lane(state, QueryClass::Cheap, || {
+                    compat::loki_query(state, &params)
+                })
+            }),
         ),
         ("GET", "/loki/api/v1/query_range") => (
             "/loki/api/v1/query_range",
-            api_auth(headers, state, || compat::loki_query_range(state, &params)),
+            api_auth(headers, state, || {
+                with_query_lane(state, QueryClass::Heavy, || {
+                    compat::loki_query_range(state, &params)
+                })
+            }),
         ),
         ("GET", "/loki/api/v1/labels") => (
             "/loki/api/v1/labels",
-            api_auth(headers, state, || compat::loki_labels(state, &params)),
+            api_auth(headers, state, || {
+                with_query_lane(state, QueryClass::Cheap, || {
+                    compat::loki_labels(state, &params)
+                })
+            }),
         ),
         ("GET", "/loki/api/v1/series") => (
             "/loki/api/v1/series",
-            api_auth(headers, state, || compat::loki_series(state, &params)),
+            api_auth(headers, state, || {
+                with_query_lane(state, QueryClass::Cheap, || {
+                    compat::loki_series(state, &params)
+                })
+            }),
         ),
         ("GET", "/api/search") => (
             "/api/search",
-            api_auth(headers, state, || compat::tempo_search(state, &params)),
+            api_auth(headers, state, || {
+                with_query_lane(state, QueryClass::Heavy, || {
+                    compat::tempo_search(state, &params)
+                })
+            }),
         ),
         ("GET", "/api/search/tags") => (
             "/api/search/tags",
-            api_auth(headers, state, || Ok(compat::tempo_tags())),
+            api_auth(headers, state, || {
+                with_query_lane(state, QueryClass::Cheap, || Ok(compat::tempo_tags()))
+            }),
         ),
         ("GET", "/api/v2/search/tags") => (
             "/api/v2/search/tags",
-            api_auth(headers, state, || Ok(compat::tempo_tags())),
+            api_auth(headers, state, || {
+                with_query_lane(state, QueryClass::Cheap, || Ok(compat::tempo_tags()))
+            }),
         ),
         ("GET", "/api/status/buildinfo") => (
             "/api/status/buildinfo",
@@ -95,7 +138,9 @@ pub(super) fn route_compat(
                         state,
                         "/api/v1/label/:name/values",
                         api_auth(headers, state, || {
-                            compat::prometheus_label_values(state, name, &params)
+                            with_query_lane(state, QueryClass::Cheap, || {
+                                compat::prometheus_label_values(state, name, &params)
+                            })
                         }),
                         started,
                     ));
@@ -108,7 +153,9 @@ pub(super) fn route_compat(
                         state,
                         "/loki/api/v1/label/:name/values",
                         api_auth(headers, state, || {
-                            compat::loki_label_values(state, name, &params)
+                            with_query_lane(state, QueryClass::Cheap, || {
+                                compat::loki_label_values(state, name, &params)
+                            })
                         }),
                         started,
                     ));
@@ -139,7 +186,9 @@ pub(super) fn route_compat(
                         state,
                         "/api/search/tag/:tag/values",
                         api_auth(headers, state, || {
-                            compat::tempo_tag_values(state, tag, &params)
+                            with_query_lane(state, QueryClass::Cheap, || {
+                                compat::tempo_tag_values(state, tag, &params)
+                            })
                         }),
                         started,
                     ));
@@ -152,7 +201,9 @@ pub(super) fn route_compat(
                         state,
                         "/api/v2/search/tag/:tag/values",
                         api_auth(headers, state, || {
-                            compat::tempo_tag_values(state, tag, &params)
+                            with_query_lane(state, QueryClass::Cheap, || {
+                                compat::tempo_tag_values(state, tag, &params)
+                            })
                         }),
                         started,
                     ));
@@ -178,19 +229,35 @@ fn tempo_trace_http(
         return compat_http(
             state,
             query_class,
-            api_auth(headers, state, || compat::tempo_trace(state, trace_id)),
+            api_auth(headers, state, || {
+                with_query_lane(state, QueryClass::Heavy, || {
+                    compat::tempo_trace(state, trace_id)
+                })
+            }),
             started,
         );
     }
 
     let result = api_auth(headers, state, || {
-        compat::tempo_trace_proto(state, trace_id)
+        with_query_lane(state, QueryClass::Heavy, || {
+            compat::tempo_trace_proto(state, trace_id)
+        })
     });
     record_query_metrics(state, query_class, &result, started);
     match result {
         Ok(bytes) => HttpResponse::bytes(200, "application/protobuf", bytes),
         Err(err) => compat_error_response(err),
     }
+}
+
+fn with_query_lane<T>(
+    state: &AppState,
+    class: QueryClass,
+    run: impl FnOnce() -> Result<T, ApiError>,
+) -> Result<T, ApiError> {
+    let inputs = state.ingestor.lane_freshness_inputs();
+    let _guard = state.lanes.reserve_query(class, inputs, &state.metrics)?;
+    run()
 }
 
 fn compat_error_response(err: ApiError) -> HttpResponse {

@@ -1,4 +1,5 @@
 use crate::config::Config;
+use crate::lanes::{FreshnessInputs, LaneController};
 use crate::metrics::Metrics;
 use crate::otlp::{self, Transformed};
 use crate::storage::Storage;
@@ -158,6 +159,7 @@ impl Ingestor {
         headers: &HashMap<String, String>,
         compressed_body: Vec<u8>,
         storage: &Storage,
+        lanes: &LaneController,
         metrics: &Metrics,
     ) -> ApiResult<Value> {
         validation::validate_body_size(compressed_body.len(), &self.config)?;
@@ -171,16 +173,21 @@ impl Ingestor {
             )
             .with_retry_after(10));
         }
-        let mut queue_credit_reservation =
-            match self.reserve_queue_credit_estimate(signal, headers, compressed_body.len()) {
-                Ok(reservation) => reservation,
-                Err(err) => {
-                    self.request_flush_observed(signal, metrics);
-                    self.record_queue_metrics(metrics);
-                    metrics.ingest_request(signal, err.status, err.reason);
-                    return Err(err);
-                }
-            };
+        let mut queue_credit_reservation = match self.reserve_queue_credit_estimate(
+            signal,
+            headers,
+            compressed_body.len(),
+            lanes,
+            metrics,
+        ) {
+            Ok(reservation) => reservation,
+            Err(err) => {
+                self.request_flush_observed(signal, metrics);
+                self.record_queue_metrics(metrics);
+                metrics.ingest_request(signal, err.status, err.reason);
+                return Err(err);
+            }
+        };
         let (raw_spool_ref, compressed_body) =
             match self.append_raw_spool(signal, headers, compressed_body, metrics) {
                 Ok(appended) => appended,
@@ -384,7 +391,27 @@ impl Ingestor {
         signal: Signal,
         headers: &HashMap<String, String>,
         compressed_body_bytes: usize,
+        lanes: &LaneController,
+        metrics: &Metrics,
     ) -> ApiResult<admission::QueueCreditReservation> {
+        let ledger = self.queue_credits.lock_or_poisoned();
+        let estimated = ledger.estimate_for_request(
+            signal,
+            headers,
+            compressed_body_bytes,
+            self.config.max_body_bytes,
+        );
+        let projected_total = ledger.projected_reserved_total_bytes(&estimated);
+        drop(ledger);
+        let oldest_age_seconds = self.max_oldest_queue_age_seconds();
+        lanes.admit_ingest(
+            FreshnessInputs {
+                queued_bytes: projected_total,
+                incoming_bytes: 0,
+                oldest_age_seconds,
+            },
+            metrics,
+        )?;
         self.queue_credits.lock_or_poisoned().reserve_estimate(
             signal,
             headers,
@@ -565,6 +592,26 @@ impl Ingestor {
                 snapshot.flush_debt_seconds,
             );
         }
+    }
+
+    pub fn lane_freshness_inputs(&self) -> FreshnessInputs {
+        FreshnessInputs {
+            queued_bytes: self.total_reserved_queue_bytes(),
+            incoming_bytes: 0,
+            oldest_age_seconds: self.max_oldest_queue_age_seconds(),
+        }
+    }
+
+    pub fn total_reserved_queue_bytes(&self) -> usize {
+        self.queue_credits.lock_or_poisoned().total_reserved_bytes()
+    }
+
+    fn max_oldest_queue_age_seconds(&self) -> f64 {
+        let queues = self.queues.lock_or_poisoned();
+        queue::snapshots(&queues, &self.config)
+            .into_iter()
+            .map(|snapshot| snapshot.oldest_age_seconds)
+            .fold(0.0, f64::max)
     }
 
     fn enqueue(

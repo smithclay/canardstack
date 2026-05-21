@@ -6,6 +6,48 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use toml_edit::{DocumentMut, Item};
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ServeRole {
+    All,
+    Ingest,
+    Query,
+}
+
+impl ServeRole {
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "all" => Ok(Self::All),
+            "ingest" => Ok(Self::Ingest),
+            "query" => Ok(Self::Query),
+            _ => anyhow::bail!("--role must be all, ingest, or query"),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Ingest => "ingest",
+            Self::Query => "query",
+        }
+    }
+
+    pub fn accepts_ingest(self) -> bool {
+        matches!(self, Self::All | Self::Ingest)
+    }
+
+    pub fn serves_queries(self) -> bool {
+        matches!(self, Self::All | Self::Query)
+    }
+
+    pub fn runs_scheduler(self) -> bool {
+        matches!(self, Self::All | Self::Ingest)
+    }
+
+    pub fn allows_maintenance_mutation(self) -> bool {
+        matches!(self, Self::All | Self::Ingest)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct QueryLane {
     pub concurrency: usize,
@@ -15,6 +57,7 @@ pub struct QueryLane {
 
 #[derive(Clone, Debug)]
 pub struct Config {
+    pub serve_role: ServeRole,
     pub bind: String,
     pub api_key: String,
     pub admin_api_key: String,
@@ -40,6 +83,10 @@ pub struct Config {
     pub ducklake_data_inlining_row_limit: usize,
     pub query_interactive: QueryLane,
     pub query_background: QueryLane,
+    pub lane_flush_capacity: usize,
+    pub lane_cheap_query_capacity: usize,
+    pub lane_heavy_query_degraded_capacity: usize,
+    pub lane_freshness_sla: Duration,
     pub logs_retention_days: i64,
     pub spans_retention_days: i64,
     pub metrics_retention_days: i64,
@@ -117,6 +164,7 @@ impl Config {
             .unwrap_or(1024 * 1024 * 1024);
 
         Ok(Self {
+            serve_role: ServeRole::All,
             bind: env_string("CANARDSTACK_BIND")?
                 .or(file.string(&["server", "bind"])?)
                 .unwrap_or_else(|| "127.0.0.1:4318".to_string()),
@@ -185,6 +233,25 @@ impl Config {
                 timeout_secs: query_timeout_secs.saturating_mul(4).max(query_timeout_secs),
                 memory_limit: query_memory_limit,
             },
+            lane_flush_capacity: env_usize("CANARDSTACK_FLUSH_LANE_CAPACITY")?
+                .or(file.usize(&["lanes", "flush_capacity"])?)
+                .unwrap_or(1),
+            lane_cheap_query_capacity: env_usize("CANARDSTACK_CHEAP_QUERY_LANE_CAPACITY")?
+                .or(file.usize(&["lanes", "cheap_query_capacity"])?)
+                .unwrap_or(1),
+            lane_heavy_query_degraded_capacity: env_usize(
+                "CANARDSTACK_HEAVY_QUERY_DEGRADED_CAPACITY",
+            )?
+            .or(file.usize(&["lanes", "heavy_query_degraded_capacity"])?)
+            .unwrap_or(1),
+            lane_freshness_sla: duration_ms_or_secs(
+                &file,
+                &["lanes", "freshness_sla_ms"],
+                &["lanes", "freshness_sla_secs"],
+                "CANARDSTACK_FRESHNESS_SLA_MS",
+                "CANARDSTACK_FRESHNESS_SLA_SECS",
+                15,
+            )?,
             logs_retention_days: retention_days,
             spans_retention_days: retention_days,
             metrics_retention_days: retention_days,
@@ -242,6 +309,7 @@ impl Config {
             .unwrap_or_else(|| std::path::Path::new("."))
             .join("storage");
         Self {
+            serve_role: ServeRole::All,
             bind: "127.0.0.1:0".to_string(),
             api_key: "test-key".to_string(),
             admin_api_key: "test-admin-key".to_string(),
@@ -275,6 +343,10 @@ impl Config {
                 timeout_secs: 60,
                 memory_limit: "1GiB".to_string(),
             },
+            lane_flush_capacity: 1,
+            lane_cheap_query_capacity: 1,
+            lane_heavy_query_degraded_capacity: 1,
+            lane_freshness_sla: Duration::from_secs(15),
             logs_retention_days: 14,
             spans_retention_days: 14,
             metrics_retention_days: 30,
@@ -362,6 +434,24 @@ impl Config {
         }
         if self.query_interactive.concurrency == 0 || self.query_background.concurrency == 0 {
             anyhow::bail!("query concurrency limits must be > 0");
+        }
+        if self.lane_flush_capacity == 0
+            || self.lane_cheap_query_capacity == 0
+            || self.lane_heavy_query_degraded_capacity == 0
+        {
+            anyhow::bail!("lane capacities must be > 0");
+        }
+        if self.lane_freshness_sla.is_zero() {
+            anyhow::bail!("CANARDSTACK_FRESHNESS_SLA_MS/SECS must be > 0");
+        }
+        if self.query_interactive.concurrency
+            <= self
+                .lane_flush_capacity
+                .saturating_add(self.lane_cheap_query_capacity)
+        {
+            anyhow::bail!(
+                "CANARDSTACK_QUERY_CONCURRENCY must leave at least one heavy query slot after flush and cheap-query lane reservations"
+            );
         }
         if self.query_interactive.timeout_secs == 0 || self.query_background.timeout_secs == 0 {
             anyhow::bail!("query timeouts must be > 0");
@@ -620,6 +710,11 @@ mod tests {
         "CANARDSTACK_QUERY_CONCURRENCY",
         "CANARDSTACK_QUERY_TIMEOUT_SECS",
         "CANARDSTACK_QUERY_MEMORY_LIMIT",
+        "CANARDSTACK_FLUSH_LANE_CAPACITY",
+        "CANARDSTACK_CHEAP_QUERY_LANE_CAPACITY",
+        "CANARDSTACK_HEAVY_QUERY_DEGRADED_CAPACITY",
+        "CANARDSTACK_FRESHNESS_SLA_MS",
+        "CANARDSTACK_FRESHNESS_SLA_SECS",
         "CANARDSTACK_RETENTION_DAYS",
         "CANARDSTACK_SCHEDULER_ENABLED",
         "CANARDSTACK_MAINTENANCE_INTERVAL_MS",
@@ -716,6 +811,12 @@ concurrency = 6
 timeout_secs = 7
 memory_limit = "384MiB"
 
+[lanes]
+flush_capacity = 1
+cheap_query_capacity = 2
+heavy_query_degraded_capacity = 1
+freshness_sla_secs = 9
+
 [retention]
 days = 5
 
@@ -771,6 +872,10 @@ http_keepalive = true
         assert_eq!(config.query_interactive.memory_limit, "384MiB");
         assert_eq!(config.query_background.concurrency, 3);
         assert_eq!(config.query_background.timeout_secs, 28);
+        assert_eq!(config.lane_flush_capacity, 1);
+        assert_eq!(config.lane_cheap_query_capacity, 2);
+        assert_eq!(config.lane_heavy_query_degraded_capacity, 1);
+        assert_eq!(config.lane_freshness_sla, Duration::from_secs(9));
         assert_eq!(config.logs_retention_days, 5);
         assert_eq!(config.metrics_retention_days, 5);
         assert!(!config.scheduler_enabled);

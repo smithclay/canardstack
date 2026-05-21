@@ -21,6 +21,7 @@ Labels stay low-cardinality:
 - `query_class`: route path (e.g. `/api/v1/query_range`).
 - `encoding`: `identity`, `gzip`.
 - `triggered_by`: who initiated a partial-commit flush.
+- `lane`: `flush`, `query_cheap`, `query_heavy`, `ingest`, or `query`.
 
 Do not label metrics by `service_name`, trace id, query text, API key, or arbitrary attributes.
 
@@ -57,6 +58,7 @@ Do not label metrics by `service_name`, trace id, query text, API key, or arbitr
 | `canardstack_ingest_queue_bytes` | Gauge | `signal` | Current queued bytes (approximate). |
 | `canardstack_ingest_queue_oldest_age_seconds` | Gauge | `signal` | Oldest queued record age. |
 | `canardstack_ingest_rejections_total` | Counter | `signal`, `status`, `reason` | Admission-control rejections (subset of `_ingest_requests_total`). |
+| `canardstack_ingest_freshness_budget_rejections_total` | Counter | none | Requests rejected before raw-spool append because projected visibility exceeded the freshness SLA. |
 | `canardstack_ingest_flush_attempted_bytes_total` | Counter | `signal` | Approximate queued Arrow bytes selected for flush attempts. |
 | `canardstack_ingest_flush_drained_rows_total` | Counter | `signal` | Rows drained from process queues into a flush attempt. |
 | `canardstack_ingest_flush_buffered_rows_total` | Counter | `signal` | Rows appended to immutable segment buffers after coalescing. |
@@ -94,8 +96,9 @@ backward-compatible benchmark parsing.
 (`segment_count`, `segment_bytes`, `pending_records`, `pending_bytes`,
 `unsynced_records`, `unsynced_bytes`, `unsynced_age_seconds`, `healthy`, and
 `error` when unhealthy), and the active raw-spool group-commit and append-sync
-settings. Operators can diagnose replay backlog, unsynced append exposure, and
-queue pressure without arbitrary SQL.
+settings. It also returns the current lane snapshot. Operators can diagnose
+replay backlog, unsynced append exposure, queue pressure, freshness-budget
+projection, and lane pressure without arbitrary SQL.
 
 The shared phase metric `canardstack_phase_duration_seconds` splits
 request-visible `raw_spool_append` latency from raw-spool writer internals:
@@ -112,6 +115,20 @@ part of `202` latency.
 | `canardstack_query_duration_seconds` | Histogram (`_count` / `_sum`) | `query_class` | User-visible latency. |
 | `canardstack_query_rejections_total` | Counter | `query_class`, `reason` | Concurrency / shape rejections. |
 | `canardstack_query_timeouts_total` | Counter | `query_class` | Timeout enforcement. |
+| `canardstack_query_lane_reductions_total` | Counter | none | Heavy query admissions that ran at the degraded capacity because freshness debt was elevated. |
+| `canardstack_query_lane_rejections_total` | Counter | none | Query lane rejections from cheap-lane saturation, heavy-lane saturation, or freshness debt. |
+
+## Lane Metrics
+
+| Metric | Type | Labels | Purpose |
+| --- | --- | --- | --- |
+| `canardstack_lane_capacity` | Gauge | `lane` | Current logical lane capacity. Heavy query capacity reports the effective capacity after freshness degradation. |
+| `canardstack_lane_in_use` | Gauge | `lane` | Current logical lane occupancy. |
+| `canardstack_lane_rejections_total` | Counter | `lane`, `reason` | Rejections at the lane controller. |
+| `canardstack_flush_ewma_bytes_per_second` | Gauge | none | EWMA queue-byte flush throughput used for freshness-budget admission. |
+| `canardstack_projected_flush_seconds` | Gauge | none | Queue byte debt divided by EWMA flush throughput. |
+| `canardstack_projected_visibility_seconds` | Gauge | none | Oldest queue age plus projected flush seconds. |
+| `canardstack_observed_freshness_lag_seconds` | Gauge | none | Max cached query-visible freshness lag from the last operator gauge refresh. |
 
 ## Maintenance Metrics
 
@@ -138,6 +155,7 @@ part of `202` latency.
 | Unsafe ingest rejection | Any `canardstack_ingest_requests_total{status="503"}` increase for 5 minutes | Critical |
 | Maintenance failing repeatedly | `canardstack_maintenance_consecutive_failures > 3` for any job | Warning |
 | Query timeouts spiking | `rate(canardstack_query_timeouts_total[5m]) > 0` | Warning |
+| Freshness admission active | `rate(canardstack_ingest_freshness_budget_rejections_total[5m]) > 0` | Warning |
 | Connection cap saturated | `rate(canardstack_http_connection_errors_total{reason="max_connections_exceeded"}[5m]) > 0` | Warning |
 | Partial-commit durability gap | `rate(canardstack_ingest_partial_commit_rows_total[5m]) > 0` | Warning |
 
@@ -150,6 +168,7 @@ The following metrics from earlier design drafts are **not** emitted by the curr
 - `canardstack_storage_logical_bytes` (the implementation emits `_logical_rows` instead)
 - `canardstack_object_store_errors_total`, `_request_seconds`
 - `canardstack_query_active`, `_memory_high_water_bytes`, `_oom_total`
+- `canardstack_query_class_active`
 - `canardstack_maintenance_last_success_timestamp`, `_backlog_bytes`
 - `canardstack_cleanup_deleted_files_total`, `_deleted_bytes_total`
 - `canardstack_retention_oldest_retained_date`

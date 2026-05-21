@@ -48,6 +48,12 @@ concurrency = 4
 timeout_secs = 15
 memory_limit = "1GiB"
 
+[lanes]
+flush_capacity = 1
+cheap_query_capacity = 1
+heavy_query_degraded_capacity = 1
+freshness_sla_secs = 15
+
 [retention]
 days = 14
 
