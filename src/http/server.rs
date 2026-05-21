@@ -18,6 +18,7 @@ use super::router::route_owned;
 
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+const KEEPALIVE_REQUEST_LIMIT: usize = 10_000;
 static NEVER_SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
 fn log_startup_storage_mode(probe: &crate::storage::StorageProbe) {
@@ -254,7 +255,9 @@ fn handle_stream(mut stream: TcpStream, state: Arc<AppState>) -> anyhow::Result<
         let client_requested_close = headers
             .get("connection")
             .is_some_and(|value| value.eq_ignore_ascii_case("close"));
-        let keep_alive = keepalive_enabled && !client_requested_close;
+        let reached_request_limit = requests >= KEEPALIVE_REQUEST_LIMIT;
+        let keep_alive =
+            should_keep_connection_alive(keepalive_enabled, client_requested_close, requests);
         state.metrics.inc(
             "canardstack_http_connection_requests_total",
             &[(
@@ -269,17 +272,24 @@ fn handle_stream(mut stream: TcpStream, state: Arc<AppState>) -> anyhow::Result<
         );
         write_response_with_connection(&mut stream, response, keep_alive)?;
         if !keep_alive {
-            return Ok(());
-        }
-        if requests >= 10_000 {
-            state.metrics.inc(
-                "canardstack_http_connection_closes_total",
-                &[("reason", "keepalive_request_limit")],
-                1,
-            );
+            if reached_request_limit {
+                state.metrics.inc(
+                    "canardstack_http_connection_closes_total",
+                    &[("reason", "keepalive_request_limit")],
+                    1,
+                );
+            }
             return Ok(());
         }
     }
+}
+
+fn should_keep_connection_alive(
+    keepalive_enabled: bool,
+    client_requested_close: bool,
+    requests_served: usize,
+) -> bool {
+    keepalive_enabled && !client_requested_close && requests_served < KEEPALIVE_REQUEST_LIMIT
 }
 
 fn header_limit_response() -> HttpResponse {
@@ -339,6 +349,25 @@ mod tests {
         );
         assert!(metrics
             .contains("canardstack_http_connection_requests_total{mode=\"connection_close\"} 1"));
+    }
+
+    #[test]
+    fn keepalive_request_limit_marks_final_response_connection_close() {
+        assert!(should_keep_connection_alive(
+            true,
+            false,
+            KEEPALIVE_REQUEST_LIMIT - 1
+        ));
+        assert!(!should_keep_connection_alive(
+            true,
+            false,
+            KEEPALIVE_REQUEST_LIMIT
+        ));
+        assert!(!should_keep_connection_alive(
+            true,
+            true,
+            KEEPALIVE_REQUEST_LIMIT - 1
+        ));
     }
 
     fn read_test_response(stream: &mut TcpStream) -> String {
