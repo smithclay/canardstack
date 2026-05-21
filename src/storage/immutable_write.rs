@@ -431,6 +431,7 @@ mod tests {
         assert_eq!(
             phases,
             vec![
+                TimingPhase::ImmutableCoalesce,
                 TimingPhase::PartitionSplit,
                 TimingPhase::ParquetEncode,
                 TimingPhase::FileWrite,

@@ -2,8 +2,8 @@ use super::codec::{
     checkpoint_path, encode_record, prepare_append_records, read_completed_sequences,
 };
 use super::writer::{
-    collect_append_batch, collect_batch, handle_append_batch, handle_checkpoint_batch,
-    AppendCommand, CheckpointCommand, RawSpoolCommand,
+    collect_append_batch, handle_append_batch, handle_checkpoint_batch, AppendCommand,
+    CheckpointCommand, RawSpoolCommand,
 };
 use super::*;
 use std::collections::VecDeque;
@@ -475,17 +475,7 @@ fn raw_spool_group_commit_collects_until_record_limit() {
 
     let mut deferred = VecDeque::new();
     let mut batch = vec![first];
-    collect_batch(
-        &rx,
-        &mut deferred,
-        2,
-        Duration::from_secs(5),
-        &mut batch,
-        |command| match command {
-            RawSpoolCommand::Append(append) => Ok(append),
-            other => Err(other),
-        },
-    );
+    collect_append_batch(&rx, &mut deferred, 2, Duration::from_secs(5), &mut batch);
 
     assert_eq!(batch.len(), 2);
     assert!(deferred.is_empty());
@@ -528,16 +518,12 @@ fn raw_spool_group_commit_delay_flushes_partial_batch() {
     let mut batch = vec![first];
     let started = Instant::now();
 
-    collect_batch(
+    collect_append_batch(
         &rx,
         &mut deferred,
         64,
         Duration::from_millis(10),
         &mut batch,
-        |command| match command {
-            RawSpoolCommand::Append(append) => Ok(append),
-            other => Err(other),
-        },
     );
 
     assert_eq!(batch.len(), 1);

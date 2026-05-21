@@ -311,16 +311,12 @@ pub(super) fn handle_checkpoint_batch(
     let mut batch = vec![first];
     let collect_started = Instant::now();
     drain_deferred_checkpoints(deferred, max_batch_records, &mut batch);
-    collect_batch(
+    collect_checkpoint_batch(
         receiver,
         deferred,
         max_batch_records,
         max_batch_delay,
         &mut batch,
-        |command| match command {
-            RawSpoolCommand::Checkpoint(checkpoint) => Ok(checkpoint),
-            other => Err(other),
-        },
     );
     let mut ids = Vec::new();
     let mut queue_seconds = 0.0;
@@ -370,13 +366,12 @@ fn drain_deferred_checkpoints(
     }
 }
 
-pub(super) fn collect_batch<T>(
+fn collect_checkpoint_batch(
     receiver: &Receiver<RawSpoolCommand>,
     deferred: &mut VecDeque<RawSpoolCommand>,
     max_batch_records: usize,
     max_batch_delay: Duration,
-    batch: &mut Vec<T>,
-    mut extract: impl FnMut(RawSpoolCommand) -> std::result::Result<T, RawSpoolCommand>,
+    batch: &mut Vec<CheckpointCommand>,
 ) {
     let deadline = Instant::now() + max_batch_delay;
     while batch.len() < max_batch_records {
@@ -395,9 +390,9 @@ pub(super) fn collect_batch<T>(
                 Err(_) => break,
             }
         };
-        match extract(command) {
-            Ok(item) => batch.push(item),
-            Err(other) => {
+        match command {
+            RawSpoolCommand::Checkpoint(checkpoint) => batch.push(checkpoint),
+            other => {
                 deferred.push_back(other);
                 break;
             }
