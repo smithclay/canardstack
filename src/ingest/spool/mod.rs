@@ -66,14 +66,16 @@ pub struct RawSpoolCheckpointBatchStats {
     pub wait_seconds: f64,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct RawSpoolAppendAck {
     pub id: RawSpoolRecordId,
+    pub compressed_body: Vec<u8>,
     pub batch_stats: Option<RawSpoolAppendBatchStats>,
 }
 
 pub struct RawSpoolAppendBatch {
     pub ids: Vec<RawSpoolRecordId>,
+    pub compressed_bodies: Vec<Vec<u8>>,
     pub stats: RawSpoolAppendBatchStats,
 }
 
@@ -338,9 +340,10 @@ impl RawSpool {
     ) -> Result<RawSpoolAppendBatch> {
         let base_sequence = self.next_sequence;
         let encode_started = Instant::now();
-        let encoded = encode_prepared_records(records, base_sequence)?;
+        let (encoded, compressed_bodies) = encode_prepared_records(records, base_sequence)?;
         let encode_seconds = encode_started.elapsed().as_secs_f64();
         let mut appended = self.append_encoded_batch(encoded)?;
+        appended.compressed_bodies = compressed_bodies;
         appended.stats.encode_seconds = encode_seconds;
         self.next_sequence = base_sequence.saturating_add(appended.ids.len() as u64);
         Ok(appended)
@@ -354,6 +357,7 @@ impl RawSpool {
         if encoded.is_empty() {
             return Ok(RawSpoolAppendBatch {
                 ids: Vec::new(),
+                compressed_bodies: Vec::new(),
                 stats: RawSpoolAppendBatchStats {
                     records: 0,
                     encoded_bytes: 0,
@@ -425,6 +429,7 @@ impl RawSpool {
                 fsync_count: 0,
             },
             ids,
+            compressed_bodies: Vec::new(),
         })
     }
 

@@ -64,18 +64,21 @@ pub(super) fn prepare_append_records(
 pub(super) fn encode_prepared_records(
     records: Vec<PreparedRawSpoolRecord>,
     base_sequence: u64,
-) -> Result<Vec<EncodedRawSpoolRecord>> {
+) -> Result<(Vec<EncodedRawSpoolRecord>, Vec<Vec<u8>>)> {
     let mut encoded = Vec::with_capacity(records.len());
+    let mut compressed_bodies = Vec::with_capacity(records.len());
     for record in records {
         let sequence = base_sequence.saturating_add(encoded.len() as u64);
         let bytes = encode_prepared_record(sequence, &record)?;
+        let compressed_body = record.record.compressed_body;
         encoded.push(EncodedRawSpoolRecord {
             sequence,
             body_len: record.body_len,
             bytes,
         });
+        compressed_bodies.push(compressed_body);
     }
-    Ok(encoded)
+    Ok((encoded, compressed_bodies))
 }
 
 #[cfg(test)]

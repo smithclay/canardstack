@@ -171,7 +171,9 @@ pub struct ArrowBatchInsert<'a> {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TimingPhase {
+    Coalesce,
     Prepare,
+    ImmutableCoalesce,
     Buffer,
     PartitionSplit,
     ParquetEncode,
@@ -187,7 +189,9 @@ pub enum TimingPhase {
 impl TimingPhase {
     pub fn as_str(self) -> &'static str {
         match self {
+            TimingPhase::Coalesce => "storage_coalesce",
             TimingPhase::Prepare => "storage_prepare",
+            TimingPhase::ImmutableCoalesce => "storage_immutable_coalesce",
             TimingPhase::Buffer => "storage_buffer",
             TimingPhase::PartitionSplit => "storage_partition_split",
             TimingPhase::ParquetEncode => "storage_parquet_encode",

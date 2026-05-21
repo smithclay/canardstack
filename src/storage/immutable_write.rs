@@ -72,8 +72,15 @@ impl Storage {
         }
         for ((table, source_format), batches) in grouped {
             let rows = batches.iter().map(|batch| batch.num_rows()).sum();
-            let prepare_started = Instant::now();
+            let coalesce_started = Instant::now();
             let batch = coalesce_storage_batches(table, &batches)?;
+            prepare_timings.push(ArrowBatchInsertTiming {
+                table,
+                phase: TimingPhase::Coalesce,
+                rows,
+                seconds: coalesce_started.elapsed().as_secs_f64(),
+            });
+            let prepare_started = Instant::now();
             let prepared_batch = storage_duckdb_batch(table, &batch, source_format)?;
             let timestamp_days = batch_timestamp_days(&prepared_batch)?;
             let prepare_seconds = prepare_started.elapsed().as_secs_f64();
@@ -319,15 +326,22 @@ fn seal_immutable_buffer(
     table: Signal,
     buffer: &ImmutableSegmentBuffer,
 ) -> Result<SealedBuffer> {
+    let coalesce_started = Instant::now();
     let batch = buffer.record_batch(table)?;
+    let mut timings = vec![ArrowBatchInsertTiming {
+        table,
+        phase: TimingPhase::ImmutableCoalesce,
+        rows: buffer.rows,
+        seconds: coalesce_started.elapsed().as_secs_f64(),
+    }];
     let started = Instant::now();
     let partitions = split_batch_by_immutable_partition(&batch)?;
-    let mut timings = vec![ArrowBatchInsertTiming {
+    timings.push(ArrowBatchInsertTiming {
         table,
         phase: TimingPhase::PartitionSplit,
         rows: buffer.rows,
         seconds: started.elapsed().as_secs_f64(),
-    }];
+    });
     let mut segments = Vec::with_capacity(partitions.len());
     for (partition, batch) in partitions {
         let write = write_immutable_segment(storage_dir, table, partition, &batch)?;

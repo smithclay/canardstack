@@ -17,7 +17,64 @@ pub fn route(
     body: &[u8],
     state: &AppState,
 ) -> HttpResponse {
-    if let Some(response) = route_compat(method, path, query, headers, body, state) {
+    route_inner(
+        method,
+        path,
+        query,
+        headers,
+        RequestBody::Borrowed(body),
+        state,
+    )
+}
+
+pub fn route_owned(
+    method: &str,
+    path: &str,
+    query: &HashMap<String, String>,
+    headers: &HashMap<String, String>,
+    body: Vec<u8>,
+    state: &AppState,
+) -> HttpResponse {
+    route_inner(
+        method,
+        path,
+        query,
+        headers,
+        RequestBody::Owned(body),
+        state,
+    )
+}
+
+enum RequestBody<'a> {
+    Borrowed(&'a [u8]),
+    Owned(Vec<u8>),
+}
+
+impl RequestBody<'_> {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Borrowed(body) => body,
+            Self::Owned(body) => body,
+        }
+    }
+
+    fn into_vec(self) -> Vec<u8> {
+        match self {
+            Self::Borrowed(body) => body.to_vec(),
+            Self::Owned(body) => body,
+        }
+    }
+}
+
+fn route_inner(
+    method: &str,
+    path: &str,
+    query: &HashMap<String, String>,
+    headers: &HashMap<String, String>,
+    body: RequestBody<'_>,
+    state: &AppState,
+) -> HttpResponse {
+    if let Some(response) = route_compat(method, path, query, headers, body.as_slice(), state) {
         return response;
     }
 
@@ -42,13 +99,13 @@ pub fn route(
             );
         }
         ("POST", "/v1/logs") => {
-            return ingest_response(ingest(Signal::Logs, headers, body, state));
+            return ingest_response(ingest(Signal::Logs, headers, body.into_vec(), state));
         }
         ("POST", "/v1/traces") => {
-            return ingest_response(ingest(Signal::Spans, headers, body, state));
+            return ingest_response(ingest(Signal::Spans, headers, body.into_vec(), state));
         }
         ("POST", "/v1/metrics") => {
-            return ingest_response(ingest(Signal::MetricGauge, headers, body, state));
+            return ingest_response(ingest(Signal::MetricGauge, headers, body.into_vec(), state));
         }
         ("GET", "/api/admin/health/storage") => {
             return admin_health_response(headers, state, || {
@@ -157,7 +214,7 @@ pub fn route(
 fn ingest(
     signal: Signal,
     headers: &HashMap<String, String>,
-    body: &[u8],
+    body: Vec<u8>,
     state: &AppState,
 ) -> Result<Value, ApiError> {
     validation::validate_api_key(headers, &state.config, false)?;

@@ -9,6 +9,7 @@ use crate::storage::Storage;
 use crate::validation::{self, ApiError, ApiResult};
 use crate::LockExt;
 use anyhow::{Context, Result};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::Ordering;
 use std::time::Instant;
@@ -111,6 +112,10 @@ impl Ingestor {
             .map_err(|err| anyhow::anyhow!(err.message.clone()))?;
         let body = otlp::decompress_if_needed(headers, compressed_body, self.config.max_body_bytes)
             .map_err(|err| anyhow::anyhow!(err.message.clone()))?;
+        let decoded_body_materialized_bytes = match &body {
+            Cow::Borrowed(_) => 0,
+            Cow::Owned(bytes) => bytes.len(),
+        };
         validation::validate_body_size(body.len(), &self.config)
             .map_err(|err| anyhow::anyhow!(err.message.clone()))?;
         #[cfg(feature = "otlp2records-observer")]
@@ -128,7 +133,7 @@ impl Ingestor {
             .map_err(|err| anyhow::anyhow!(err.message.clone()))?;
         let pending_bytes = batches.iter().map(|b| b.approx_bytes).sum::<usize>();
         let peak_bytes = request_bytes
-            .saturating_add(body.len())
+            .saturating_add(decoded_body_materialized_bytes)
             .saturating_add(pending_bytes);
         runtime_memory_reservation
             .reserve_at_least(peak_bytes, signal, metrics)
@@ -224,14 +229,24 @@ impl Ingestor {
         &self,
         signal: Signal,
         headers: &HashMap<String, String>,
-        compressed_body: &[u8],
+        compressed_body: Vec<u8>,
         metrics: &Metrics,
-    ) -> ApiResult<RawSpoolAppendRef> {
+    ) -> ApiResult<(RawSpoolAppendRef, Vec<u8>)> {
         let lane = self.raw_spool_lane_for_append(signal);
         let content_type = headers.get("content-type").cloned().unwrap_or_default();
         let content_encoding = headers.get("content-encoding").cloned();
+        let compressed_body_len = compressed_body.len();
         let started = Instant::now();
         let record = RawSpoolRecord::new(signal, content_type, content_encoding, compressed_body);
+        metrics.inc(
+            "canardstack_ingest_materialized_bytes_total",
+            &[
+                ("signal", lane.as_str()),
+                ("component", "raw_spool_record"),
+                ("kind", "body_clone"),
+            ],
+            0,
+        );
         let result = self
             .raw_spool_for(lane)
             .and_then(|raw_spool| raw_spool.append(record));
@@ -254,9 +269,9 @@ impl Ingestor {
                 metrics.inc(
                     "canardstack_raw_spool_bytes_total",
                     &[("signal", lane.as_str())],
-                    compressed_body.len() as u64,
+                    compressed_body_len as u64,
                 );
-                Ok(RawSpoolAppendRef { lane, id: ack.id })
+                Ok((RawSpoolAppendRef { lane, id: ack.id }, ack.compressed_body))
             }
             Err(err) => {
                 if raw_spool_full_info(&err).is_some() {
@@ -305,6 +320,24 @@ impl Ingestor {
         metrics.inc(
             "canardstack_raw_spool_append_batch_encoded_bytes_total",
             &[("signal", signal.as_str())],
+            stats.encoded_bytes,
+        );
+        metrics.inc(
+            "canardstack_ingest_materialized_bytes_total",
+            &[
+                ("signal", signal.as_str()),
+                ("component", "raw_spool_encode"),
+                ("kind", "record_frame"),
+            ],
+            stats.encoded_bytes,
+        );
+        metrics.inc(
+            "canardstack_ingest_materialized_bytes_total",
+            &[
+                ("signal", signal.as_str()),
+                ("component", "raw_spool_group"),
+                ("kind", "encoded_copy"),
+            ],
             stats.encoded_bytes,
         );
         metrics.inc(

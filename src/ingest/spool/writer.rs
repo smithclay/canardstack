@@ -243,9 +243,14 @@ pub(super) fn handle_append_batch(
             appended.stats.queue_seconds = queue_seconds;
             appended.stats.wait_seconds = wait_seconds;
             let mut stats = Some(appended.stats);
-            for (reply, id) in replies.into_iter().zip(appended.ids) {
+            for ((reply, id), compressed_body) in replies
+                .into_iter()
+                .zip(appended.ids)
+                .zip(appended.compressed_bodies)
+            {
                 let _ = reply.send(Ok(RawSpoolAppendAck {
                     id,
+                    compressed_body,
                     batch_stats: stats.take(),
                 }));
             }

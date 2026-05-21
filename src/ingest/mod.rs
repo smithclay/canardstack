@@ -9,6 +9,7 @@ use raw_spool::RawSpoolFlushRef;
 use serde::Serialize;
 use serde_json::{json, Value};
 use spool::{RawSpoolOptions, RawSpoolRecordId, RawSpoolWriter};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -155,7 +156,7 @@ impl Ingestor {
         &self,
         signal: Signal,
         headers: &HashMap<String, String>,
-        compressed_body: &[u8],
+        compressed_body: Vec<u8>,
         storage: &Storage,
         metrics: &Metrics,
     ) -> ApiResult<Value> {
@@ -180,14 +181,15 @@ impl Ingestor {
                     return Err(err);
                 }
             };
-        let raw_spool_ref = match self.append_raw_spool(signal, headers, compressed_body, metrics) {
-            Ok(id) => id,
-            Err(err) => {
-                self.release_queue_credit_reservation(&mut queue_credit_reservation);
-                metrics.ingest_request(signal, err.status, err.reason);
-                return Err(err);
-            }
-        };
+        let (raw_spool_ref, compressed_body) =
+            match self.append_raw_spool(signal, headers, compressed_body, metrics) {
+                Ok(appended) => appended,
+                Err(err) => {
+                    self.release_queue_credit_reservation(&mut queue_credit_reservation);
+                    metrics.ingest_request(signal, err.status, err.reason);
+                    return Err(err);
+                }
+            };
         let mut runtime_memory_reservation =
             match self.admit_runtime_memory(signal, headers, compressed_body.len(), metrics) {
                 Ok(reservation) => reservation,
@@ -206,7 +208,7 @@ impl Ingestor {
 
         let started = Instant::now();
         let body_result =
-            otlp::decompress_if_needed(headers, compressed_body, self.config.max_body_bytes);
+            otlp::decompress_if_needed(headers, &compressed_body, self.config.max_body_bytes);
         metrics.observe_phase_seconds(
             signal.as_str(),
             "decompress",
@@ -225,6 +227,10 @@ impl Ingestor {
                 )?;
                 return Err(err);
             }
+        };
+        let decoded_body_materialized_bytes = match &body {
+            Cow::Borrowed(_) => 0,
+            Cow::Owned(bytes) => bytes.len(),
         };
         if let Err(err) = validation::validate_body_size(body.len(), &self.config) {
             self.release_queue_credit_reservation(&mut queue_credit_reservation);
@@ -306,7 +312,7 @@ impl Ingestor {
         }
         let pending_bytes = batches.iter().map(|b| b.approx_bytes).sum::<usize>();
         let peak_bytes = request_bytes
-            .saturating_add(body.len())
+            .saturating_add(decoded_body_materialized_bytes)
             .saturating_add(pending_bytes);
         if let Err(err) = runtime_memory_reservation.reserve_at_least(peak_bytes, signal, metrics) {
             self.release_queue_credit_reservation(&mut queue_credit_reservation);
@@ -338,7 +344,14 @@ impl Ingestor {
         };
         queue_credit_reservation.commit_to_queue();
         metrics.ingest_request(signal, 202, "accepted");
-        self.record_accepted_body_metrics(signal, headers, request_bytes, body.len(), metrics);
+        self.record_accepted_body_metrics(
+            signal,
+            headers,
+            request_bytes,
+            body.len(),
+            decoded_body_materialized_bytes,
+            metrics,
+        );
         metrics.inc(
             "canardstack_ingest_records_total",
             &[("signal", signal.as_str())],
@@ -587,6 +600,7 @@ impl Ingestor {
         headers: &HashMap<String, String>,
         request_bytes: usize,
         decoded_bytes: usize,
+        decoded_body_materialized_bytes: usize,
         metrics: &Metrics,
     ) {
         let encoding = headers
@@ -602,6 +616,15 @@ impl Ingestor {
             "canardstack_ingest_decoded_bytes_total",
             &[("signal", signal.as_str()), ("encoding", encoding)],
             decoded_bytes as u64,
+        );
+        metrics.inc(
+            "canardstack_ingest_materialized_bytes_total",
+            &[
+                ("signal", signal.as_str()),
+                ("component", "decoded_body"),
+                ("kind", encoding),
+            ],
+            decoded_body_materialized_bytes as u64,
         );
     }
 

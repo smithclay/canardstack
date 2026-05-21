@@ -11,6 +11,7 @@ use otlp2records::{
     TransformCounter, TransformCounterValue, TransformObserver, TransformPhase,
     TransformPhaseTiming,
 };
+use std::borrow::Cow;
 #[cfg(feature = "otlp2records-observer")]
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -37,17 +38,17 @@ impl Transformed {
     }
 }
 
-pub fn decompress_if_needed(
+pub fn decompress_if_needed<'a>(
     headers: &HashMap<String, String>,
-    body: &[u8],
+    body: &'a [u8],
     max_decompressed_bytes: usize,
-) -> ApiResult<Vec<u8>> {
+) -> ApiResult<Cow<'a, [u8]>> {
     match headers
         .get("content-encoding")
         .map(|v| v.to_ascii_lowercase())
     {
-        None => Ok(body.to_vec()),
-        Some(v) if v == "identity" => Ok(body.to_vec()),
+        None => Ok(Cow::Borrowed(body)),
+        Some(v) if v == "identity" => Ok(Cow::Borrowed(body)),
         Some(v) if v == "gzip" => {
             let decoder = GzDecoder::new(body);
             let mut limited = decoder.take(max_decompressed_bytes as u64 + 1);
@@ -62,7 +63,7 @@ pub fn decompress_if_needed(
                     format!("decompressed payload exceeds max of {max_decompressed_bytes} bytes"),
                 ));
             }
-            Ok(out)
+            Ok(Cow::Owned(out))
         }
         Some(v) => Err(ApiError::new(
             400,

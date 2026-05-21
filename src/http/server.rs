@@ -14,7 +14,7 @@ use super::parser::{
     MAX_HEADER_LINE_BYTES, MAX_REQUEST_LINE_BYTES,
 };
 use super::response::{write_response, write_response_with_connection, HttpResponse};
-use super::router::route;
+use super::router::route_owned;
 
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -249,7 +249,7 @@ fn handle_stream(mut stream: TcpStream, state: Arc<AppState>) -> anyhow::Result<
         }
 
         let (path, query) = split_target(&target);
-        let response = route(&method, &path, &query, &headers, &body, &state);
+        let response = route_owned(&method, &path, &query, &headers, body, &state);
         requests += 1;
         let client_requested_close = headers
             .get("connection")
