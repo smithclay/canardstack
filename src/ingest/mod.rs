@@ -97,10 +97,43 @@ impl Ingestor {
         })
     }
 
-    pub fn request_flush(&self) {
+    pub fn request_flush(&self) -> bool {
         let mut requested = self.flush_signal.requested.lock_or_poisoned();
+        let already_requested = *requested;
         *requested = true;
-        self.flush_signal.ready.notify_one();
+        if !already_requested {
+            self.flush_signal.ready.notify_one();
+        }
+        already_requested
+    }
+
+    fn request_flush_observed(&self, triggered_by: Signal, metrics: &Metrics) {
+        let started = Instant::now();
+        let already_requested = self.request_flush();
+        let status = if already_requested {
+            "coalesced"
+        } else {
+            "queued"
+        };
+        metrics.inc(
+            "canardstack_ingest_flush_requests_total",
+            &[("triggered_by", triggered_by.as_str())],
+            1,
+        );
+        metrics.inc(
+            "canardstack_ingest_flush_request_events_total",
+            &[("triggered_by", triggered_by.as_str()), ("status", status)],
+            1,
+        );
+        metrics.observe_seconds(
+            "canardstack_phase_duration_seconds",
+            &[
+                ("signal", triggered_by.as_str()),
+                ("phase", "flush_request"),
+                ("status", status),
+            ],
+            started.elapsed().as_secs_f64(),
+        );
     }
 
     pub fn wait_for_flush_or_timeout(&self, timeout: Duration, stop: &AtomicBool) -> bool {
@@ -141,12 +174,7 @@ impl Ingestor {
             match self.reserve_queue_credit_estimate(signal, headers, compressed_body.len()) {
                 Ok(reservation) => reservation,
                 Err(err) => {
-                    self.request_flush();
-                    metrics.inc(
-                        "canardstack_ingest_flush_requests_total",
-                        &[("triggered_by", signal.as_str())],
-                        1,
-                    );
+                    self.request_flush_observed(signal, metrics);
                     self.record_queue_metrics(metrics);
                     metrics.ingest_request(signal, err.status, err.reason);
                     return Err(err);
@@ -271,12 +299,7 @@ impl Ingestor {
         {
             self.release_queue_credit_reservation(&mut queue_credit_reservation);
             self.checkpoint_raw_spool_terminal(raw_spool_ref, signal, "queue_rejected", metrics)?;
-            self.request_flush();
-            metrics.inc(
-                "canardstack_ingest_flush_requests_total",
-                &[("triggered_by", signal.as_str())],
-                1,
-            );
+            self.request_flush_observed(signal, metrics);
             self.record_queue_metrics(metrics);
             metrics.ingest_request(signal, err.status, err.reason);
             return Err(err);
@@ -553,12 +576,7 @@ impl Ingestor {
         );
         let queue_result = queue_result?;
         if queue_result.should_request_flush {
-            self.request_flush();
-            metrics.inc(
-                "canardstack_ingest_flush_requests_total",
-                &[("triggered_by", request_signal.as_str())],
-                1,
-            );
+            self.request_flush_observed(request_signal, metrics);
         }
         Ok(queue_result.accepted)
     }

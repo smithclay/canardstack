@@ -63,10 +63,19 @@ impl Ingestor {
         storage: &Storage,
         metrics: Option<&Metrics>,
     ) -> anyhow::Result<HashMap<Signal, usize>> {
+        let due_started = Instant::now();
         let due = {
             let queues = self.queues.lock_or_poisoned();
             queue::due_keys(&queues, &self.config)
         };
+        if let Some(metrics) = metrics {
+            metrics.observe_phase_seconds(
+                "all",
+                "flush_due_scan",
+                None,
+                due_started.elapsed().as_secs_f64(),
+            );
+        }
         observe_due_keys(metrics, &due);
         let lock_started = Instant::now();
         let _guard = self.flush_lock.lock_or_poisoned();
@@ -133,6 +142,7 @@ impl Ingestor {
         storage: &Storage,
         metrics: Option<&Metrics>,
     ) -> anyhow::Result<HashMap<Signal, usize>> {
+        let drain_started = Instant::now();
         let mut sets = Vec::new();
         let mut metric_partitions = Vec::new();
         for key in due {
@@ -150,6 +160,14 @@ impl Ingestor {
                 sets.push((key, self.drain_flush_batches(key)));
             }
         }
+        if let Some(metrics) = metrics {
+            metrics.observe_phase_seconds(
+                "all",
+                "flush_drain",
+                None,
+                drain_started.elapsed().as_secs_f64(),
+            );
+        }
         self.insert_drained_batches_observed(sets, storage, metrics)
     }
 
@@ -163,6 +181,7 @@ impl Ingestor {
             return Ok(HashMap::new());
         }
         if let Some(metrics) = metrics {
+            let metrics_started = Instant::now();
             for (key, batches) in &sets {
                 let attempted_rows: usize = batches.iter().map(QueuedBatch::len).sum();
                 let attempted_bytes: usize = batches.iter().map(|batch| batch.approx_bytes).sum();
@@ -201,32 +220,53 @@ impl Ingestor {
                     attempted_bytes as u64,
                 );
             }
+            metrics.observe_phase_seconds(
+                "all",
+                "flush_attempt_metrics",
+                None,
+                metrics_started.elapsed().as_secs_f64(),
+            );
         }
         if let Some(metrics) = metrics {
+            let metrics_started = Instant::now();
+            let mut by_signal = HashMap::<Signal, (u64, u64, u64)>::new();
             for (key, batches) in &sets {
                 for batch in batches {
                     if batch.len() == 0 {
                         continue;
                     }
-                    metrics.inc(
-                        "canardstack_ingest_flush_coalesced_batches_total",
-                        &[("signal", key.signal.as_str())],
-                        1,
-                    );
-                    metrics.inc(
-                        "canardstack_ingest_flush_coalesced_rows_total",
-                        &[("signal", key.signal.as_str())],
-                        batch.batch.num_rows() as u64,
-                    );
-                    metrics.inc(
-                        "canardstack_ingest_flush_coalesced_bytes_total",
-                        &[("signal", key.signal.as_str())],
-                        batch.batch.get_array_memory_size() as u64,
-                    );
+                    let (batch_count, rows, bytes) = by_signal.entry(key.signal).or_default();
+                    *batch_count = batch_count.saturating_add(1);
+                    *rows = rows.saturating_add(batch.batch.num_rows() as u64);
+                    *bytes = bytes.saturating_add(batch.batch.get_array_memory_size() as u64);
                 }
             }
+            for (signal, (batch_count, rows, bytes)) in by_signal {
+                metrics.inc(
+                    "canardstack_ingest_flush_coalesced_batches_total",
+                    &[("signal", signal.as_str())],
+                    batch_count,
+                );
+                metrics.inc(
+                    "canardstack_ingest_flush_coalesced_rows_total",
+                    &[("signal", signal.as_str())],
+                    rows,
+                );
+                metrics.inc(
+                    "canardstack_ingest_flush_coalesced_bytes_total",
+                    &[("signal", signal.as_str())],
+                    bytes,
+                );
+            }
+            metrics.observe_phase_seconds(
+                "all",
+                "flush_batch_metrics",
+                None,
+                metrics_started.elapsed().as_secs_f64(),
+            );
         }
         let insert_result = {
+            let insert_prepare_started = Instant::now();
             let inserts =
                 sets.iter()
                     .flat_map(|(key, batches)| {
@@ -239,11 +279,30 @@ impl Ingestor {
                         })
                     })
                     .collect::<Vec<_>>();
-            storage.insert_arrow_batches(&inserts)
+            if let Some(metrics) = metrics {
+                metrics.observe_phase_seconds(
+                    "all",
+                    "flush_insert_prepare",
+                    None,
+                    insert_prepare_started.elapsed().as_secs_f64(),
+                );
+            }
+            let insert_started = Instant::now();
+            let result = storage.insert_arrow_batches(&inserts);
+            if let Some(metrics) = metrics {
+                metrics.observe_phase_seconds(
+                    "all",
+                    "flush_storage_insert",
+                    None,
+                    insert_started.elapsed().as_secs_f64(),
+                );
+            }
+            result
         };
         match insert_result {
             Ok(result) => {
                 let mut rows = HashMap::new();
+                let mut success_metrics = metrics.map(|_| HashMap::<Signal, (u64, u64)>::new());
                 for (key, batches) in &sets {
                     for batch in batches {
                         let batch_rows = batch.batch.num_rows();
@@ -251,25 +310,41 @@ impl Ingestor {
                             continue;
                         }
                         *rows.entry(key.signal).or_default() += batch_rows;
-                        if let Some(metrics) = metrics {
+                        if metrics.is_some() {
                             let batch_bytes = batch.batch.get_array_memory_size();
-                            metrics.inc(
-                                "canardstack_ingest_flush_rows_total",
-                                &[("signal", key.signal.as_str())],
-                                batch_rows as u64,
-                            );
-                            metrics.inc(
-                                "canardstack_ingest_flush_buffered_rows_total",
-                                &[("signal", key.signal.as_str())],
-                                batch_rows as u64,
-                            );
-                            metrics.inc(
-                                "canardstack_ingest_flush_buffered_bytes_total",
-                                &[("signal", key.signal.as_str())],
-                                batch_bytes as u64,
-                            );
+                            if let Some(success_metrics) = &mut success_metrics {
+                                let (rows, bytes) = success_metrics.entry(key.signal).or_default();
+                                *rows = rows.saturating_add(batch_rows as u64);
+                                *bytes = bytes.saturating_add(batch_bytes as u64);
+                            }
                         }
                     }
+                }
+                if let (Some(metrics), Some(success_metrics)) = (metrics, success_metrics) {
+                    let metrics_started = Instant::now();
+                    for (signal, (rows, bytes)) in success_metrics {
+                        metrics.inc(
+                            "canardstack_ingest_flush_rows_total",
+                            &[("signal", signal.as_str())],
+                            rows,
+                        );
+                        metrics.inc(
+                            "canardstack_ingest_flush_buffered_rows_total",
+                            &[("signal", signal.as_str())],
+                            rows,
+                        );
+                        metrics.inc(
+                            "canardstack_ingest_flush_buffered_bytes_total",
+                            &[("signal", signal.as_str())],
+                            bytes,
+                        );
+                    }
+                    metrics.observe_phase_seconds(
+                        "all",
+                        "flush_success_metrics",
+                        None,
+                        metrics_started.elapsed().as_secs_f64(),
+                    );
                 }
                 for timing in result.timings {
                     if let Some(metrics) = metrics {
@@ -281,8 +356,17 @@ impl Ingestor {
                         );
                     }
                 }
+                let commit_started = Instant::now();
                 self.release_queue_credits_for_batches(&sets);
                 self.mark_raw_spool_batches_storage_committed(&sets, metrics)?;
+                if let Some(metrics) = metrics {
+                    metrics.observe_phase_seconds(
+                        "all",
+                        "flush_commit_accounting",
+                        None,
+                        commit_started.elapsed().as_secs_f64(),
+                    );
+                }
                 Ok(rows)
             }
             Err(err) => {
