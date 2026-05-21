@@ -200,7 +200,7 @@ impl Config {
             max_rows_per_flush: 5_000,
             max_bytes_per_flush: flush_target_bytes,
             max_age: flush_max_age,
-            high_pressure_max_age: (flush_max_age / 5).max(Duration::from_millis(100)),
+            high_pressure_max_age: (flush_max_age / 5).max(Duration::from_millis(500)),
             duckdb_write_memory_limit: env_string("CANARDSTACK_DUCKDB_MEMORY_LIMIT")?
                 .or(file.string(&["duckdb", "memory_limit"])?)
                 .unwrap_or_else(|| "1GiB".to_string()),
@@ -863,7 +863,7 @@ http_keepalive = true
         assert_eq!(config.runtime_memory_limit_bytes, Some(4_000_000));
         assert_eq!(config.max_bytes_per_flush, 654_321);
         assert_eq!(config.max_age, Duration::from_millis(125));
-        assert_eq!(config.high_pressure_max_age, Duration::from_millis(100));
+        assert_eq!(config.high_pressure_max_age, Duration::from_millis(500));
         assert_eq!(config.duckdb_write_memory_limit, "2GiB");
         assert_eq!(config.immutable_segment_target_bytes, 777);
         assert_eq!(config.immutable_segment_max_age, Duration::from_secs(12));

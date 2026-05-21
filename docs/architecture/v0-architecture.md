@@ -166,7 +166,7 @@ Flush triggers:
 
 - `CANARDSTACK_FLUSH_TARGET_BYTES`, default 4 MiB.
 - `CANARDSTACK_FLUSH_MAX_AGE_SECS` or `_MS`, default 10 seconds. The
-  high-pressure age is derived from this value.
+  high-pressure age is derived as one fifth of this value, with a 500ms floor.
 
 Flush drains queues, coalesces batches, appends them to immutable segment
 buffers, seals due Parquet files, registers those files in DuckLake, and then
