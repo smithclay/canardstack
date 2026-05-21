@@ -7,6 +7,10 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 const EWMA_ALPHA: f64 = 0.20;
+const HEAVY_QUERY_DEGRADE_FRACTION: f64 = 1.00;
+const HEAVY_QUERY_REJECT_FRACTION: f64 = 1.50;
+const INGEST_FRESHNESS_BUDGET_FRACTION: f64 = 0.95;
+const INGEST_FRESHNESS_BUDGET_WITH_HEAVY_FRACTION: f64 = 0.90;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum QueryClass {
@@ -27,7 +31,10 @@ impl QueryClass {
 pub struct FreshnessInputs {
     pub queued_bytes: usize,
     pub incoming_bytes: usize,
-    pub oldest_age_seconds: f64,
+    pub oldest_queue_age_seconds: f64,
+    pub buffered_bytes: usize,
+    pub buffered_active_count: usize,
+    pub oldest_buffer_age_seconds: f64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -41,6 +48,7 @@ pub struct LaneSnapshot {
     pub heavy_query_effective_capacity: usize,
     pub ewma_flush_bytes_per_second: f64,
     pub projected_flush_seconds: f64,
+    pub projected_buffer_seconds: f64,
     pub projected_visibility_seconds: f64,
     pub observed_freshness_lag_seconds: f64,
     pub freshness_sla_seconds: f64,
@@ -56,6 +64,9 @@ pub struct LaneController {
     heavy_query_capacity: usize,
     heavy_query_degraded_capacity: usize,
     freshness_sla_seconds: f64,
+    visibility_buffer_target_bytes: usize,
+    visibility_buffer_max_age_seconds: f64,
+    visibility_flush_bytes_per_second: f64,
 }
 
 #[derive(Debug)]
@@ -65,6 +76,7 @@ struct LaneState {
     heavy_query_active: usize,
     ewma_flush_bytes_per_second: f64,
     projected_flush_seconds: f64,
+    projected_buffer_seconds: f64,
     projected_visibility_seconds: f64,
     observed_freshness_lag_seconds: f64,
     heavy_query_reductions_total: u64,
@@ -91,6 +103,8 @@ impl LaneController {
             .max(1);
         let initial_flush_bytes_per_second =
             config.max_bytes_per_flush as f64 / config.max_age.as_secs_f64().max(0.001);
+        let visibility_flush_bytes_per_second = config.immutable_segment_target_bytes as f64
+            / config.immutable_segment_max_age.as_secs_f64().max(0.001);
         Self {
             inner: Mutex::new(LaneState {
                 flush_active: 0,
@@ -98,6 +112,7 @@ impl LaneController {
                 heavy_query_active: 0,
                 ewma_flush_bytes_per_second: initial_flush_bytes_per_second.max(1.0),
                 projected_flush_seconds: 0.0,
+                projected_buffer_seconds: 0.0,
                 projected_visibility_seconds: 0.0,
                 observed_freshness_lag_seconds: 0.0,
                 heavy_query_reductions_total: 0,
@@ -109,6 +124,9 @@ impl LaneController {
             heavy_query_capacity,
             heavy_query_degraded_capacity,
             freshness_sla_seconds: config.lane_freshness_sla.as_secs_f64(),
+            visibility_buffer_target_bytes: config.immutable_segment_target_bytes.max(1),
+            visibility_buffer_max_age_seconds: config.immutable_segment_max_age.as_secs_f64(),
+            visibility_flush_bytes_per_second: visibility_flush_bytes_per_second.max(1.0),
         }
     }
 
@@ -143,7 +161,7 @@ impl LaneController {
         metrics: &Metrics,
     ) -> ApiResult<QueryLaneGuard<'_>> {
         let mut state = self.inner.lock_or_poisoned();
-        update_projection(&mut state, inputs);
+        self.update_projection_locked(&mut state, inputs);
         let effective_heavy = self.effective_heavy_capacity_locked(&state);
         let rejection_reason = query_rejection_reason(class, &state, effective_heavy);
         let accepted = match class {
@@ -190,13 +208,13 @@ impl LaneController {
 
     pub fn admit_ingest(&self, inputs: FreshnessInputs, metrics: &Metrics) -> ApiResult<()> {
         let mut state = self.inner.lock_or_poisoned();
-        update_projection(&mut state, inputs);
-        let heavy_pressure = if state.heavy_query_active > 0 {
-            0.85
+        self.update_projection_locked(&mut state, inputs);
+        let budget_fraction = if state.heavy_query_active > 0 {
+            INGEST_FRESHNESS_BUDGET_WITH_HEAVY_FRACTION
         } else {
-            1.0
+            INGEST_FRESHNESS_BUDGET_FRACTION
         };
-        let budget = self.freshness_sla_seconds * heavy_pressure;
+        let budget = self.freshness_sla_seconds * budget_fraction;
         if state.projected_visibility_seconds > budget {
             state.ingest_freshness_rejections_total += 1;
             metrics.inc(
@@ -230,9 +248,6 @@ impl LaneController {
     pub fn record_observed_freshness_lag(&self, lag_seconds: f64, metrics: &Metrics) {
         let mut state = self.inner.lock_or_poisoned();
         state.observed_freshness_lag_seconds = lag_seconds.max(0.0);
-        state.projected_visibility_seconds = state
-            .projected_visibility_seconds
-            .max(state.observed_freshness_lag_seconds);
         drop(state);
         self.record_metrics(metrics, FreshnessInputs::default());
     }
@@ -252,7 +267,7 @@ impl LaneController {
 
     pub fn snapshot_for(&self, inputs: FreshnessInputs) -> LaneSnapshot {
         let mut state = self.inner.lock_or_poisoned();
-        update_projection(&mut state, inputs);
+        self.update_projection_locked(&mut state, inputs);
         let heavy_query_effective_capacity = self.effective_heavy_capacity_locked(&state);
         snapshot_locked(
             &state,
@@ -307,6 +322,11 @@ impl LaneController {
             snapshot.projected_flush_seconds,
         );
         metrics.gauge(
+            "canardstack_projected_buffer_seconds",
+            &[],
+            snapshot.projected_buffer_seconds,
+        );
+        metrics.gauge(
             "canardstack_projected_visibility_seconds",
             &[],
             snapshot.projected_visibility_seconds,
@@ -334,7 +354,9 @@ impl LaneController {
     }
 
     fn effective_heavy_capacity_locked(&self, state: &LaneState) -> usize {
-        if state.projected_visibility_seconds >= self.freshness_sla_seconds * 0.50 {
+        if state.projected_visibility_seconds
+            >= self.freshness_sla_seconds * HEAVY_QUERY_DEGRADE_FRACTION
+        {
             self.heavy_query_degraded_capacity
         } else {
             self.heavy_query_capacity
@@ -342,7 +364,28 @@ impl LaneController {
     }
 
     fn freshness_at_risk_locked(&self, state: &LaneState) -> bool {
-        state.projected_visibility_seconds >= self.freshness_sla_seconds
+        state.projected_visibility_seconds
+            >= self.freshness_sla_seconds * HEAVY_QUERY_REJECT_FRACTION
+    }
+
+    fn update_projection_locked(&self, state: &mut LaneState, inputs: FreshnessInputs) {
+        let queued_bytes = inputs.queued_bytes.saturating_add(inputs.incoming_bytes);
+        state.projected_flush_seconds =
+            queued_bytes as f64 / state.ewma_flush_bytes_per_second.max(1.0);
+        let queue_visibility_seconds =
+            inputs.oldest_queue_age_seconds + state.projected_flush_seconds;
+        let allowed_buffer_bytes = self
+            .visibility_buffer_target_bytes
+            .saturating_mul(inputs.buffered_active_count);
+        let excess_buffer_bytes = inputs.buffered_bytes.saturating_sub(allowed_buffer_bytes);
+        let buffer_size_debt_seconds =
+            excess_buffer_bytes as f64 / self.visibility_flush_bytes_per_second.max(1.0);
+        let buffer_age_debt_seconds =
+            (inputs.oldest_buffer_age_seconds - self.visibility_buffer_max_age_seconds).max(0.0);
+        state.projected_buffer_seconds = buffer_size_debt_seconds + buffer_age_debt_seconds;
+        let buffer_visibility_seconds = state.projected_buffer_seconds;
+        state.projected_visibility_seconds =
+            queue_visibility_seconds.max(buffer_visibility_seconds);
     }
 }
 
@@ -351,7 +394,10 @@ impl Default for FreshnessInputs {
         Self {
             queued_bytes: 0,
             incoming_bytes: 0,
-            oldest_age_seconds: 0.0,
+            oldest_queue_age_seconds: 0.0,
+            buffered_bytes: 0,
+            buffered_active_count: 0,
+            oldest_buffer_age_seconds: 0.0,
         }
     }
 }
@@ -410,14 +456,6 @@ impl Drop for QueryLaneGuard<'_> {
     }
 }
 
-fn update_projection(state: &mut LaneState, inputs: FreshnessInputs) {
-    let bytes = inputs.queued_bytes.saturating_add(inputs.incoming_bytes);
-    state.projected_flush_seconds = bytes as f64 / state.ewma_flush_bytes_per_second.max(1.0);
-    state.projected_visibility_seconds = (inputs.oldest_age_seconds
-        + state.projected_flush_seconds)
-        .max(state.observed_freshness_lag_seconds);
-}
-
 fn snapshot_locked(
     state: &LaneState,
     flush_capacity: usize,
@@ -436,6 +474,7 @@ fn snapshot_locked(
         heavy_query_effective_capacity,
         ewma_flush_bytes_per_second: state.ewma_flush_bytes_per_second,
         projected_flush_seconds: state.projected_flush_seconds,
+        projected_buffer_seconds: state.projected_buffer_seconds,
         projected_visibility_seconds: state.projected_visibility_seconds,
         observed_freshness_lag_seconds: state.observed_freshness_lag_seconds,
         freshness_sla_seconds,
@@ -480,6 +519,8 @@ mod tests {
         config.lane_freshness_sla = std::time::Duration::from_secs(10);
         config.max_bytes_per_flush = 1_000;
         config.max_age = std::time::Duration::from_secs(1);
+        config.immutable_segment_target_bytes = 1_000;
+        config.immutable_segment_max_age = std::time::Duration::from_secs(1);
         LaneController::new(&config)
     }
 
@@ -503,9 +544,10 @@ mod tests {
         let lanes = controller();
         let metrics = Metrics::default();
         let inputs = FreshnessInputs {
-            queued_bytes: 20_000,
+            queued_bytes: 16_000,
             incoming_bytes: 0,
-            oldest_age_seconds: 0.0,
+            oldest_queue_age_seconds: 0.0,
+            ..FreshnessInputs::default()
         };
         let err = match lanes.reserve_query(QueryClass::Heavy, inputs, &metrics) {
             Ok(_) => panic!("heavy query should reject under freshness debt"),
@@ -521,14 +563,57 @@ mod tests {
         let lanes = controller();
         let metrics = Metrics::default();
         let inputs = FreshnessInputs {
-            queued_bytes: 20_000,
+            queued_bytes: 16_000,
             incoming_bytes: 0,
-            oldest_age_seconds: 0.0,
+            oldest_queue_age_seconds: 0.0,
+            ..FreshnessInputs::default()
         };
 
         assert!(lanes
             .reserve_query(QueryClass::Cheap, inputs, &metrics)
             .is_ok());
+    }
+
+    #[test]
+    fn heavy_query_keeps_full_capacity_before_late_degradation() {
+        let lanes = controller();
+        let metrics = Metrics::default();
+        let inputs = FreshnessInputs {
+            queued_bytes: 9_000,
+            incoming_bytes: 0,
+            oldest_queue_age_seconds: 0.0,
+            ..FreshnessInputs::default()
+        };
+
+        let _first = lanes
+            .reserve_query(QueryClass::Heavy, inputs, &metrics)
+            .unwrap();
+        assert!(lanes
+            .reserve_query(QueryClass::Heavy, inputs, &metrics)
+            .is_ok());
+    }
+
+    #[test]
+    fn heavy_query_degrades_before_hard_freshness_rejection() {
+        let lanes = controller();
+        let metrics = Metrics::default();
+        let inputs = FreshnessInputs {
+            queued_bytes: 12_000,
+            incoming_bytes: 0,
+            oldest_queue_age_seconds: 0.0,
+            ..FreshnessInputs::default()
+        };
+
+        let _first = lanes
+            .reserve_query(QueryClass::Heavy, inputs, &metrics)
+            .unwrap();
+        let err = match lanes.reserve_query(QueryClass::Heavy, inputs, &metrics) {
+            Ok(_) => panic!("second heavy query should hit degraded capacity"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.status, 429);
+        assert_eq!(err.reason, "heavy_query_lane_full");
     }
 
     #[test]
@@ -538,9 +623,10 @@ mod tests {
         let err = lanes
             .admit_ingest(
                 FreshnessInputs {
-                    queued_bytes: 20_000,
+                    queued_bytes: 60_000,
                     incoming_bytes: 1,
-                    oldest_age_seconds: 0.0,
+                    oldest_queue_age_seconds: 0.0,
+                    ..FreshnessInputs::default()
                 },
                 &metrics,
             )
@@ -551,17 +637,17 @@ mod tests {
     }
 
     #[test]
-    fn cached_visible_freshness_lag_blocks_ingest_admission() {
+    fn ingest_rejects_when_buffer_visibility_debt_exceeds_budget() {
         let lanes = controller();
         let metrics = Metrics::default();
-        lanes.record_observed_freshness_lag(12.0, &metrics);
-
         let err = lanes
             .admit_ingest(
                 FreshnessInputs {
                     queued_bytes: 0,
+                    buffered_bytes: 12_000,
                     incoming_bytes: 1,
-                    oldest_age_seconds: 0.0,
+                    oldest_queue_age_seconds: 0.0,
+                    ..FreshnessInputs::default()
                 },
                 &metrics,
             )
@@ -569,5 +655,43 @@ mod tests {
 
         assert_eq!(err.status, 429);
         assert_eq!(err.reason, "freshness_budget_exceeded");
+    }
+
+    #[test]
+    fn cached_visible_freshness_lag_does_not_block_empty_queue_ingest() {
+        let lanes = controller();
+        let metrics = Metrics::default();
+        lanes.record_observed_freshness_lag(12.0, &metrics);
+
+        lanes
+            .admit_ingest(
+                FreshnessInputs {
+                    queued_bytes: 0,
+                    incoming_bytes: 1,
+                    oldest_queue_age_seconds: 0.0,
+                    ..FreshnessInputs::default()
+                },
+                &metrics,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn cached_visible_freshness_lag_does_not_latch_existing_queue_debt() {
+        let lanes = controller();
+        let metrics = Metrics::default();
+        lanes.record_observed_freshness_lag(12.0, &metrics);
+
+        lanes
+            .admit_ingest(
+                FreshnessInputs {
+                    queued_bytes: 1,
+                    incoming_bytes: 1,
+                    oldest_queue_age_seconds: 0.0,
+                    ..FreshnessInputs::default()
+                },
+                &metrics,
+            )
+            .unwrap();
     }
 }

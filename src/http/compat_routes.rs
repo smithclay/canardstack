@@ -255,7 +255,7 @@ fn with_query_lane<T>(
     class: QueryClass,
     run: impl FnOnce() -> Result<T, ApiError>,
 ) -> Result<T, ApiError> {
-    let inputs = state.ingestor.lane_freshness_inputs();
+    let inputs = state.ingestor.lane_freshness_inputs(&state.storage);
     let _guard = state.lanes.reserve_query(class, inputs, &state.metrics)?;
     run()
 }

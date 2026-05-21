@@ -127,7 +127,8 @@ part of `202` latency.
 | `canardstack_lane_rejections_total` | Counter | `lane`, `reason` | Rejections at the lane controller. |
 | `canardstack_flush_ewma_bytes_per_second` | Gauge | none | EWMA queue-byte flush throughput used for freshness-budget admission. |
 | `canardstack_projected_flush_seconds` | Gauge | none | Queue byte debt divided by EWMA flush throughput. |
-| `canardstack_projected_visibility_seconds` | Gauge | none | Oldest queue age plus projected flush seconds. |
+| `canardstack_projected_buffer_seconds` | Gauge | none | Immutable-buffer visibility debt past configured segment target or max age. |
+| `canardstack_projected_visibility_seconds` | Gauge | none | Max of process-queue visibility debt and immutable-buffer visibility debt. |
 | `canardstack_observed_freshness_lag_seconds` | Gauge | none | Max cached query-visible freshness lag from the last operator gauge refresh. |
 
 ## Maintenance Metrics

@@ -177,6 +177,7 @@ impl Ingestor {
             signal,
             headers,
             compressed_body.len(),
+            storage,
             lanes,
             metrics,
         ) {
@@ -391,6 +392,7 @@ impl Ingestor {
         signal: Signal,
         headers: &HashMap<String, String>,
         compressed_body_bytes: usize,
+        storage: &Storage,
         lanes: &LaneController,
         metrics: &Metrics,
     ) -> ApiResult<admission::QueueCreditReservation> {
@@ -402,16 +404,12 @@ impl Ingestor {
             self.config.max_body_bytes,
         );
         let projected_total = ledger.projected_reserved_total_bytes(&estimated);
+        let queued_total = ledger.total_reserved_bytes();
         drop(ledger);
-        let oldest_age_seconds = self.max_oldest_queue_age_seconds();
-        lanes.admit_ingest(
-            FreshnessInputs {
-                queued_bytes: projected_total,
-                incoming_bytes: 0,
-                oldest_age_seconds,
-            },
-            metrics,
-        )?;
+        let mut inputs = self.lane_freshness_inputs(storage);
+        inputs.queued_bytes = queued_total;
+        inputs.incoming_bytes = projected_total.saturating_sub(queued_total);
+        lanes.admit_ingest(inputs, metrics)?;
         self.queue_credits.lock_or_poisoned().reserve_estimate(
             signal,
             headers,
@@ -594,11 +592,24 @@ impl Ingestor {
         }
     }
 
-    pub fn lane_freshness_inputs(&self) -> FreshnessInputs {
+    pub fn lane_freshness_inputs(&self, storage: &Storage) -> FreshnessInputs {
+        let (buffered_bytes, buffered_active_count, oldest_buffer_age_seconds) = storage
+            .immutable_buffer_metrics()
+            .into_iter()
+            .fold((0usize, 0usize, 0.0f64), |(bytes, count, age), metric| {
+                (
+                    bytes.saturating_add(metric.bytes),
+                    count.saturating_add(usize::from(metric.bytes > 0)),
+                    age.max(metric.age_seconds),
+                )
+            });
         FreshnessInputs {
             queued_bytes: self.total_reserved_queue_bytes(),
             incoming_bytes: 0,
-            oldest_age_seconds: self.max_oldest_queue_age_seconds(),
+            oldest_queue_age_seconds: self.max_oldest_queue_age_seconds(),
+            buffered_bytes,
+            buffered_active_count,
+            oldest_buffer_age_seconds,
         }
     }
 

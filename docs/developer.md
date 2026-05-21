@@ -336,18 +336,19 @@ cleanly when `serve` exits.
 
 ## Lane Controller
 
-`src/lanes.rs` owns the logical lane counters and flush-throughput EWMA. It is
-intentionally not a generic scheduler. The request path asks it one direct
-question before raw-spool append: will the projected queue visibility stay
-within `CANARDSTACK_FRESHNESS_SLA_SECS` or `_MS`?
+`src/lanes.rs` owns the logical lane counters and queue-flush throughput EWMA.
+It is intentionally not a generic scheduler. The request path asks it one
+direct question before raw-spool append: will the process queue debt plus
+immutable-buffer visibility debt stay within `CANARDSTACK_FRESHNESS_SLA_SECS`
+or `_MS`?
 
 Flush jobs reserve the flush lane before doing DuckDB/DuckLake work and record
 successful queue-byte drain into the EWMA. Compatibility routes reserve either
 the cheap lane (labels, metadata, probe, instant-ish queries) or the heavy lane
 (range/search/trace lookups). Heavy query capacity is reduced first under
 freshness debt and then rejected with the normal protocol error envelope when
-freshness is at risk. The controller also consumes cached query-visible
-freshness lag from operator gauge refreshes; ingest request threads never query
+freshness is at risk. The controller records cached query-visible freshness lag
+from operator gauge refreshes as telemetry; ingest request threads never query
 DuckDB for admission.
 
 ## V0 Gaps

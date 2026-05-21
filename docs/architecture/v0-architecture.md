@@ -173,13 +173,23 @@ buffers, seals due Parquet files, registers those files in DuckLake, and then
 checkpoints the corresponding raw-spool records.
 
 Freshness-budget admission happens before raw-spool append. The request path
-uses queue-credit bytes, oldest queue age, cached query-visible freshness lag,
-query pressure, and the lane controller's EWMA flush bytes/sec to estimate:
+uses two local debt signals:
+
+- process-queue debt: queue-credit bytes and oldest queue age before the
+  process flush moves batches into storage buffers.
+- visibility-buffer debt: immutable storage-buffer bytes and age beyond the
+  configured segment target and max age, before files are DuckLake-registered.
+
+The lane controller estimates:
 
 ```text
 projected_flush_seconds = queued_bytes / ewma_flush_bytes_per_sec
+projected_buffer_seconds =
+  excess_buffer_bytes / immutable_buffer_bytes_per_sec
+  + max(0, oldest_buffer_age_seconds - immutable_segment_max_age_seconds)
 projected_visibility_seconds =
-  max(cached_freshness_lag_seconds, oldest_queue_age_seconds + projected_flush_seconds)
+  max(oldest_queue_age_seconds + projected_flush_seconds,
+      projected_buffer_seconds)
 ```
 
 If the projected visibility exceeds `CANARDSTACK_FRESHNESS_SLA_SECS` or `_MS`,
@@ -201,10 +211,11 @@ The process has logical lanes, implemented by one small in-process controller:
 
 Heavy range/search/trace queries consume only the remaining query capacity after
 the flush and cheap-query reservations. When projected visibility debt reaches
-half of the freshness SLA, heavy query capacity degrades to
-`CANARDSTACK_HEAVY_QUERY_DEGRADED_CAPACITY`. At the SLA, heavy queries return a
-protocol-compatible `429 freshness_debt` envelope. Cheap metadata, label,
-probe, and instant-ish routes retain `CANARDSTACK_CHEAP_QUERY_LANE_CAPACITY`.
+the freshness SLA, heavy query capacity degrades to
+`CANARDSTACK_HEAVY_QUERY_DEGRADED_CAPACITY`. If debt keeps rising, heavy queries
+return a protocol-compatible `429 freshness_debt` envelope. Cheap metadata,
+label, probe, and instant-ish routes retain
+`CANARDSTACK_CHEAP_QUERY_LANE_CAPACITY`.
 
 Lane knobs:
 

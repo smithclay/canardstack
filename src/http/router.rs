@@ -154,7 +154,7 @@ fn route_inner(
                 .unwrap_or_else(|err| json!({"error": err.to_string()}));
             Ok(json!({
                 "queues": state.ingestor.snapshots(),
-                "lanes": state.lanes.snapshot_for(state.ingestor.lane_freshness_inputs()),
+                "lanes": state.lanes.snapshot_for(state.ingestor.lane_freshness_inputs(&state.storage)),
                 "raw_spool": raw_spool,
                 "raw_spool_by_signal": raw_spool_by_signal,
                 "raw_spool_config": {
@@ -180,7 +180,7 @@ fn route_inner(
                 let mut health = state.queries.health();
                 health["lanes"] = json!(state
                     .lanes
-                    .snapshot_for(state.ingestor.lane_freshness_inputs()));
+                    .snapshot_for(state.ingestor.lane_freshness_inputs(&state.storage)));
                 (state.storage.probe().is_ready(), health)
             });
         }
@@ -308,8 +308,8 @@ fn run_flush_with_lane(
             }
             storage_error(err)
         });
-    let after = state.ingestor.total_reserved_queue_bytes();
     if result.is_ok() {
+        let after = state.ingestor.total_reserved_queue_bytes();
         guard.record_bytes(before.saturating_sub(after));
     }
     guard.finish(&state.metrics);

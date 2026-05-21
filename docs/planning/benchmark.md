@@ -153,8 +153,9 @@ Reports include:
 - queue trends
 - raw-spool, transform, enqueue, flush, seal, checkpoint, and storage-visible
   stage throughput
-- lane capacity/in-use, projected flush seconds, projected visibility seconds,
-  freshness-budget rejections, and heavy-query lane reductions when emitted
+- lane capacity/in-use, projected flush seconds, projected buffer seconds,
+  projected visibility seconds, freshness-budget rejections, and heavy-query
+  lane reductions when emitted
 - Loki query latency for log runs
 - process CPU/RSS samples when `--server-pid` can be sampled
 
@@ -213,6 +214,13 @@ Metrics:
   `1,474,970` `429`s, `14` `503`s, had `14/144` query failures, max queue
   bytes `509,995,784`, max queue oldest age `16.91s`, and max measured
   freshness lag `4.53s`.
+- The May 21 split-debt lane tuning report is
+  `/private/tmp/canardstack-lanes-debt2-report/20260521T185804Z/report.json`.
+  It used the same `4000 GB/day` metrics mixed-query shape, accepted
+  `37.03 MB/s`, returned `3,544,056` `202`s, `882,684` `429`s, `0` `503`s,
+  had `2/230` query failures, max queue oldest age `16.96s`, and max measured
+  freshness lag `2.28s`. It still failed the absolute 90%-of-target and
+  zero-query-failure gates, but materially improved the lane baseline.
 
 Recent single-node throughput scout, May 20 2026: the highest clean 10-minute
 mixed-signal run was `2000 GB/day` at ingest concurrency `64`, with
