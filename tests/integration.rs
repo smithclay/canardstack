@@ -95,6 +95,17 @@ fn flush_all(state: &AppState) -> usize {
         .sum::<u64>() as usize
 }
 
+fn wait_for_inflight_empty(state: &AppState) {
+    let deadline = Instant::now() + StdDuration::from_secs(5);
+    while Instant::now() < deadline {
+        if state.ingestor.inflight_bytes() == 0 {
+            return;
+        }
+        thread::sleep(StdDuration::from_millis(10));
+    }
+    panic!("timed out waiting for ingest workers to drain");
+}
+
 #[test]
 fn telemetry_tables_are_timestamp_partitioned_without_event_date_column() {
     let (_dir, state) = app();
@@ -528,6 +539,40 @@ fn operator_metrics_snapshot_is_written_to_metric_store() {
 }
 
 #[test]
+fn metrics_route_renders_core_metrics_without_storage_health_scan() {
+    let (_dir, state) = app();
+    state.metrics.ingest_request(Signal::Logs, 202, "accepted");
+
+    let metrics = metrics_text(&state);
+    assert!(
+        metrics.contains(
+            "canardstack_ingest_requests_total{signal=\"logs\",status=\"202\",reason=\"accepted\"} 1"
+        ),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains("canardstack_raw_spool_pending_records"),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains("canardstack_immutable_buffer_rows"),
+        "{metrics}"
+    );
+    assert!(
+        !metrics.contains("canardstack_storage_logical_rows"),
+        "{metrics}"
+    );
+    assert!(
+        !metrics.contains("canardstack_ducklake_parquet_files"),
+        "{metrics}"
+    );
+    assert!(
+        !metrics.contains("canardstack_freshness_watermark_timestamp"),
+        "{metrics}"
+    );
+}
+
+#[test]
 fn healthz_is_cheap_and_unauthenticated() {
     let (_dir, state) = app();
     let response = http::route(
@@ -718,7 +763,7 @@ fn ingest_rejects_missing_or_unparseable_event_timestamps() {
 }
 
 #[test]
-fn gzip_payloads_are_capped_after_decompression() {
+fn gzip_payloads_over_decoded_limit_are_terminal_checkpointed() {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
     config.max_body_bytes = 128;
@@ -741,12 +786,24 @@ fn gzip_payloads_are_capped_after_decompression() {
         &compressed,
         &state,
     );
-    assert_eq!(response.status(), 400);
-    assert_eq!(response.json_body()["error"], "payload_too_large");
+    assert_eq!(response.status(), 202, "{}", response.json_body());
+    wait_for_inflight_empty(&state);
+    assert_eq!(
+        state.ingestor.raw_spool_stats().unwrap().pending_records,
+        0,
+        "decoded-size worker rejection must terminal-checkpoint the accepted raw record"
+    );
+    let metrics = metrics_text(&state);
+    assert!(
+        metrics.contains(
+            "canardstack_raw_spool_checkpointed_records_total{signal=\"logs\",reason=\"body_size_invalid\"} 1"
+        ),
+        "{metrics}"
+    );
 }
 
 #[test]
-fn timestamp_skew_returns_400() {
+fn timestamp_skew_is_terminal_checkpointed_after_acceptance() {
     let (_dir, state) = app();
     let old = (Utc::now() - Duration::days(3))
         .timestamp_nanos_opt()
@@ -760,8 +817,21 @@ fn timestamp_skew_returns_400() {
         body.as_bytes(),
         &state,
     );
-    assert_eq!(response.status(), 400);
-    assert_eq!(response.json_body()["error"], "timestamp_too_old");
+    assert_eq!(response.status(), 202, "{}", response.json_body());
+    wait_for_inflight_empty(&state);
+    assert_eq!(
+        state.ingestor.raw_spool_stats().unwrap().pending_records,
+        0,
+        "timestamp-skew worker rejection must terminal-checkpoint the accepted raw record"
+    );
+    assert_eq!(log_rows(&state), 0);
+    let metrics = metrics_text(&state);
+    assert!(
+        metrics.contains(
+            "canardstack_raw_spool_checkpointed_records_total{signal=\"logs\",reason=\"timestamp_rejected\"} 1"
+        ),
+        "{metrics}"
+    );
 }
 
 #[test]
@@ -780,6 +850,11 @@ fn dependency_unhealthy_returns_503() {
         &state,
     );
     assert_eq!(response.status(), 503);
+    assert_eq!(
+        state.ingestor.raw_spool_stats().unwrap().pending_records,
+        0,
+        "dependency rejection must happen before durable raw spool append"
+    );
 }
 
 #[test]
@@ -862,6 +937,11 @@ fn runtime_memory_pressure_returns_429_before_enqueue() {
     );
     assert_eq!(response.status(), 429);
     assert_eq!(response.json_body()["error"], "runtime_memory_full");
+    assert_eq!(
+        state.ingestor.raw_spool_stats().unwrap().pending_records,
+        0,
+        "runtime-memory rejection must happen before durable raw spool append"
+    );
     let metrics = metrics_text(&state);
     assert!(
         metrics.contains(
@@ -1096,7 +1176,7 @@ fn raw_spool_acknowledges_local_spool_write_before_storage_commit() {
 }
 
 #[test]
-fn ingest_fsyncs_raw_spool_and_reports_real_record_count_before_ack() {
+fn ingest_fsyncs_raw_spool_before_ack_without_claiming_record_count() {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
     config.raw_spool_dir = dir.path().join("raw-spool");
@@ -1112,15 +1192,8 @@ fn ingest_fsyncs_raw_spool_and_reports_real_record_count_before_ack() {
     );
 
     assert_eq!(response.status(), 202, "{}", response.json_body());
-    // The async handoff still reports the true row count because transform runs
-    // on the connection thread before the 202 (guards against a records:0
-    // regression on the worker path).
-    assert_eq!(
-        response.json_body()["records"],
-        1,
-        "{}",
-        response.json_body()
-    );
+    let json_body = response.json_body();
+    assert!(json_body.get("records").is_none(), "{json_body}");
     assert_eq!(response.json_body()["acknowledgement"], "locally_spooled");
 
     // The 202 is only returned after the raw request is fsynced to the local
@@ -1305,30 +1378,24 @@ fn raw_spool_full_returns_429_before_transform() {
     config.raw_spool_dir = dir.path().join("raw-spool");
     config.raw_spool_max_segment_bytes = 16 * 1024;
     config.raw_spool_max_record_bytes = 16 * 1024;
-    config.raw_spool_max_total_bytes = 900;
+    config.raw_spool_max_total_bytes = 1;
     let state = AppState::new(config).unwrap();
     let body = log_fixture(Utc::now().timestamp_nanos_opt().unwrap()).to_string();
 
-    let mut saw_full = false;
-    for _ in 0..10 {
-        let response = http::route(
-            "POST",
-            "/v1/logs",
-            &HashMap::new(),
-            &headers(&state),
-            body.as_bytes(),
-            &state,
-        );
-        if response.status() == 429 {
-            assert_eq!(response.json_body()["error"], "raw_spool_full");
-            saw_full = true;
-            break;
-        }
-        assert_eq!(response.status(), 202, "{}", response.json_body());
-    }
-    assert!(
-        saw_full,
-        "raw spool did not fill within the bounded test loop"
+    let response = http::route(
+        "POST",
+        "/v1/logs",
+        &HashMap::new(),
+        &headers(&state),
+        body.as_bytes(),
+        &state,
+    );
+    assert_eq!(response.status(), 429, "{}", response.json_body());
+    assert_eq!(response.json_body()["error"], "raw_spool_full");
+    assert_eq!(
+        state.ingestor.raw_spool_stats().unwrap().pending_records,
+        0,
+        "raw-spool-full rejection must not leave pending raw work"
     );
     let metrics = state.metrics.render_prometheus();
     assert!(
@@ -1341,10 +1408,11 @@ fn raw_spool_full_returns_429_before_transform() {
         ),
         "{metrics}"
     );
+    assert!(!metrics.contains("phase=\"otlp_transform\""), "{metrics}");
 }
 
 #[test]
-fn ingest_workers_unavailable_preserves_spooled_work_for_replay() {
+fn ingest_workers_unavailable_rejects_before_raw_spool_append() {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
     config.raw_spool_dir = dir.path().join("raw-spool");
@@ -1374,8 +1442,8 @@ fn ingest_workers_unavailable_preserves_spooled_work_for_replay() {
     assert_eq!(err.reason, "ingest_workers_unavailable");
     assert_eq!(
         ingestor.raw_spool_stats().unwrap().pending_records,
-        1,
-        "spooled work must remain pending when the ingest worker pool handoff fails"
+        0,
+        "worker-unavailable rejection must happen before durable raw spool append"
     );
 }
 

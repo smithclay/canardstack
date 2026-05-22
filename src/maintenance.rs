@@ -286,6 +286,7 @@ fn scheduler_loop(state: Arc<AppState>, stop: Arc<AtomicBool>) {
         if now >= next_metrics {
             let ok = run_job(&state, "metrics_snapshot", |s| {
                 crate::http::record_operator_gauges(s);
+                crate::http::record_storage_operator_gauges(s);
                 let rows = s.metrics.write_snapshot_to_storage(&s.storage)?;
                 Ok(json!({"status": "ok", "rows": rows}))
             });

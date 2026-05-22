@@ -5,7 +5,7 @@ use super::{
 };
 use anyhow::{Context, Result};
 use std::collections::VecDeque;
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -76,12 +76,15 @@ impl Writer {
             .as_ref()
             .context("raw spool writer is stopped")?;
         commands
-            .send(Command::Append(AppendCommand {
+            .try_send(Command::Append(AppendCommand {
                 record,
                 queued_at: Instant::now(),
                 reply,
             }))
-            .context("send raw spool append command")?;
+            .map_err(|err| match err {
+                TrySendError::Full(_) => anyhow::anyhow!("raw spool writer queue is full"),
+                TrySendError::Disconnected(_) => anyhow::anyhow!("raw spool writer is stopped"),
+            })?;
         rx.recv().context("receive raw spool append result")?
     }
 

@@ -238,7 +238,7 @@ MotherDuck, or SQL clients.
 | Process model | One synchronous Rust binary, one DuckDB process, no async runtime. |
 | Ingest | OTLP/HTTP JSON and protobuf for logs, traces, gauge metrics, and sum metrics. |
 | Backpressure | Bounded queues return `429` under pressure. Storage dependency failures surface as `503`. |
-| Durability | A `2xx` ingest response means written to the local raw spool and accepted into bounded processing. It does not mean fsynced, committed to DuckLake, or query-visible. |
+| Durability | A `2xx` ingest response means fsynced to the local raw spool and accepted into bounded processing. It does not mean committed to DuckLake or query-visible. |
 | Storage | DuckLake-backed DuckDB tables by default. Local DuckLake is the quickstart path; MotherDuck and Postgres-catalog DuckLake are supported paths. |
 | Query | Prometheus, Loki, and Tempo compatibility subsets with server-side time range, row limit, timeout, memory, and concurrency guards. |
 | SQL | Direct SQL is intentionally outside the HTTP product surface. Use DuckDB CLI, MotherDuck, or another SQL client. |
@@ -257,10 +257,9 @@ Known v0 limits:
   throughput, no `429`/`503` or query failures). A `2500 GB/day` mixed run
   reached Vector-like log event rates briefly, but failed the 10-minute guardrail
   with `429` queue-pressure responses after roughly eight minutes.
-- No fully durable ingest acknowledgement. A process crash should generally
-  replay written raw-spool records, but OS crashes, VM crashes, power loss, and
-  disk/controller failures may lose records accepted since the most recent
-  append sync.
+- No exactly-once ingest acknowledgement. A crash after `2xx` should replay the
+  fsynced raw-spool record if it was not checkpointed, but duplicate replay can
+  occur when storage commit succeeds before raw-spool checkpoint.
 - No OTLP/gRPC endpoint. Use an OpenTelemetry Collector if your clients need
   gRPC.
 - No histograms or exponential histograms.

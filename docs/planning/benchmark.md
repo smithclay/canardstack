@@ -9,8 +9,8 @@ old scout runs.
 The current MVP architecture is:
 
 ```text
-OTLP/HTTP -> inline transform -> freshness-budget admission + per-signal in-flight ceiling
-  -> local raw spool write, periodic append sync -> ingest worker pool -> immutable buffer
+OTLP/HTTP -> cheap validation + freshness/runtime/queue admission
+  -> fsynced local raw spool write -> ingest worker transform -> immutable buffer
   -> scheduler single seal driver (protected flush lane) -> immutable Parquet segments
   -> DuckLake registration -> logical DuckLake SQL compatibility APIs
 ```
@@ -23,9 +23,8 @@ Current product constraints:
 - DuckDB/DuckLake for storage and query execution.
 - No async runtime, gRPC, Kafka, DataFusion, Vortex, Postgres requirement,
   second service, or arbitrary SQL over compatibility APIs.
-- `202` means the raw request was written to the local raw spool and accepted
-  for processing, pending periodic or byte-threshold append sync. It does not
-  mean the append is fsynced, rows are committed, or rows are query-visible.
+- `202` means the raw request was fsynced to the local raw spool and accepted
+  for bounded processing. It does not mean rows are committed or query-visible.
 - QueryEngine and compatibility APIs read registered logical DuckLake tables,
   not raw Parquet file paths.
 - Logical lane admission reserves flush capacity before query capacity. Cheap
@@ -111,8 +110,8 @@ done from a reduced gate.
 
 The group-commit settings are part of the ingest capacity envelope. Record any
 non-default values next to benchmark latency and throughput results because a
-larger batch/delay can improve throughput while directly raising `202`
-acknowledgement latency.
+larger batch/delay can improve throughput while directly raising the
+fsync-before-`202` acknowledgement latency.
 
 ## Benchmark Harness
 

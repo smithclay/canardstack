@@ -146,6 +146,9 @@ impl Ingestor {
         let runtime_memory_reservation = self
             .admit_runtime_memory(signal, &headers, compressed_body.len(), metrics.as_ref())
             .map_err(|err| anyhow::anyhow!(err.message.clone()))?;
+        let worker_queue_reservation = self
+            .reserve_worker_queue(signal, metrics.as_ref())
+            .map_err(|err| anyhow::anyhow!(err.message.clone()))?;
         let work = crate::ingest::SpooledIngestWork {
             signal,
             headers: headers.clone(),
@@ -153,10 +156,10 @@ impl Ingestor {
             raw_spool_ref,
             inflight_reservation,
             runtime_memory_reservation,
+            worker_queue_reservation,
             metrics: metrics.clone(),
-            prepared: None,
         };
-        self.dispatch_ingest_work(work, 0, 0, metrics.as_ref())
+        self.dispatch_ingest_work(work, metrics.as_ref(), false)
             .map(|_| ())
             .map_err(|err| anyhow::anyhow!(err.message.clone()))
     }
@@ -286,6 +289,18 @@ impl Ingestor {
                         "raw_spool_full",
                         "raw ingest spool is full",
                     ))
+                } else if err.to_string().contains("raw spool writer queue is full") {
+                    metrics.inc(
+                        "canardstack_raw_spool_records_total",
+                        &[("signal", lane.as_str()), ("status", "queue_full")],
+                        1,
+                    );
+                    Err(ApiError::new(
+                        429,
+                        "raw_spool_queue_full",
+                        "raw ingest spool writer queue is full",
+                    )
+                    .with_retry_after(5))
                 } else {
                     metrics.inc(
                         "canardstack_raw_spool_records_total",
@@ -324,25 +339,7 @@ impl Ingestor {
             stats.encoded_bytes,
         );
         metrics.inc(
-            "canardstack_ingest_materialized_bytes_total",
-            &[
-                ("signal", signal.as_str()),
-                ("component", "raw_spool_encode"),
-                ("kind", "record_frame"),
-            ],
-            stats.encoded_bytes,
-        );
-        metrics.inc(
-            "canardstack_ingest_materialized_bytes_total",
-            &[
-                ("signal", signal.as_str()),
-                ("component", "raw_spool_group"),
-                ("kind", "encoded_copy"),
-            ],
-            stats.encoded_bytes,
-        );
-        metrics.inc(
-            "canardstack_raw_spool_append_syncs_total",
+            "canardstack_raw_spool_append_file_fsyncs_total",
             &[("signal", signal.as_str())],
             stats.fsync_count,
         );
@@ -365,11 +362,6 @@ impl Ingestor {
             "canardstack_raw_spool_append_batch_encoded_bytes",
             &[("signal", signal.as_str()), ("stat", "max")],
             stats.encoded_bytes as f64,
-        );
-        metrics.inc(
-            "canardstack_raw_spool_append_batch_deferred_commands_total",
-            &[("signal", signal.as_str()), ("kind", "checkpoint")],
-            stats.deferred_checkpoint_commands as u64,
         );
         metrics.observe_phase_seconds_n(
             signal.as_str(),
@@ -426,11 +418,6 @@ impl Ingestor {
             "canardstack_raw_spool_checkpoint_batch_commands_total",
             &[("signal", signal.as_str())],
             stats.commands as u64,
-        );
-        metrics.inc(
-            "canardstack_raw_spool_checkpoint_batch_deferred_commands_total",
-            &[("signal", signal.as_str()), ("kind", "append")],
-            stats.deferred_append_commands as u64,
         );
         metrics.observe_phase_seconds_n(
             signal.as_str(),
@@ -665,6 +652,11 @@ impl Ingestor {
                 &[],
                 stats.append_sync_failures_total,
             );
+            metrics.set_counter(
+                "canardstack_raw_spool_append_file_fsyncs_total",
+                &[],
+                stats.append_sync_file_fsyncs_total,
+            );
             metrics.set_observation(
                 "canardstack_phase_duration_seconds",
                 &[("signal", "all"), ("phase", "raw_spool_append_fsync")],
@@ -725,6 +717,11 @@ impl Ingestor {
                 "canardstack_raw_spool_append_sync_failures_total",
                 &[("signal", signal.as_str())],
                 stats.append_sync_failures_total,
+            );
+            metrics.set_counter(
+                "canardstack_raw_spool_append_file_fsyncs_total",
+                &[("signal", signal.as_str())],
+                stats.append_sync_file_fsyncs_total,
             );
             metrics.set_observation(
                 "canardstack_phase_duration_seconds",

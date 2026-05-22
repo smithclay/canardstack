@@ -8,8 +8,8 @@ For a practitioner-focused overview, start with the [README](../README.md).
 ## Architecture
 
 ```text
-OTLP/HTTP -> otlp2records transform -> freshness-first admission -> local raw spool write
-  -> ingest worker pool -> immutable buffer -> scheduler seal driver -> immutable Parquet segments
+OTLP/HTTP -> cheap validation -> freshness-first admission -> fsynced local raw spool
+  -> ingest worker transform -> immutable buffer -> scheduler seal driver -> immutable Parquet segments
   -> DuckLake registration -> logical queries
 ```
 
@@ -18,8 +18,8 @@ canardstack is currently shaped as:
 - One Rust binary, `canardstack`.
 - Synchronous standard-library HTTP server on `CANARDSTACK_BIND`.
 - `otlp2records` for OTLP logs, traces, gauge metrics, and sum metrics.
-- Local raw spool for the `202` acceptance boundary, with append fsync handled
-  by periodic or byte-threshold sync.
+- Local raw spool for the `202` acceptance boundary, with append fsync completed
+  before acknowledgement.
 - Bounded per-signal in-memory queues with row, byte, age, and pressure checks.
 - Logical lanes for freshness-budget ingest admission, protected flush, cheap
   query, heavy query, and operator/control traffic.
@@ -35,9 +35,10 @@ canardstack is currently shaped as:
 - Whole-day retention execution for telemetry tables, followed by DuckLake
   snapshot expiration and cleanup hooks when DuckLake is attached.
 - Storage health with freshness watermarks, logical row counts, and local
-  physical bytes.
+  physical bytes on admin health and scheduler-maintained metric snapshots.
 - Prometheus-style operator metrics at `/metrics`, also snapshotted into the
-  metric store for Grafana dashboards.
+  metric store for Grafana dashboards. `/metrics` itself records only cheap
+  in-process gauges.
 
 ## Configuration
 
@@ -245,8 +246,10 @@ normal HTTP API does not expose arbitrary SQL.
 
 Supported ingest response behavior:
 
-- `400` for invalid payload, content type, compression, payload size, or
-  timestamp skew.
+- `400` for cheap request validation failures such as content type or
+  compressed payload size. Decompression, OTLP transform, and timestamp-skew
+  checks run in ingest workers after `202`; terminal failures checkpoint the
+  raw-spool record instead of replaying it forever.
 - `401` for missing API key.
 - `403` for bad API key.
 - `429` for retryable raw-spool, queue, or process ingest pressure.

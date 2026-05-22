@@ -50,6 +50,9 @@ cargo bench --bench throughput_iteration
 
 DuckLake is the only ingest storage mode and requires the DuckLake DuckDB extension; startup should fail loudly if it is not loadable. With no remote catalog configuration, canardstack uses a local DuckLake catalog and local data files.
 
+For the reusable 10 minute mixed-query performance smoke, use
+`docs/BENCHMARKING.md`.
+
 ## Architecture
 
 Data flow:

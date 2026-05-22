@@ -30,11 +30,11 @@ current sustained MVP performance envelope is only claimed for logs and traces.
 
 ```text
 OTLP/HTTP (JSON or protobuf, optional gzip)
-  -> request validation (auth, size, content-type, compression, timestamp skew)
-  -> inline decode and otlp2records transform (connection thread)
-  -> freshness-first admission (projected-visibility lane gate + per-signal in-flight ceiling)
-  -> local raw spool write, pending periodic append sync
-  -> ingest worker pool inserts Arrow batches into the immutable buffer
+  -> cheap request validation (auth, compressed size, content-type)
+  -> dependency, freshness, runtime-memory, and worker-queue admission
+  -> fsynced local raw spool write
+  -> ingest worker decode, otlp2records transform, timestamp-skew validation
+  -> immutable buffer insert
   -> scheduler single seal driver writes immutable Parquet segment files
   -> ducklake_add_data_files registration
   -> raw spool checkpoint
@@ -44,11 +44,11 @@ OTLP/HTTP (JSON or protobuf, optional gzip)
 ```mermaid
 flowchart LR
   A["OTLP/HTTP exporter"] --> B["HTTP parser and auth"]
-  B --> C["Size, content-type, compression, timestamp checks"]
-  C --> D["Decode OTLP and transform with otlp2records"]
-  D --> E["Freshness-first admission: lane gate + per-signal in-flight ceiling"]
-  E --> F["Write raw request to local spool"]
-  F --> G["Ingest worker pool: insert into immutable buffer"]
+  B --> C["Cheap validation: size and content-type"]
+  C --> D["Dependency, freshness, memory, and worker-queue admission"]
+  D --> E["Fsync raw request to local spool"]
+  E --> F["Worker decode, transform, and timestamp validation"]
+  F --> G["Insert into immutable buffer"]
   G --> H["Scheduler single seal driver: Parquet segment seal"]
   H --> I["DuckLake registration"]
   I --> J["Raw spool checkpoint"]
@@ -71,28 +71,25 @@ A successful ingest response is `202`.
 
 `202` means:
 
-- The API key, content type, body size, compression, and timestamp skew passed.
-- The compressed raw request was accepted by the local raw-spool writer and
-  written to the active spool file.
-- The append may still be pending the next periodic or byte-threshold append
-  sync.
+- The API key, content type, compressed body size, dependency health,
+  freshness, runtime-memory, and worker-buffer admission checks passed.
+- The compressed raw request was written and fsynced to the local raw spool.
+- The request was accepted for bounded worker processing or durable replay.
 
 `202` does not mean:
 
+- The OTLP payload has already been decompressed, transformed, or
+  timestamp-skew validated.
 - The rows are DuckLake-committed.
 - The rows are query-visible.
-- The raw-spool append has been fsynced.
 - Exactly-once delivery is guaranteed.
 
 Crash behavior:
 
-- A process crash should generally replay written raw-spool records if the OS
-  page cache and file contents survive.
-- An OS crash, VM crash, power loss, or disk/controller failure may lose records
-  accepted since the most recent successful append sync.
-- If a periodic append sync fails after records have received `202`,
-  canardstack marks the raw spool unhealthy and rejects subsequent ingest with
-  `503 raw_spool_unavailable`.
+- A process crash, OS crash, VM crash, or power loss after `202` should replay
+  fsynced raw-spool records that were not checkpointed.
+- If an append fsync fails before `202`, canardstack rejects that request with
+  `503 raw_spool_unavailable` and marks the raw spool unhealthy.
 
 At-least-once duplicate window:
 
@@ -103,7 +100,8 @@ At-least-once duplicate window:
 Retryable failure behavior:
 
 - `429 raw_spool_full` when the raw-spool byte budget is exhausted.
-- `429` for freshness-budget, queue, process-memory, or runtime-memory pressure.
+- `429 raw_spool_queue_full` when the raw-spool writer queue is saturated.
+- `429` for freshness-budget, worker-queue, process-memory, or runtime-memory pressure.
 - `503 raw_spool_unavailable` when the local spool cannot be opened, written,
   or append-synced.
 - `503 dependency_unhealthy` when storage is unavailable.
@@ -124,9 +122,9 @@ Recovery sequence:
 
 ```text
 open segment -> append record on raw-spool writer
-  -> write append batch -> return 202
-  -> periodic or byte-threshold append sync
-  -> transform/enqueue -> DuckLake storage commit
+  -> write append batch -> force append fsync -> return 202
+  -> worker decode/transform/timestamp check -> immutable buffer insert
+  -> DuckLake storage commit
   -> checkpoint raw-spool record -> delayed checkpoint fsync -> segment reclaimable
 ```
 
@@ -135,13 +133,14 @@ before scheduler work starts.
 Replay enters the same decode, transform, queue, flush, and DuckLake commit path
 as normal ingest.
 
-The raw-spool writer is on the ingest acknowledgement path only through local
-file writes. It batches channel receives and writes internally up to 64 records,
-or until `CANARDSTACK_RAW_SPOOL_GROUP_COMMIT_MS` elapses from the first record
-in the group. Append sync is decoupled from `202` and runs every
-`CANARDSTACK_RAW_SPOOL_APPEND_SYNC_MS` milliseconds, or earlier when
-`CANARDSTACK_RAW_SPOOL_APPEND_SYNC_BYTES` dirty encoded bytes accumulate. Both
-append sync knobs reject zero values at startup.
+The raw-spool writer is on the ingest acknowledgement path through local file
+writes and forced append fsync. It uses a bounded command queue; a saturated
+append queue returns `429 raw_spool_queue_full` instead of parking request
+threads. It batches channel receives and writes internally up to 64 records, or
+until `CANARDSTACK_RAW_SPOOL_GROUP_COMMIT_MS` elapses from the first record in
+the group. Append sync is forced before each `202`; the interval and byte knobs
+still bound dirty data for internal writer cycles and shutdown. Append sync
+knobs reject zero values at startup.
 
 Checkpoint durability remains weaker than append sync. A lost checkpoint only
 causes duplicate replay of data already accepted into storage. Checkpoint log
@@ -162,13 +161,15 @@ Size the local data directory for the aggregate budget, not just one lane.
 
 ## Queues And Flush
 
-Ingest transforms inline on the HTTP request thread (so malformed payloads are
-rejected synchronously), then hands the durably-spooled work to a fixed pool of
-ingest workers over a bounded channel. Each worker admits Arrow `RecordBatch`es
-into the per-signal immutable storage buffer. The ingest worker pool is the
-single "parallel ingest across OS threads" concept; there is no separate
-dataflow topology or storage-sink stage. Queue ownership is intentionally
-low-cardinality: signal plus source encoding.
+HTTP request threads run only cheap validation and rejectable admission gates,
+then hand durably-spooled work to a fixed pool of ingest workers over bounded
+queue reservations. Workers perform decompression, `otlp2records` transform,
+timestamp-skew validation, and immutable-buffer insertion. Malformed or
+skew-rejected accepted payloads are durably terminal-checkpointed so they do
+not replay forever. The ingest worker pool is the single "parallel ingest
+across OS threads" concept; there is no separate dataflow topology or
+storage-sink stage. Queue ownership is intentionally low-cardinality: signal
+plus source encoding.
 
 Memory and queue guardrails:
 

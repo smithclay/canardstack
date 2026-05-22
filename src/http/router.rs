@@ -371,12 +371,6 @@ fn record_maintenance_metrics(
 pub(crate) fn record_operator_gauges(state: &AppState) {
     state.ingestor.record_inflight_metrics(&state.metrics);
     state.ingestor.record_raw_spool_metrics(&state.metrics);
-    let storage = state.storage.health();
-    state.metrics.gauge(
-        "canardstack_storage_physical_bytes",
-        &[("table", "all")],
-        storage.physical_bytes as f64,
-    );
     let immutable_buffers = state
         .storage
         .immutable_buffer_metrics()
@@ -417,6 +411,25 @@ pub(crate) fn record_operator_gauges(state: &AppState) {
             age_seconds,
         );
     }
+    let maintenance = state.maintenance.health();
+    let paused = maintenance
+        .get("paused")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    state.metrics.gauge(
+        "canardstack_maintenance_paused",
+        &[],
+        if paused { 1.0 } else { 0.0 },
+    );
+}
+
+pub(crate) fn record_storage_operator_gauges(state: &AppState) {
+    let storage = state.storage.health();
+    state.metrics.gauge(
+        "canardstack_storage_physical_bytes",
+        &[("table", "all")],
+        storage.physical_bytes as f64,
+    );
     if let Some(rows) = storage.logical_rows.as_object() {
         for (table, value) in rows {
             if let Some(count) = value.as_i64() {
@@ -470,14 +483,4 @@ pub(crate) fn record_operator_gauges(state: &AppState) {
     state
         .lanes
         .record_observed_freshness_lag(max_freshness_lag, &state.metrics);
-    let maintenance = state.maintenance.health();
-    let paused = maintenance
-        .get("paused")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    state.metrics.gauge(
-        "canardstack_maintenance_paused",
-        &[],
-        if paused { 1.0 } else { 0.0 },
-    );
 }

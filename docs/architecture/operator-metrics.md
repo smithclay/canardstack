@@ -3,8 +3,11 @@
 ## Metric Naming
 
 The canardstack process exposes Prometheus-text metrics at `GET /metrics`. The
-scheduler also writes a snapshot of those same samples every
-the derived metrics-snapshot maintenance cadence with `service_name="canardstack"`:
+scrape path records only cheap in-process gauges. Storage layout, row-count,
+physical-byte, and freshness-watermark gauges are refreshed by the scheduler's
+metrics-snapshot job, then rendered from the metric store. The scheduler also
+writes a snapshot of the current samples every derived metrics-snapshot
+maintenance cadence with `service_name="canardstack"`:
 counters land in `metric_sum`, and gauges land in `metric_gauge`. Grafana can
 query canardstack's own monitoring data through the normal Prometheus-compatible
 datastore path. The names below are the implemented contract: only metrics that
@@ -31,12 +34,13 @@ Do not label metrics by `service_name`, trace id, query text, API key, or arbitr
 | --- | --- | --- | --- |
 | `canardstack_ingest_requests_total` | Counter | `signal`, `status`, `reason` | Request outcomes. |
 | `canardstack_ingest_request_bytes_total` | Counter | `signal`, `encoding` | Compressed request bytes accepted. |
-| `canardstack_raw_spool_records_total` | Counter | `signal`, `status` | Raw request spool outcomes: `spooled`, `full`, or `error`. `spooled` means written to the local raw-spool file, possibly pending append sync. |
+| `canardstack_raw_spool_records_total` | Counter | `signal`, `status` | Raw request spool outcomes: `spooled`, `full`, `queue_full`, or `error`. `spooled` means written and fsynced to the local raw-spool file. |
 | `canardstack_raw_spool_bytes_total` | Counter | `signal` | Compressed raw request bytes written into the local spool. |
 | `canardstack_raw_spool_append_batches_total` | Counter | none | Raw-spool append batches written by the writer. |
 | `canardstack_raw_spool_append_batch_records_total` | Counter | none | Raw-spool records included in append batches. |
 | `canardstack_raw_spool_append_batch_encoded_bytes_total` | Counter | none | Encoded raw-spool bytes included in append batches. |
-| `canardstack_raw_spool_append_syncs_total` | Counter | none | Successful periodic or byte-threshold raw-spool append sync cycles. |
+| `canardstack_raw_spool_append_syncs_total` | Counter | none | Successful raw-spool append sync cycles. |
+| `canardstack_raw_spool_append_file_fsyncs_total` | Counter | none | Segment file fsync calls performed by append sync cycles. |
 | `canardstack_raw_spool_append_sync_failures_total` | Counter | none | Failed raw-spool append sync cycles. Any increase should make the raw spool unhealthy and subsequent ingest return `503`. |
 | `canardstack_raw_spool_append_batch_records` | Gauge | `stat` | Last and max records per raw-spool append batch. |
 | `canardstack_raw_spool_append_batch_encoded_bytes` | Gauge | `stat` | Last and max encoded bytes per raw-spool append batch. |
@@ -51,12 +55,14 @@ Do not label metrics by `service_name`, trace id, query text, API key, or arbitr
 | `canardstack_raw_spool_segment_bytes` | Gauge | none | Total raw-spool segment bytes on disk. |
 | `canardstack_raw_spool_segments` | Gauge | none | Raw-spool segment file count. |
 | `canardstack_ingest_records_total` | Counter | `signal` | Records accepted into the immutable buffer. |
-| `canardstack_ingest_transformed_rows_total` | Counter | `signal`, `request_signal` | Rows produced by `otlp2records` before admission. |
+| `canardstack_ingest_transformed_rows_total` | Counter | `signal`, `request_signal` | Rows produced by worker-side `otlp2records` transform. |
+| `canardstack_ingest_unsupported_histograms_total` | Counter | `signal` | Histogram datapoints observed and dropped by the v0 metrics transformer. Emitted only when nonzero. |
 | `canardstack_ingest_buffered_rows_total` | Counter | `signal` | Rows inserted into the storage immutable buffer. |
 | `canardstack_ingest_buffered_bytes_total` | Counter | `signal` | Approximate Arrow bytes inserted into the storage immutable buffer. |
 | `canardstack_ingest_inflight_bytes` | Gauge | `signal` | Bytes admitted (spooled, handed to a worker) but not yet inserted into the immutable buffer. |
 | `canardstack_ingest_inflight_capacity_bytes` | Gauge | `signal` | Per-signal in-flight ceiling. |
 | `canardstack_ingest_inflight_pressure` | Gauge | `signal` | In-flight bytes as a fraction of the per-signal ceiling (`0..1`). |
+| `canardstack_ingest_worker_queue_slots` | Gauge | `state` | Worker queue slots used and configured capacity. |
 | `canardstack_ingest_storage_insert_total` | Counter | `signal`, `status` | Worker inserts of Arrow batches into the immutable buffer. |
 | `canardstack_ingest_worker_completed_total` | Counter | `signal`, `status` | Ingest worker tasks completed, by outcome. |
 | `canardstack_ingest_rejections_total` | Counter | `signal`, `status`, `reason` | Admission-control rejections (subset of `_ingest_requests_total`). |
@@ -71,6 +77,9 @@ Do not label metrics by `service_name`, trace id, query text, API key, or arbitr
 | `canardstack_http_connection_errors_total` | Counter | `reason` | Per-connection failures: `max_connections_exceeded`, `socket_timeout`, `connection_reset`, `io_error`. |
 
 ## Storage Metrics
+
+These gauges are scheduler-maintained snapshots, not fresh `/metrics` scrape
+scans.
 
 | Metric | Type | Labels | Purpose |
 | --- | --- | --- | --- |
@@ -102,8 +111,8 @@ The shared phase metric `canardstack_phase_duration_seconds` splits
 request-visible `raw_spool_append` latency from raw-spool writer internals:
 `raw_spool_append_batch_wait` is time spent collecting a group-commit batch,
 `raw_spool_append_write` is file write time, and `raw_spool_append_fsync` is
-periodic or threshold append sync time. `raw_spool_append_fsync` is no longer
-part of `202` latency.
+append sync time. `raw_spool_append_fsync` is part of `202` latency because
+accepted requests are fsynced before acknowledgement.
 
 ## Query Metrics
 
@@ -156,13 +165,16 @@ part of `202` latency.
 | Query timeouts spiking | `rate(canardstack_query_timeouts_total[5m]) > 0` | Warning |
 | Freshness admission active | `rate(canardstack_ingest_freshness_budget_rejections_total[5m]) > 0` | Warning |
 | Connection cap saturated | `rate(canardstack_http_connection_errors_total{reason="max_connections_exceeded"}[5m]) > 0` | Warning |
-| Partial-commit durability gap | `rate(canardstack_ingest_partial_commit_rows_total[5m]) > 0` | Warning |
 
 ## Not Currently Emitted
 
 The following metrics from earlier design drafts are **not** emitted by the current implementation. They are listed here so dashboards and runbooks don't silently depend on them:
 
 - `canardstack_ingest_decode_seconds`
+- `canardstack_ingest_materialized_bytes_total`
+- `canardstack_raw_spool_append_batch_deferred_commands_total`
+- `canardstack_raw_spool_checkpoint_batch_deferred_commands_total`
+- `canardstack_ingest_partial_commit_rows_total`
 - `canardstack_ducklake_insert_seconds`, `_commit_seconds`, `_inlined_bytes`, `_oldest_inlined_age_seconds`, `_snapshot_count`, `_flush_failures_total`
 - `canardstack_storage_logical_bytes` (the implementation emits `_logical_rows` instead)
 - `canardstack_object_store_errors_total`, `_request_seconds`

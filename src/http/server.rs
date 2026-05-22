@@ -42,7 +42,7 @@ pub fn serve_until(state: Arc<AppState>, shutdown: &AtomicBool) -> anyhow::Resul
     log_startup_storage_mode(&probe);
     tracing::info!(
         event = "ingest_acknowledgement",
-        "2xx means written to the local raw spool and pending periodic append sync"
+        "2xx means fsynced to the local raw spool and accepted for bounded processing"
     );
     let active = Arc::new(AtomicUsize::new(0));
     let max_conns = state.config.max_concurrent_connections;

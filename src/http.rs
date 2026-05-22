@@ -6,6 +6,6 @@ mod router;
 mod server;
 
 pub use response::HttpResponse;
-pub(crate) use router::record_operator_gauges;
 pub use router::route;
+pub(crate) use router::{record_operator_gauges, record_storage_operator_gauges};
 pub use server::{serve, serve_until};
