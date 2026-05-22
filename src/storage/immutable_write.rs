@@ -209,42 +209,39 @@ impl Storage {
         let mut sealed = Vec::with_capacity(buffers.len());
         let mut affected = BTreeMap::new();
 
-        let mut handles = Vec::with_capacity(buffers.len());
-        for (&table, buffer) in buffers {
-            let storage_dir = self.local_storage_dir.clone();
-            let buffer = buffer.clone();
-            handles.push((
-                table,
-                thread::spawn(move || seal_immutable_buffer(&storage_dir, table, &buffer)),
-            ));
-        }
-
-        let mut seal_error = None;
-        for (table, handle) in handles {
-            match handle.join() {
-                Ok(Ok(buffer)) => {
-                    if seal_error.is_none() {
-                        timings.extend(buffer.timings);
-                        sealed.extend(buffer.segments);
-                        affected.insert(table, buffer.affected_days);
-                    }
-                }
-                Ok(Err(err)) => {
-                    if seal_error.is_none() {
-                        seal_error = Some(err);
-                    }
-                }
-                Err(_) => {
-                    if seal_error.is_none() {
-                        seal_error = Some(anyhow::anyhow!(
+        // Encode each table's buffer to Parquet in parallel via scoped threads:
+        // they borrow the buffers directly (no per-flush full-buffer clone) and
+        // are all joined before the scope returns. The DuckLake register+commit
+        // below stays serialized under the single writer lock.
+        let storage_dir = self.local_storage_dir.as_path();
+        let sealed_results: Vec<(Signal, Result<SealedBuffer>)> = thread::scope(|scope| {
+            let handles = buffers
+                .iter()
+                .map(|(&table, buffer)| {
+                    (
+                        table,
+                        scope.spawn(move || seal_immutable_buffer(storage_dir, table, buffer)),
+                    )
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|(table, handle)| {
+                    let result = handle.join().unwrap_or_else(|_| {
+                        Err(anyhow::anyhow!(
                             "immutable segment writer panicked for {table}"
-                        ));
-                    }
-                }
-            }
-        }
-        if let Some(err) = seal_error {
-            return Err(err);
+                        ))
+                    });
+                    (table, result)
+                })
+                .collect()
+        });
+
+        for (table, result) in sealed_results {
+            let sealed_buffer = result?;
+            timings.extend(sealed_buffer.timings);
+            sealed.extend(sealed_buffer.segments);
+            affected.insert(table, sealed_buffer.affected_days);
         }
 
         let conn = self.writer.lock_or_poisoned();
