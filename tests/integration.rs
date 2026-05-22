@@ -718,7 +718,7 @@ fn unhealthy_raw_spool_writer_makes_readiness_not_ready() {
 }
 
 #[test]
-fn invalid_payload_returns_400() {
+fn invalid_payload_is_terminal_checkpointed_after_acceptance() {
     let (_dir, state) = app();
     let response = http::route(
         "POST",
@@ -728,11 +728,24 @@ fn invalid_payload_returns_400() {
         b"{bad json",
         &state,
     );
-    assert_eq!(response.status(), 400);
+    assert_eq!(response.status(), 202, "{}", response.json_body());
+    wait_for_inflight_empty(&state);
+    assert_eq!(
+        state.ingestor.raw_spool_stats().unwrap().pending_records,
+        0,
+        "worker transform failure must terminal-checkpoint the accepted raw record"
+    );
+    let metrics = metrics_text(&state);
+    assert!(
+        metrics.contains(
+            "canardstack_raw_spool_checkpointed_records_total{signal=\"logs\",reason=\"transform_failed\"} 1"
+        ),
+        "{metrics}"
+    );
 }
 
 #[test]
-fn ingest_rejects_missing_or_unparseable_event_timestamps() {
+fn ingest_terminal_checkpoints_missing_event_timestamps_after_acceptance() {
     let (_dir, state) = app();
     let mut body = log_fixture(Utc::now().timestamp_nanos_opt().unwrap());
     let log_record = body["resourceLogs"][0]["scopeLogs"][0]["logRecords"][0]
@@ -748,8 +761,21 @@ fn ingest_rejects_missing_or_unparseable_event_timestamps() {
         body.to_string().as_bytes(),
         &state,
     );
-    assert_eq!(response.status(), 400);
-    assert_eq!(response.json_body()["error"], "invalid_timestamp");
+    assert_eq!(response.status(), 202, "{}", response.json_body());
+    wait_for_inflight_empty(&state);
+    assert_eq!(
+        state.ingestor.raw_spool_stats().unwrap().pending_records,
+        0,
+        "worker timestamp failure must terminal-checkpoint the accepted raw record"
+    );
+    assert_eq!(log_rows(&state), 0);
+    let metrics = metrics_text(&state);
+    assert!(
+        metrics.contains(
+            "canardstack_raw_spool_checkpointed_records_total{signal=\"logs\",reason=\"timestamp_rejected\"} 1"
+        ),
+        "{metrics}"
+    );
 
     let config = Config::test(tempdir().unwrap().path().join("canardstack.duckdb"));
     let invalid_batch = RecordBatch::try_new(
