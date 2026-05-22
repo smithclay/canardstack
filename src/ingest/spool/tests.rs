@@ -132,10 +132,10 @@ fn raw_spool_writer_reports_batch_wait_stats_once() {
     let second_ack = second_rx.recv().unwrap().unwrap();
     let stats = first_ack.batch_stats.unwrap();
     assert_eq!(stats.records, 2);
-    assert_eq!(stats.fsync_count, 0);
+    assert_eq!(stats.fsync_count, 1);
     assert!(stats.wait_seconds >= 0.0);
     assert!(second_ack.batch_stats.is_none());
-    assert_eq!(spool.stats().unwrap().append_syncs_total, 0);
+    assert_eq!(spool.stats().unwrap().append_syncs_total, 1);
 }
 
 #[test]

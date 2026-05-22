@@ -111,10 +111,11 @@ pub struct Config {
     pub raw_spool_append_sync_bytes: usize,
     pub raw_spool_checkpoint_fsync_records: usize,
     pub raw_spool_checkpoint_fsync_delay: Duration,
-    pub experimental_async_ingest_workers: usize,
-    pub experimental_async_ingest_queue_capacity: usize,
-    pub experimental_vector_storage_sink: bool,
-    pub experimental_vector_storage_sink_queue_capacity: usize,
+    pub ingest_workers: usize,
+    pub ingest_buffer_capacity: usize,
+    pub storage_sink_buffer_capacity: usize,
+    pub storage_sink_batch_rows: usize,
+    pub storage_sink_flush_interval: Duration,
 }
 
 const DEFAULT_CONFIG_PATH: &str = "config.toml";
@@ -304,26 +305,23 @@ impl Config {
                 .unwrap_or(16 * 1024 * 1024),
             raw_spool_checkpoint_fsync_records: 1024,
             raw_spool_checkpoint_fsync_delay: Duration::from_millis(1000),
-            experimental_async_ingest_workers: env_usize(
-                "CANARDSTACK_EXPERIMENTAL_ASYNC_INGEST_WORKERS",
-            )?
-            .or(file.usize(&["experimental", "async_ingest_workers"])?)
-            .unwrap_or(0),
-            experimental_async_ingest_queue_capacity: env_usize(
-                "CANARDSTACK_EXPERIMENTAL_ASYNC_INGEST_QUEUE_CAPACITY",
-            )?
-            .or(file.usize(&["experimental", "async_ingest_queue_capacity"])?)
-            .unwrap_or(1024),
-            experimental_vector_storage_sink: env_bool(
-                "CANARDSTACK_EXPERIMENTAL_VECTOR_STORAGE_SINK",
-            )?
-            .or(file.bool(&["experimental", "vector_storage_sink"])?)
-            .unwrap_or(false),
-            experimental_vector_storage_sink_queue_capacity: env_usize(
-                "CANARDSTACK_EXPERIMENTAL_VECTOR_STORAGE_SINK_QUEUE_CAPACITY",
-            )?
-            .or(file.usize(&["experimental", "vector_storage_sink_queue_capacity"])?)
-            .unwrap_or(1024),
+            ingest_workers: env_usize("CANARDSTACK_INGEST_WORKERS")?
+                .or(file.usize(&["ingest", "workers"])?)
+                .unwrap_or(4),
+            ingest_buffer_capacity: env_usize("CANARDSTACK_INGEST_BUFFER_CAPACITY")?
+                .or(file.usize(&["ingest", "buffer_capacity"])?)
+                .unwrap_or(1024),
+            storage_sink_buffer_capacity: env_usize("CANARDSTACK_STORAGE_SINK_BUFFER_CAPACITY")?
+                .or(file.usize(&["storage_sink", "buffer_capacity"])?)
+                .unwrap_or(1024),
+            storage_sink_batch_rows: env_usize("CANARDSTACK_STORAGE_SINK_BATCH_ROWS")?
+                .or(file.usize(&["storage_sink", "batch_rows"])?)
+                .unwrap_or(5_000),
+            storage_sink_flush_interval: Duration::from_millis(
+                env_usize("CANARDSTACK_STORAGE_SINK_FLUSH_INTERVAL_MS")?
+                    .or(file.usize(&["storage_sink", "flush_interval_ms"])?)
+                    .unwrap_or(1000) as u64,
+            ),
         })
     }
 
@@ -395,10 +393,11 @@ impl Config {
             raw_spool_append_sync_bytes: 16 * 1024 * 1024,
             raw_spool_checkpoint_fsync_records: 1024,
             raw_spool_checkpoint_fsync_delay: Duration::from_millis(1000),
-            experimental_async_ingest_workers: 0,
-            experimental_async_ingest_queue_capacity: 1024,
-            experimental_vector_storage_sink: false,
-            experimental_vector_storage_sink_queue_capacity: 1024,
+            ingest_workers: 4,
+            ingest_buffer_capacity: 1024,
+            storage_sink_buffer_capacity: 1024,
+            storage_sink_batch_rows: 5_000,
+            storage_sink_flush_interval: Duration::from_millis(10),
         }
     }
 
@@ -506,17 +505,20 @@ impl Config {
         if self.raw_spool_checkpoint_fsync_delay.is_zero() {
             anyhow::bail!("raw spool checkpoint fsync delay must be > 0");
         }
-        if self.experimental_async_ingest_workers > 0
-            && self.experimental_async_ingest_queue_capacity == 0
-        {
-            anyhow::bail!("CANARDSTACK_EXPERIMENTAL_ASYNC_INGEST_QUEUE_CAPACITY must be > 0");
+        if self.ingest_workers == 0 {
+            anyhow::bail!("CANARDSTACK_INGEST_WORKERS must be > 0");
         }
-        if self.experimental_vector_storage_sink
-            && self.experimental_vector_storage_sink_queue_capacity == 0
-        {
-            anyhow::bail!(
-                "CANARDSTACK_EXPERIMENTAL_VECTOR_STORAGE_SINK_QUEUE_CAPACITY must be > 0"
-            );
+        if self.ingest_buffer_capacity == 0 {
+            anyhow::bail!("CANARDSTACK_INGEST_BUFFER_CAPACITY must be > 0");
+        }
+        if self.storage_sink_buffer_capacity == 0 {
+            anyhow::bail!("CANARDSTACK_STORAGE_SINK_BUFFER_CAPACITY must be > 0");
+        }
+        if self.storage_sink_batch_rows == 0 {
+            anyhow::bail!("CANARDSTACK_STORAGE_SINK_BATCH_ROWS must be > 0");
+        }
+        if self.storage_sink_flush_interval.is_zero() {
+            anyhow::bail!("CANARDSTACK_STORAGE_SINK_FLUSH_INTERVAL_MS must be > 0");
         }
         if self.raw_spool_max_record_bytes > self.raw_spool_max_total_bytes {
             anyhow::bail!(
@@ -765,6 +767,15 @@ mod tests {
         "CANARDSTACK_BENCH_HTTP_KEEPALIVE",
         "CANARDSTACK_RAW_SPOOL_CAPACITY_BYTES",
         "CANARDSTACK_RAW_SPOOL_GROUP_COMMIT_MS",
+        "CANARDSTACK_INGEST_WORKERS",
+        "CANARDSTACK_INGEST_BUFFER_CAPACITY",
+        "CANARDSTACK_STORAGE_SINK_BUFFER_CAPACITY",
+        "CANARDSTACK_STORAGE_SINK_BATCH_ROWS",
+        "CANARDSTACK_STORAGE_SINK_FLUSH_INTERVAL_MS",
+        "CANARDSTACK_EXPERIMENTAL_ASYNC_INGEST_WORKERS",
+        "CANARDSTACK_EXPERIMENTAL_ASYNC_INGEST_QUEUE_CAPACITY",
+        "CANARDSTACK_EXPERIMENTAL_VECTOR_STORAGE_SINK",
+        "CANARDSTACK_EXPERIMENTAL_VECTOR_STORAGE_SINK_QUEUE_CAPACITY",
     ];
 
     fn env_lock() -> &'static Mutex<()> {
@@ -837,6 +848,8 @@ memory_bytes = 3000000
 process_memory_limit_bytes = 4000000
 flush_target_bytes = 654321
 flush_max_age_secs = 11
+workers = 3
+buffer_capacity = 33
 
 [validation]
 accept_late_secs = 100
@@ -869,6 +882,11 @@ capacity_bytes = 16384
 group_commit_ms = 3
 append_sync_ms = 250
 append_sync_bytes = 8192
+
+[storage_sink]
+buffer_capacity = 44
+batch_rows = 55
+flush_interval_ms = 66
 
 [bench]
 http_keepalive = true
@@ -943,7 +961,36 @@ http_keepalive = true
             config.raw_spool_checkpoint_fsync_delay,
             Duration::from_millis(1000)
         );
+        assert_eq!(config.ingest_workers, 3);
+        assert_eq!(config.ingest_buffer_capacity, 33);
+        assert_eq!(config.storage_sink_buffer_capacity, 44);
+        assert_eq!(config.storage_sink_batch_rows, 55);
+        assert_eq!(
+            config.storage_sink_flush_interval,
+            Duration::from_millis(66)
+        );
         assert!(config.bench_http_keepalive);
+    }
+
+    #[test]
+    fn old_experimental_ingest_env_vars_are_ignored() {
+        let _guard = env_lock().lock().unwrap();
+        let _snapshot = EnvSnapshot::capture_and_clear();
+
+        unsafe {
+            env::set_var("CANARDSTACK_EXPERIMENTAL_ASYNC_INGEST_WORKERS", "99");
+            env::set_var("CANARDSTACK_EXPERIMENTAL_ASYNC_INGEST_QUEUE_CAPACITY", "99");
+            env::set_var("CANARDSTACK_EXPERIMENTAL_VECTOR_STORAGE_SINK", "false");
+            env::set_var(
+                "CANARDSTACK_EXPERIMENTAL_VECTOR_STORAGE_SINK_QUEUE_CAPACITY",
+                "99",
+            );
+        }
+
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.ingest_workers, 4);
+        assert_eq!(config.ingest_buffer_capacity, 1024);
+        assert_eq!(config.storage_sink_buffer_capacity, 1024);
     }
 
     #[test]

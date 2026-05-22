@@ -27,7 +27,7 @@ fn main() -> anyhow::Result<()> {
             if !state.config.scheduler_enabled {
                 tracing::warn!(
                     event = "scheduler_disabled",
-                    "202 ingest acknowledgements are locally spooled pending periodic append sync, but rows remain query-invisible until admin-triggered flush"
+                    "scheduler disabled; ingest topology and storage sink continue independently, but maintenance jobs will not run"
                 );
             }
             let _scheduler = state

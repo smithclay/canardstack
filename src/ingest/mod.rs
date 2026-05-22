@@ -13,19 +13,17 @@ use spool::{RawSpoolOptions, RawSpoolRecordId, RawSpoolWriter};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::mpsc::{self, SyncSender, TrySendError};
-use std::sync::{Arc, Condvar, Mutex, Weak};
+use std::sync::atomic::AtomicUsize;
+use std::sync::mpsc::{self, RecvTimeoutError, SyncSender, TrySendError};
+use std::sync::{Arc, Mutex, Weak};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 mod admission;
-mod flush;
 mod queue;
 mod raw_spool;
 pub mod spool;
 
-pub use flush::{partial_commit_info, PartialFlushError};
 pub use queue::IngestSnapshot;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize)]
@@ -65,26 +63,17 @@ impl fmt::Display for Signal {
 }
 
 pub struct Ingestor {
-    queues: Arc<Mutex<queue::QueueMap>>,
-    flush_lock: Arc<Mutex<()>>,
-    flush_signal: Arc<FlushSignal>,
     runtime_memory_reserved_bytes: Arc<AtomicUsize>,
     queue_credits: Arc<Mutex<admission::QueueCreditLedger>>,
     raw_spools: BTreeMap<Signal, RawSpoolWriter>,
     metric_raw_spool_next: AtomicUsize,
     raw_spool_flush_refs: Arc<Mutex<BTreeMap<(Signal, RawSpoolRecordId), RawSpoolFlushRef>>>,
-    async_ingest: Mutex<Option<AsyncIngestDispatcher>>,
+    topology: Mutex<Option<IngestTopologyDispatcher>>,
     storage_sink: Mutex<Option<StorageSinkDispatcher>>,
     config: Config,
 }
 
-#[derive(Default)]
-struct FlushSignal {
-    requested: Mutex<bool>,
-    ready: Condvar,
-}
-
-struct AsyncIngestDispatcher {
+struct IngestTopologyDispatcher {
     commands: Vec<SyncSender<SpooledIngestWork>>,
     handles: Vec<JoinHandle<()>>,
     next_worker: usize,
@@ -110,11 +99,13 @@ struct StorageSinkWork {
     sets: Vec<(queue::QueueKey, Vec<queue::QueuedBatch>)>,
 }
 
-impl Drop for AsyncIngestDispatcher {
+impl Drop for IngestTopologyDispatcher {
     fn drop(&mut self) {
         self.commands.clear();
         for handle in self.handles.drain(..) {
-            let _ = handle.join();
+            if handle.thread().id() != thread::current().id() {
+                let _ = handle.join();
+            }
         }
     }
 }
@@ -123,7 +114,9 @@ impl Drop for StorageSinkDispatcher {
     fn drop(&mut self) {
         self.commands.take();
         if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
+            if handle.thread().id() != thread::current().id() {
+                let _ = handle.join();
+            }
         }
     }
 }
@@ -135,27 +128,24 @@ impl Ingestor {
             raw_spools.insert(signal, spawn_raw_spool_writer(&config, signal)?);
         }
         Ok(Self {
-            queues: Arc::new(Mutex::new(HashMap::new())),
-            flush_lock: Arc::new(Mutex::new(())),
-            flush_signal: Arc::new(FlushSignal::default()),
             runtime_memory_reserved_bytes: Arc::new(AtomicUsize::new(0)),
             queue_credits: Arc::new(Mutex::new(admission::QueueCreditLedger::new(&config))),
             raw_spools,
             metric_raw_spool_next: AtomicUsize::new(0),
             raw_spool_flush_refs: Arc::new(Mutex::new(BTreeMap::new())),
-            async_ingest: Mutex::new(None),
+            topology: Mutex::new(None),
             storage_sink: Mutex::new(None),
             config,
         })
     }
 
-    pub fn start_experimental_topology(
+    pub fn start_topology(
         self: &Arc<Self>,
         storage: Arc<Storage>,
         metrics: Arc<Metrics>,
     ) -> Result<()> {
         self.start_storage_sink(storage, metrics)?;
-        self.start_async_workers()
+        self.start_transform_workers()
     }
 
     fn start_storage_sink(
@@ -163,23 +153,19 @@ impl Ingestor {
         storage: Arc<Storage>,
         metrics: Arc<Metrics>,
     ) -> Result<()> {
-        if !self.config.experimental_vector_storage_sink {
-            return Ok(());
-        }
         let mut storage_sink = self.storage_sink.lock_or_poisoned();
         if storage_sink.is_some() {
             return Ok(());
         }
-        let (commands, receiver) =
-            mpsc::sync_channel(self.config.experimental_vector_storage_sink_queue_capacity);
+        let (commands, receiver) = mpsc::sync_channel(self.config.storage_sink_buffer_capacity);
         let weak = Arc::downgrade(self);
         let handle = thread::Builder::new()
-            .name("canardstack-vector-storage-sink".to_string())
+            .name("canardstack-storage-sink".to_string())
             .spawn(move || run_storage_sink_worker(receiver, weak, storage, metrics))
-            .context("spawn vector storage sink thread")?;
+            .context("spawn storage sink thread")?;
         tracing::info!(
-            event = "vector_storage_sink_started",
-            queue_capacity = self.config.experimental_vector_storage_sink_queue_capacity
+            event = "storage_sink_started",
+            buffer_capacity = self.config.storage_sink_buffer_capacity
         );
         *storage_sink = Some(StorageSinkDispatcher {
             commands: Some(commands),
@@ -188,20 +174,17 @@ impl Ingestor {
         Ok(())
     }
 
-    pub fn start_async_workers(self: &Arc<Self>) -> Result<()> {
-        let worker_count = self.config.experimental_async_ingest_workers;
-        if worker_count == 0 {
-            return Ok(());
-        }
-        let mut async_ingest = self.async_ingest.lock_or_poisoned();
-        if async_ingest.is_some() {
+    pub fn start_transform_workers(self: &Arc<Self>) -> Result<()> {
+        let worker_count = self.config.ingest_workers;
+        let mut topology = self.topology.lock_or_poisoned();
+        if topology.is_some() {
             return Ok(());
         }
         let weak = Arc::downgrade(self);
         let mut handles = Vec::with_capacity(worker_count);
         let per_worker_capacity = self
             .config
-            .experimental_async_ingest_queue_capacity
+            .ingest_buffer_capacity
             .div_ceil(worker_count)
             .max(1);
         let mut commands = Vec::with_capacity(worker_count);
@@ -210,77 +193,23 @@ impl Ingestor {
             let (command_tx, command_rx) = mpsc::sync_channel(per_worker_capacity);
             let handle = thread::Builder::new()
                 .name(format!("canardstack-ingest-worker-{worker_idx}"))
-                .spawn(move || run_async_ingest_worker(command_rx, weak))
-                .context("spawn async ingest worker thread")?;
+                .spawn(move || run_transform_worker(command_rx, weak))
+                .context("spawn ingest transform worker thread")?;
             commands.push(command_tx);
             handles.push(handle);
         }
         tracing::info!(
-            event = "async_ingest_workers_started",
+            event = "ingest_topology_started",
             workers = worker_count,
-            queue_capacity = self.config.experimental_async_ingest_queue_capacity,
-            per_worker_queue_capacity = per_worker_capacity
+            buffer_capacity = self.config.ingest_buffer_capacity,
+            per_worker_buffer_capacity = per_worker_capacity
         );
-        *async_ingest = Some(AsyncIngestDispatcher {
+        *topology = Some(IngestTopologyDispatcher {
             commands,
             handles,
             next_worker: 0,
         });
         Ok(())
-    }
-
-    pub fn request_flush(&self) -> bool {
-        let mut requested = self.flush_signal.requested.lock_or_poisoned();
-        let already_requested = *requested;
-        *requested = true;
-        if !already_requested {
-            self.flush_signal.ready.notify_one();
-        }
-        already_requested
-    }
-
-    fn request_flush_observed(&self, triggered_by: Signal, metrics: &Metrics) {
-        let started = Instant::now();
-        let already_requested = self.request_flush();
-        let status = if already_requested {
-            "coalesced"
-        } else {
-            "queued"
-        };
-        metrics.inc(
-            "canardstack_ingest_flush_requests_total",
-            &[("triggered_by", triggered_by.as_str())],
-            1,
-        );
-        metrics.inc(
-            "canardstack_ingest_flush_request_events_total",
-            &[("triggered_by", triggered_by.as_str()), ("status", status)],
-            1,
-        );
-        metrics.observe_seconds(
-            "canardstack_phase_duration_seconds",
-            &[
-                ("signal", triggered_by.as_str()),
-                ("phase", "flush_request"),
-                ("status", status),
-            ],
-            started.elapsed().as_secs_f64(),
-        );
-    }
-
-    pub fn wait_for_flush_or_timeout(&self, timeout: Duration, stop: &AtomicBool) -> bool {
-        let mut requested = self.flush_signal.requested.lock_or_poisoned();
-        if !*requested && !stop.load(Ordering::SeqCst) {
-            let (guard, _) = self
-                .flush_signal
-                .ready
-                .wait_timeout(requested, timeout)
-                .unwrap_or_else(|e| e.into_inner());
-            requested = guard;
-        }
-        let was_requested = *requested;
-        *requested = false;
-        was_requested
     }
 
     pub fn ingest(
@@ -294,8 +223,19 @@ impl Ingestor {
     ) -> ApiResult<Value> {
         let async_metrics = Arc::clone(&metrics);
         let metrics = metrics.as_ref();
-        validation::validate_body_size(compressed_body.len(), &self.config)?;
-        validation::validate_content_type(headers)?;
+        if let Err(err) = validation::validate_body_size(compressed_body.len(), &self.config) {
+            metrics.ingest_request(signal, err.status, err.reason);
+            return Err(err);
+        }
+        if let Err(err) = validation::validate_content_type(headers) {
+            metrics.ingest_request(signal, err.status, err.reason);
+            return Err(err);
+        }
+        if let Err(err) = self.validate_request_payload(signal, headers, &compressed_body, metrics)
+        {
+            metrics.ingest_request(signal, err.status, err.reason);
+            return Err(err);
+        }
         if !storage.accepts_memory_ingest() || self.config.force_dependency_unhealthy {
             metrics.ingest_request(signal, 503, "dependency_unhealthy");
             return Err(ApiError::new(
@@ -315,7 +255,6 @@ impl Ingestor {
         ) {
             Ok(reservation) => reservation,
             Err(err) => {
-                self.request_flush_observed(signal, metrics);
                 self.record_queue_metrics(metrics);
                 metrics.ingest_request(signal, err.status, err.reason);
                 return Err(err);
@@ -354,11 +293,7 @@ impl Ingestor {
             runtime_memory_reservation,
             metrics: async_metrics,
         };
-        if self.async_ingest_enabled() {
-            return self.dispatch_async_ingest(spooled, metrics);
-        }
-
-        self.process_spooled_ingest(spooled, true)
+        self.dispatch_topology_work(spooled, metrics)
     }
 
     fn process_spooled_ingest(
@@ -390,12 +325,6 @@ impl Ingestor {
             Ok(body) => body,
             Err(err) => {
                 self.release_queue_credit_reservation(&mut queue_credit_reservation);
-                self.checkpoint_raw_spool_terminal(
-                    raw_spool_ref,
-                    signal,
-                    "decompress_rejected",
-                    metrics,
-                )?;
                 if record_request_status {
                     metrics.ingest_request(signal, err.status, err.reason);
                 }
@@ -408,12 +337,6 @@ impl Ingestor {
         };
         if let Err(err) = validation::validate_body_size(body.len(), &self.config) {
             self.release_queue_credit_reservation(&mut queue_credit_reservation);
-            self.checkpoint_raw_spool_terminal(
-                raw_spool_ref,
-                signal,
-                "decoded_size_rejected",
-                metrics,
-            )?;
             if record_request_status {
                 metrics.ingest_request(signal, err.status, err.reason);
             }
@@ -434,12 +357,6 @@ impl Ingestor {
             Ok(transformed) => transformed,
             Err(err) => {
                 self.release_queue_credit_reservation(&mut queue_credit_reservation);
-                self.checkpoint_raw_spool_terminal(
-                    raw_spool_ref,
-                    signal,
-                    "transform_rejected",
-                    metrics,
-                )?;
                 if record_request_status {
                     metrics.ingest_request(signal, err.status, err.reason);
                 }
@@ -466,12 +383,6 @@ impl Ingestor {
         );
         if let Err(err) = skew_result {
             self.release_queue_credit_reservation(&mut queue_credit_reservation);
-            self.checkpoint_raw_spool_terminal(
-                raw_spool_ref,
-                signal,
-                "timestamp_rejected",
-                metrics,
-            )?;
             if record_request_status {
                 metrics.ingest_request(signal, err.status, err.reason);
             }
@@ -481,14 +392,12 @@ impl Ingestor {
         let request_bytes = compressed_body.len();
         let unsupported_histograms = transformed.unsupported_histograms;
         let mut batches = queue::pending_batches(transformed);
-        let enqueued_totals = pending_batch_totals(&batches);
+        let buffered_totals = pending_batch_totals(&batches);
         let exact_queue_credits = admission::credit_bytes_by_signal(&batches);
         if let Err(err) =
             self.adjust_queue_credit_reservation(&mut queue_credit_reservation, exact_queue_credits)
         {
             self.release_queue_credit_reservation(&mut queue_credit_reservation);
-            self.checkpoint_raw_spool_terminal(raw_spool_ref, signal, "queue_rejected", metrics)?;
-            self.request_flush_observed(signal, metrics);
             self.record_queue_metrics(metrics);
             if record_request_status {
                 metrics.ingest_request(signal, err.status, err.reason);
@@ -501,7 +410,6 @@ impl Ingestor {
             .saturating_add(pending_bytes);
         if let Err(err) = runtime_memory_reservation.reserve_at_least(peak_bytes, signal, metrics) {
             self.release_queue_credit_reservation(&mut queue_credit_reservation);
-            self.checkpoint_raw_spool_terminal(raw_spool_ref, signal, "memory_rejected", metrics)?;
             if record_request_status {
                 metrics.ingest_request(signal, err.status, err.reason);
             }
@@ -513,85 +421,22 @@ impl Ingestor {
         } else {
             self.track_raw_spool_batches(raw_spool_ref, signal, &mut batches);
         }
-        if self.storage_sink_enabled() {
-            let accepted = enqueued_totals
-                .values()
-                .map(|(rows, _)| *rows)
-                .sum::<usize>();
-            let sets = storage_sink_sets(batches);
-            if let Err(err) =
-                self.dispatch_storage_sink(signal, sets, metrics, &mut queue_credit_reservation)
-            {
-                self.untrack_raw_spool_record(raw_spool_ref);
-                self.release_queue_credit_reservation(&mut queue_credit_reservation);
-                self.checkpoint_raw_spool_terminal(
-                    raw_spool_ref,
-                    signal,
-                    "vector_storage_sink_rejected",
-                    metrics,
-                )?;
-                self.record_queue_metrics(metrics);
-                if record_request_status {
-                    metrics.ingest_request(signal, err.status, err.reason);
-                }
-                return Err(err);
-            }
-            queue_credit_reservation.commit_to_queue();
-            if record_request_status {
-                metrics.ingest_request(signal, 202, "accepted");
-            }
-            self.record_accepted_body_metrics(
-                signal,
-                &headers,
-                request_bytes,
-                body.len(),
-                decoded_body_materialized_bytes,
-                metrics,
-            );
-            metrics.inc(
-                "canardstack_ingest_records_total",
-                &[("signal", signal.as_str())],
-                accepted as u64,
-            );
-            for (output_signal, (rows, bytes)) in enqueued_totals {
-                metrics.inc(
-                    "canardstack_ingest_enqueued_rows_total",
-                    &[("signal", output_signal.as_str())],
-                    rows as u64,
-                );
-                metrics.inc(
-                    "canardstack_ingest_enqueued_bytes_total",
-                    &[("signal", output_signal.as_str())],
-                    bytes as u64,
-                );
-            }
+        let accepted = buffered_totals
+            .values()
+            .map(|(rows, _)| *rows)
+            .sum::<usize>();
+        let sets = storage_sink_sets(batches);
+        if let Err(err) =
+            self.dispatch_storage_sink(signal, sets, metrics, &mut queue_credit_reservation)
+        {
+            self.untrack_raw_spool_record(raw_spool_ref);
+            self.release_queue_credit_reservation(&mut queue_credit_reservation);
             self.record_queue_metrics(metrics);
-            return Ok(json!({
-                "accepted": true,
-                "records": accepted,
-                "acknowledgement": "locally_spooled_vector_storage_sink",
-                "unsupported_histograms": unsupported_histograms
-            }));
-        }
-        let accepted = match self.enqueue(signal, batches, metrics) {
-            Ok(accepted) => accepted,
-            Err(err) => {
-                self.untrack_raw_spool_record(raw_spool_ref);
-                self.release_queue_credit_reservation(&mut queue_credit_reservation);
-                self.checkpoint_raw_spool_terminal(
-                    raw_spool_ref,
-                    signal,
-                    "queue_rejected",
-                    metrics,
-                )?;
-                self.record_queue_metrics(metrics);
-                if record_request_status {
-                    metrics.ingest_request(signal, err.status, err.reason);
-                }
-                return Err(err);
+            if record_request_status {
+                metrics.ingest_request(signal, err.status, err.reason);
             }
-        };
-        queue_credit_reservation.commit_to_queue();
+            return Err(err);
+        }
         if record_request_status {
             metrics.ingest_request(signal, 202, "accepted");
         }
@@ -608,14 +453,14 @@ impl Ingestor {
             &[("signal", signal.as_str())],
             accepted as u64,
         );
-        for (output_signal, (rows, bytes)) in enqueued_totals {
+        for (output_signal, (rows, bytes)) in buffered_totals {
             metrics.inc(
-                "canardstack_ingest_enqueued_rows_total",
+                "canardstack_ingest_buffered_rows_total",
                 &[("signal", output_signal.as_str())],
                 rows as u64,
             );
             metrics.inc(
-                "canardstack_ingest_enqueued_bytes_total",
+                "canardstack_ingest_buffered_bytes_total",
                 &[("signal", output_signal.as_str())],
                 bytes as u64,
             );
@@ -625,17 +470,9 @@ impl Ingestor {
         Ok(json!({
             "accepted": true,
             "records": accepted,
-            "acknowledgement": "locally_spooled_pending_periodic_sync",
+            "acknowledgement": "locally_spooled_storage_sink",
             "unsupported_histograms": unsupported_histograms
         }))
-    }
-
-    fn async_ingest_enabled(&self) -> bool {
-        self.async_ingest.lock_or_poisoned().is_some()
-    }
-
-    fn storage_sink_enabled(&self) -> bool {
-        self.storage_sink.lock_or_poisoned().is_some()
     }
 
     fn dispatch_storage_sink(
@@ -657,48 +494,64 @@ impl Ingestor {
             let Some(dispatcher) = storage_sink.as_ref() else {
                 return Err(ApiError::new(
                     503,
-                    "vector_storage_sink_unavailable",
-                    "vector storage sink is not available",
+                    "storage_sink_unavailable",
+                    "storage sink is not available",
                 )
                 .with_retry_after(5));
             };
             let Some(commands) = dispatcher.commands.as_ref() else {
                 return Err(ApiError::new(
                     503,
-                    "vector_storage_sink_unavailable",
-                    "vector storage sink is stopped",
+                    "storage_sink_unavailable",
+                    "storage sink is stopped",
                 )
                 .with_retry_after(5));
             };
-            commands.send(work)
+            commands.try_send(work)
         };
         match result {
             Ok(()) => {
+                self.release_queue_credit_reservation(queue_credit_reservation);
                 metrics.inc(
-                    "canardstack_vector_storage_sink_requests_total",
+                    "canardstack_storage_sink_requests_total",
                     &[("signal", request_signal.as_str()), ("status", "queued")],
                     1,
                 );
                 Ok(())
             }
-            Err(err) => {
+            Err(TrySendError::Full(work)) => {
                 self.release_queue_credit_reservation(queue_credit_reservation);
-                let work = err.0;
                 self.untrack_storage_sink_work(&work);
                 metrics.inc(
-                    "canardstack_vector_storage_sink_requests_total",
+                    "canardstack_storage_sink_requests_total",
+                    &[
+                        ("signal", request_signal.as_str()),
+                        ("status", "buffer_full"),
+                    ],
+                    1,
+                );
+                Err(ApiError::new(
+                    429,
+                    "storage_sink_buffer_full",
+                    "storage sink buffer is full",
+                )
+                .with_retry_after(5))
+            }
+            Err(TrySendError::Disconnected(work)) => {
+                self.release_queue_credit_reservation(queue_credit_reservation);
+                self.untrack_storage_sink_work(&work);
+                metrics.inc(
+                    "canardstack_storage_sink_requests_total",
                     &[
                         ("signal", request_signal.as_str()),
                         ("status", "disconnected"),
                     ],
                     1,
                 );
-                Err(ApiError::new(
-                    503,
-                    "vector_storage_sink_unavailable",
-                    "vector storage sink is stopped",
+                Err(
+                    ApiError::new(503, "storage_sink_unavailable", "storage sink is stopped")
+                        .with_retry_after(5),
                 )
-                .with_retry_after(5))
             }
         }
     }
@@ -715,28 +568,27 @@ impl Ingestor {
         }
     }
 
-    fn dispatch_async_ingest(
+    fn dispatch_topology_work(
         &self,
         work: SpooledIngestWork,
         metrics: &Metrics,
     ) -> ApiResult<Value> {
         let signal = work.signal;
-        let raw_spool_ref = work.raw_spool_ref;
         let send_result = {
-            let mut async_ingest = self.async_ingest.lock_or_poisoned();
-            let Some(dispatcher) = async_ingest.as_mut() else {
+            let mut topology = self.topology.lock_or_poisoned();
+            let Some(dispatcher) = topology.as_mut() else {
                 return Err(ApiError::new(
                     503,
-                    "async_ingest_unavailable",
-                    "async ingest workers are not available",
+                    "ingest_topology_unavailable",
+                    "ingest topology workers are not available",
                 )
                 .with_retry_after(5));
             };
             if dispatcher.commands.is_empty() {
                 return Err(ApiError::new(
                     503,
-                    "async_ingest_unavailable",
-                    "async ingest workers are stopped",
+                    "ingest_topology_unavailable",
+                    "ingest topology workers are stopped",
                 )
                 .with_retry_after(5));
             }
@@ -748,7 +600,7 @@ impl Ingestor {
                 match dispatcher.commands[worker_idx].try_send(work) {
                     Ok(()) => {
                         dispatcher.next_worker = worker_idx.wrapping_add(1);
-                        return self.async_ingest_queued(signal, metrics);
+                        return self.topology_work_queued(signal, metrics);
                     }
                     Err(TrySendError::Full(returned)) => {
                         work = returned;
@@ -770,63 +622,48 @@ impl Ingestor {
             Err(TrySendError::Full(work)) => {
                 let mut queue_credit_reservation = work.queue_credit_reservation;
                 self.release_queue_credit_reservation(&mut queue_credit_reservation);
-                self.checkpoint_raw_spool_terminal(
-                    raw_spool_ref,
-                    signal,
-                    "async_queue_rejected",
-                    metrics,
-                )?;
-                self.request_flush_observed(signal, metrics);
                 self.record_queue_metrics(metrics);
-                metrics.ingest_request(signal, 429, "async_ingest_queue_full");
+                metrics.ingest_request(signal, 429, "ingest_buffer_full");
                 metrics.inc(
-                    "canardstack_async_ingest_requests_total",
-                    &[("signal", signal.as_str()), ("status", "queue_full")],
+                    "canardstack_ingest_topology_requests_total",
+                    &[("signal", signal.as_str()), ("status", "buffer_full")],
                     1,
                 );
-                Err(ApiError::new(
-                    429,
-                    "async_ingest_queue_full",
-                    "async ingest worker queue is full",
+                Err(
+                    ApiError::new(429, "ingest_buffer_full", "ingest worker buffer is full")
+                        .with_retry_after(5),
                 )
-                .with_retry_after(5))
             }
             Err(TrySendError::Disconnected(work)) => {
                 let mut queue_credit_reservation = work.queue_credit_reservation;
                 self.release_queue_credit_reservation(&mut queue_credit_reservation);
-                self.checkpoint_raw_spool_terminal(
-                    raw_spool_ref,
-                    signal,
-                    "async_worker_stopped",
-                    metrics,
-                )?;
-                metrics.ingest_request(signal, 503, "async_ingest_unavailable");
+                metrics.ingest_request(signal, 503, "ingest_topology_unavailable");
                 metrics.inc(
-                    "canardstack_async_ingest_requests_total",
+                    "canardstack_ingest_topology_requests_total",
                     &[("signal", signal.as_str()), ("status", "disconnected")],
                     1,
                 );
                 Err(ApiError::new(
                     503,
-                    "async_ingest_unavailable",
-                    "async ingest workers are stopped",
+                    "ingest_topology_unavailable",
+                    "ingest topology workers are stopped",
                 )
                 .with_retry_after(5))
             }
         }
     }
 
-    fn async_ingest_queued(&self, signal: Signal, metrics: &Metrics) -> ApiResult<Value> {
+    fn topology_work_queued(&self, signal: Signal, metrics: &Metrics) -> ApiResult<Value> {
         metrics.ingest_request(signal, 202, "accepted");
         metrics.inc(
-            "canardstack_async_ingest_requests_total",
+            "canardstack_ingest_topology_requests_total",
             &[("signal", signal.as_str()), ("status", "queued")],
             1,
         );
         Ok(json!({
             "accepted": true,
             "records": 0,
-            "acknowledgement": "locally_spooled_async_processing",
+            "acknowledgement": "locally_spooled_topology_handoff",
             "unsupported_histograms": 0
         }))
     }
@@ -862,15 +699,6 @@ impl Ingestor {
         )
     }
 
-    fn reserve_queue_credit_exact(
-        &self,
-        bytes_by_signal: BTreeMap<Signal, usize>,
-    ) -> ApiResult<admission::QueueCreditReservation> {
-        self.queue_credits
-            .lock_or_poisoned()
-            .reserve_exact(bytes_by_signal)
-    }
-
     fn adjust_queue_credit_reservation(
         &self,
         reservation: &mut admission::QueueCreditReservation,
@@ -888,25 +716,6 @@ impl Ingestor {
         self.queue_credits
             .lock_or_poisoned()
             .release_reservation(reservation);
-    }
-
-    fn release_queue_credits_for_batches(
-        &self,
-        sets: &[(queue::QueueKey, Vec<queue::QueuedBatch>)],
-    ) {
-        let mut bytes_by_signal = BTreeMap::<Signal, usize>::new();
-        for (key, batches) in sets {
-            for batch in batches {
-                if batch.len() > 0 {
-                    *bytes_by_signal.entry(key.signal).or_default() += batch.credit_bytes;
-                }
-            }
-        }
-        if !bytes_by_signal.is_empty() {
-            self.queue_credits
-                .lock_or_poisoned()
-                .release_bytes(&bytes_by_signal);
-        }
     }
 
     fn admit_runtime_memory(
@@ -936,30 +745,35 @@ impl Ingestor {
     }
 
     pub fn snapshots(&self) -> Vec<IngestSnapshot> {
-        let queues = self.queues.lock_or_poisoned();
-        let mut snapshots = queue::snapshots(&queues, &self.config);
-        drop(queues);
-
         let credit_snapshots = self.queue_credits.lock_or_poisoned().snapshots();
-        for snapshot in &mut snapshots {
-            let Some((_, credit)) = credit_snapshots
-                .iter()
-                .find(|(signal, _)| signal.as_str() == snapshot.signal)
-            else {
-                continue;
-            };
-            snapshot.queue_credit_reserved_bytes = credit.reserved_bytes;
-            snapshot.queue_credit_available_bytes = credit.available_bytes;
-            snapshot.queue_credit_capacity_bytes = credit.capacity_bytes;
-            snapshot.queue_credit_closed = credit.closed;
-            snapshot.flush_debt_seconds = credit.flush_debt_seconds;
-            snapshot.pressure = if credit.capacity_bytes == 0 {
-                0.0
-            } else {
-                credit.reserved_bytes as f64 / credit.capacity_bytes as f64
-            };
-        }
-        snapshots
+        Signal::ALL
+            .into_iter()
+            .map(|signal| {
+                let credit = credit_snapshots.get(&signal);
+                let reserved = credit.map(|c| c.reserved_bytes).unwrap_or_default();
+                let capacity = credit
+                    .map(|c| c.capacity_bytes)
+                    .unwrap_or(self.config.per_signal_queue_bytes);
+                IngestSnapshot {
+                    signal: signal.as_str(),
+                    buffered_rows: 0,
+                    buffered_bytes: reserved,
+                    queue_credit_reserved_bytes: reserved,
+                    queue_credit_available_bytes: credit
+                        .map(|c| c.available_bytes)
+                        .unwrap_or(capacity.saturating_sub(reserved)),
+                    queue_credit_capacity_bytes: capacity,
+                    queue_credit_closed: credit.map(|c| c.closed).unwrap_or(false),
+                    visibility_debt_seconds: credit.map(|c| c.flush_debt_seconds).unwrap_or(0.0),
+                    oldest_age_seconds: 0.0,
+                    pressure: if capacity == 0 {
+                        0.0
+                    } else {
+                        reserved as f64 / capacity as f64
+                    },
+                }
+            })
+            .collect()
     }
 
     pub fn record_queue_metrics(&self, metrics: &Metrics) {
@@ -967,22 +781,22 @@ impl Ingestor {
             metrics.gauge(
                 "canardstack_ingest_queue_rows",
                 &[("signal", snapshot.signal)],
-                snapshot.queued_rows as f64,
+                snapshot.buffered_rows as f64,
             );
             metrics.gauge_max(
                 "canardstack_ingest_queue_rows_max",
                 &[("signal", snapshot.signal)],
-                snapshot.queued_rows as f64,
+                snapshot.buffered_rows as f64,
             );
             metrics.gauge(
                 "canardstack_ingest_queue_bytes",
                 &[("signal", snapshot.signal)],
-                snapshot.queued_bytes as f64,
+                snapshot.buffered_bytes as f64,
             );
             metrics.gauge_max(
                 "canardstack_ingest_queue_bytes_max",
                 &[("signal", snapshot.signal)],
-                snapshot.queued_bytes as f64,
+                snapshot.buffered_bytes as f64,
             );
             metrics.gauge(
                 "canardstack_ingest_queue_oldest_age_seconds",
@@ -1029,9 +843,9 @@ impl Ingestor {
                 },
             );
             metrics.gauge(
-                "canardstack_ingest_flush_debt_seconds",
+                "canardstack_ingest_visibility_debt_seconds",
                 &[("signal", snapshot.signal)],
-                snapshot.flush_debt_seconds,
+                snapshot.visibility_debt_seconds,
             );
         }
     }
@@ -1062,38 +876,7 @@ impl Ingestor {
     }
 
     fn max_oldest_queue_age_seconds(&self) -> f64 {
-        let queues = self.queues.lock_or_poisoned();
-        queue::snapshots(&queues, &self.config)
-            .into_iter()
-            .map(|snapshot| snapshot.oldest_age_seconds)
-            .fold(0.0, f64::max)
-    }
-
-    fn enqueue(
-        &self,
-        request_signal: Signal,
-        batches: Vec<queue::PendingBatch>,
-        metrics: &Metrics,
-    ) -> ApiResult<usize> {
-        if batches.is_empty() {
-            return Ok(0);
-        }
-        let started = Instant::now();
-        let queue_result = {
-            let mut queues = self.queues.lock_or_poisoned();
-            admission::admit_and_enqueue(&mut queues, batches, &self.config)
-        };
-        metrics.observe_phase_seconds(
-            request_signal.as_str(),
-            "queue_admission",
-            None,
-            started.elapsed().as_secs_f64(),
-        );
-        let queue_result = queue_result?;
-        if queue_result.should_request_flush {
-            self.request_flush_observed(request_signal, metrics);
-        }
-        Ok(queue_result.accepted)
+        0.0
     }
 
     fn record_accepted_body_metrics(
@@ -1138,9 +921,41 @@ impl Ingestor {
         }
         Ok(())
     }
+
+    fn validate_request_payload(
+        &self,
+        signal: Signal,
+        headers: &HashMap<String, String>,
+        compressed_body: &[u8],
+        metrics: &Metrics,
+    ) -> ApiResult<()> {
+        let started = Instant::now();
+        let body = otlp::decompress_if_needed(headers, compressed_body, self.config.max_body_bytes);
+        metrics.observe_phase_seconds(
+            signal.as_str(),
+            "request_validation_decompress",
+            None,
+            started.elapsed().as_secs_f64(),
+        );
+        let body = body?;
+        validation::validate_body_size(body.len(), &self.config)?;
+
+        let started = Instant::now();
+        #[cfg(feature = "otlp2records-observer")]
+        let transformed = otlp::transform_observed(signal, headers, &body, metrics)?;
+        #[cfg(not(feature = "otlp2records-observer"))]
+        let transformed = otlp::transform(signal, headers, &body)?;
+        metrics.observe_phase_seconds(
+            signal.as_str(),
+            "request_validation_transform",
+            None,
+            started.elapsed().as_secs_f64(),
+        );
+        self.validate_skew(&transformed)
+    }
 }
 
-fn run_async_ingest_worker(receiver: mpsc::Receiver<SpooledIngestWork>, ingestor: Weak<Ingestor>) {
+fn run_transform_worker(receiver: mpsc::Receiver<SpooledIngestWork>, ingestor: Weak<Ingestor>) {
     loop {
         let work = receiver.recv();
         let Ok(work) = work else {
@@ -1156,31 +971,31 @@ fn run_async_ingest_worker(receiver: mpsc::Receiver<SpooledIngestWork>, ingestor
         match result {
             Ok(_) => {
                 metrics.inc(
-                    "canardstack_async_ingest_completed_total",
+                    "canardstack_ingest_transform_completed_total",
                     &[("signal", signal.as_str()), ("status", "ok")],
                     1,
                 );
                 metrics.observe_phase_seconds(
                     signal.as_str(),
-                    "async_ingest_worker",
+                    "ingest_transform_worker",
                     Some("ok"),
                     started.elapsed().as_secs_f64(),
                 );
             }
             Err(err) => {
                 metrics.inc(
-                    "canardstack_async_ingest_completed_total",
+                    "canardstack_ingest_transform_completed_total",
                     &[("signal", signal.as_str()), ("status", err.reason)],
                     1,
                 );
                 metrics.observe_phase_seconds(
                     signal.as_str(),
-                    "async_ingest_worker",
+                    "ingest_transform_worker",
                     Some("error"),
                     started.elapsed().as_secs_f64(),
                 );
                 tracing::warn!(
-                    event = "async_ingest_worker_failed",
+                    event = "ingest_transform_worker_failed",
                     signal = signal.as_str(),
                     status = err.status,
                     reason = err.reason,
@@ -1202,10 +1017,20 @@ fn run_storage_sink_worker(
             return;
         };
         let mut works = vec![first];
-        while works.len() < ingestor.config.raw_spool_group_commit_records {
-            match receiver.try_recv() {
-                Ok(work) => works.push(work),
-                Err(_) => break,
+        let mut rows = storage_sink_work_rows(&works[0]);
+        let flush_by = Instant::now() + ingestor.config.storage_sink_flush_interval;
+        while rows < ingestor.config.storage_sink_batch_rows {
+            let timeout = flush_by.saturating_duration_since(Instant::now());
+            if timeout.is_zero() {
+                break;
+            }
+            match receiver.recv_timeout(timeout) {
+                Ok(work) => {
+                    rows = rows.saturating_add(storage_sink_work_rows(&work));
+                    works.push(work);
+                }
+                Err(RecvTimeoutError::Timeout) => break,
+                Err(RecvTimeoutError::Disconnected) => break,
             }
         }
         let started = Instant::now();
@@ -1213,35 +1038,33 @@ fn run_storage_sink_worker(
         match result {
             Ok(()) => {
                 for work in works {
-                    ingestor.release_queue_credits_for_batches(&work.sets);
                     if let Err(err) = ingestor
                         .mark_raw_spool_batches_storage_committed(&work.sets, Some(&metrics))
                     {
                         tracing::error!(
-                            event = "vector_storage_sink_checkpoint_failed",
+                            event = "storage_sink_checkpoint_failed",
                             signal = work.request_signal.as_str(),
                             error = %err
                         );
                     }
                     metrics.inc(
-                        "canardstack_vector_storage_sink_completed_total",
+                        "canardstack_storage_sink_completed_total",
                         &[("signal", work.request_signal.as_str()), ("status", "ok")],
                         1,
                     );
                 }
                 metrics.observe_phase_seconds(
                     "all",
-                    "vector_storage_sink_worker",
+                    "storage_sink_worker",
                     Some("ok"),
                     started.elapsed().as_secs_f64(),
                 );
             }
             Err(err) => {
                 for work in works {
-                    ingestor.release_queue_credits_for_batches(&work.sets);
                     ingestor.untrack_storage_sink_work(&work);
                     metrics.inc(
-                        "canardstack_vector_storage_sink_completed_total",
+                        "canardstack_storage_sink_completed_total",
                         &[
                             ("signal", work.request_signal.as_str()),
                             ("status", "storage_error"),
@@ -1251,14 +1074,22 @@ fn run_storage_sink_worker(
                 }
                 metrics.observe_phase_seconds(
                     "all",
-                    "vector_storage_sink_worker",
+                    "storage_sink_worker",
                     Some("error"),
                     started.elapsed().as_secs_f64(),
                 );
-                tracing::error!(event = "vector_storage_sink_failed", error = %err);
+                tracing::error!(event = "storage_sink_failed", error = %err);
             }
         }
     }
+}
+
+fn storage_sink_work_rows(work: &StorageSinkWork) -> usize {
+    work.sets
+        .iter()
+        .flat_map(|(_, batches)| batches)
+        .map(queue::QueuedBatch::len)
+        .sum()
 }
 
 fn insert_storage_sink_work(
@@ -1284,7 +1115,7 @@ fn insert_storage_sink_work(
         .collect::<Vec<_>>();
     metrics.observe_phase_seconds(
         "all",
-        "vector_storage_sink_insert_prepare",
+        "storage_sink_insert_prepare",
         None,
         insert_prepare_started.elapsed().as_secs_f64(),
     );
@@ -1296,7 +1127,7 @@ fn insert_storage_sink_work(
     let result = storage.insert_arrow_batches(&inserts)?;
     metrics.observe_phase_seconds(
         "all",
-        "vector_storage_sink_insert",
+        "storage_sink_insert",
         None,
         insert_started.elapsed().as_secs_f64(),
     );
@@ -1304,10 +1135,10 @@ fn insert_storage_sink_work(
     record_storage_sink_success_metrics(works, metrics);
 
     let seal_started = Instant::now();
-    let immutable = storage.flush_immutable_segments(false)?;
+    let immutable = storage.flush_immutable_segments(true)?;
     metrics.observe_phase_seconds(
         "all",
-        "vector_storage_sink_seal",
+        "storage_sink_seal",
         None,
         seal_started.elapsed().as_secs_f64(),
     );
@@ -1332,17 +1163,17 @@ fn record_storage_sink_success_metrics(works: &[StorageSinkWork], metrics: &Metr
     }
     for (signal, (rows, bytes)) in by_signal {
         metrics.inc(
-            "canardstack_ingest_flush_rows_total",
+            "canardstack_storage_sink_rows_total",
             &[("signal", signal.as_str())],
             rows,
         );
         metrics.inc(
-            "canardstack_ingest_flush_buffered_rows_total",
+            "canardstack_storage_sink_buffered_rows_total",
             &[("signal", signal.as_str())],
             rows,
         );
         metrics.inc(
-            "canardstack_ingest_flush_buffered_bytes_total",
+            "canardstack_storage_sink_buffered_bytes_total",
             &[("signal", signal.as_str())],
             bytes,
         );
@@ -1365,12 +1196,12 @@ fn observe_storage_sink_immutable_flush(metrics: &Metrics, outcome: &ImmutableFl
         return;
     }
     metrics.inc(
-        "canardstack_vector_storage_sink_sealed_rows_total",
+        "canardstack_storage_sink_sealed_rows_total",
         &[("signal", "all")],
         outcome.sealed_rows as u64,
     );
     metrics.inc(
-        "canardstack_vector_storage_sink_sealed_files_total",
+        "canardstack_storage_sink_sealed_files_total",
         &[("signal", "all")],
         outcome.sealed_files as u64,
     );

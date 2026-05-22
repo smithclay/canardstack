@@ -288,30 +288,12 @@ fn run_flush_with_lane(
     triggered_by: &'static str,
     options: crate::maintenance::FlushOptions<'_>,
 ) -> Result<Value, ApiError> {
-    let before = state.ingestor.total_reserved_queue_bytes();
-    let mut guard = state.lanes.reserve_flush(&state.metrics)?;
+    let guard = state.lanes.reserve_flush(&state.metrics)?;
     let result = state
         .maintenance
-        .run_flush(&state.ingestor, &state.storage, &state.metrics, options)
-        .map_err(|err| {
-            if let Some((partial_signal, committed)) = crate::ingest::partial_commit_info(&err) {
-                if committed > 0 {
-                    state.metrics.inc(
-                        "canardstack_ingest_partial_commit_rows_total",
-                        &[
-                            ("signal", partial_signal.as_str()),
-                            ("triggered_by", triggered_by),
-                        ],
-                        committed as u64,
-                    );
-                }
-            }
-            storage_error(err)
-        });
-    if result.is_ok() {
-        let after = state.ingestor.total_reserved_queue_bytes();
-        guard.record_bytes(before.saturating_sub(after));
-    }
+        .run_flush(&state.storage, &state.metrics, options)
+        .map_err(storage_error);
+    let _ = triggered_by;
     guard.finish(&state.metrics);
     result
 }

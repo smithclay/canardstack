@@ -453,6 +453,20 @@ pub(super) fn handle_append_batch(
     let wait_seconds = collect_started.elapsed().as_secs_f64();
     match spool.append_prepared_batch(records) {
         Ok(mut appended) => {
+            match spool.sync_append_if_due(true) {
+                Ok(Some(sync)) => {
+                    appended.stats.fsync_seconds = sync.seconds;
+                    appended.stats.fsync_count = sync.file_count;
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    let message = err.to_string();
+                    for reply in replies {
+                        let _ = reply.send(Err(anyhow::anyhow!(message.clone())));
+                    }
+                    return;
+                }
+            }
             appended.stats.queue_seconds = queue_seconds;
             appended.stats.wait_seconds = wait_seconds;
             appended.stats.max_pending_commands_at_enqueue = max_enqueue_depth.pending_commands;

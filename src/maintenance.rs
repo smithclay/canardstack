@@ -1,6 +1,6 @@
 use crate::app::AppState;
 use crate::config::Config;
-use crate::ingest::{IngestSnapshot, Ingestor};
+use crate::ingest::IngestSnapshot;
 use crate::metrics::Metrics;
 use crate::storage::{ArrowBatchInsertTiming, ImmutableFlushOutcome, RetentionPolicy, Storage};
 use crate::LockExt;
@@ -99,19 +99,17 @@ impl Maintenance {
                 "spans": self.retention.spans_days,
                 "metrics": self.retention.metrics_days
             },
-            "scheduler_jobs": ["watchdog", "flush", "metadata_refresh", "metrics_snapshot", "retention"]
+            "scheduler_jobs": ["metadata_refresh", "metrics_snapshot", "retention"]
         })
     }
 
     pub fn run_flush(
         &self,
-        ingestor: &Ingestor,
         storage: &Storage,
         metrics: &Metrics,
         options: FlushOptions<'_>,
     ) -> Result<Value> {
         let started = Instant::now();
-        let process_rows = ingestor.flush_all_with_metrics(storage, Some(metrics))?;
         let immutable = storage.flush_immutable_segments(options.force_immutable_segments)?;
         observe_phase_timings(metrics, &immutable.timings);
         observe_immutable_flush(metrics, &immutable);
@@ -125,7 +123,6 @@ impl Maintenance {
         self.record_run("flush");
         Ok(json!({
             "status": "ok",
-            "process_rows_flushed": process_rows,
             "immutable_segments": immutable.to_json(),
             "ducklake": ducklake,
             "duration_ms": started.elapsed().as_millis()
@@ -152,32 +149,6 @@ impl Maintenance {
             "retention": retention,
             "snapshot_expiration": snapshot_expiration,
             "cleanup": cleanup,
-            "duration_ms": started.elapsed().as_millis()
-        }))
-    }
-
-    pub fn run_watchdog(
-        &self,
-        ingestor: &Ingestor,
-        storage: &Storage,
-        metrics: &Metrics,
-    ) -> Result<Value> {
-        let started = Instant::now();
-        let flushed = ingestor.flush_due(storage, Some(metrics))?;
-        let immutable = storage.flush_immutable_segments(false)?;
-        observe_phase_timings(metrics, &immutable.timings);
-        observe_immutable_flush(metrics, &immutable);
-        if !flushed.is_empty() {
-            self.record_run("watchdog");
-        }
-        let by_signal: BTreeMap<String, usize> = flushed
-            .into_iter()
-            .map(|(s, n)| (s.as_str().to_string(), n))
-            .collect();
-        Ok(json!({
-            "status": "ok",
-            "flushed": by_signal,
-            "immutable_segments": immutable.to_json(),
             "duration_ms": started.elapsed().as_millis()
         }))
     }
@@ -274,16 +245,12 @@ impl Drop for Scheduler {
 }
 
 fn scheduler_loop(state: Arc<AppState>, stop: Arc<AtomicBool>) {
-    let watchdog_every = state.config.scheduler_watchdog_interval;
-    let flush_every = state.config.scheduler_flush_interval;
     let metadata_every = state.config.scheduler_metadata_interval;
     let metrics_every = state.config.scheduler_metrics_interval;
     let retention_every = state.config.scheduler_retention_interval;
-    let tick = watchdog_every
+    let tick = metadata_every
         .min(Duration::from_millis(500))
         .max(Duration::from_millis(10));
-    let mut next_watchdog = Instant::now();
-    let mut next_flush = Instant::now();
     let mut next_metadata = Instant::now() + metadata_every;
     let mut next_metrics = Instant::now() + metrics_every;
     let mut next_retention = Instant::now() + retention_every;
@@ -292,7 +259,7 @@ fn scheduler_loop(state: Arc<AppState>, stop: Arc<AtomicBool>) {
         if stop.load(Ordering::SeqCst) {
             return;
         }
-        let flush_requested = state.ingestor.wait_for_flush_or_timeout(tick, &stop);
+        thread::sleep(tick);
         if stop.load(Ordering::SeqCst) {
             return;
         }
@@ -300,18 +267,6 @@ fn scheduler_loop(state: Arc<AppState>, stop: Arc<AtomicBool>) {
 
         if state.maintenance.is_paused() {
             continue;
-        }
-
-        if flush_requested || now >= next_watchdog {
-            let ok = run_job(&state, "watchdog", run_watchdog_with_lane);
-            next_watchdog = now + next_interval(&state, "watchdog", watchdog_every, ok);
-        }
-
-        if now >= next_flush {
-            let ok = run_job(&state, "flush", |s| {
-                run_flush_with_lane(s, FlushOptions::default())
-            });
-            next_flush = now + next_interval(&state, "flush", flush_every, ok);
         }
 
         if now >= next_metadata {
@@ -350,41 +305,6 @@ fn scheduler_loop(state: Arc<AppState>, stop: Arc<AtomicBool>) {
     }
 }
 
-fn run_flush_with_lane(state: &AppState, options: FlushOptions<'_>) -> Result<Value> {
-    let before = state.ingestor.total_reserved_queue_bytes();
-    let mut guard = state
-        .lanes
-        .reserve_flush(&state.metrics)
-        .map_err(|err| anyhow::anyhow!("{}: {}", err.reason, err.message))?;
-    let result =
-        state
-            .maintenance
-            .run_flush(&state.ingestor, &state.storage, &state.metrics, options);
-    if result.is_ok() {
-        let after = state.ingestor.total_reserved_queue_bytes();
-        guard.record_bytes(before.saturating_sub(after));
-    }
-    guard.finish(&state.metrics);
-    result
-}
-
-fn run_watchdog_with_lane(state: &AppState) -> Result<Value> {
-    let before = state.ingestor.total_reserved_queue_bytes();
-    let mut guard = state
-        .lanes
-        .reserve_flush(&state.metrics)
-        .map_err(|err| anyhow::anyhow!("{}: {}", err.reason, err.message))?;
-    let result = state
-        .maintenance
-        .run_watchdog(&state.ingestor, &state.storage, &state.metrics);
-    if result.is_ok() {
-        let after = state.ingestor.total_reserved_queue_bytes();
-        guard.record_bytes(before.saturating_sub(after));
-    }
-    guard.finish(&state.metrics);
-    result
-}
-
 fn run_job<F>(state: &AppState, job: &'static str, f: F) -> bool
 where
     F: FnOnce(&AppState) -> Result<Value>,
@@ -398,15 +318,6 @@ where
             true
         }
         Err(err) => {
-            if let Some((partial_signal, committed)) = crate::ingest::partial_commit_info(&err) {
-                if committed > 0 {
-                    state.metrics.inc(
-                        "canardstack_ingest_partial_commit_rows_total",
-                        &[("signal", partial_signal.as_str()), ("triggered_by", job)],
-                        committed as u64,
-                    );
-                }
-            }
             let reason = classify_job_error(&err, job);
             let consecutive = state.maintenance.record_failure(job, reason);
             tracing::error!(
@@ -485,13 +396,13 @@ mod tests {
     fn snapshot(signal: &'static str, pressure: f64) -> IngestSnapshot {
         IngestSnapshot {
             signal,
-            queued_rows: 0,
-            queued_bytes: 0,
+            buffered_rows: 0,
+            buffered_bytes: 0,
             queue_credit_reserved_bytes: 0,
             queue_credit_available_bytes: 0,
             queue_credit_capacity_bytes: 0,
             queue_credit_closed: false,
-            flush_debt_seconds: 0.0,
+            visibility_debt_seconds: 0.0,
             oldest_age_seconds: 0.0,
             pressure,
         }

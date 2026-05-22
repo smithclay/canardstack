@@ -1,4 +1,4 @@
-use super::queue::{self, PendingBatch, QueueMap};
+use super::queue::PendingBatch;
 use super::Signal;
 use crate::config::Config;
 use crate::metrics::Metrics;
@@ -91,11 +91,6 @@ impl Drop for RuntimeMemoryReservation {
             self.reserved_bytes.fetch_sub(self.bytes, Ordering::AcqRel);
         }
     }
-}
-
-pub(super) struct QueueAdmission {
-    pub(super) accepted: usize,
-    pub(super) should_request_flush: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -356,41 +351,6 @@ impl QueueCreditLedger {
 pub(super) struct QueueCreditReservation {
     credits: BTreeMap<Signal, usize>,
     active: bool,
-}
-
-impl QueueCreditReservation {
-    pub(super) fn commit_to_queue(mut self) {
-        self.active = false;
-    }
-}
-
-pub(super) fn admit_and_enqueue(
-    queues: &mut QueueMap,
-    batches: Vec<PendingBatch>,
-    config: &Config,
-) -> ApiResult<QueueAdmission> {
-    let process_bytes = queue::process_bytes(queues);
-    let added_process_bytes = queue::added_process_bytes(&batches);
-    if process_bytes + added_process_bytes > config.process_ingest_bytes {
-        tracing::warn!(
-            event = "ingest_process_memory_full",
-            process_bytes,
-            incoming_bytes = added_process_bytes,
-            cap_bytes = config.process_ingest_bytes
-        );
-        return Err(ApiError::new(
-            429,
-            "process_ingest_memory_full",
-            "process ingest memory cap would be exceeded",
-        )
-        .with_retry_after(5));
-    }
-
-    let accepted = queue::enqueue_batches(queues, batches);
-    Ok(QueueAdmission {
-        accepted,
-        should_request_flush: queue::has_threshold_due_queue(queues, config),
-    })
 }
 
 pub(super) fn credit_bytes_by_signal(batches: &[PendingBatch]) -> BTreeMap<Signal, usize> {

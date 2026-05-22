@@ -2,16 +2,16 @@ use super::spool::{
     self, raw_spool_full_info, RawSpoolAppendBatchStats, RawSpoolCheckpointBatchStats,
     RawSpoolRecord, RawSpoolRecordId, RawSpoolWriter,
 };
-use super::{admission, all_signals, queue, Ingestor, Signal};
+use super::{all_signals, queue, Ingestor, Signal};
+use crate::lanes::LaneController;
 use crate::metrics::Metrics;
-use crate::otlp;
 use crate::storage::Storage;
 use crate::validation::{self, ApiError, ApiResult};
 use crate::LockExt;
 use anyhow::{Context, Result};
-use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::Instant;
 
 #[derive(Clone, Copy, Debug)]
@@ -26,8 +26,20 @@ pub(super) struct RawSpoolAppendRef {
     pub(super) id: RawSpoolRecordId,
 }
 
+struct RecoveredRawSpoolWork {
+    raw_spool_ref: RawSpoolAppendRef,
+    signal: Signal,
+    headers: HashMap<String, String>,
+    compressed_body: Vec<u8>,
+}
+
 impl Ingestor {
-    pub fn replay_raw_spool(&self, storage: &Storage, metrics: &Metrics) -> Result<usize> {
+    pub fn replay_raw_spool(
+        &self,
+        storage: &Storage,
+        lanes: &LaneController,
+        metrics: Arc<Metrics>,
+    ) -> Result<usize> {
         let mut replayed = 0usize;
         for signal in all_signals() {
             let pending = self
@@ -52,15 +64,18 @@ impl Ingestor {
                     1,
                 );
                 match self.ingest_replayed_raw_record(
-                    RawSpoolAppendRef {
-                        lane: signal,
-                        id: recovered.id,
+                    RecoveredRawSpoolWork {
+                        raw_spool_ref: RawSpoolAppendRef {
+                            lane: signal,
+                            id: recovered.id,
+                        },
+                        signal: recovered.record.signal,
+                        headers,
+                        compressed_body: recovered.record.compressed_body,
                     },
-                    recovered.record.signal,
-                    &headers,
-                    &recovered.record.compressed_body,
                     storage,
-                    metrics,
+                    lanes,
+                    metrics.clone(),
                 ) {
                     Ok(()) => {
                         replayed += 1;
@@ -87,70 +102,55 @@ impl Ingestor {
                 }
             }
         }
-        self.record_raw_spool_metrics(metrics);
+        self.record_raw_spool_metrics(metrics.as_ref());
         Ok(replayed)
     }
 
     fn ingest_replayed_raw_record(
         &self,
-        raw_spool_ref: RawSpoolAppendRef,
-        signal: Signal,
-        headers: &HashMap<String, String>,
-        compressed_body: &[u8],
+        recovered: RecoveredRawSpoolWork,
         storage: &Storage,
-        metrics: &Metrics,
+        lanes: &LaneController,
+        metrics: Arc<Metrics>,
     ) -> Result<()> {
+        let RecoveredRawSpoolWork {
+            raw_spool_ref,
+            signal,
+            headers,
+            compressed_body,
+        } = recovered;
         validation::validate_body_size(compressed_body.len(), &self.config)
             .map_err(|err| anyhow::anyhow!(err.message.clone()))?;
-        validation::validate_content_type(headers)
+        validation::validate_content_type(&headers)
             .map_err(|err| anyhow::anyhow!(err.message.clone()))?;
         if !storage.accepts_memory_ingest() || self.config.force_dependency_unhealthy {
             anyhow::bail!("storage dependency is unhealthy");
         }
-        let mut runtime_memory_reservation = self
-            .admit_runtime_memory(signal, headers, compressed_body.len(), metrics)
+        let queue_credit_reservation = self
+            .reserve_queue_credit_estimate(
+                signal,
+                &headers,
+                compressed_body.len(),
+                storage,
+                lanes,
+                metrics.as_ref(),
+            )
             .map_err(|err| anyhow::anyhow!(err.message.clone()))?;
-        let body = otlp::decompress_if_needed(headers, compressed_body, self.config.max_body_bytes)
+        let runtime_memory_reservation = self
+            .admit_runtime_memory(signal, &headers, compressed_body.len(), metrics.as_ref())
             .map_err(|err| anyhow::anyhow!(err.message.clone()))?;
-        let decoded_body_materialized_bytes = match &body {
-            Cow::Borrowed(_) => 0,
-            Cow::Owned(bytes) => bytes.len(),
+        let work = super::SpooledIngestWork {
+            signal,
+            headers: headers.clone(),
+            compressed_body,
+            raw_spool_ref,
+            queue_credit_reservation,
+            runtime_memory_reservation,
+            metrics: metrics.clone(),
         };
-        validation::validate_body_size(body.len(), &self.config)
-            .map_err(|err| anyhow::anyhow!(err.message.clone()))?;
-        #[cfg(feature = "otlp2records-observer")]
-        let transformed = otlp::transform_observed(signal, headers, &body, metrics)
-            .map_err(|err| anyhow::anyhow!(err.message.clone()))?;
-        #[cfg(not(feature = "otlp2records-observer"))]
-        let transformed = otlp::transform(signal, headers, &body)
-            .map_err(|err| anyhow::anyhow!(err.message.clone()))?;
-        self.validate_skew(&transformed)
-            .map_err(|err| anyhow::anyhow!(err.message.clone()))?;
-        let request_bytes = compressed_body.len();
-        let mut batches = queue::pending_batches(transformed);
-        let mut queue_credit_reservation = self
-            .reserve_queue_credit_exact(admission::credit_bytes_by_signal(&batches))
-            .map_err(|err| anyhow::anyhow!(err.message.clone()))?;
-        let pending_bytes = batches.iter().map(|b| b.approx_bytes).sum::<usize>();
-        let peak_bytes = request_bytes
-            .saturating_add(decoded_body_materialized_bytes)
-            .saturating_add(pending_bytes);
-        runtime_memory_reservation
-            .reserve_at_least(peak_bytes, signal, metrics)
-            .map_err(|err| anyhow::anyhow!(err.message.clone()))?;
-        if batches.is_empty() {
-            self.release_queue_credit_reservation(&mut queue_credit_reservation);
-            self.checkpoint_raw_spool(raw_spool_ref, signal, "replay_empty", Some(metrics))?;
-            return Ok(());
-        }
-        self.track_raw_spool_batches(raw_spool_ref, signal, &mut batches);
-        self.enqueue(signal, batches, metrics).map_err(|err| {
-            self.untrack_raw_spool_record(raw_spool_ref);
-            self.release_queue_credit_reservation(&mut queue_credit_reservation);
-            anyhow::anyhow!(err.message.clone())
-        })?;
-        queue_credit_reservation.commit_to_queue();
-        Ok(())
+        self.dispatch_topology_work(work, metrics.as_ref())
+            .map(|_| ())
+            .map_err(|err| anyhow::anyhow!(err.message.clone()))
     }
 
     pub(super) fn track_raw_spool_batches(

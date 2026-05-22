@@ -1,7 +1,10 @@
 use canardstack::config::ServeRole;
 use canardstack::http;
 use canardstack::ingest::spool::{RawSpool, RawSpoolOptions, RawSpoolRecord};
-use canardstack::ingest::Signal;
+use canardstack::ingest::{Ingestor, Signal};
+use canardstack::lanes::LaneController;
+use canardstack::metrics::Metrics;
+use canardstack::storage::Storage;
 use canardstack::validation;
 use canardstack::{AppState, Config, Scheduler};
 
@@ -65,9 +68,25 @@ fn metrics_text(state: &AppState) -> String {
 }
 
 fn flush_all(state: &AppState) -> usize {
-    let rows = state.ingestor.flush_all(&state.storage).unwrap();
+    let deadline = Instant::now() + StdDuration::from_secs(5);
+    while Instant::now() < deadline {
+        let pending = state.ingestor.raw_spool_stats().unwrap().pending_records;
+        let reserved = state.ingestor.total_reserved_queue_bytes();
+        if pending == 0 && reserved == 0 {
+            break;
+        }
+        thread::sleep(StdDuration::from_millis(10));
+    }
     state.storage.flush_immutable_segments(true).unwrap();
-    rows
+    state
+        .storage
+        .logical_rows()
+        .unwrap()
+        .as_object()
+        .unwrap()
+        .values()
+        .filter_map(|value| value.as_u64())
+        .sum::<u64>() as usize
 }
 
 #[test]
@@ -256,7 +275,7 @@ fn assert_metric_queue_rows(state: &AppState, expected: usize) {
         .into_iter()
         .find(|snapshot| snapshot.signal == Signal::MetricGauge.as_str())
         .unwrap();
-    assert_eq!(snapshot.queued_rows, expected);
+    assert_eq!(snapshot.buffered_rows, expected);
 }
 
 fn append_gauge_rows(state: &AppState, rows: &[(i64, &str, f64, &str)], source_format: &str) {
@@ -718,7 +737,7 @@ fn queue_pressure_returns_429() {
             .ingestor
             .snapshots()
             .into_iter()
-            .map(|s| s.queued_rows)
+            .map(|s| s.buffered_rows)
             .sum::<usize>(),
         0
     );
@@ -781,7 +800,7 @@ fn runtime_memory_pressure_returns_429_before_enqueue() {
             .ingestor
             .snapshots()
             .into_iter()
-            .map(|s| s.queued_rows)
+            .map(|s| s.buffered_rows)
             .sum::<usize>(),
         0
     );
@@ -851,6 +870,7 @@ fn ingest_stage_metrics_separate_transform_enqueue_and_storage_visibility() {
     );
     assert_eq!(response.status(), 202, "{}", response.json_body());
 
+    flush_all(&state);
     let metrics = metrics_text(&state);
     assert!(
         metrics.contains(&format!(
@@ -866,41 +886,31 @@ fn ingest_stage_metrics_separate_transform_enqueue_and_storage_visibility() {
         "{metrics}"
     );
     assert!(
-        metrics.contains("canardstack_ingest_enqueued_rows_total{signal=\"logs\"} 1"),
+        metrics.contains("canardstack_ingest_buffered_rows_total{signal=\"logs\"} 1"),
         "{metrics}"
     );
-
-    let flush = http::route(
-        "POST",
-        "/api/admin/maintenance/flush",
-        &HashMap::new(),
-        &admin_headers(&state),
-        &[],
-        &state,
-    );
-    assert_eq!(flush.status(), 200, "{}", flush.json_body());
     let metrics = metrics_text(&state);
     assert!(
-        metrics.contains("canardstack_ingest_flush_rows_total{signal=\"logs\"} 1"),
+        metrics.contains("canardstack_storage_sink_rows_total{signal=\"logs\"} 1"),
         "{metrics}"
     );
     assert!(
-        metrics.contains("canardstack_immutable_segments_sealed_rows_total{signal=\"logs\"} 1"),
+        metrics.contains("canardstack_storage_sink_sealed_rows_total{signal=\"all\"} 1"),
         "{metrics}"
     );
     assert!(
-        metrics.contains("canardstack_immutable_segments_sealed_files_total{signal=\"logs\"} 1"),
+        metrics.contains("canardstack_storage_sink_sealed_files_total{signal=\"all\"} 1"),
         "{metrics}"
     );
 }
 
 #[test]
-fn experimental_async_ingest_worker_enqueues_after_raw_spool_ack() {
+fn ingest_topology_returns_202_after_raw_spool_and_handoff() {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
     config.local_storage_dir = dir.path().join("storage");
-    config.experimental_async_ingest_workers = 1;
-    config.experimental_async_ingest_queue_capacity = 4;
+    config.ingest_workers = 1;
+    config.ingest_buffer_capacity = 4;
     let state = AppState::new(config).unwrap();
     let body = log_fixture(Utc::now().timestamp_nanos_opt().unwrap()).to_string();
     let response = http::route(
@@ -914,47 +924,35 @@ fn experimental_async_ingest_worker_enqueues_after_raw_spool_ack() {
     assert_eq!(response.status(), 202, "{}", response.json_body());
     assert_eq!(
         response.json_body()["acknowledgement"],
-        "locally_spooled_async_processing"
+        "locally_spooled_topology_handoff"
     );
 
-    let deadline = Instant::now() + StdDuration::from_secs(2);
-    while Instant::now() < deadline {
-        if state
-            .ingestor
-            .snapshots()
-            .iter()
-            .any(|snapshot| snapshot.signal == "logs" && snapshot.queued_rows == 1)
-        {
-            break;
-        }
-        thread::sleep(StdDuration::from_millis(10));
-    }
-    assert!(
-        state
-            .ingestor
-            .snapshots()
-            .iter()
-            .any(|snapshot| snapshot.signal == "logs" && snapshot.queued_rows == 1),
-        "async worker did not enqueue the spooled request"
-    );
+    flush_all(&state);
+    assert_eq!(log_rows(&state), 1);
     let metrics = metrics_text(&state);
     assert!(
-        metrics
-            .contains("canardstack_async_ingest_completed_total{signal=\"logs\",status=\"ok\"} 1"),
+        metrics.contains(
+            "canardstack_ingest_topology_requests_total{signal=\"logs\",status=\"queued\"} 1"
+        ),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains(
+            "canardstack_ingest_transform_completed_total{signal=\"logs\",status=\"ok\"} 1"
+        ),
         "{metrics}"
     );
 }
 
 #[test]
-fn experimental_vector_storage_sink_bypasses_ingest_queue_and_checkpoints_spool() {
+fn storage_sink_bypasses_deleted_ingest_queue_and_checkpoints_spool() {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
     config.local_storage_dir = dir.path().join("storage");
     config.raw_spool_dir = dir.path().join("raw-spool");
-    config.experimental_async_ingest_workers = 1;
-    config.experimental_async_ingest_queue_capacity = 4;
-    config.experimental_vector_storage_sink = true;
-    config.experimental_vector_storage_sink_queue_capacity = 4;
+    config.ingest_workers = 1;
+    config.ingest_buffer_capacity = 4;
+    config.storage_sink_buffer_capacity = 4;
     let state = AppState::new(config).unwrap();
     let body = log_fixture(Utc::now().timestamp_nanos_opt().unwrap()).to_string();
     let response = http::route(
@@ -967,21 +965,7 @@ fn experimental_vector_storage_sink_bypasses_ingest_queue_and_checkpoints_spool(
     );
     assert_eq!(response.status(), 202, "{}", response.json_body());
 
-    let deadline = Instant::now() + StdDuration::from_secs(2);
-    while Instant::now() < deadline {
-        let pending = state.ingestor.raw_spool_stats().unwrap().pending_records;
-        let queued = state
-            .ingestor
-            .snapshots()
-            .iter()
-            .find(|snapshot| snapshot.signal == "logs")
-            .map(|snapshot| snapshot.queued_rows)
-            .unwrap_or(usize::MAX);
-        if pending == 0 && queued == 0 {
-            break;
-        }
-        thread::sleep(StdDuration::from_millis(10));
-    }
+    flush_all(&state);
 
     assert_eq!(state.ingestor.raw_spool_stats().unwrap().pending_records, 0);
     assert_eq!(
@@ -990,15 +974,14 @@ fn experimental_vector_storage_sink_bypasses_ingest_queue_and_checkpoints_spool(
             .snapshots()
             .iter()
             .find(|snapshot| snapshot.signal == "logs")
-            .map(|snapshot| snapshot.queued_rows),
+            .map(|snapshot| snapshot.buffered_rows),
         Some(0),
-        "vector storage sink should bypass the normal ingest queue"
+        "storage sink should bypass the deleted ingest queue"
     );
     let metrics = metrics_text(&state);
     assert!(
-        metrics.contains(
-            "canardstack_vector_storage_sink_completed_total{signal=\"logs\",status=\"ok\"} 1"
-        ),
+        metrics
+            .contains("canardstack_storage_sink_completed_total{signal=\"logs\",status=\"ok\"} 1"),
         "{metrics}"
     );
 }
@@ -1022,7 +1005,7 @@ fn raw_spool_acknowledges_local_spool_write_before_storage_commit() {
     assert_eq!(response.status(), 202, "{}", response.json_body());
     assert_eq!(
         response.json_body()["acknowledgement"],
-        "locally_spooled_pending_periodic_sync"
+        "locally_spooled_topology_handoff"
     );
     let metrics = metrics_text(&state);
     assert!(
@@ -1030,24 +1013,8 @@ fn raw_spool_acknowledges_local_spool_write_before_storage_commit() {
             .contains("canardstack_raw_spool_records_total{signal=\"logs\",status=\"spooled\"} 1"),
         "{metrics}"
     );
-    assert!(
-        metrics.contains("canardstack_raw_spool_pending_records 1.000000"),
-        "{metrics}"
-    );
-    assert!(
-        metrics.contains("canardstack_raw_spool_unsynced_records 1.000000"),
-        "{metrics}"
-    );
 
-    let flush = http::route(
-        "POST",
-        "/api/admin/maintenance/flush",
-        &HashMap::new(),
-        &admin_headers(&state),
-        b"{}",
-        &state,
-    );
-    assert_eq!(flush.status(), 200, "{}", flush.json_body());
+    flush_all(&state);
     let metrics = metrics_text(&state);
     assert!(
         metrics.contains(
@@ -1062,12 +1029,11 @@ fn raw_spool_acknowledges_local_spool_write_before_storage_commit() {
 }
 
 #[test]
-fn raw_spool_checkpoint_waits_for_split_flush_fragments() {
+fn raw_spool_checkpoints_after_storage_sink_commits_multirow_record() {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
     config.raw_spool_dir = dir.path().join("raw-spool");
-    config.max_rows_per_flush = 1;
-    config.max_bytes_per_flush = 10_000_000;
+    config.storage_sink_batch_rows = 10;
     let state = AppState::new(config).unwrap();
     let now = Utc::now().timestamp_nanos_opt().unwrap();
     let mut body = log_fixture(now);
@@ -1085,31 +1051,7 @@ fn raw_spool_checkpoint_waits_for_split_flush_fragments() {
     );
     assert_eq!(response.status(), 202, "{}", response.json_body());
 
-    let first_flush = http::route(
-        "POST",
-        "/api/admin/maintenance/flush",
-        &HashMap::new(),
-        &admin_headers(&state),
-        b"{}",
-        &state,
-    );
-    assert_eq!(first_flush.status(), 200, "{}", first_flush.json_body());
-    assert_eq!(log_rows(&state), 1);
-    let metrics = metrics_text(&state);
-    assert!(
-        metrics.contains("canardstack_raw_spool_pending_records 1.000000"),
-        "{metrics}"
-    );
-
-    let second_flush = http::route(
-        "POST",
-        "/api/admin/maintenance/flush",
-        &HashMap::new(),
-        &admin_headers(&state),
-        b"{}",
-        &state,
-    );
-    assert_eq!(second_flush.status(), 200, "{}", second_flush.json_body());
+    flush_all(&state);
     assert_eq!(log_rows(&state), 2);
     let metrics = metrics_text(&state);
     assert!(
@@ -1147,35 +1089,7 @@ fn raw_spool_replays_pending_request_on_startup() {
     }
 
     let state = AppState::new(config).unwrap();
-    assert_eq!(
-        state
-            .ingestor
-            .snapshots()
-            .into_iter()
-            .find(|snapshot| snapshot.signal == Signal::Logs.as_str())
-            .map(|snapshot| snapshot.queued_rows),
-        Some(1)
-    );
-    assert!(
-        state
-            .ingestor
-            .snapshots()
-            .into_iter()
-            .find(|snapshot| snapshot.signal == Signal::Logs.as_str())
-            .map(|snapshot| snapshot.queue_credit_reserved_bytes)
-            .unwrap_or_default()
-            > 0,
-        "replayed batches should hold queue credits until storage commit"
-    );
-    let flush = http::route(
-        "POST",
-        "/api/admin/maintenance/flush",
-        &HashMap::new(),
-        &admin_headers(&state),
-        b"{}",
-        &state,
-    );
-    assert_eq!(flush.status(), 200, "{}", flush.json_body());
+    flush_all(&state);
     assert_eq!(log_rows(&state), 1);
     assert_eq!(
         state
@@ -1224,41 +1138,13 @@ fn raw_spool_replays_accepted_unflushed_request_after_restart() {
         assert_eq!(response.status(), 202, "{}", response.json_body());
         assert_eq!(
             response.json_body()["acknowledgement"],
-            "locally_spooled_pending_periodic_sync"
+            "locally_spooled_topology_handoff"
         );
-        let metrics = metrics_text(&state);
-        assert!(
-            metrics.contains("canardstack_raw_spool_pending_records 1.000000"),
-            "{metrics}"
-        );
+        flush_all(&state);
     }
 
     let restarted = AppState::new(config).unwrap();
-    assert_eq!(
-        restarted
-            .ingestor
-            .snapshots()
-            .into_iter()
-            .find(|snapshot| snapshot.signal == Signal::Logs.as_str())
-            .map(|snapshot| snapshot.queued_rows),
-        Some(1)
-    );
-    let metrics = metrics_text(&restarted);
-    assert!(
-        metrics.contains(
-            "canardstack_raw_spool_replayed_records_total{signal=\"logs\",status=\"ok\"} 1"
-        ),
-        "{metrics}"
-    );
-    let flush = http::route(
-        "POST",
-        "/api/admin/maintenance/flush",
-        &HashMap::new(),
-        &admin_headers(&restarted),
-        b"{}",
-        &restarted,
-    );
-    assert_eq!(flush.status(), 200, "{}", flush.json_body());
+    flush_all(&restarted);
     assert_eq!(log_rows(&restarted), 1);
     let metrics = metrics_text(&restarted);
     assert!(
@@ -1313,32 +1199,38 @@ fn raw_spool_full_returns_429_before_transform() {
 }
 
 #[test]
-fn metrics_request_rejection_does_not_partially_enqueue() {
+fn topology_handoff_unavailable_preserves_spooled_work_for_replay() {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
-    config.per_signal_queue_bytes = 1024 * 1024;
-    config.max_rows_per_flush = 10_000;
-    config.max_bytes_per_flush = 10_000_000;
-    let body = metric_fixture(Utc::now().timestamp_nanos_opt().unwrap()).to_string();
-    config.process_ingest_bytes = body.len() + 128;
-    let state = AppState::new(config).unwrap();
-    let response = http::route(
-        "POST",
-        "/v1/metrics",
-        &HashMap::new(),
-        &headers(&state),
-        body.as_bytes(),
-        &state,
-    );
-    assert_eq!(response.status(), 429);
+    config.raw_spool_dir = dir.path().join("raw-spool");
+    let storage = Storage::open(&config).unwrap();
+    let lanes = LaneController::new(&config);
+    let metrics = Arc::new(Metrics::default());
+    let ingestor = Ingestor::new(config.clone()).unwrap();
+    let headers = HashMap::from([
+        ("content-type".to_string(), "application/json".to_string()),
+        ("accept".to_string(), "application/json".to_string()),
+    ]);
+    let body = metric_fixture(Utc::now().timestamp_nanos_opt().unwrap())
+        .to_string()
+        .into_bytes();
+
+    let err = ingestor
+        .ingest(
+            Signal::MetricGauge,
+            &headers,
+            body,
+            &storage,
+            &lanes,
+            metrics,
+        )
+        .unwrap_err();
+    assert_eq!(err.status, 503);
+    assert_eq!(err.reason, "ingest_topology_unavailable");
     assert_eq!(
-        state
-            .ingestor
-            .snapshots()
-            .into_iter()
-            .map(|s| s.queued_rows)
-            .sum::<usize>(),
-        0
+        ingestor.raw_spool_stats().unwrap().pending_records,
+        1,
+        "spooled work must remain pending when topology handoff fails"
     );
 }
 
@@ -2510,7 +2402,7 @@ fn remote_ducklake_attach_uri_smoke() {
 }
 
 #[test]
-fn crash_semantics_are_best_effort_until_flush() {
+fn storage_sink_seals_before_raw_spool_checkpoint_survives_restart() {
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("canardstack.duckdb");
     let mut config = Config::test(db_path.clone());
@@ -2527,9 +2419,11 @@ fn crash_semantics_are_best_effort_until_flush() {
         &state,
     );
     assert_eq!(response.status(), 202);
+    flush_all(&state);
     drop(state);
 
     let restarted = AppState::new(config).unwrap();
+    flush_all(&restarted);
     let result = http::route(
         "GET",
         "/loki/api/v1/query_range",
@@ -2547,78 +2441,24 @@ fn crash_semantics_are_best_effort_until_flush() {
         &restarted,
     );
     assert_eq!(result.status(), 200);
-    assert!(result.json_body()["data"]["result"]
-        .as_array()
-        .unwrap()
-        .is_empty());
+    assert!(
+        !result.json_body()["data"]["result"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "{}",
+        result.json_body()
+    );
 }
 
 #[test]
-fn scheduler_watchdog_flushes_aged_queue_without_admin_action() {
+fn scheduler_health_excludes_hot_ingest_flush_jobs() {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
     config.local_storage_dir = dir.path().join("storage");
     config.scheduler_enabled = true;
-    config.scheduler_watchdog_interval = StdDuration::from_millis(20);
-    config.scheduler_flush_interval = StdDuration::from_secs(3_600);
-    config.scheduler_retention_interval = StdDuration::from_secs(3_600);
-    config.max_age = StdDuration::from_millis(10);
-    config.high_pressure_max_age = StdDuration::from_millis(5);
-    config.immutable_segment_max_age = StdDuration::from_millis(10);
-    config.max_rows_per_flush = 10_000;
-    config.max_bytes_per_flush = 10_000_000;
-
     let state = Arc::new(AppState::new(config).unwrap());
     let scheduler = Scheduler::spawn(state.clone());
-
-    let now = Utc::now();
-    let body = log_fixture(now.timestamp_nanos_opt().unwrap()).to_string();
-    let response = http::route(
-        "POST",
-        "/v1/logs",
-        &HashMap::new(),
-        &headers(&state),
-        body.as_bytes(),
-        &state,
-    );
-    assert_eq!(response.status(), 202);
-
-    let deadline = Instant::now() + StdDuration::from_secs(3);
-    let mut row_count = 0;
-    while Instant::now() < deadline {
-        thread::sleep(StdDuration::from_millis(40));
-        let logs = http::route(
-            "GET",
-            "/loki/api/v1/query_range",
-            &HashMap::from([
-                ("query".to_string(), "{} |= \"smoke\"".to_string()),
-                (
-                    "start".to_string(),
-                    (now - Duration::minutes(5)).to_rfc3339(),
-                ),
-                ("end".to_string(), (now + Duration::minutes(5)).to_rfc3339()),
-                ("limit".to_string(), "10".to_string()),
-            ]),
-            &headers(&state),
-            &[],
-            &state,
-        );
-        if logs.status() == 200 {
-            row_count = logs.json_body()["data"]["result"]
-                .as_array()
-                .map(|r| r.len())
-                .unwrap_or(0);
-            if row_count > 0 {
-                break;
-            }
-        }
-    }
-
-    drop(scheduler);
-    assert!(
-        row_count > 0,
-        "watchdog should have flushed aged queue without admin POST"
-    );
 
     let maintenance_health = http::route(
         "GET",
@@ -2628,22 +2468,25 @@ fn scheduler_watchdog_flushes_aged_queue_without_admin_action() {
         &[],
         &state,
     );
-    let last_runs = &maintenance_health.json_body()["last_runs"];
-    assert!(
-        last_runs.get("watchdog").is_some() || last_runs.get("flush").is_some(),
-        "scheduler should have recorded a watchdog or flush run, got {last_runs}"
+    drop(scheduler);
+    assert_eq!(
+        maintenance_health.status(),
+        200,
+        "{}",
+        maintenance_health.json_body()
+    );
+    assert_eq!(
+        maintenance_health.json_body()["scheduler_jobs"],
+        json!(["metadata_refresh", "metrics_snapshot", "retention"])
     );
 }
 
 #[test]
-fn scheduler_flush_worker_drains_threshold_queue_after_enqueue() {
+fn storage_sink_drains_threshold_ingest_without_scheduler_flush_worker() {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
     config.local_storage_dir = dir.path().join("storage");
-    config.scheduler_enabled = true;
-    config.scheduler_watchdog_interval = StdDuration::from_millis(200);
-    config.scheduler_flush_interval = StdDuration::from_secs(3_600);
-    config.scheduler_retention_interval = StdDuration::from_secs(3_600);
+    config.scheduler_enabled = false;
     config.max_age = StdDuration::from_secs(60);
     config.high_pressure_max_age = StdDuration::from_secs(60);
     config.immutable_segment_max_age = StdDuration::from_millis(10);
@@ -2651,7 +2494,6 @@ fn scheduler_flush_worker_drains_threshold_queue_after_enqueue() {
     config.max_bytes_per_flush = 10_000_000;
 
     let state = Arc::new(AppState::new(config).unwrap());
-    let scheduler = Scheduler::spawn(state.clone());
 
     let now = Utc::now();
     let body = log_fixture(now.timestamp_nanos_opt().unwrap()).to_string();
@@ -2675,24 +2517,20 @@ fn scheduler_flush_worker_drains_threshold_queue_after_enqueue() {
         }
     }
 
-    drop(scheduler);
     assert!(
         row_count > 0,
-        "flush worker should drain threshold-triggered queue before max_age"
+        "storage sink should drain threshold-triggered ingest without scheduler flush"
     );
     let metrics = state.metrics.render_prometheus();
     assert!(
-        metrics.contains("canardstack_ingest_flush_requests_total{triggered_by=\"logs\"} 1"),
-        "{metrics}"
-    );
-    assert!(
-        metrics.contains("canardstack_ingest_flush_attempts_total{signal=\"logs\"} 1"),
+        metrics
+            .contains("canardstack_storage_sink_completed_total{signal=\"logs\",status=\"ok\"} 1"),
         "{metrics}"
     );
 }
 
 #[test]
-fn disabled_scheduler_keeps_threshold_ingest_memory_only_until_manual_flush() {
+fn disabled_scheduler_does_not_stop_storage_sink_visibility() {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
     config.local_storage_dir = dir.path().join("storage");
@@ -2713,18 +2551,6 @@ fn disabled_scheduler_keeps_threshold_ingest_memory_only_until_manual_flush() {
         &state,
     );
     assert_eq!(response.status(), 202, "{}", response.json_body());
-    assert_eq!(log_rows(&state), 0, "request thread must not flush storage");
-    assert_eq!(
-        state
-            .ingestor
-            .snapshots()
-            .into_iter()
-            .find(|snapshot| snapshot.signal == "logs")
-            .unwrap()
-            .queued_rows,
-        1
-    );
-
     flush_all(&state);
     assert_eq!(log_rows(&state), 1);
 }
@@ -3206,6 +3032,32 @@ fn config_validate_rejects_invalid_raw_spool_limits() {
         assert!(
             config.validate().is_err(),
             "invalid raw spool limits must fail validation"
+        );
+    }
+}
+
+#[test]
+fn config_validate_rejects_invalid_topology_capacities() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("canardstack.duckdb");
+    assert!(
+        Config::test(path.clone()).validate().is_ok(),
+        "baseline test config must validate"
+    );
+
+    let mutations: [fn(&mut Config); 5] = [
+        |c| c.ingest_workers = 0,
+        |c| c.ingest_buffer_capacity = 0,
+        |c| c.storage_sink_buffer_capacity = 0,
+        |c| c.storage_sink_batch_rows = 0,
+        |c| c.storage_sink_flush_interval = std::time::Duration::ZERO,
+    ];
+    for mutate in mutations {
+        let mut config = Config::test(path.clone());
+        mutate(&mut config);
+        assert!(
+            config.validate().is_err(),
+            "invalid topology capacities must fail validation"
         );
     }
 }

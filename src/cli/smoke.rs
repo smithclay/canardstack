@@ -3,6 +3,8 @@ use crate::{AppState, Config};
 use chrono::{Duration, Utc};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::thread;
+use std::time::{Duration as StdDuration, Instant};
 
 pub fn run() -> anyhow::Result<()> {
     let state = AppState::new(Config::from_env()?)?;
@@ -48,7 +50,10 @@ pub fn run() -> anyhow::Result<()> {
         metrics.to_string().as_bytes(),
         &state,
     );
-    state.ingestor.flush_all(&state.storage)?;
+    let deadline = Instant::now() + StdDuration::from_secs(5);
+    while Instant::now() < deadline && state.ingestor.raw_spool_stats()?.pending_records > 0 {
+        thread::sleep(StdDuration::from_millis(20));
+    }
     state.storage.flush_immutable_segments(true)?;
 
     let mut admin_headers = HashMap::new();
