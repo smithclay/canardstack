@@ -863,9 +863,8 @@ fn timestamp_skew_is_terminal_checkpointed_after_acceptance() {
 #[test]
 fn dependency_unhealthy_returns_503() {
     let dir = tempdir().unwrap();
-    let mut config = Config::test(dir.path().join("canardstack.duckdb"));
-    config.force_dependency_unhealthy = true;
-    let state = AppState::new(config).unwrap();
+    let state = AppState::new(Config::test(dir.path().join("canardstack.duckdb"))).unwrap();
+    state.storage.set_dependency_unhealthy_for_tests(true);
     let body = log_fixture(Utc::now().timestamp_nanos_opt().unwrap()).to_string();
     let response = http::route(
         "POST",
@@ -1352,8 +1351,10 @@ fn raw_spool_replay_failure_does_not_abort_boot() {
 
     // Force every replay attempt to fail by marking the storage dependency unhealthy.
     // Boot must still succeed: the failing record stays pending for a later retry.
-    config.force_dependency_unhealthy = true;
-    let state = AppState::new(config).expect("boot must succeed despite replay failures");
+    let state = AppState::new_with_storage_hook_for_tests(config, |storage| {
+        storage.set_dependency_unhealthy_for_tests(true);
+    })
+    .expect("boot must succeed despite replay failures");
 
     let metrics = metrics_text(&state);
     assert!(

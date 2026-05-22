@@ -8,6 +8,8 @@ use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::PathBuf;
+#[cfg(debug_assertions)]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -99,6 +101,8 @@ pub struct Storage {
     mode: String,
     catalog_name: String,
     ducklake_available: bool,
+    #[cfg(debug_assertions)]
+    force_dependency_unhealthy: AtomicBool,
     postgres_catalog_configured: bool,
     local_storage_dir: PathBuf,
     ducklake_required: bool,
@@ -176,7 +180,6 @@ pub enum TimingPhase {
     Buffer,
     PartitionSplit,
     ParquetEncode,
-    ParquetWrite,
     FileWrite,
     FileFsync,
     FileRename,
@@ -193,7 +196,6 @@ impl TimingPhase {
             TimingPhase::Buffer => "storage_buffer",
             TimingPhase::PartitionSplit => "storage_partition_split",
             TimingPhase::ParquetEncode => "storage_parquet_encode",
-            TimingPhase::ParquetWrite => "storage_parquet_write",
             TimingPhase::FileWrite => "storage_file_write",
             TimingPhase::FileFsync => "storage_file_fsync",
             TimingPhase::FileRename => "storage_file_rename",
@@ -274,6 +276,8 @@ impl Storage {
             mode,
             catalog_name: "canardlake".to_string(),
             ducklake_available: true,
+            #[cfg(debug_assertions)]
+            force_dependency_unhealthy: AtomicBool::new(false),
             postgres_catalog_configured: config.postgres_dsn.is_some(),
             local_storage_dir: config.local_storage_dir.clone(),
             ducklake_required: true,

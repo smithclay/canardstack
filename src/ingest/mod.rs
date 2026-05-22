@@ -154,7 +154,7 @@ impl Ingestor {
             metrics.ingest_request(route.as_str(), err.status, err.reason);
             return Err(err);
         }
-        if !storage.accepts_memory_ingest() || self.config.force_dependency_unhealthy {
+        if !storage.accepts_memory_ingest() {
             metrics.ingest_request(route.as_str(), 503, "dependency_unhealthy");
             return Err(ApiError::new(
                 503,

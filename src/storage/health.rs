@@ -6,6 +6,8 @@ use chrono::Utc;
 use duckdb::Connection;
 use serde_json::{json, Value};
 use std::fs;
+#[cfg(debug_assertions)]
+use std::sync::atomic::Ordering;
 
 impl Storage {
     pub fn healthy(&self) -> bool {
@@ -22,7 +24,22 @@ impl Storage {
     }
 
     pub fn accepts_memory_ingest(&self) -> bool {
-        self.ducklake_available
+        self.ducklake_available && {
+            #[cfg(debug_assertions)]
+            {
+                !self.force_dependency_unhealthy.load(Ordering::Acquire)
+            }
+            #[cfg(not(debug_assertions))]
+            {
+                true
+            }
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn set_dependency_unhealthy_for_tests(&self, unhealthy: bool) {
+        self.force_dependency_unhealthy
+            .store(unhealthy, Ordering::SeqCst);
     }
 
     pub fn health(&self) -> StorageHealth {

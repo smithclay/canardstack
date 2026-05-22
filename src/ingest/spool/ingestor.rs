@@ -130,7 +130,7 @@ impl Ingestor {
             .map_err(|err| anyhow::anyhow!(err.message.clone()))?;
         validation::validate_content_type(&headers)
             .map_err(|err| anyhow::anyhow!(err.message.clone()))?;
-        if !storage.accepts_memory_ingest() || self.config.force_dependency_unhealthy {
+        if !storage.accepts_memory_ingest() {
             anyhow::bail!("storage dependency is unhealthy");
         }
         let inflight_reservation = self

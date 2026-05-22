@@ -8,6 +8,15 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+// Request-byte admission estimates budget compressed/raw payload expansion into
+// Arrow buffers; metrics fan out into gauge+sum tables and usually carry more
+// label/value overhead than logs or spans.
+const NON_METRIC_IDENTITY_EXPANSION: usize = 4;
+const NON_METRIC_GZIP_EXPANSION: usize = 8;
+const METRIC_IDENTITY_EXPANSION: usize = 6;
+const METRIC_GZIP_EXPANSION: usize = 12;
+const GZIP_EXPANSION_MAX_BODY_MULTIPLIER: usize = 4;
+
 pub(super) struct RuntimeMemoryReservation {
     reserved_bytes: Arc<AtomicUsize>,
     bytes: usize,
@@ -263,9 +272,9 @@ fn inflight_estimate_bytes(
         .as_deref()
     {
         Some("gzip") => compressed_body_bytes
-            .saturating_mul(8)
-            .min(max_body_bytes.saturating_mul(4)),
-        _ => compressed_body_bytes.saturating_mul(4),
+            .saturating_mul(NON_METRIC_GZIP_EXPANSION)
+            .min(max_body_bytes.saturating_mul(GZIP_EXPANSION_MAX_BODY_MULTIPLIER)),
+        _ => compressed_body_bytes.saturating_mul(NON_METRIC_IDENTITY_EXPANSION),
     }
 }
 
@@ -299,9 +308,9 @@ fn metric_inflight_estimate_bytes(
         .as_deref()
     {
         Some("gzip") => compressed_body_bytes
-            .saturating_mul(12)
-            .min(max_body_bytes.saturating_mul(4)),
-        _ => compressed_body_bytes.saturating_mul(6),
+            .saturating_mul(METRIC_GZIP_EXPANSION)
+            .min(max_body_bytes.saturating_mul(GZIP_EXPANSION_MAX_BODY_MULTIPLIER)),
+        _ => compressed_body_bytes.saturating_mul(METRIC_IDENTITY_EXPANSION),
     }
 }
 

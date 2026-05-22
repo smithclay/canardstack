@@ -92,8 +92,8 @@ The shared phase metric `canardstack_phase_duration_seconds` also records
 storage proof phases with `signal` and `phase` labels:
 `storage_prepare`, `storage_buffer`, `storage_partition_split`,
 `storage_parquet_encode`, `storage_file_write`, `storage_file_fsync`,
-`storage_file_rename`, `storage_parquet_write`,
-`storage_ducklake_register`, and `storage_ducklake_commit`.
+`storage_file_rename`, `storage_ducklake_register`, and
+`storage_ducklake_commit`.
 
 `/api/admin/health/ingest` returns queue snapshots, raw-spool stats
 (`segment_count`, `segment_bytes`, `pending_records`, `pending_bytes`,

@@ -77,7 +77,6 @@ pub struct Config {
     pub duckdb_write_memory_limit: String,
     pub late_accept_secs: i64,
     pub future_accept_secs: i64,
-    pub force_dependency_unhealthy: bool,
     pub immutable_segment_target_bytes: usize,
     pub immutable_segment_max_age: Duration,
     pub query_interactive: QueryLane,
@@ -209,7 +208,6 @@ impl Config {
             future_accept_secs: env_i64("CANARDSTACK_ACCEPT_FUTURE_SECS")?
                 .or(file.i64(&["validation", "accept_future_secs"])?)
                 .unwrap_or(10 * 60),
-            force_dependency_unhealthy: false,
             immutable_segment_target_bytes: env_usize("CANARDSTACK_SEGMENT_TARGET_BYTES")?
                 .or(file.usize(&["storage", "segment_target_bytes"])?)
                 .unwrap_or(64 * 1024 * 1024),
@@ -337,7 +335,6 @@ impl Config {
             duckdb_write_memory_limit: "512MiB".to_string(),
             late_accept_secs: 24 * 60 * 60,
             future_accept_secs: 10 * 60,
-            force_dependency_unhealthy: false,
             immutable_segment_target_bytes: 64 * 1024 * 1024,
             immutable_segment_max_age: Duration::from_secs(10),
             query_interactive: QueryLane {

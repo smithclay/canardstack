@@ -339,13 +339,6 @@ fn seal_immutable_buffer(
         timings.extend(write.timings);
         segments.push(write.segment);
     }
-    timings.push(ArrowBatchBufferTiming {
-        table,
-        phase: TimingPhase::ParquetWrite,
-        rows: buffer.rows,
-        seconds: started.elapsed().as_secs_f64(),
-    });
-
     Ok(SealedBuffer {
         segments,
         timings,
@@ -428,7 +421,6 @@ mod tests {
                 TimingPhase::FileWrite,
                 TimingPhase::FileFsync,
                 TimingPhase::FileRename,
-                TimingPhase::ParquetWrite,
             ]
         );
     }

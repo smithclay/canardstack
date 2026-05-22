@@ -22,7 +22,23 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(config: Config) -> Result<Self> {
+        Self::new_with_storage_hook(config, |_| {})
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn new_with_storage_hook_for_tests<F>(config: Config, storage_hook: F) -> Result<Self>
+    where
+        F: FnOnce(&Arc<Storage>),
+    {
+        Self::new_with_storage_hook(config, storage_hook)
+    }
+
+    fn new_with_storage_hook<F>(config: Config, storage_hook: F) -> Result<Self>
+    where
+        F: FnOnce(&Arc<Storage>),
+    {
         let storage = Arc::new(Storage::open(&config)?);
+        storage_hook(&storage);
         let ingestor = Arc::new(Ingestor::new(config.clone())?);
         let lanes = LaneController::new(&config);
         let metrics = Arc::new(Metrics::default());
