@@ -1,9 +1,7 @@
 use super::{Ingestor, SpooledIngestWork};
 use crate::storage::Storage;
-use crate::validation::{ApiError, ApiResult};
 use crate::LockExt;
 use anyhow::{Context, Result};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, SyncSender};
 use std::sync::{Arc, Weak};
 use std::thread::{self, JoinHandle};
@@ -17,76 +15,6 @@ pub(super) struct IngestWorkerPool {
     pub(super) commands: Vec<SyncSender<SpooledIngestWork>>,
     pub(super) handles: Vec<JoinHandle<()>>,
     pub(super) next_worker: usize,
-}
-
-pub(super) struct WorkerQueueSlots {
-    used: AtomicUsize,
-    capacity: usize,
-}
-
-impl WorkerQueueSlots {
-    pub(super) fn new(capacity: usize) -> Self {
-        Self {
-            used: AtomicUsize::new(0),
-            capacity: capacity.max(1),
-        }
-    }
-
-    pub(super) fn reserve(self: &Arc<Self>) -> ApiResult<WorkerQueueReservation> {
-        let mut current = self.used.load(Ordering::Acquire);
-        loop {
-            if current >= self.capacity {
-                return Err(ApiError::new(
-                    429,
-                    "ingest_buffer_full",
-                    "ingest worker buffer is full",
-                )
-                .with_retry_after(5));
-            }
-            match self.used.compare_exchange_weak(
-                current,
-                current + 1,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    return Ok(WorkerQueueReservation {
-                        slots: Arc::clone(self),
-                        active: true,
-                    });
-                }
-                Err(observed) => current = observed,
-            }
-        }
-    }
-
-    pub(super) fn used(&self) -> usize {
-        self.used.load(Ordering::Acquire)
-    }
-
-    pub(super) fn capacity(&self) -> usize {
-        self.capacity
-    }
-}
-
-pub(super) struct WorkerQueueReservation {
-    slots: Arc<WorkerQueueSlots>,
-    active: bool,
-}
-
-impl WorkerQueueReservation {
-    pub(super) fn release(&mut self) {
-        if self.active {
-            self.slots.used.fetch_sub(1, Ordering::AcqRel);
-            self.active = false;
-        }
-    }
-}
-
-impl Drop for WorkerQueueReservation {
-    fn drop(&mut self) {
-        self.release();
-    }
 }
 
 impl Drop for IngestWorkerPool {
@@ -150,8 +78,6 @@ fn run_ingest_worker(
         let Some(ingestor) = ingestor.upgrade() else {
             return;
         };
-        let mut work = work;
-        work.worker_queue_reservation.release();
         let signal = work.signal;
         let metrics = Arc::clone(&work.metrics);
         let started = Instant::now();
@@ -190,27 +116,5 @@ fn run_ingest_worker(
                 );
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn worker_queue_slots_reject_when_capacity_is_reserved() {
-        let slots = Arc::new(WorkerQueueSlots::new(1));
-        let reservation = slots.reserve().unwrap();
-
-        let err = match slots.reserve() {
-            Ok(_) => panic!("second queue reservation must reject"),
-            Err(err) => err,
-        };
-        assert_eq!(err.status, 429);
-        assert_eq!(err.reason, "ingest_buffer_full");
-        assert_eq!(slots.used(), 1);
-
-        drop(reservation);
-        assert_eq!(slots.used(), 0);
     }
 }

@@ -18,24 +18,6 @@ pub fn time_predicate(from: DateTime<Utc>, to: DateTime<Utc>) -> String {
     )
 }
 
-pub fn push_eq(where_sql: &mut Vec<String>, column: &str, value: Option<&Value>) {
-    if let Some(v) = value.and_then(Value::as_str).filter(|s| !s.is_empty()) {
-        where_sql.push(format!("{column} = {}", quote(v)));
-    }
-}
-
-pub fn push_eq_expr(where_sql: &mut Vec<String>, expr: &str, value: Option<&Value>) {
-    if let Some(v) = value.and_then(Value::as_str).filter(|s| !s.is_empty()) {
-        where_sql.push(format!("{expr} = {}", quote(v)));
-    }
-}
-
-pub fn push_eq_i_expr(where_sql: &mut Vec<String>, expr: &str, value: Option<&Value>) {
-    if let Some(v) = value.and_then(Value::as_i64) {
-        where_sql.push(format!("{expr} = {v}"));
-    }
-}
-
 pub fn json_attr(column: &str, key: &str) -> String {
     format!("json_extract_string({column}, '$.\"{key}\"')")
 }

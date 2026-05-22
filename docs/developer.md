@@ -323,8 +323,8 @@ loop without operator action:
   when per-signal size or age thresholds fire, or on the freshness cadence, then
   checkpoints the raw spool. Ingest workers insert Arrow batches into the
   immutable buffer; request threads do not perform DuckDB/DuckLake writes inline.
-- A periodic flush drains process queues to DuckLake and triggers DuckLake's
-  inlined-data flush.
+- A periodic flush seals immutable buffers to Parquet and registers the files
+  with DuckLake.
 - DuckLake adjacent-file compaction is disabled for immutable telemetry
   segments and is not exposed as a v0 maintenance control; segment sizing is
   controlled by immutable target bytes and max age.

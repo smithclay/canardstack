@@ -267,8 +267,7 @@ Tables:
 - `metric_sum`
 - `metadata_summary`
 
-DuckLake inlined telemetry rows should normally remain zero. Segment sizing is
-controlled by:
+Segment sizing is controlled by:
 
 - `CANARDSTACK_SEGMENT_TARGET_BYTES`
 - `CANARDSTACK_SEGMENT_MAX_AGE_SECS` or `_MS`
@@ -342,7 +341,6 @@ Scheduler jobs:
   freshness cadence, then checkpoints the raw spool)
 - metadata refresh
 - operator metric snapshot
-- DuckLake inlined-data flush
 - retention
 - snapshot expiration and cleanup when supported by DuckLake
 

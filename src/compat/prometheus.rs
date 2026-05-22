@@ -2,6 +2,10 @@ use super::params::{
     optional_range, optional_time, parse_any_time_to_utc, parse_step, required_param,
     required_time, result_rows, validate_range,
 };
+use crate::query::plan::{
+    FieldMatcher, MetricAggregation, MetricPlan, MetricSignal, SelectorPlan, SortDirection,
+    TimeBounds,
+};
 use crate::query::prometheus::parse_prom_query;
 use crate::validation::ApiResult;
 use crate::AppState;
@@ -25,19 +29,23 @@ pub fn prometheus_query(state: &AppState, params: &HashMap<String, String>) -> A
     }
     let from = at - chrono::Duration::minutes(5);
     let prom = parse_prom_query(query)?;
-    let req = json!({
-        "from": from.to_rfc3339(),
-        "to": (at + chrono::Duration::seconds(1)).to_rfc3339(),
-        "metric_name": prom.metric_name,
-        "signal": prom.signal,
-        "aggregation": prom.aggregation,
-        "step_seconds": 300,
-        "filters": prom.filters,
-        "group_by": prom.group_by.clone(),
-        "order": "desc",
-        "limit": 1
-    });
-    let result = state.queries.metric_query(&state.storage, &req)?;
+    let result = state.queries.execute_metric(
+        &state.storage,
+        &metric_plan(MetricPlanInput {
+            metric_name: &prom.metric_name,
+            signal: prom.signal,
+            aggregation: prom.aggregation,
+            filters: prom.filters.clone(),
+            group_by: prom.group_by.clone(),
+            time_bounds: TimeBounds {
+                from,
+                to: at + chrono::Duration::seconds(1),
+            },
+            step_seconds: 300,
+            limit: 1,
+            order: SortDirection::Backward,
+        })?,
+    )?;
     let rows = result_rows(&result);
     if rows.is_empty() {
         return Ok(prom_success(json!({"resultType": "vector", "result": []})));
@@ -65,34 +73,39 @@ pub fn prometheus_query_range(
     validate_range(start, end, METRIC_RANGE_SECS)?;
     let step = parse_step(params.get("step").map(String::as_str).unwrap_or("60"))?;
     let prom = parse_prom_query(query)?;
-    let req = json!({
-        "from": start.to_rfc3339(),
-        "to": end.to_rfc3339(),
-        "metric_name": prom.metric_name,
-        "signal": prom.signal,
-        "aggregation": prom.aggregation,
-        "step_seconds": step,
-        "filters": prom.filters,
-        "group_by": if prom.explicit_grouping { json!(prom.group_by.clone()) } else { json!(["service_name"]) },
-        "limit": 5000
-    });
-    let result = state.queries.metric_query(&state.storage, &req)?;
-    let group_by = req
-        .get("group_by")
-        .and_then(Value::as_array)
-        .map(|values| values.iter().filter_map(Value::as_str).collect::<Vec<_>>())
-        .unwrap_or_default();
+    let group_by = if prom.explicit_grouping {
+        prom.group_by.clone()
+    } else {
+        vec!["service_name".to_string()]
+    };
+    let result = state.queries.execute_metric(
+        &state.storage,
+        &metric_plan(MetricPlanInput {
+            metric_name: &prom.metric_name,
+            signal: prom.signal,
+            aggregation: prom.aggregation,
+            filters: prom.filters,
+            group_by: group_by.clone(),
+            time_bounds: TimeBounds {
+                from: start,
+                to: end,
+            },
+            step_seconds: step,
+            limit: 5000,
+            order: SortDirection::Forward,
+        })?,
+    )?;
     let mut series: BTreeMap<String, (Map<String, Value>, Vec<Value>)> = BTreeMap::new();
     for row in result_rows(&result) {
         let mut labels = Map::new();
         labels.insert("__name__".to_string(), json!(prom.metric_name));
         for label in &group_by {
             if let Some(value) = row
-                .get(*label)
+                .get(label.as_str())
                 .and_then(Value::as_str)
                 .filter(|v| !v.is_empty())
             {
-                labels.insert((*label).to_string(), json!(value));
+                labels.insert(label.to_string(), json!(value));
             }
         }
         let key = serde_json::to_string(&labels).unwrap_or_default();
@@ -169,6 +182,39 @@ fn prom_metric_labels(metric_name: &str, row: Option<&Value>) -> Value {
         labels.insert("service_name".to_string(), json!(service));
     }
     Value::Object(labels)
+}
+
+struct MetricPlanInput<'a> {
+    metric_name: &'a str,
+    signal: &'a str,
+    aggregation: &'a str,
+    filters: BTreeMap<String, String>,
+    group_by: Vec<String>,
+    time_bounds: TimeBounds,
+    step_seconds: i64,
+    limit: usize,
+    order: SortDirection,
+}
+
+fn metric_plan(input: MetricPlanInput<'_>) -> ApiResult<MetricPlan> {
+    Ok(MetricPlan {
+        selector: SelectorPlan {
+            resource: Some(input.metric_name.to_string()),
+            matchers: input
+                .filters
+                .into_iter()
+                .map(|(field, value)| FieldMatcher { field, value })
+                .collect(),
+            text_filters: Vec::new(),
+        },
+        time_bounds: input.time_bounds,
+        signal: MetricSignal::parse(input.signal)?,
+        aggregation: MetricAggregation::parse(input.aggregation)?,
+        group_by: input.group_by,
+        step_seconds: input.step_seconds,
+        limit: input.limit,
+        order: input.order,
+    })
 }
 
 fn prom_value(value: f64) -> String {

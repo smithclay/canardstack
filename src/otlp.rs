@@ -1,4 +1,4 @@
-use crate::ingest::Signal;
+use crate::ingest::{IngestRoute, Signal};
 #[cfg(feature = "otlp2records-observer")]
 use crate::metrics::Metrics;
 use crate::validation::{ApiError, ApiResult};
@@ -76,15 +76,15 @@ pub fn decompress_if_needed<'a>(
 /// Parse depth is bounded by serde_json's default 128-level recursion limit
 /// (asserted in the test module below) and `Config::max_body_bytes` upstream.
 pub fn transform(
-    signal: Signal,
+    route: IngestRoute,
     headers: &HashMap<String, String>,
     body: &[u8],
 ) -> ApiResult<Transformed> {
     let format = input_format(headers);
     let source_format = source_format(format);
 
-    match signal {
-        Signal::Logs => transform_logs(body, format)
+    match route {
+        IngestRoute::Logs => transform_logs(body, format)
             .map(|logs| Transformed {
                 logs: Some(logs),
                 spans: None,
@@ -94,7 +94,7 @@ pub fn transform(
                 unsupported_histograms: 0,
             })
             .map_err(|e| ApiError::new(400, "invalid_payload", e.to_string())),
-        Signal::Spans => transform_traces(body, format)
+        IngestRoute::Traces => transform_traces(body, format)
             .map(|spans| Transformed {
                 logs: None,
                 spans: Some(spans),
@@ -104,7 +104,7 @@ pub fn transform(
                 unsupported_histograms: 0,
             })
             .map_err(|e| ApiError::new(400, "invalid_payload", e.to_string())),
-        Signal::MetricGauge | Signal::MetricSum => {
+        IngestRoute::Metrics => {
             let batches = transform_metrics(body, format)
                 .map_err(|e| ApiError::new(400, "invalid_payload", e.to_string()))?;
             let unsupported_histograms = batches
@@ -131,17 +131,17 @@ pub fn transform(
 
 #[cfg(feature = "otlp2records-observer")]
 pub fn transform_observed(
-    signal: Signal,
+    route: IngestRoute,
     headers: &HashMap<String, String>,
     body: &[u8],
     metrics: &Metrics,
 ) -> ApiResult<Transformed> {
     let format = input_format(headers);
     let source_format = source_format(format);
-    let mut observer = OtlpTransformMetrics::new(signal);
+    let mut observer = OtlpTransformMetrics::new(route);
 
-    let result = match signal {
-        Signal::Logs => transform_logs_with_observer(body, format, &mut observer)
+    let result = match route {
+        IngestRoute::Logs => transform_logs_with_observer(body, format, &mut observer)
             .map(|logs| Transformed {
                 logs: Some(logs),
                 spans: None,
@@ -151,7 +151,7 @@ pub fn transform_observed(
                 unsupported_histograms: 0,
             })
             .map_err(|e| ApiError::new(400, "invalid_payload", e.to_string())),
-        Signal::Spans => transform_traces_with_observer(body, format, &mut observer)
+        IngestRoute::Traces => transform_traces_with_observer(body, format, &mut observer)
             .map(|spans| Transformed {
                 logs: None,
                 spans: Some(spans),
@@ -161,30 +161,28 @@ pub fn transform_observed(
                 unsupported_histograms: 0,
             })
             .map_err(|e| ApiError::new(400, "invalid_payload", e.to_string())),
-        Signal::MetricGauge | Signal::MetricSum => {
-            transform_metrics_with_observer(body, format, &mut observer)
-                .map(|batches| {
-                    let unsupported_histograms = batches
-                        .histogram
+        IngestRoute::Metrics => transform_metrics_with_observer(body, format, &mut observer)
+            .map(|batches| {
+                let unsupported_histograms = batches
+                    .histogram
+                    .as_ref()
+                    .map(RecordBatch::num_rows)
+                    .unwrap_or(0)
+                    + batches
+                        .exp_histogram
                         .as_ref()
                         .map(RecordBatch::num_rows)
-                        .unwrap_or(0)
-                        + batches
-                            .exp_histogram
-                            .as_ref()
-                            .map(RecordBatch::num_rows)
-                            .unwrap_or(0);
-                    Transformed {
-                        logs: None,
-                        spans: None,
-                        gauge: batches.gauge,
-                        sum: batches.sum,
-                        source_format,
-                        unsupported_histograms,
-                    }
-                })
-                .map_err(|e| ApiError::new(400, "invalid_payload", e.to_string()))
-        }
+                        .unwrap_or(0);
+                Transformed {
+                    logs: None,
+                    spans: None,
+                    gauge: batches.gauge,
+                    sum: batches.sum,
+                    source_format,
+                    unsupported_histograms,
+                }
+            })
+            .map_err(|e| ApiError::new(400, "invalid_payload", e.to_string())),
     };
     observer.flush(metrics);
     result
@@ -192,7 +190,7 @@ pub fn transform_observed(
 
 #[cfg(feature = "otlp2records-observer")]
 struct OtlpTransformMetrics {
-    signal: Signal,
+    route: IngestRoute,
     phase_totals: BTreeMap<&'static str, PhaseTotal>,
     counters: BTreeMap<&'static str, u64>,
 }
@@ -206,16 +204,16 @@ struct PhaseTotal {
 
 #[cfg(feature = "otlp2records-observer")]
 impl OtlpTransformMetrics {
-    fn new(signal: Signal) -> Self {
+    fn new(route: IngestRoute) -> Self {
         Self {
-            signal,
+            route,
             phase_totals: BTreeMap::new(),
             counters: BTreeMap::new(),
         }
     }
 
     fn flush(&self, metrics: &Metrics) {
-        let signal = self.signal.as_str();
+        let signal = self.route.as_str();
         for (phase, total) in &self.phase_totals {
             metrics.observe_phase_seconds_n(signal, phase, None, total.count, total.sum_seconds);
         }
@@ -324,7 +322,7 @@ mod tests {
         bytes.extend(std::iter::repeat_n(b']', depth));
         let mut headers = HashMap::new();
         headers.insert("content-type".to_string(), "application/json".to_string());
-        let result = transform(Signal::Logs, &headers, &bytes);
+        let result = transform(IngestRoute::Logs, &headers, &bytes);
         assert!(result.is_err(), "depth={depth} should be rejected");
     }
 }

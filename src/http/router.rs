@@ -1,4 +1,4 @@
-use crate::ingest::Signal;
+use crate::ingest::{IngestRoute, Signal};
 use crate::validation::{self, ApiError};
 use crate::AppState;
 use serde_json::{json, Value};
@@ -125,7 +125,7 @@ fn route_inner(
                     "ingest routes are disabled for this serve role",
                 ));
             }
-            return ingest_response(ingest(Signal::Logs, headers, body.into_vec(), state));
+            return ingest_response(ingest(IngestRoute::Logs, headers, body.into_vec(), state));
         }
         ("POST", "/v1/traces") => {
             if !state.config.serve_role.accepts_ingest() {
@@ -135,7 +135,7 @@ fn route_inner(
                     "ingest routes are disabled for this serve role",
                 ));
             }
-            return ingest_response(ingest(Signal::Spans, headers, body.into_vec(), state));
+            return ingest_response(ingest(IngestRoute::Traces, headers, body.into_vec(), state));
         }
         ("POST", "/v1/metrics") => {
             if !state.config.serve_role.accepts_ingest() {
@@ -145,7 +145,12 @@ fn route_inner(
                     "ingest routes are disabled for this serve role",
                 ));
             }
-            return ingest_response(ingest(Signal::MetricGauge, headers, body.into_vec(), state));
+            return ingest_response(ingest(
+                IngestRoute::Metrics,
+                headers,
+                body.into_vec(),
+                state,
+            ));
         }
         ("GET", "/api/admin/health/storage") => {
             return admin_health_response(headers, state, || {
@@ -214,13 +219,8 @@ fn route_inner(
         ("POST", "/api/admin/maintenance/flush") => admin(headers, state, || {
             ensure_maintenance_allowed(state)?;
             let started = Instant::now();
-            let result = run_flush_with_lane(
-                state,
-                "admin_flush",
-                crate::maintenance::FlushOptions {
-                    table: query.get("table").map(String::as_str),
-                },
-            );
+            let result =
+                run_flush_with_lane(state, "admin_flush", crate::maintenance::FlushOptions);
             record_maintenance_metrics(state, "flush", &result, started);
             result
         }),
@@ -246,14 +246,14 @@ fn route_inner(
 }
 
 fn ingest(
-    signal: Signal,
+    route: IngestRoute,
     headers: &HashMap<String, String>,
     body: Vec<u8>,
     state: &AppState,
 ) -> Result<Value, ApiError> {
     validation::validate_api_key(headers, &state.config, false)?;
     state.ingestor.ingest(
-        signal,
+        route,
         headers,
         body,
         &state.storage,
@@ -302,7 +302,7 @@ fn run_maintenance_job(
 fn run_flush_with_lane(
     state: &AppState,
     triggered_by: &'static str,
-    options: crate::maintenance::FlushOptions<'_>,
+    options: crate::maintenance::FlushOptions,
 ) -> Result<Value, ApiError> {
     let guard = state.lanes.reserve_flush(&state.metrics)?;
     let result = state
@@ -450,7 +450,6 @@ pub(crate) fn record_storage_operator_gauges(state: &AppState) {
             for (metric, field) in [
                 ("canardstack_ducklake_parquet_files", "parquet_files"),
                 ("canardstack_ducklake_parquet_rows", "parquet_rows"),
-                ("canardstack_ducklake_inlined_rows", "inlined_rows"),
             ] {
                 if let Some(count) = value.get(field).and_then(Value::as_i64) {
                     state

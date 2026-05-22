@@ -1,4 +1,4 @@
-use super::ducklake::{ducklake_metadata_prefix, quote_ident};
+use super::ducklake::ducklake_metadata_prefix;
 use super::{Storage, StorageCapabilities, StorageHealth, StorageProbe};
 use crate::LockExt;
 use anyhow::Result;
@@ -37,7 +37,6 @@ impl Storage {
             capabilities: StorageCapabilities {
                 insert: true,
                 query: true,
-                inlined_flush: self.ducklake_managed_maintenance,
                 snapshot_expiration: self.ducklake_managed_maintenance,
                 cleanup_old_files: self.ducklake_managed_maintenance,
                 whole_day_retention: true,
@@ -102,32 +101,9 @@ impl Storage {
                 json!({
                     "table_id": table_id,
                     "parquet_files": parquet_files,
-                    "parquet_rows": parquet_rows,
-                    "inlined_rows": 0
+                    "parquet_rows": parquet_rows
                 }),
             );
-        }
-
-        let sql = format!(
-            "SELECT table_id, table_name FROM {metadata_prefix}ducklake_inlined_data_tables ORDER BY table_id"
-        );
-        let mut stmt = conn.prepare(&sql)?;
-        let inlined = stmt.query_map([], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-        })?;
-        for row in inlined {
-            let (table_id, inlined_table) = row?;
-            let count_sql = format!(
-                "SELECT count(*) FROM {metadata_prefix}{} WHERE end_snapshot IS NULL",
-                quote_ident(&inlined_table)
-            );
-            let inlined_rows: i64 = conn.query_row(&count_sql, [], |row| row.get(0))?;
-            for value in tables.values_mut() {
-                if value.get("table_id").and_then(Value::as_i64) == Some(table_id) {
-                    value["inlined_rows"] = json!(inlined_rows);
-                    break;
-                }
-            }
         }
         Ok(Value::Object(tables))
     }

@@ -23,9 +23,7 @@ struct FailureRecord {
 }
 
 #[derive(Clone, Copy, Default)]
-pub struct FlushOptions<'a> {
-    pub table: Option<&'a str>,
-}
+pub struct FlushOptions;
 
 pub struct Maintenance {
     paused: AtomicBool,
@@ -105,22 +103,14 @@ impl Maintenance {
         ingestor: &Ingestor,
         storage: &Storage,
         metrics: &Metrics,
-        options: FlushOptions<'_>,
+        _options: FlushOptions,
     ) -> Result<Value> {
         let started = Instant::now();
         let immutable = ingestor.flush_committed_to_storage(storage, metrics)?;
-        let ducklake_started = Instant::now();
-        let ducklake = storage.flush_inlined_data(options.table)?;
-        metrics.observe_seconds(
-            "canardstack_ducklake_flush_inlined_duration_seconds",
-            &[("table", options.table.unwrap_or("all"))],
-            ducklake_started.elapsed().as_secs_f64(),
-        );
         self.record_run("flush");
         Ok(json!({
             "status": "ok",
             "immutable_segments": immutable.to_json(),
-            "ducklake": ducklake,
             "duration_ms": started.elapsed().as_millis()
         }))
     }
@@ -315,9 +305,9 @@ fn run_flush_tick(state: &AppState) -> bool {
             .reserve_flush(&s.metrics)
             .map_err(|err| anyhow::anyhow!(err.message.clone()))?;
         guard.record_bytes(pending_bytes);
-        let result =
-            s.maintenance
-                .run_flush(&s.ingestor, &s.storage, &s.metrics, FlushOptions::default());
+        let result = s
+            .maintenance
+            .run_flush(&s.ingestor, &s.storage, &s.metrics, FlushOptions);
         guard.finish(&s.metrics);
         result
     })

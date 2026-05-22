@@ -1,5 +1,5 @@
 use super::{RetentionPolicy, Storage};
-use crate::db::sql::{escape_value, quote as sql_quote};
+use crate::db::sql::quote as sql_quote;
 use crate::LockExt;
 use anyhow::Result;
 use chrono::Utc;
@@ -7,28 +7,6 @@ use serde_json::{json, Value};
 use std::sync::atomic::Ordering;
 
 impl Storage {
-    pub fn flush_inlined_data(&self, table: Option<&str>) -> Result<Value> {
-        if !self.ducklake_managed_maintenance {
-            return Ok(
-                json!({"supported": false, "reason": "ducklake maintenance is not managed by this process"}),
-            );
-        }
-        let conn = self.writer.lock_or_poisoned();
-        let sql = match table {
-            Some(t) => format!(
-                "SELECT * FROM ducklake_flush_inlined_data('{}', table_name => '{}')",
-                self.catalog_name,
-                escape_value(t)
-            ),
-            None => format!(
-                "SELECT * FROM ducklake_flush_inlined_data('{}')",
-                self.catalog_name
-            ),
-        };
-        conn.execute_batch(&sql)?;
-        Ok(json!({"supported": true, "status": "ok"}))
-    }
-
     pub fn cleanup_old_files(&self, dry_run: bool) -> Result<Value> {
         if !self.ducklake_managed_maintenance {
             return Ok(

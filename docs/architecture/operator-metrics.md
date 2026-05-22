@@ -62,7 +62,7 @@ Do not label metrics by `service_name`, trace id, query text, API key, or arbitr
 | `canardstack_ingest_inflight_bytes` | Gauge | `signal` | Bytes admitted (spooled, handed to a worker) but not yet inserted into the immutable buffer. |
 | `canardstack_ingest_inflight_capacity_bytes` | Gauge | `signal` | Per-signal in-flight ceiling. |
 | `canardstack_ingest_inflight_pressure` | Gauge | `signal` | In-flight bytes as a fraction of the per-signal ceiling (`0..1`). |
-| `canardstack_ingest_worker_queue_slots` | Gauge | `state` | Worker queue slots used and configured capacity. |
+| `canardstack_ingest_worker_queue_capacity` | Gauge | `state=capacity` | Configured bounded worker channel capacity. |
 | `canardstack_ingest_storage_insert_total` | Counter | `signal`, `status` | Worker inserts of Arrow batches into the immutable buffer. |
 | `canardstack_ingest_worker_completed_total` | Counter | `signal`, `status` | Ingest worker tasks completed, by outcome. |
 | `canardstack_ingest_rejections_total` | Counter | `signal`, `status`, `reason` | Admission-control rejections (subset of `_ingest_requests_total`). |
@@ -87,8 +87,6 @@ scans.
 | `canardstack_storage_physical_bytes` | Gauge | `table=all` | Local storage directory size on disk. |
 | `canardstack_ducklake_parquet_files` | Gauge | `table` | Active DuckLake Parquet data files per table. |
 | `canardstack_ducklake_parquet_rows` | Gauge | `table` | Active rows stored in DuckLake Parquet data files per table. |
-| `canardstack_ducklake_inlined_rows` | Gauge | `table` | Rows currently held in DuckLake inlined-data tables per table. |
-| `canardstack_ducklake_flush_inlined_duration_seconds` | Histogram (`_count` / `_sum`) | `table` | Time spent in DuckLake inlined-data flush during maintenance. |
 
 The shared phase metric `canardstack_phase_duration_seconds` also records
 storage proof phases with `signal` and `phase` labels:
@@ -175,7 +173,7 @@ The following metrics from earlier design drafts are **not** emitted by the curr
 - `canardstack_raw_spool_append_batch_deferred_commands_total`
 - `canardstack_raw_spool_checkpoint_batch_deferred_commands_total`
 - `canardstack_ingest_partial_commit_rows_total`
-- `canardstack_ducklake_insert_seconds`, `_commit_seconds`, `_inlined_bytes`, `_oldest_inlined_age_seconds`, `_snapshot_count`, `_flush_failures_total`
+- `canardstack_ducklake_insert_seconds`, `_commit_seconds`, `_snapshot_count`, `_flush_failures_total`
 - `canardstack_storage_logical_bytes` (the implementation emits `_logical_rows` instead)
 - `canardstack_object_store_errors_total`, `_request_seconds`
 - `canardstack_query_active`, `_memory_high_water_bytes`, `_oom_total`

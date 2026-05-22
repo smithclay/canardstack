@@ -80,9 +80,7 @@ pub struct Config {
     pub force_dependency_unhealthy: bool,
     pub immutable_segment_target_bytes: usize,
     pub immutable_segment_max_age: Duration,
-    pub ducklake_data_inlining_row_limit: usize,
     pub query_interactive: QueryLane,
-    pub query_background: QueryLane,
     pub lane_flush_capacity: usize,
     pub lane_cheap_query_capacity: usize,
     pub lane_heavy_query_degraded_capacity: usize,
@@ -223,15 +221,9 @@ impl Config {
                 "CANARDSTACK_SEGMENT_MAX_AGE_SECS",
                 10,
             )?,
-            ducklake_data_inlining_row_limit: 0,
             query_interactive: QueryLane {
                 concurrency: query_concurrency,
                 timeout_secs: query_timeout_secs,
-                memory_limit: query_memory_limit.clone(),
-            },
-            query_background: QueryLane {
-                concurrency: (query_concurrency / 2).max(1),
-                timeout_secs: query_timeout_secs.saturating_mul(4).max(query_timeout_secs),
                 memory_limit: query_memory_limit,
             },
             lane_flush_capacity: env_usize("CANARDSTACK_FLUSH_LANE_CAPACITY")?
@@ -348,16 +340,10 @@ impl Config {
             force_dependency_unhealthy: false,
             immutable_segment_target_bytes: 64 * 1024 * 1024,
             immutable_segment_max_age: Duration::from_secs(10),
-            ducklake_data_inlining_row_limit: 0,
             query_interactive: QueryLane {
                 concurrency: 4,
                 timeout_secs: 15,
                 memory_limit: "512MiB".to_string(),
-            },
-            query_background: QueryLane {
-                concurrency: 2,
-                timeout_secs: 60,
-                memory_limit: "1GiB".to_string(),
             },
             lane_flush_capacity: 1,
             lane_cheap_query_capacity: 1,
@@ -449,7 +435,7 @@ impl Config {
         if self.max_concurrent_connections == 0 {
             anyhow::bail!("CANARDSTACK_MAX_CONNECTIONS must be > 0");
         }
-        if self.query_interactive.concurrency == 0 || self.query_background.concurrency == 0 {
+        if self.query_interactive.concurrency == 0 {
             anyhow::bail!("query concurrency limits must be > 0");
         }
         if self.lane_flush_capacity == 0
@@ -470,7 +456,7 @@ impl Config {
                 "CANARDSTACK_QUERY_CONCURRENCY must leave at least one heavy query slot after flush and cheap-query lane reservations"
             );
         }
-        if self.query_interactive.timeout_secs == 0 || self.query_background.timeout_secs == 0 {
+        if self.query_interactive.timeout_secs == 0 {
             anyhow::bail!("query timeouts must be > 0");
         }
         if self.socket_read_timeout.is_zero() || self.socket_write_timeout.is_zero() {
@@ -750,9 +736,6 @@ mod tests {
         "CANARDSTACK_RAW_SPOOL_GROUP_COMMIT_MS",
         "CANARDSTACK_INGEST_WORKERS",
         "CANARDSTACK_INGEST_BUFFER_CAPACITY",
-        "CANARDSTACK_STORAGE_SINK_BUFFER_CAPACITY",
-        "CANARDSTACK_STORAGE_SINK_BATCH_ROWS",
-        "CANARDSTACK_STORAGE_SINK_FLUSH_INTERVAL_MS",
     ];
 
     fn env_lock() -> &'static Mutex<()> {
@@ -901,8 +884,6 @@ http_keepalive = true
         assert_eq!(config.query_interactive.concurrency, 6);
         assert_eq!(config.query_interactive.timeout_secs, 7);
         assert_eq!(config.query_interactive.memory_limit, "384MiB");
-        assert_eq!(config.query_background.concurrency, 3);
-        assert_eq!(config.query_background.timeout_secs, 28);
         assert_eq!(config.lane_flush_capacity, 1);
         assert_eq!(config.lane_cheap_query_capacity, 2);
         assert_eq!(config.lane_heavy_query_degraded_capacity, 1);

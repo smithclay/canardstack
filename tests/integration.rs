@@ -1,7 +1,7 @@
 use canardstack::config::ServeRole;
 use canardstack::http;
 use canardstack::ingest::spool::{Options, Record, Spool};
-use canardstack::ingest::{Ingestor, Signal};
+use canardstack::ingest::{IngestRoute, Ingestor, Signal};
 use canardstack::lanes::LaneController;
 use canardstack::metrics::Metrics;
 use canardstack::storage::Storage;
@@ -485,8 +485,8 @@ fn removed_ui_dashboard_alert_and_rest_query_routes_are_not_available() {
 #[test]
 fn operator_metrics_snapshot_is_written_to_metric_store() {
     let (_dir, state) = app();
-    state.metrics.ingest_request(Signal::Logs, 202, "accepted");
-    state.metrics.ingest_request(Signal::Logs, 202, "accepted");
+    state.metrics.ingest_request("logs", 202, "accepted");
+    state.metrics.ingest_request("logs", 202, "accepted");
     state
         .metrics
         .query_request("/api/v1/query_range", 200, "ok", 0.125);
@@ -541,7 +541,7 @@ fn operator_metrics_snapshot_is_written_to_metric_store() {
 #[test]
 fn metrics_route_renders_core_metrics_without_storage_health_scan() {
     let (_dir, state) = app();
-    state.metrics.ingest_request(Signal::Logs, 202, "accepted");
+    state.metrics.ingest_request("logs", 202, "accepted");
 
     let metrics = metrics_text(&state);
     assert!(
@@ -1456,7 +1456,7 @@ fn ingest_workers_unavailable_rejects_before_raw_spool_append() {
 
     let err = ingestor
         .ingest(
-            Signal::MetricGauge,
+            IngestRoute::Metrics,
             &headers,
             body,
             &storage,
@@ -3091,27 +3091,6 @@ fn loki_query_range_backward_uses_standard_log_query() {
     let result = body["data"]["result"].as_array().expect("streams");
     assert_eq!(result.len(), 1, "{body}");
     assert_eq!(result[0]["values"].as_array().unwrap().len(), 1, "{body}");
-}
-
-#[test]
-fn admin_flush_records_ducklake_inlined_flush_metrics() {
-    let (_dir, state) = app();
-    let response = http::route(
-        "POST",
-        "/api/admin/maintenance/flush",
-        &HashMap::new(),
-        &admin_headers(&state),
-        &[],
-        &state,
-    );
-    assert_eq!(response.status(), 200, "{}", response.json_body());
-
-    let metrics = state.metrics.render_prometheus();
-    assert!(
-        metrics
-            .contains("canardstack_ducklake_flush_inlined_duration_seconds_count{table=\"all\"} 1"),
-        "{metrics}"
-    );
 }
 
 #[test]

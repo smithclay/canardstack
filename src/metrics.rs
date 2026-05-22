@@ -209,12 +209,12 @@ impl Metrics {
         }
     }
 
-    pub fn ingest_request(&self, signal: Signal, status: u16, reason: &str) {
+    pub fn ingest_request(&self, signal: &str, status: u16, reason: &str) {
         let status = status_label(status);
         self.inc(
             "canardstack_ingest_requests_total",
             &[
-                ("signal", signal.as_str()),
+                ("signal", signal),
                 ("status", status.as_ref()),
                 ("reason", reason),
             ],
@@ -224,7 +224,7 @@ impl Metrics {
             self.inc(
                 "canardstack_ingest_rejections_total",
                 &[
-                    ("signal", signal.as_str()),
+                    ("signal", signal),
                     ("status", status.as_ref()),
                     ("reason", reason),
                 ],

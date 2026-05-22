@@ -73,7 +73,6 @@ impl StorageHealth {
 pub struct StorageCapabilities {
     pub insert: bool,
     pub query: bool,
-    pub inlined_flush: bool,
     pub snapshot_expiration: bool,
     pub cleanup_old_files: bool,
     pub whole_day_retention: bool,
@@ -252,7 +251,6 @@ impl Storage {
             &config.duckdb_path,
             &config.local_storage_dir,
             config.duckdb_extension_dir.as_deref(),
-            config.ducklake_data_inlining_row_limit,
         )
         .context(
             "DuckLake attach failed. Fix the catalog config (URI, token, network, or extension path) and restart.",
@@ -314,13 +312,12 @@ mod tests {
             Some("ducklake:md:test-ducklake"),
             &dir.path().join("canardstack.duckdb"),
             &dir.path().join("storage"),
-            1_000,
         )
         .unwrap();
 
         assert_eq!(
             plan.sql,
-            "ATTACH 'ducklake:md:test-ducklake' AS canardlake (DATA_INLINING_ROW_LIMIT 1000); USE canardlake;"
+            "ATTACH 'ducklake:md:test-ducklake' AS canardlake; USE canardlake;"
         );
         assert_eq!(plan.mode, "ducklake_custom_uri");
         assert!(plan.needs_ducklake);
@@ -336,7 +333,6 @@ mod tests {
             Some("md:test-ducklake"),
             &dir.path().join("canardstack.duckdb"),
             &dir.path().join("storage"),
-            1_000,
         )
         .unwrap();
 
@@ -359,7 +355,6 @@ mod tests {
             Some("ducklake:md:test-ducklake"),
             &dir.path().join("canardstack.duckdb"),
             &dir.path().join("storage"),
-            1_000,
         )
         .unwrap_err();
 
@@ -369,18 +364,18 @@ mod tests {
     }
 
     #[test]
-    fn ducklake_attach_uses_configured_data_inlining_limit() {
+    fn local_ducklake_attach_uses_data_path_without_inlining() {
         let dir = tempdir().unwrap();
         let plan = build_ducklake_attach_plan(
             None,
             None,
             &dir.path().join("canardstack.duckdb"),
             &dir.path().join("storage"),
-            0,
         )
         .unwrap();
 
-        assert!(plan.sql.contains("DATA_INLINING_ROW_LIMIT 0"));
+        assert!(plan.sql.contains("DATA_PATH"));
+        assert!(!plan.sql.contains("DATA_INLINING_ROW_LIMIT"));
     }
 
     #[test]
@@ -391,7 +386,6 @@ mod tests {
             Some("ATTACH 'md:test-ducklake';"),
             &dir.path().join("canardstack.duckdb"),
             &dir.path().join("storage"),
-            1_000,
         )
         .unwrap_err();
 
@@ -408,7 +402,6 @@ mod tests {
             Some("sqlite:/tmp/not-ducklake.db"),
             &dir.path().join("canardstack.duckdb"),
             &dir.path().join("storage"),
-            1_000,
         )
         .unwrap_err();
 
