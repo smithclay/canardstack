@@ -3,7 +3,7 @@ use super::codec::{
 };
 use super::writer::{
     collect_append_batch, handle_append_batch, handle_checkpoint_batch, AppendCommand,
-    CheckpointCommand, RawSpoolCommand,
+    CheckpointCommand, RawSpoolCommand, RawSpoolWriterDepths,
 };
 use super::*;
 use std::collections::VecDeque;
@@ -48,6 +48,7 @@ fn append_command(
         AppendCommand {
             record,
             queued_at: Instant::now(),
+            enqueue_depth: Default::default(),
             reply,
         },
         rx,
@@ -65,6 +66,7 @@ fn checkpoint_command(
         CheckpointCommand {
             ids,
             queued_at: Instant::now(),
+            enqueue_depth: Default::default(),
             reply,
         },
         rx,
@@ -114,6 +116,7 @@ fn raw_spool_writer_reports_batch_wait_stats_once() {
     let (second, second_rx) = append_command(b"second", 2);
     tx.send(RawSpoolCommand::Append(second)).unwrap();
     let mut deferred = VecDeque::new();
+    let depths = RawSpoolWriterDepths::default();
 
     handle_append_batch(
         &mut spool,
@@ -122,6 +125,7 @@ fn raw_spool_writer_reports_batch_wait_stats_once() {
         &mut deferred,
         2,
         Duration::from_secs(5),
+        &depths,
     );
 
     let first_ack = first_rx.recv().unwrap().unwrap();
@@ -146,6 +150,7 @@ fn raw_spool_writer_batches_checkpoint_commands_and_reports_stats_once() {
     tx.send(RawSpoolCommand::Checkpoint(second_command))
         .unwrap();
     let mut deferred = VecDeque::new();
+    let depths = RawSpoolWriterDepths::default();
 
     handle_checkpoint_batch(
         &mut spool,
@@ -154,6 +159,7 @@ fn raw_spool_writer_batches_checkpoint_commands_and_reports_stats_once() {
         &mut deferred,
         2,
         Duration::from_secs(5),
+        &depths,
     );
 
     let first_stats = first_rx.recv().unwrap().unwrap();
@@ -180,6 +186,7 @@ fn raw_spool_writer_batches_deferred_checkpoint_commands() {
         RawSpoolCommand::Checkpoint(third_command),
     ]);
     let (_tx, rx) = mpsc::sync_channel(4);
+    let depths = RawSpoolWriterDepths::default();
 
     handle_checkpoint_batch(
         &mut spool,
@@ -188,6 +195,7 @@ fn raw_spool_writer_batches_deferred_checkpoint_commands() {
         &mut deferred,
         64,
         Duration::from_millis(1),
+        &depths,
     );
 
     let first_stats = first_rx.recv().unwrap().unwrap();
@@ -475,9 +483,11 @@ fn raw_spool_group_commit_collects_until_record_limit() {
 
     let mut deferred = VecDeque::new();
     let mut batch = vec![first];
-    collect_append_batch(&rx, &mut deferred, 2, Duration::from_secs(5), &mut batch);
+    let deferred_checkpoints =
+        collect_append_batch(&rx, &mut deferred, 2, Duration::from_secs(5), &mut batch);
 
     assert_eq!(batch.len(), 2);
+    assert_eq!(deferred_checkpoints, 0);
     assert!(deferred.is_empty());
 }
 
@@ -492,6 +502,7 @@ fn raw_spool_append_batch_defers_checkpoint_and_keeps_collecting_appends() {
             sequence: 1,
         }],
         queued_at: Instant::now(),
+        enqueue_depth: Default::default(),
         reply: checkpoint_reply,
     }))
     .unwrap();
@@ -500,9 +511,11 @@ fn raw_spool_append_batch_defers_checkpoint_and_keeps_collecting_appends() {
 
     let mut deferred = VecDeque::new();
     let mut batch = vec![first];
-    collect_append_batch(&rx, &mut deferred, 2, Duration::from_secs(5), &mut batch);
+    let deferred_checkpoints =
+        collect_append_batch(&rx, &mut deferred, 2, Duration::from_secs(5), &mut batch);
 
     assert_eq!(batch.len(), 2);
+    assert_eq!(deferred_checkpoints, 1);
     assert_eq!(deferred.len(), 1);
     assert!(matches!(
         deferred.front(),
@@ -518,7 +531,7 @@ fn raw_spool_group_commit_delay_flushes_partial_batch() {
     let mut batch = vec![first];
     let started = Instant::now();
 
-    collect_append_batch(
+    let deferred_checkpoints = collect_append_batch(
         &rx,
         &mut deferred,
         64,
@@ -527,6 +540,7 @@ fn raw_spool_group_commit_delay_flushes_partial_batch() {
     );
 
     assert_eq!(batch.len(), 1);
+    assert_eq!(deferred_checkpoints, 0);
     assert!(deferred.is_empty());
     assert!(started.elapsed() >= Duration::from_millis(5));
 }

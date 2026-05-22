@@ -365,6 +365,19 @@ impl Ingestor {
             &[("signal", signal.as_str()), ("stat", "max")],
             stats.encoded_bytes as f64,
         );
+        Self::record_raw_spool_batch_enqueue_depth_metrics(
+            metrics,
+            "canardstack_raw_spool_append_batch_enqueue_pending_commands",
+            signal,
+            stats.max_pending_commands_at_enqueue,
+            stats.max_pending_append_commands_at_enqueue,
+            stats.max_pending_checkpoint_commands_at_enqueue,
+        );
+        metrics.inc(
+            "canardstack_raw_spool_append_batch_deferred_commands_total",
+            &[("signal", signal.as_str()), ("kind", "checkpoint")],
+            stats.deferred_checkpoint_commands as u64,
+        );
         metrics.observe_phase_seconds_n(
             signal.as_str(),
             "raw_spool_append_queue_wait",
@@ -421,6 +434,19 @@ impl Ingestor {
             &[("signal", signal.as_str())],
             stats.commands as u64,
         );
+        Self::record_raw_spool_batch_enqueue_depth_metrics(
+            metrics,
+            "canardstack_raw_spool_checkpoint_batch_enqueue_pending_commands",
+            signal,
+            stats.max_pending_commands_at_enqueue,
+            stats.max_pending_append_commands_at_enqueue,
+            stats.max_pending_checkpoint_commands_at_enqueue,
+        );
+        metrics.inc(
+            "canardstack_raw_spool_checkpoint_batch_deferred_commands_total",
+            &[("signal", signal.as_str()), ("kind", "append")],
+            stats.deferred_append_commands as u64,
+        );
         metrics.observe_phase_seconds_n(
             signal.as_str(),
             "raw_spool_checkpoint_queue_wait",
@@ -434,6 +460,36 @@ impl Ingestor {
             None,
             stats.wait_seconds,
         );
+    }
+
+    fn record_raw_spool_batch_enqueue_depth_metrics(
+        metrics: &Metrics,
+        metric_name: &str,
+        signal: Signal,
+        pending_commands: usize,
+        pending_append_commands: usize,
+        pending_checkpoint_commands: usize,
+    ) {
+        for (kind, value) in [
+            ("all", pending_commands),
+            ("append", pending_append_commands),
+            ("checkpoint", pending_checkpoint_commands),
+        ] {
+            metrics.gauge(
+                metric_name,
+                &[
+                    ("signal", signal.as_str()),
+                    ("kind", kind),
+                    ("stat", "last"),
+                ],
+                value as f64,
+            );
+            metrics.gauge_max(
+                metric_name,
+                &[("signal", signal.as_str()), ("kind", kind), ("stat", "max")],
+                value as f64,
+            );
+        }
     }
 
     pub(super) fn checkpoint_raw_spool_terminal(
@@ -624,6 +680,7 @@ impl Ingestor {
                 stats.append_syncs_total,
                 stats.append_sync_seconds_total,
             );
+            Self::record_raw_spool_writer_metrics(metrics, None, &stats);
         }
         for signal in all_signals() {
             let Ok(stats) = self.raw_spool_for(signal).and_then(|spool| spool.stats()) else {
@@ -688,6 +745,76 @@ impl Ingestor {
                 stats.append_syncs_total,
                 stats.append_sync_seconds_total,
             );
+            Self::record_raw_spool_writer_metrics(metrics, Some(signal.as_str()), &stats);
+        }
+    }
+
+    fn record_raw_spool_writer_metrics(
+        metrics: &Metrics,
+        signal: Option<&str>,
+        stats: &spool::RawSpoolStats,
+    ) {
+        for (kind, current, max) in [
+            (
+                "all",
+                stats.writer_pending_commands,
+                stats.writer_pending_commands_max,
+            ),
+            (
+                "append",
+                stats.writer_pending_append_commands,
+                stats.writer_pending_append_commands_max,
+            ),
+            (
+                "checkpoint",
+                stats.writer_pending_checkpoint_commands,
+                stats.writer_pending_checkpoint_commands_max,
+            ),
+        ] {
+            if let Some(signal) = signal {
+                metrics.gauge(
+                    "canardstack_raw_spool_writer_pending_commands",
+                    &[("signal", signal), ("kind", kind), ("stat", "current")],
+                    current as f64,
+                );
+                metrics.gauge(
+                    "canardstack_raw_spool_writer_pending_commands",
+                    &[("signal", signal), ("kind", kind), ("stat", "max")],
+                    max as f64,
+                );
+            } else {
+                metrics.gauge(
+                    "canardstack_raw_spool_writer_pending_commands",
+                    &[("kind", kind), ("stat", "current")],
+                    current as f64,
+                );
+                metrics.gauge(
+                    "canardstack_raw_spool_writer_pending_commands",
+                    &[("kind", kind), ("stat", "max")],
+                    max as f64,
+                );
+            }
+        }
+
+        for (kind, total) in [
+            ("append", stats.writer_append_commands_total),
+            ("checkpoint", stats.writer_checkpoint_commands_total),
+            ("recover", stats.writer_recover_commands_total),
+            ("stats", stats.writer_stats_commands_total),
+        ] {
+            if let Some(signal) = signal {
+                metrics.set_counter(
+                    "canardstack_raw_spool_writer_commands_total",
+                    &[("signal", signal), ("kind", kind)],
+                    total,
+                );
+            } else {
+                metrics.set_counter(
+                    "canardstack_raw_spool_writer_commands_total",
+                    &[("kind", kind)],
+                    total,
+                );
+            }
         }
     }
 
@@ -736,6 +863,30 @@ fn merge_raw_spool_stats(aggregate: &mut spool::RawSpoolStats, stats: &spool::Ra
     aggregate.append_sync_file_fsyncs_total = aggregate
         .append_sync_file_fsyncs_total
         .saturating_add(stats.append_sync_file_fsyncs_total);
+    aggregate.writer_pending_commands += stats.writer_pending_commands;
+    aggregate.writer_pending_append_commands += stats.writer_pending_append_commands;
+    aggregate.writer_pending_checkpoint_commands += stats.writer_pending_checkpoint_commands;
+    aggregate.writer_pending_commands_max = aggregate
+        .writer_pending_commands_max
+        .max(stats.writer_pending_commands_max);
+    aggregate.writer_pending_append_commands_max = aggregate
+        .writer_pending_append_commands_max
+        .max(stats.writer_pending_append_commands_max);
+    aggregate.writer_pending_checkpoint_commands_max = aggregate
+        .writer_pending_checkpoint_commands_max
+        .max(stats.writer_pending_checkpoint_commands_max);
+    aggregate.writer_append_commands_total = aggregate
+        .writer_append_commands_total
+        .saturating_add(stats.writer_append_commands_total);
+    aggregate.writer_checkpoint_commands_total = aggregate
+        .writer_checkpoint_commands_total
+        .saturating_add(stats.writer_checkpoint_commands_total);
+    aggregate.writer_recover_commands_total = aggregate
+        .writer_recover_commands_total
+        .saturating_add(stats.writer_recover_commands_total);
+    aggregate.writer_stats_commands_total = aggregate
+        .writer_stats_commands_total
+        .saturating_add(stats.writer_stats_commands_total);
     aggregate.healthy &= stats.healthy;
     if let Some(error) = &stats.error {
         aggregate.error = Some(match aggregate.error.take() {
