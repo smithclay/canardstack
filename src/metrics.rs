@@ -10,14 +10,27 @@ use arrow58::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow58::record_batch::RecordBatch;
 use chrono::Utc;
 use serde_json::{json, Map, Value};
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Instant;
 
-#[derive(Default)]
+/// Number of independent lock shards. A power of two so shard selection is a
+/// cheap mask. Sized to cover the connection-thread + ingest-worker fan-out so
+/// the hot ingest path stops serializing on a single metrics mutex.
+const METRICS_SHARDS: usize = 16;
+
 pub struct Metrics {
-    inner: Mutex<MetricsInner>,
+    shards: [Mutex<MetricsInner>; METRICS_SHARDS],
+}
+
+impl Default for Metrics {
+    fn default() -> Self {
+        Self {
+            shards: std::array::from_fn(|_| Mutex::new(MetricsInner::default())),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -68,28 +81,43 @@ pub enum MetricKind {
 }
 
 impl Metrics {
+    /// Select the lock shard for a rendered metric key. A given key always maps
+    /// to the same shard, so read-modify-write counters/gauges remain correct
+    /// without a single global lock. FNV-1a keeps this branch-free and cheap.
+    fn shard_for(&self, metric_key: &str) -> &Mutex<MetricsInner> {
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for byte in metric_key.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        &self.shards[(hash as usize) & (METRICS_SHARDS - 1)]
+    }
+
     pub fn inc(&self, name: &str, labels: &[(&str, &str)], by: u64) {
-        let mut inner = self.inner.lock_or_poisoned();
-        *inner.counters.entry(key(name, labels)).or_default() += by;
+        let metric_key = key(name, labels);
+        let mut inner = self.shard_for(&metric_key).lock_or_poisoned();
+        *inner.counters.entry(metric_key).or_default() += by;
     }
 
     pub fn set_counter(&self, name: &str, labels: &[(&str, &str)], value: u64) {
-        self.inner
+        let metric_key = key(name, labels);
+        self.shard_for(&metric_key)
             .lock_or_poisoned()
             .counters
-            .insert(key(name, labels), value);
+            .insert(metric_key, value);
     }
 
     pub fn gauge(&self, name: &str, labels: &[(&str, &str)], value: f64) {
-        self.inner
+        let metric_key = key(name, labels);
+        self.shard_for(&metric_key)
             .lock_or_poisoned()
             .gauges
-            .insert(key(name, labels), value);
+            .insert(metric_key, value);
     }
 
     pub fn gauge_max(&self, name: &str, labels: &[(&str, &str)], value: f64) {
-        let mut inner = self.inner.lock_or_poisoned();
         let metric_key = key(name, labels);
+        let mut inner = self.shard_for(&metric_key).lock_or_poisoned();
         let current = inner.gauges.get(&metric_key).copied().unwrap_or(value);
         inner.gauges.insert(metric_key, current.max(value));
     }
@@ -102,24 +130,28 @@ impl Metrics {
         if count == 0 {
             return;
         }
-        let mut inner = self.inner.lock_or_poisoned();
-        *inner
-            .counters
-            .entry(key(&format!("{name}_count"), labels))
-            .or_default() += count;
+        let count_key = key(&format!("{name}_count"), labels);
         let sum_key = key(&format!("{name}_sum"), labels);
+        {
+            let mut inner = self.shard_for(&count_key).lock_or_poisoned();
+            *inner.counters.entry(count_key).or_default() += count;
+        }
+        let mut inner = self.shard_for(&sum_key).lock_or_poisoned();
         let current = inner.gauges.get(&sum_key).copied().unwrap_or(0.0);
         inner.gauges.insert(sum_key, current + seconds);
     }
 
     pub fn set_observation(&self, name: &str, labels: &[(&str, &str)], count: u64, seconds: f64) {
-        let mut inner = self.inner.lock_or_poisoned();
-        inner
+        let count_key = key(&format!("{name}_count"), labels);
+        let sum_key = key(&format!("{name}_sum"), labels);
+        self.shard_for(&count_key)
+            .lock_or_poisoned()
             .counters
-            .insert(key(&format!("{name}_count"), labels), count);
-        inner
+            .insert(count_key, count);
+        self.shard_for(&sum_key)
+            .lock_or_poisoned()
             .gauges
-            .insert(key(&format!("{name}_sum"), labels), seconds);
+            .insert(sum_key, seconds);
     }
 
     pub fn observe_phase_seconds(
@@ -178,21 +210,22 @@ impl Metrics {
     }
 
     pub fn ingest_request(&self, signal: Signal, status: u16, reason: &str) {
+        let status = status_label(status);
         self.inc(
             "canardstack_ingest_requests_total",
             &[
                 ("signal", signal.as_str()),
-                ("status", &status.to_string()),
+                ("status", status.as_ref()),
                 ("reason", reason),
             ],
             1,
         );
-        if status == 429 || status == 503 {
+        if status == "429" || status == "503" {
             self.inc(
                 "canardstack_ingest_rejections_total",
                 &[
                     ("signal", signal.as_str()),
-                    ("status", &status.to_string()),
+                    ("status", status.as_ref()),
                     ("reason", reason),
                 ],
                 1,
@@ -201,11 +234,12 @@ impl Metrics {
     }
 
     pub fn query_request(&self, query_class: &str, status: u16, reason: &str, seconds: f64) {
+        let status = status_label(status);
         self.inc(
             "canardstack_query_requests_total",
             &[
                 ("query_class", query_class),
-                ("status", &status.to_string()),
+                ("status", status.as_ref()),
                 ("reason", reason),
             ],
             1,
@@ -215,7 +249,7 @@ impl Metrics {
             &[("query_class", query_class)],
             seconds,
         );
-        if status == 429 {
+        if status == "429" {
             self.inc(
                 "canardstack_query_rejections_total",
                 &[("query_class", query_class), ("reason", reason)],
@@ -245,15 +279,15 @@ impl Metrics {
     }
 
     pub fn render_prometheus(&self) -> String {
-        let inner = self.inner.lock_or_poisoned();
+        let (counters, gauges) = self.merged_shards();
         let mut out = String::new();
-        for (k, v) in &inner.counters {
+        for (k, v) in &counters {
             out.push_str(k);
             out.push(' ');
             out.push_str(&v.to_string());
             out.push('\n');
         }
-        for (k, v) in &inner.gauges {
+        for (k, v) in &gauges {
             out.push_str(k);
             out.push(' ');
             out.push_str(&format!("{v:.6}"));
@@ -263,19 +297,32 @@ impl Metrics {
     }
 
     pub fn snapshot(&self) -> Vec<MetricSample> {
-        let inner = self.inner.lock_or_poisoned();
-        inner
-            .counters
+        let (counters, gauges) = self.merged_shards();
+        counters
             .iter()
             .map(|(k, v)| {
                 let (name, labels) = split_metric_key(k);
                 MetricSample::counter(name, labels, *v as f64)
             })
-            .chain(inner.gauges.iter().map(|(k, v)| {
+            .chain(gauges.iter().map(|(k, v)| {
                 let (name, labels) = split_metric_key(k);
                 MetricSample::gauge(name, labels, *v)
             }))
             .collect()
+    }
+
+    /// Merge all shards into sorted maps for a stable, deduplicated read. Each
+    /// key lives in exactly one shard, so the merge never collides. Locks one
+    /// shard at a time, so it cannot deadlock against the per-key writers.
+    fn merged_shards(&self) -> (BTreeMap<String, u64>, BTreeMap<String, f64>) {
+        let mut counters: BTreeMap<String, u64> = BTreeMap::new();
+        let mut gauges: BTreeMap<String, f64> = BTreeMap::new();
+        for shard in &self.shards {
+            let inner = shard.lock_or_poisoned();
+            counters.extend(inner.counters.iter().map(|(k, v)| (k.clone(), *v)));
+            gauges.extend(inner.gauges.iter().map(|(k, v)| (k.clone(), *v)));
+        }
+        (counters, gauges)
     }
 
     pub fn write_snapshot_to_storage(&self, storage: &Storage) -> Result<usize> {
@@ -327,6 +374,22 @@ impl Timer {
 
     pub fn elapsed_ms(&self) -> u128 {
         self.start.elapsed().as_millis()
+    }
+}
+
+/// Render an HTTP status as a label without allocating for the handful of
+/// statuses the hot ingest/query paths actually emit.
+fn status_label(status: u16) -> Cow<'static, str> {
+    match status {
+        200 => Cow::Borrowed("200"),
+        202 => Cow::Borrowed("202"),
+        400 => Cow::Borrowed("400"),
+        413 => Cow::Borrowed("413"),
+        415 => Cow::Borrowed("415"),
+        429 => Cow::Borrowed("429"),
+        500 => Cow::Borrowed("500"),
+        503 => Cow::Borrowed("503"),
+        other => Cow::Owned(other.to_string()),
     }
 }
 

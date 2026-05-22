@@ -3,55 +3,22 @@ use crate::otlp::Transformed;
 use arrow58::record_batch::RecordBatch;
 use serde::Serialize;
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
-pub(super) struct QueueKey {
-    pub(super) signal: Signal,
-    pub(super) partition: BatchPartition,
-}
-
-impl QueueKey {
-    pub(super) fn new(signal: Signal, source_format: &'static str) -> Self {
-        Self {
-            signal,
-            partition: BatchPartition::from_source_format(source_format),
-        }
-    }
-}
-
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
-pub(super) enum BatchPartition {
-    Json,
-    Protobuf,
-}
-
-impl BatchPartition {
-    fn from_source_format(source_format: &'static str) -> Self {
-        match source_format {
-            "json" | "otlp_json" => Self::Json,
-            _ => Self::Protobuf,
-        }
-    }
-}
-
 pub(super) struct PendingBatch {
-    pub(super) key: QueueKey,
+    pub(super) signal: Signal,
     pub(super) batch: RecordBatch,
     pub(super) source_format: &'static str,
     pub(super) approx_bytes: usize,
-    pub(super) credit_bytes: usize,
 }
 
+/// Per-signal view of ingest in-flight pressure: bytes that have been admitted
+/// (durably spooled, handed to a worker) but not yet inserted into the immutable
+/// buffer. There is no separate in-memory queue, so this is the only "queue"
+/// depth ingest exposes; freshness/visibility debt lives in the lane snapshot.
 #[derive(Debug, Serialize)]
 pub struct IngestSnapshot {
     pub signal: &'static str,
-    pub buffered_rows: usize,
-    pub buffered_bytes: usize,
-    pub queue_credit_reserved_bytes: usize,
-    pub queue_credit_available_bytes: usize,
-    pub queue_credit_capacity_bytes: usize,
-    pub queue_credit_closed: bool,
-    pub visibility_debt_seconds: f64,
-    pub oldest_age_seconds: f64,
+    pub inflight_bytes: usize,
+    pub inflight_capacity_bytes: usize,
     pub pressure: f64,
 }
 
@@ -94,10 +61,9 @@ fn push_pending_arrow(
     }
     let approx_bytes = batch.get_array_memory_size().max(batch.num_rows());
     batches.push(PendingBatch {
-        key: QueueKey::new(signal, source_format),
+        signal,
         batch,
         source_format,
         approx_bytes,
-        credit_bytes: approx_bytes,
     });
 }

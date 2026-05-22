@@ -18,11 +18,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 mod admission;
-mod queue;
+mod batches;
 pub mod spool;
 mod worker;
 
-pub use queue::IngestSnapshot;
+pub use batches::IngestSnapshot;
 use worker::IngestWorkerPool;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize)]
@@ -63,7 +63,7 @@ impl fmt::Display for Signal {
 
 pub struct Ingestor {
     runtime_memory_reserved_bytes: Arc<AtomicUsize>,
-    queue_credits: Arc<Mutex<admission::QueueCreditLedger>>,
+    inflight: Arc<admission::InflightBytes>,
     raw_spools: BTreeMap<Signal, Writer>,
     metric_raw_spool_next: AtomicUsize,
     raw_spool_flush_refs: Arc<Mutex<BTreeMap<(Signal, RecordId), FlushRef>>>,
@@ -76,7 +76,7 @@ pub(in crate::ingest) struct SpooledIngestWork {
     headers: HashMap<String, String>,
     compressed_body: Vec<u8>,
     raw_spool_ref: spool::AppendRef,
-    queue_credit_reservation: admission::QueueCreditReservation,
+    inflight_reservation: admission::InflightReservation,
     runtime_memory_reservation: admission::RuntimeMemoryReservation,
     pub(in crate::ingest) metrics: Arc<Metrics>,
     // Payload already decompressed, transformed, and skew-validated on the
@@ -99,7 +99,7 @@ impl Ingestor {
         }
         Ok(Self {
             runtime_memory_reserved_bytes: Arc::new(AtomicUsize::new(0)),
-            queue_credits: Arc::new(Mutex::new(admission::QueueCreditLedger::new(&config))),
+            inflight: Arc::new(admission::InflightBytes::new(&config)),
             raw_spools,
             metric_raw_spool_next: AtomicUsize::new(0),
             raw_spool_flush_refs: Arc::new(Mutex::new(BTreeMap::new())),
@@ -144,7 +144,7 @@ impl Ingestor {
             )
             .with_retry_after(10));
         }
-        let mut queue_credit_reservation = match self.reserve_queue_credit_estimate(
+        let mut inflight_reservation = match self.reserve_inflight(
             signal,
             headers,
             compressed_body.len(),
@@ -154,7 +154,7 @@ impl Ingestor {
         ) {
             Ok(reservation) => reservation,
             Err(err) => {
-                self.record_queue_metrics(metrics);
+                self.record_inflight_metrics(metrics);
                 metrics.ingest_request(signal, err.status, err.reason);
                 return Err(err);
             }
@@ -163,7 +163,7 @@ impl Ingestor {
             match self.append_raw_spool(signal, headers, compressed_body, metrics) {
                 Ok(appended) => appended,
                 Err(err) => {
-                    self.release_queue_credit_reservation(&mut queue_credit_reservation);
+                    inflight_reservation.release();
                     metrics.ingest_request(signal, err.status, err.reason);
                     return Err(err);
                 }
@@ -172,7 +172,7 @@ impl Ingestor {
             match self.admit_runtime_memory(signal, headers, compressed_body.len(), metrics) {
                 Ok(reservation) => reservation,
                 Err(err) => {
-                    self.release_queue_credit_reservation(&mut queue_credit_reservation);
+                    inflight_reservation.release();
                     self.checkpoint_raw_spool_terminal(
                         raw_spool_ref,
                         signal,
@@ -192,7 +192,7 @@ impl Ingestor {
             headers: headers.clone(),
             compressed_body,
             raw_spool_ref,
-            queue_credit_reservation,
+            inflight_reservation,
             runtime_memory_reservation,
             metrics: async_metrics,
             prepared: Some(prepared),
@@ -210,7 +210,7 @@ impl Ingestor {
             headers,
             compressed_body,
             raw_spool_ref,
-            mut queue_credit_reservation,
+            mut inflight_reservation,
             mut runtime_memory_reservation,
             metrics,
             prepared,
@@ -248,7 +248,7 @@ impl Ingestor {
                 let body = match body_result {
                     Ok(body) => body,
                     Err(err) => {
-                        self.release_queue_credit_reservation(&mut queue_credit_reservation);
+                        inflight_reservation.release();
                         return Err(err);
                     }
                 };
@@ -257,7 +257,7 @@ impl Ingestor {
                     Cow::Owned(bytes) => bytes.len(),
                 };
                 if let Err(err) = validation::validate_body_size(body.len(), &self.config) {
-                    self.release_queue_credit_reservation(&mut queue_credit_reservation);
+                    inflight_reservation.release();
                     return Err(err);
                 }
                 let started = Instant::now();
@@ -274,7 +274,7 @@ impl Ingestor {
                 let transformed = match transformed_result {
                     Ok(transformed) => transformed,
                     Err(err) => {
-                        self.release_queue_credit_reservation(&mut queue_credit_reservation);
+                        inflight_reservation.release();
                         return Err(err);
                     }
                 };
@@ -287,7 +287,7 @@ impl Ingestor {
                     started.elapsed().as_secs_f64(),
                 );
                 if let Err(err) = skew_result {
-                    self.release_queue_credit_reservation(&mut queue_credit_reservation);
+                    inflight_reservation.release();
                     return Err(err);
                 }
                 let decoded_body_len = body.len();
@@ -310,26 +310,22 @@ impl Ingestor {
         }
 
         let request_bytes = compressed_body.len();
-        let batches = queue::pending_batches(transformed);
+        let batches = batches::pending_batches(transformed);
         let buffered_totals = pending_batch_totals(&batches);
-        let exact_queue_credits = admission::credit_bytes_by_signal(&batches);
-        if let Err(err) =
-            self.adjust_queue_credit_reservation(&mut queue_credit_reservation, exact_queue_credits)
-        {
-            self.release_queue_credit_reservation(&mut queue_credit_reservation);
-            self.record_queue_metrics(metrics);
-            return Err(err);
-        }
+        // Correct the admission estimate to the exact buffered Arrow bytes. The
+        // request is already durably spooled, so this is infallible accounting,
+        // never a late rejection.
+        inflight_reservation.adjust(admission::inflight_bytes_by_signal(&batches));
         let pending_bytes = batches.iter().map(|b| b.approx_bytes).sum::<usize>();
         let peak_bytes = request_bytes
             .saturating_add(decoded_body_materialized_bytes)
             .saturating_add(pending_bytes);
         if let Err(err) = runtime_memory_reservation.reserve_at_least(peak_bytes, signal, metrics) {
-            self.release_queue_credit_reservation(&mut queue_credit_reservation);
+            inflight_reservation.release();
             return Err(err);
         }
         if batches.is_empty() {
-            self.release_queue_credit_reservation(&mut queue_credit_reservation);
+            inflight_reservation.release();
             self.checkpoint_raw_spool_terminal(raw_spool_ref, signal, "transform_empty", metrics)?;
             return Ok(());
         }
@@ -338,7 +334,7 @@ impl Ingestor {
             .iter()
             .filter(|batch| batch.batch.num_rows() > 0)
             .map(|batch| ArrowBatchInsert {
-                table: batch.key.signal,
+                table: batch.signal,
                 batch: &batch.batch,
                 source_format: batch.source_format,
             })
@@ -358,8 +354,8 @@ impl Ingestor {
                 // record was not tracked, so it stays pending and replays on a
                 // future restart (at-least-once). Release the admission credit
                 // and surface a retryable dependency error.
-                self.release_queue_credit_reservation(&mut queue_credit_reservation);
-                self.record_queue_metrics(metrics);
+                inflight_reservation.release();
+                self.record_inflight_metrics(metrics);
                 metrics.inc(
                     "canardstack_ingest_storage_insert_total",
                     &[("signal", signal.as_str()), ("status", "error")],
@@ -388,7 +384,7 @@ impl Ingestor {
         // admission credit (buffer occupancy is now reflected as buffered bytes
         // for freshness, not as a held queue credit).
         self.track_raw_spool_record(raw_spool_ref, signal);
-        self.release_queue_credit_reservation(&mut queue_credit_reservation);
+        inflight_reservation.release();
 
         let accepted = buffered_totals
             .values()
@@ -491,9 +487,9 @@ impl Ingestor {
         };
         match send_err {
             TrySendError::Full(work) => {
-                let mut queue_credit_reservation = work.queue_credit_reservation;
-                self.release_queue_credit_reservation(&mut queue_credit_reservation);
-                self.record_queue_metrics(metrics);
+                let mut inflight_reservation = work.inflight_reservation;
+                inflight_reservation.release();
+                self.record_inflight_metrics(metrics);
                 metrics.ingest_request(signal, 429, "ingest_buffer_full");
                 metrics.inc(
                     "canardstack_ingest_requests_queued_total",
@@ -506,8 +502,8 @@ impl Ingestor {
                 )
             }
             TrySendError::Disconnected(work) => {
-                let mut queue_credit_reservation = work.queue_credit_reservation;
-                self.release_queue_credit_reservation(&mut queue_credit_reservation);
+                let mut inflight_reservation = work.inflight_reservation;
+                inflight_reservation.release();
                 metrics.ingest_request(signal, 503, "ingest_workers_unavailable");
                 metrics.inc(
                     "canardstack_ingest_requests_queued_total",
@@ -524,7 +520,11 @@ impl Ingestor {
         }
     }
 
-    fn reserve_queue_credit_estimate(
+    /// Single ingest admission gate: project visibility through the lane
+    /// controller (the freshness-first authority), then take a per-signal
+    /// in-flight reservation as a cheap isolation ceiling. Both run before the
+    /// durable raw-spool append, so a rejection never spools.
+    fn reserve_inflight(
         &self,
         signal: Signal,
         headers: &HashMap<String, String>,
@@ -532,48 +532,17 @@ impl Ingestor {
         storage: &Storage,
         lanes: &LaneController,
         metrics: &Metrics,
-    ) -> ApiResult<admission::QueueCreditReservation> {
-        let ledger = self.queue_credits.lock_or_poisoned();
-        let estimated = ledger.estimate_for_request(
+    ) -> ApiResult<admission::InflightReservation> {
+        let estimate = self.inflight.estimate_for_request(
             signal,
             headers,
             compressed_body_bytes,
             self.config.max_body_bytes,
         );
-        let projected_total = ledger.projected_reserved_total_bytes(&estimated);
-        let queued_total = ledger.total_reserved_bytes();
-        drop(ledger);
         let mut inputs = self.lane_freshness_inputs(storage);
-        inputs.queued_bytes = queued_total;
-        inputs.incoming_bytes = projected_total.saturating_sub(queued_total);
+        inputs.incoming_bytes = estimate.values().sum::<usize>();
         lanes.admit_ingest(inputs, metrics)?;
-        let mut reservation = self.queue_credits.lock_or_poisoned().reserve_estimate(
-            signal,
-            headers,
-            compressed_body_bytes,
-            self.config.max_body_bytes,
-        )?;
-        reservation.bind_ledger(Arc::downgrade(&self.queue_credits));
-        Ok(reservation)
-    }
-
-    fn adjust_queue_credit_reservation(
-        &self,
-        reservation: &mut admission::QueueCreditReservation,
-        desired: BTreeMap<Signal, usize>,
-    ) -> ApiResult<()> {
-        self.queue_credits
-            .lock_or_poisoned()
-            .adjust_reservation(reservation, desired)
-    }
-
-    fn release_queue_credit_reservation(
-        &self,
-        reservation: &mut admission::QueueCreditReservation,
-    ) {
-        self.queue_credits
-            .lock_or_poisoned()
-            .release_reservation(reservation);
+        self.inflight.reserve(estimate)
     }
 
     fn admit_runtime_memory(
@@ -603,107 +572,51 @@ impl Ingestor {
     }
 
     pub fn snapshots(&self) -> Vec<IngestSnapshot> {
-        let credit_snapshots = self.queue_credits.lock_or_poisoned().snapshots();
+        let capacity = self.inflight.capacity_bytes();
         Signal::ALL
             .into_iter()
             .map(|signal| {
-                let credit = credit_snapshots.get(&signal);
-                let reserved = credit.map(|c| c.reserved_bytes).unwrap_or_default();
-                let capacity = credit
-                    .map(|c| c.capacity_bytes)
-                    .unwrap_or(self.config.per_signal_queue_bytes);
+                let inflight_bytes = self.inflight.signal_bytes(signal);
                 IngestSnapshot {
                     signal: signal.as_str(),
-                    buffered_rows: 0,
-                    buffered_bytes: reserved,
-                    queue_credit_reserved_bytes: reserved,
-                    queue_credit_available_bytes: credit
-                        .map(|c| c.available_bytes)
-                        .unwrap_or(capacity.saturating_sub(reserved)),
-                    queue_credit_capacity_bytes: capacity,
-                    queue_credit_closed: credit.map(|c| c.closed).unwrap_or(false),
-                    visibility_debt_seconds: credit.map(|c| c.flush_debt_seconds).unwrap_or(0.0),
-                    oldest_age_seconds: 0.0,
+                    inflight_bytes,
+                    inflight_capacity_bytes: capacity,
                     pressure: if capacity == 0 {
                         0.0
                     } else {
-                        reserved as f64 / capacity as f64
+                        inflight_bytes as f64 / capacity as f64
                     },
                 }
             })
             .collect()
     }
 
-    pub fn record_queue_metrics(&self, metrics: &Metrics) {
+    pub fn record_inflight_metrics(&self, metrics: &Metrics) {
         for snapshot in self.snapshots() {
             metrics.gauge(
-                "canardstack_ingest_queue_rows",
+                "canardstack_ingest_inflight_bytes",
                 &[("signal", snapshot.signal)],
-                snapshot.buffered_rows as f64,
+                snapshot.inflight_bytes as f64,
             );
             metrics.gauge_max(
-                "canardstack_ingest_queue_rows_max",
+                "canardstack_ingest_inflight_bytes_max",
                 &[("signal", snapshot.signal)],
-                snapshot.buffered_rows as f64,
+                snapshot.inflight_bytes as f64,
             );
             metrics.gauge(
-                "canardstack_ingest_queue_bytes",
-                &[("signal", snapshot.signal)],
-                snapshot.buffered_bytes as f64,
-            );
-            metrics.gauge_max(
-                "canardstack_ingest_queue_bytes_max",
-                &[("signal", snapshot.signal)],
-                snapshot.buffered_bytes as f64,
-            );
-            metrics.gauge(
-                "canardstack_ingest_queue_oldest_age_seconds",
-                &[("signal", snapshot.signal)],
-                snapshot.oldest_age_seconds,
-            );
-            metrics.gauge_max(
-                "canardstack_ingest_queue_oldest_age_seconds_max",
-                &[("signal", snapshot.signal)],
-                snapshot.oldest_age_seconds,
-            );
-            metrics.gauge(
-                "canardstack_ingest_queue_pressure",
+                "canardstack_ingest_inflight_pressure",
                 &[("signal", snapshot.signal)],
                 snapshot.pressure,
             );
             metrics.gauge_max(
-                "canardstack_ingest_queue_pressure_max",
+                "canardstack_ingest_inflight_pressure_max",
                 &[("signal", snapshot.signal)],
                 snapshot.pressure,
             );
             metrics.gauge(
-                "canardstack_ingest_queue_credit_reserved_bytes",
+                "canardstack_ingest_inflight_capacity_bytes",
                 &[("signal", snapshot.signal)],
-                snapshot.queue_credit_reserved_bytes as f64,
-            );
-            metrics.gauge(
-                "canardstack_ingest_queue_credit_available_bytes",
-                &[("signal", snapshot.signal)],
-                snapshot.queue_credit_available_bytes as f64,
-            );
-            metrics.gauge(
-                "canardstack_ingest_queue_credit_capacity_bytes",
-                &[("signal", snapshot.signal)],
-                snapshot.queue_credit_capacity_bytes as f64,
-            );
-            metrics.gauge(
-                "canardstack_ingest_queue_credit_closed",
-                &[("signal", snapshot.signal)],
-                if snapshot.queue_credit_closed {
-                    1.0
-                } else {
-                    0.0
-                },
-            );
-            metrics.gauge(
-                "canardstack_ingest_visibility_debt_seconds",
-                &[("signal", snapshot.signal)],
-                snapshot.visibility_debt_seconds,
+                snapshot.inflight_capacity_bytes as f64,
             );
         }
     }
@@ -720,21 +633,20 @@ impl Ingestor {
                 )
             });
         FreshnessInputs {
-            queued_bytes: self.total_reserved_queue_bytes(),
+            queued_bytes: self.inflight_bytes(),
             incoming_bytes: 0,
-            oldest_queue_age_seconds: self.max_oldest_queue_age_seconds(),
+            // Admitted bytes move straight from the worker into the immutable
+            // buffer; there is no separate in-memory queue to age out, so queue
+            // dwell is zero and buffer age is carried by oldest_buffer_age_seconds.
+            oldest_queue_age_seconds: 0.0,
             buffered_bytes,
             buffered_active_count,
             oldest_buffer_age_seconds,
         }
     }
 
-    pub fn total_reserved_queue_bytes(&self) -> usize {
-        self.queue_credits.lock_or_poisoned().total_reserved_bytes()
-    }
-
-    fn max_oldest_queue_age_seconds(&self) -> f64 {
-        0.0
+    pub fn inflight_bytes(&self) -> usize {
+        self.inflight.total_bytes()
     }
 
     fn record_accepted_body_metrics(
@@ -875,10 +787,10 @@ fn spawn_raw_spool_writer(config: &Config, signal: Signal) -> Result<Writer> {
     .with_context(|| format!("spawn {signal} raw spool writer"))
 }
 
-fn pending_batch_totals(batches: &[queue::PendingBatch]) -> BTreeMap<Signal, (usize, usize)> {
+fn pending_batch_totals(batches: &[batches::PendingBatch]) -> BTreeMap<Signal, (usize, usize)> {
     let mut totals = BTreeMap::new();
     for batch in batches {
-        let (rows, bytes) = totals.entry(batch.key.signal).or_insert((0, 0));
+        let (rows, bytes) = totals.entry(batch.signal).or_insert((0, 0));
         *rows += batch.batch.num_rows();
         *bytes += batch.approx_bytes;
     }

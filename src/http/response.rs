@@ -96,8 +96,13 @@ pub(super) fn write_response_with_connection(
         503 => "Service Unavailable",
         _ => "OK",
     };
+    // Assemble the whole response (status line, headers, body) into one buffer
+    // and flush it with a single write_all, instead of a syscall per header
+    // line plus one per body. With TCP_NODELAY set on the socket this lets the
+    // response go out in one packet rather than dribbling.
+    let mut out = Vec::with_capacity(response.body.len() + 128);
     write!(
-        stream,
+        out,
         "HTTP/1.1 {} {}\r\ncontent-type: {}\r\ncontent-length: {}\r\nconnection: {}\r\n",
         response.status,
         reason,
@@ -106,9 +111,10 @@ pub(super) fn write_response_with_connection(
         if keep_alive { "keep-alive" } else { "close" }
     )?;
     if let Some(seconds) = response.retry_after_seconds {
-        write!(stream, "retry-after: {seconds}\r\n")?;
+        write!(out, "retry-after: {seconds}\r\n")?;
     }
-    stream.write_all(b"\r\n")?;
-    stream.write_all(&response.body)?;
+    out.extend_from_slice(b"\r\n");
+    out.extend_from_slice(&response.body);
+    stream.write_all(&out)?;
     Ok(())
 }

@@ -51,7 +51,7 @@ pub fn run() -> anyhow::Result<()> {
         &state,
     );
     let deadline = Instant::now() + StdDuration::from_secs(5);
-    while Instant::now() < deadline && state.ingestor.total_reserved_queue_bytes() > 0 {
+    while Instant::now() < deadline && state.ingestor.inflight_bytes() > 0 {
         thread::sleep(StdDuration::from_millis(20));
     }
     state

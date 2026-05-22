@@ -59,8 +59,9 @@ OTLP/HTTP (JSON or protobuf, optional gzip)
   -> validation (auth, content type, size, timestamp skew)
   -> local fsync raw spool
   -> otlp2records -> Arrow RecordBatch grouped by Signal
-  -> bounded per-signal in-memory queue
-  -> immutable Parquet segment files registered with DuckLake
+  -> freshness-first admission (lane projection + per-signal in-flight ceiling)
+  -> ingest worker pool inserts into the storage immutable buffer
+  -> scheduler single seal driver -> immutable Parquet segment files registered with DuckLake
   -> bounded compat query adapters for Prometheus / Loki / Tempo subsets
 ```
 
@@ -77,7 +78,7 @@ Top-level modules map to pipeline stages or boundaries. Subdirectories group hel
 - `src/http.rs` - hand-rolled std-library HTTP/1.1 server with bounded per-connection threads and non-blocking accept shutdown.
 - `src/validation.rs` - auth, content-type, size, compression, timestamp-skew checks, `ApiError`, and error envelopes.
 - `src/otlp.rs` - OTLP JSON/protobuf decode and `Transformed` payload construction.
-- `src/ingest/` - request flow, admission, queue accounting, flush orchestration, and `PartialFlushError`.
+- `src/ingest/` - request flow, freshness-first admission, per-signal in-flight accounting, the durable raw spool, and the ingest worker pool that inserts into the storage immutable buffer.
 - `src/lanes.rs` - minimal logical lane controller for flush reservation, freshness-budget ingest admission, and cheap/heavy query admission.
 - `src/storage/` - DuckDB lifecycle, DuckLake `ATTACH`, extension install, immutable segment writes, `StorageProbe`, retention, and maintenance SQL.
 - `src/query/` - bounded query helpers, shared query plans, and Prometheus/Loki/Tempo selector parsing.
@@ -94,7 +95,7 @@ Top-level modules map to pipeline stages or boundaries. Subdirectories group hel
 - Keep the code synchronous. Do not add `tokio`, `async fn`, gRPC, Kafka, a second binary, or another long-running service unless the task explicitly changes the architecture.
 - Use OS threads plus `Arc<Mutex<_>>`. Prefer `LockExt::lock_or_poisoned()` over `.lock().unwrap()` for shared state.
 - Treat ingest as at-least-once after local durable spool: a 2xx response means the raw request was fsynced to the local raw spool and accepted for bounded processing. It does not mean the rows are DuckLake-committed or query-visible yet.
-- Preserve pressure behavior: queues return 429 under pressure, and storage/dependency failures surface as 503 where appropriate.
+- Preserve pressure behavior: ingest admission returns 429 under pressure, and storage/dependency failures surface as 503 where appropriate.
 - Preserve freshness-first admission: request-path checks may reject with 429 before raw-spool append when projected flush visibility exceeds the configured freshness SLA.
 - Preserve flush/query lane priority: flush capacity is reserved before query capacity; cheap metadata/probe/discovery/instant-ish queries keep a protected lane, and heavy range/search queries degrade or reject first under freshness debt.
 - Keep query routes bounded by time range, row limit, timeout, DuckDB memory limit, and concurrency caps through `QueryEngine`.

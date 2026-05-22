@@ -75,7 +75,7 @@ fn flush_all(state: &AppState) -> usize {
     // checkpointing the raw spool, leaving records pending forever.
     let deadline = Instant::now() + StdDuration::from_secs(5);
     while Instant::now() < deadline {
-        if state.ingestor.total_reserved_queue_bytes() == 0 {
+        if state.ingestor.inflight_bytes() == 0 {
             break;
         }
         thread::sleep(StdDuration::from_millis(10));
@@ -274,14 +274,14 @@ fn log_rows(state: &AppState) -> i64 {
         .unwrap()
 }
 
-fn assert_metric_queue_rows(state: &AppState, expected: usize) {
+fn assert_metric_inflight_bytes(state: &AppState, expected: usize) {
     let snapshot = state
         .ingestor
         .snapshots()
         .into_iter()
         .find(|snapshot| snapshot.signal == Signal::MetricGauge.as_str())
         .unwrap();
-    assert_eq!(snapshot.buffered_rows, expected);
+    assert_eq!(snapshot.inflight_bytes, expected);
 }
 
 fn append_gauge_rows(state: &AppState, rows: &[(i64, &str, f64, &str)], source_format: &str) {
@@ -811,7 +811,7 @@ fn queue_pressure_returns_429() {
             .ingestor
             .snapshots()
             .into_iter()
-            .map(|s| s.buffered_rows)
+            .map(|s| s.inflight_bytes)
             .sum::<usize>(),
         0
     );
@@ -874,7 +874,7 @@ fn runtime_memory_pressure_returns_429_before_enqueue() {
             .ingestor
             .snapshots()
             .into_iter()
-            .map(|s| s.buffered_rows)
+            .map(|s| s.inflight_bytes)
             .sum::<usize>(),
         0
     );
@@ -1044,7 +1044,7 @@ fn ingest_workers_inserts_storage_buffer_and_checkpoints_spool() {
             .snapshots()
             .iter()
             .find(|snapshot| snapshot.signal == "logs")
-            .map(|snapshot| snapshot.buffered_rows),
+            .map(|snapshot| snapshot.inflight_bytes),
         Some(0),
         "buffered rows should drain once the scheduler seal path runs"
     );
@@ -1201,7 +1201,7 @@ fn raw_spool_replays_pending_request_on_startup() {
             .snapshots()
             .into_iter()
             .find(|snapshot| snapshot.signal == Signal::Logs.as_str())
-            .map(|snapshot| snapshot.queue_credit_reserved_bytes),
+            .map(|snapshot| snapshot.inflight_bytes),
         Some(0)
     );
     let metrics = metrics_text(&state);
@@ -1706,7 +1706,7 @@ fn metric_flush_drains_oversized_batch_and_preserves_queue_accounting() {
     flush_all(&state);
     flush_all(&state);
     assert_eq!(metric_gauge_rows(&state), 5);
-    assert_metric_queue_rows(&state, 0);
+    assert_metric_inflight_bytes(&state, 0);
 }
 
 #[test]
@@ -3108,8 +3108,7 @@ fn config_validate_rejects_zero_scheduler_intervals() {
         "baseline test config must validate"
     );
 
-    let mutations: [fn(&mut Config); 5] = [
-        |c| c.scheduler_watchdog_interval = std::time::Duration::ZERO,
+    let mutations: [fn(&mut Config); 4] = [
         |c| c.scheduler_flush_interval = std::time::Duration::ZERO,
         |c| c.scheduler_metadata_interval = std::time::Duration::ZERO,
         |c| c.scheduler_metrics_interval = std::time::Duration::ZERO,

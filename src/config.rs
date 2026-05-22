@@ -91,7 +91,6 @@ pub struct Config {
     pub spans_retention_days: i64,
     pub metrics_retention_days: i64,
     pub scheduler_enabled: bool,
-    pub scheduler_watchdog_interval: Duration,
     pub scheduler_flush_interval: Duration,
     pub scheduler_metadata_interval: Duration,
     pub scheduler_metrics_interval: Duration,
@@ -260,7 +259,6 @@ impl Config {
             scheduler_enabled: env_bool("CANARDSTACK_SCHEDULER_ENABLED")?
                 .or(file.bool(&["scheduler", "enabled"])?)
                 .unwrap_or(true),
-            scheduler_watchdog_interval: Duration::from_secs(1),
             // Seal cadence for the single flush driver. Decoupled from the coarse
             // maintenance interval: it must stay well under the freshness SLA so
             // immutable-buffer age never approaches the lane reject threshold.
@@ -369,7 +367,6 @@ impl Config {
             spans_retention_days: 14,
             metrics_retention_days: 30,
             scheduler_enabled: false,
-            scheduler_watchdog_interval: Duration::from_millis(50),
             scheduler_flush_interval: Duration::from_millis(200),
             scheduler_metadata_interval: Duration::from_millis(200),
             scheduler_metrics_interval: Duration::from_millis(200),
@@ -509,8 +506,7 @@ impl Config {
                 "CANARDSTACK_MAX_BODY_BYTES must be <= CANARDSTACK_RAW_SPOOL_CAPACITY_BYTES"
             );
         }
-        if self.scheduler_watchdog_interval.is_zero()
-            || self.scheduler_flush_interval.is_zero()
+        if self.scheduler_flush_interval.is_zero()
             || self.scheduler_metadata_interval.is_zero()
             || self.scheduler_metrics_interval.is_zero()
             || self.scheduler_retention_interval.is_zero()

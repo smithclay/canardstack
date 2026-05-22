@@ -398,7 +398,7 @@ fn classify_job_error(err: &anyhow::Error, job: &str) -> &'static str {
         return "disk_full";
     }
     match job {
-        "flush" | "watchdog" => "flush_failed",
+        "flush" => "flush_failed",
         "metadata_refresh" => "metadata_refresh_failed",
         "metrics_snapshot" => "metrics_snapshot_failed",
         "retention" | "retention_dry_run" => "retention_failed",
@@ -413,14 +413,8 @@ mod tests {
     fn snapshot(signal: &'static str, pressure: f64) -> IngestSnapshot {
         IngestSnapshot {
             signal,
-            buffered_rows: 0,
-            buffered_bytes: 0,
-            queue_credit_reserved_bytes: 0,
-            queue_credit_available_bytes: 0,
-            queue_credit_capacity_bytes: 0,
-            queue_credit_closed: false,
-            visibility_debt_seconds: 0.0,
-            oldest_age_seconds: 0.0,
+            inflight_bytes: 0,
+            inflight_capacity_bytes: 0,
             pressure,
         }
     }

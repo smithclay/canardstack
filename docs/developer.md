@@ -8,8 +8,9 @@ For a practitioner-focused overview, start with the [README](../README.md).
 ## Architecture
 
 ```text
-OTLP/HTTP -> local raw spool write, periodic append sync -> otlp2records -> bounded queues
-  -> immutable Parquet segments -> DuckLake registration -> logical queries
+OTLP/HTTP -> otlp2records transform -> freshness-first admission -> local raw spool write
+  -> ingest worker pool -> immutable buffer -> scheduler seal driver -> immutable Parquet segments
+  -> DuckLake registration -> logical queries
 ```
 
 canardstack is currently shaped as:
@@ -284,10 +285,10 @@ cargo test
 
 Coverage currently includes auth, invalid payloads, timestamp skew,
 dependency-unhealthy mode, unauthenticated `/healthz`, raw-spool replay and
-full-spool rejection, queue pressure, query limit validation, compatibility
-auth/error envelopes, ingest-to-query visibility through Prometheus/Loki/Tempo
-subsets, the scheduled queue watchdog, removed dashboard/alert routes, and the
-retention executor.
+full-spool rejection, in-flight admission pressure, query limit validation,
+compatibility auth/error envelopes, ingest-to-query visibility through
+Prometheus/Loki/Tempo subsets, the scheduled seal driver, removed
+dashboard/alert routes, and the retention executor.
 
 Docker-local checks are intentionally outside normal `cargo test`:
 
@@ -315,9 +316,10 @@ scripts/smoke-docker-local.sh
 The `serve` command spawns one background thread that closes the maintenance
 loop without operator action:
 
-- A queue watchdog/flush worker drains due queue partitions when row, byte, or
-  age thresholds fire. Ingest request threads enqueue and signal this worker;
-  they do not perform DuckDB/DuckLake writes inline.
+- A single seal driver seals the storage immutable buffer to durable Parquet
+  when per-signal size or age thresholds fire, or on the freshness cadence, then
+  checkpoints the raw spool. Ingest workers insert Arrow batches into the
+  immutable buffer; request threads do not perform DuckDB/DuckLake writes inline.
 - A periodic flush drains process queues to DuckLake and triggers DuckLake's
   inlined-data flush.
 - DuckLake adjacent-file compaction is disabled for immutable telemetry

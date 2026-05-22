@@ -369,7 +369,7 @@ fn record_maintenance_metrics(
 }
 
 pub(crate) fn record_operator_gauges(state: &AppState) {
-    state.ingestor.record_queue_metrics(&state.metrics);
+    state.ingestor.record_inflight_metrics(&state.metrics);
     state.ingestor.record_raw_spool_metrics(&state.metrics);
     let storage = state.storage.health();
     state.metrics.gauge(

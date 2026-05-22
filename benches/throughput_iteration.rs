@@ -2623,20 +2623,8 @@ fn scrape_metrics(text: &str) -> ScrapedMetrics {
                         .insert(table.clone(), metric.value);
                 }
             }
-            "canardstack_ingest_queue_rows" | "canardstack_ingest_queue_rows_max" => {
-                out.queue.max_rows = Some(out.queue.max_rows.unwrap_or(0.0).max(metric.value));
-            }
-            "canardstack_ingest_queue_bytes" | "canardstack_ingest_queue_bytes_max" => {
+            "canardstack_ingest_inflight_bytes" | "canardstack_ingest_inflight_bytes_max" => {
                 out.queue.max_bytes = Some(out.queue.max_bytes.unwrap_or(0.0).max(metric.value));
-            }
-            "canardstack_ingest_queue_oldest_age_seconds"
-            | "canardstack_ingest_queue_oldest_age_seconds_max" => {
-                out.queue.max_oldest_age_seconds = Some(
-                    out.queue
-                        .max_oldest_age_seconds
-                        .unwrap_or(0.0)
-                        .max(metric.value),
-                );
             }
             "canardstack_storage_physical_bytes" => {
                 out.storage.physical_bytes = Some(metric.value as u64);

@@ -133,8 +133,8 @@ impl Ingestor {
         if !storage.accepts_memory_ingest() || self.config.force_dependency_unhealthy {
             anyhow::bail!("storage dependency is unhealthy");
         }
-        let queue_credit_reservation = self
-            .reserve_queue_credit_estimate(
+        let inflight_reservation = self
+            .reserve_inflight(
                 signal,
                 &headers,
                 compressed_body.len(),
@@ -151,7 +151,7 @@ impl Ingestor {
             headers: headers.clone(),
             compressed_body,
             raw_spool_ref,
-            queue_credit_reservation,
+            inflight_reservation,
             runtime_memory_reservation,
             metrics: metrics.clone(),
             prepared: None,

@@ -17,7 +17,7 @@ Labels stay low-cardinality:
 - `table`: `logs`, `spans`, `metric_gauge`, `metric_sum`, or `all`.
 - `status`: HTTP status code or grouped class.
 - `reason`: bounded rejection or failure reason.
-- `job`: maintenance job name (`watchdog`, `flush`, `metadata_refresh`, `metrics_snapshot`, `retention`).
+- `job`: maintenance job name (`flush`, `metadata_refresh`, `metrics_snapshot`, `retention`).
 - `query_class`: route path (e.g. `/api/v1/query_range`).
 - `encoding`: `identity`, `gzip`.
 - `triggered_by`: who initiated a partial-commit flush.
@@ -50,21 +50,19 @@ Do not label metrics by `service_name`, trace id, query text, API key, or arbitr
 | `canardstack_raw_spool_healthy` | Gauge | none | `1` when the writer is accepting appends; `0` after a fatal append sync failure. |
 | `canardstack_raw_spool_segment_bytes` | Gauge | none | Total raw-spool segment bytes on disk. |
 | `canardstack_raw_spool_segments` | Gauge | none | Raw-spool segment file count. |
-| `canardstack_ingest_records_total` | Counter | `signal` | Records accepted into the in-process queue. |
-| `canardstack_ingest_transformed_rows_total` | Counter | `signal`, `request_signal` | Rows produced by `otlp2records` before queue admission. |
-| `canardstack_ingest_enqueued_rows_total` | Counter | `signal` | Rows admitted into bounded in-process queues. |
-| `canardstack_ingest_enqueued_bytes_total` | Counter | `signal` | Approximate Arrow bytes admitted into bounded in-process queues. |
-| `canardstack_ingest_queue_rows` | Gauge | `signal` | Current queued records. |
-| `canardstack_ingest_queue_bytes` | Gauge | `signal` | Current queued bytes (approximate). |
-| `canardstack_ingest_queue_oldest_age_seconds` | Gauge | `signal` | Oldest queued record age. |
+| `canardstack_ingest_records_total` | Counter | `signal` | Records accepted into the immutable buffer. |
+| `canardstack_ingest_transformed_rows_total` | Counter | `signal`, `request_signal` | Rows produced by `otlp2records` before admission. |
+| `canardstack_ingest_buffered_rows_total` | Counter | `signal` | Rows inserted into the storage immutable buffer. |
+| `canardstack_ingest_buffered_bytes_total` | Counter | `signal` | Approximate Arrow bytes inserted into the storage immutable buffer. |
+| `canardstack_ingest_inflight_bytes` | Gauge | `signal` | Bytes admitted (spooled, handed to a worker) but not yet inserted into the immutable buffer. |
+| `canardstack_ingest_inflight_capacity_bytes` | Gauge | `signal` | Per-signal in-flight ceiling. |
+| `canardstack_ingest_inflight_pressure` | Gauge | `signal` | In-flight bytes as a fraction of the per-signal ceiling (`0..1`). |
+| `canardstack_ingest_storage_insert_total` | Counter | `signal`, `status` | Worker inserts of Arrow batches into the immutable buffer. |
+| `canardstack_ingest_worker_completed_total` | Counter | `signal`, `status` | Ingest worker tasks completed, by outcome. |
 | `canardstack_ingest_rejections_total` | Counter | `signal`, `status`, `reason` | Admission-control rejections (subset of `_ingest_requests_total`). |
 | `canardstack_ingest_freshness_budget_rejections_total` | Counter | none | Requests rejected before raw-spool append because projected visibility exceeded the freshness SLA. |
-| `canardstack_ingest_flush_attempted_bytes_total` | Counter | `signal` | Approximate queued Arrow bytes selected for flush attempts. |
-| `canardstack_ingest_flush_drained_rows_total` | Counter | `signal` | Rows drained from process queues into a flush attempt. |
-| `canardstack_ingest_flush_buffered_rows_total` | Counter | `signal` | Rows appended to immutable segment buffers after coalescing. |
 | `canardstack_immutable_segments_sealed_rows_total` | Counter | `signal` | Rows sealed into immutable Parquet segments. |
 | `canardstack_immutable_segments_sealed_files_total` | Counter | `signal` | Immutable Parquet files written and registered with DuckLake. |
-| `canardstack_ingest_partial_commit_rows_total` | Counter | `signal`, `triggered_by` | Rows durably committed before a mid-batch flush failure; surfaces best-effort durability. |
 
 ## HTTP Metrics
 

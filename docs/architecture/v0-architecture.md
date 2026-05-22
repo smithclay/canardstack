@@ -30,12 +30,14 @@ current sustained MVP performance envelope is only claimed for logs and traces.
 
 ```text
 OTLP/HTTP (JSON or protobuf, optional gzip)
-  -> request validation
+  -> request validation (auth, size, content-type, compression, timestamp skew)
+  -> inline decode and otlp2records transform (connection thread)
+  -> freshness-first admission (projected-visibility lane gate + per-signal in-flight ceiling)
   -> local raw spool write, pending periodic append sync
-  -> inline decode and otlp2records transform
-  -> bounded in-process queues
-  -> immutable Parquet segment files
+  -> ingest worker pool inserts Arrow batches into the immutable buffer
+  -> scheduler single seal driver writes immutable Parquet segment files
   -> ducklake_add_data_files registration
+  -> raw spool checkpoint
   -> logical DuckLake SQL compatibility queries
 ```
 
@@ -43,16 +45,25 @@ OTLP/HTTP (JSON or protobuf, optional gzip)
 flowchart LR
   A["OTLP/HTTP exporter"] --> B["HTTP parser and auth"]
   B --> C["Size, content-type, compression, timestamp checks"]
-  C --> D["Write raw request to local spool"]
-  D --> E["Decode OTLP and transform with otlp2records"]
-  E --> F["Bounded per-signal queues"]
-  F --> G["Flush worker"]
-  G --> H["Immutable Parquet segment seal"]
+  C --> D["Decode OTLP and transform with otlp2records"]
+  D --> E["Freshness-first admission: lane gate + per-signal in-flight ceiling"]
+  E --> F["Write raw request to local spool"]
+  F --> G["Ingest worker pool: insert into immutable buffer"]
+  G --> H["Scheduler single seal driver: Parquet segment seal"]
   H --> I["DuckLake registration"]
   I --> J["Raw spool checkpoint"]
   I --> K["Logical DuckLake SQL"]
   K --> L["Prometheus / Loki / Tempo adapters"]
 ```
+
+Admission is freshness-first: before the durable raw-spool append, the request
+projects flush visibility through the lane controller and is shed with `429`
+when projected visibility exceeds the freshness budget. A cheap per-signal
+in-flight ceiling (`signal_queue_full`) keeps one signal's burst from
+monopolizing the accepted-but-not-yet-buffered window. There is no separate
+in-memory queue and no flush worker: ingest workers insert directly into the
+storage immutable buffer, and a single scheduler-driven seal driver is the only
+path that seals that buffer to durable Parquet and checkpoints the raw spool.
 
 ## Ingest Semantics
 
@@ -175,7 +186,7 @@ Flush triggers:
 - `CANARDSTACK_FLUSH_MAX_AGE_SECS` or `_MS`, default 10 seconds. The
   high-pressure age is derived as one fifth of this value, with a 500ms floor.
 
-A single scheduler flush worker is the only seal driver. It seals on a frequent
+A single scheduler-driven seal driver is the only seal path. It seals on a frequent
 cadence (`CANARDSTACK_FLUSH_INTERVAL_MS`, default 1s) or earlier when a buffered
 signal reaches its size (`CANARDSTACK_SEGMENT_TARGET_BYTES`) or age
 (`CANARDSTACK_SEGMENT_MAX_AGE_*`) threshold. The cadence must stay well under the
@@ -217,10 +228,10 @@ and retryable.
 
 The process has logical lanes, implemented by one small in-process controller:
 
-- ingest admission lane: checks queue credit and freshness budget before
-  durable raw-spool append.
-- flush lane: reserves capacity for watchdog, scheduled flush, and manual
-  flush before query capacity is considered.
+- ingest admission lane: checks the projected-visibility freshness budget and a
+  per-signal in-flight ceiling before durable raw-spool append.
+- flush lane: reserves capacity for the scheduled seal driver and manual flush
+  before query capacity is considered.
 - query lane: splits compatibility routes into cheap and heavy classes.
 - operator/control lane: keeps health, metrics, and admin health available in
   every serve role.
@@ -326,7 +337,8 @@ sets the base cadence; individual job cadences are derived from it.
 
 Scheduler jobs:
 
-- queue watchdog / due flush
+- single seal driver (seals the immutable buffer on size/age threshold or the
+  freshness cadence, then checkpoints the raw spool)
 - metadata refresh
 - operator metric snapshot
 - DuckLake inlined-data flush

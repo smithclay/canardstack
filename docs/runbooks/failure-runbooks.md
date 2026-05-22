@@ -28,7 +28,7 @@ status is the HTTP code, not just the body.
 ### Symptoms
 
 - `canardstack_maintenance_consecutive_failures{job="flush"}` rises.
-- `canardstack_ingest_queue_oldest_age_seconds` rises.
+- `canardstack_observed_freshness_lag_seconds` rises.
 - Query freshness gets worse even though ingest is accepting data.
 - Maintenance logs show flush/checkpoint failures.
 
@@ -37,8 +37,8 @@ status is the HTTP code, not just the body.
 - `canardstack_maintenance_runs_total{job="flush",status="error"}`.
 - `canardstack_maintenance_failures_total{job="flush"}`.
 - `canardstack_maintenance_consecutive_failures{job="flush"}`.
-- `canardstack_ingest_queue_bytes{signal}`.
-- `canardstack_ingest_queue_oldest_age_seconds{signal}`.
+- `canardstack_ingest_inflight_bytes{signal}`.
+- `canardstack_observed_freshness_lag_seconds`.
 - `canardstack_ingest_to_query_lag_seconds{table}`.
 - `canardstack_projected_visibility_seconds`.
 - `canardstack_flush_ewma_bytes_per_second`.
@@ -127,7 +127,7 @@ endpoint. Steps 2 and 3 require an operator-driven restart.
 - `canardstack_maintenance_failures_total`.
 - `canardstack_maintenance_consecutive_failures`.
 - `canardstack_ingest_requests_total{status="503"}`.
-- `canardstack_ingest_queue_bytes{signal}`.
+- `canardstack_ingest_inflight_bytes{signal}`.
 - `canardstack_ingest_to_query_lag_seconds{table}`.
 - `canardstack_projected_visibility_seconds`.
 
@@ -166,8 +166,8 @@ endpoint. Steps 2 and 3 require an operator-driven restart.
 - `canardstack_raw_spool_records_total{status="full"}`.
 - `canardstack_raw_spool_pending_records`.
 - `canardstack_raw_spool_pending_bytes`.
-- `canardstack_ingest_queue_bytes{signal}`.
-- `canardstack_ingest_queue_oldest_age_seconds{signal}`.
+- `canardstack_ingest_inflight_bytes{signal}`.
+- `canardstack_observed_freshness_lag_seconds`.
 - `canardstack_ingest_freshness_budget_rejections_total`.
 - `canardstack_projected_visibility_seconds`.
 - `canardstack_ingest_records_total{signal}`.
@@ -213,7 +213,7 @@ endpoint. Steps 2 and 3 require an operator-driven restart.
 - `canardstack_raw_spool_pending_bytes`.
 - `canardstack_raw_spool_replayed_records_total{status}`.
 - `canardstack_raw_spool_checkpointed_records_total{reason="storage_committed"}`.
-- `canardstack_ingest_queue_rows{signal}`.
+- `canardstack_ingest_inflight_bytes{signal}`.
 - `canardstack_storage_logical_rows{table}`.
 
 ### Immediate Mitigation

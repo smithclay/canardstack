@@ -9,9 +9,9 @@ old scout runs.
 The current MVP architecture is:
 
 ```text
-OTLP/HTTP -> local raw spool write, periodic append sync -> inline transform/admission
-  -> freshness-budget admission -> bounded in-process queues -> protected flush lane
-  -> immutable Parquet segments
+OTLP/HTTP -> inline transform -> freshness-budget admission + per-signal in-flight ceiling
+  -> local raw spool write, periodic append sync -> ingest worker pool -> immutable buffer
+  -> scheduler single seal driver (protected flush lane) -> immutable Parquet segments
   -> DuckLake registration -> logical DuckLake SQL compatibility APIs
 ```
 

@@ -61,6 +61,10 @@ pub fn serve_until(state: Arc<AppState>, shutdown: &AtomicBool) -> anyhow::Resul
         let _ = stream.set_nonblocking(false);
         let _ = stream.set_read_timeout(Some(read_timeout));
         let _ = stream.set_write_timeout(Some(write_timeout));
+        // Responses are assembled into a single buffer and written in one shot,
+        // so disable Nagle to send each response promptly instead of waiting to
+        // coalesce with a follow-up that may not come (esp. under keepalive).
+        let _ = stream.set_nodelay(true);
 
         // Bound concurrent connections so a slow-loris attacker can't pin one OS
         // thread per socket indefinitely. Reply 503 + Retry-After (not RST) so
