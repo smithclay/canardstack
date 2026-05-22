@@ -895,6 +895,115 @@ fn ingest_stage_metrics_separate_transform_enqueue_and_storage_visibility() {
 }
 
 #[test]
+fn experimental_async_ingest_worker_enqueues_after_raw_spool_ack() {
+    let dir = tempdir().unwrap();
+    let mut config = Config::test(dir.path().join("canardstack.duckdb"));
+    config.local_storage_dir = dir.path().join("storage");
+    config.experimental_async_ingest_workers = 1;
+    config.experimental_async_ingest_queue_capacity = 4;
+    let state = AppState::new(config).unwrap();
+    let body = log_fixture(Utc::now().timestamp_nanos_opt().unwrap()).to_string();
+    let response = http::route(
+        "POST",
+        "/v1/logs",
+        &HashMap::new(),
+        &headers(&state),
+        body.as_bytes(),
+        &state,
+    );
+    assert_eq!(response.status(), 202, "{}", response.json_body());
+    assert_eq!(
+        response.json_body()["acknowledgement"],
+        "locally_spooled_async_processing"
+    );
+
+    let deadline = Instant::now() + StdDuration::from_secs(2);
+    while Instant::now() < deadline {
+        if state
+            .ingestor
+            .snapshots()
+            .iter()
+            .any(|snapshot| snapshot.signal == "logs" && snapshot.queued_rows == 1)
+        {
+            break;
+        }
+        thread::sleep(StdDuration::from_millis(10));
+    }
+    assert!(
+        state
+            .ingestor
+            .snapshots()
+            .iter()
+            .any(|snapshot| snapshot.signal == "logs" && snapshot.queued_rows == 1),
+        "async worker did not enqueue the spooled request"
+    );
+    let metrics = metrics_text(&state);
+    assert!(
+        metrics
+            .contains("canardstack_async_ingest_completed_total{signal=\"logs\",status=\"ok\"} 1"),
+        "{metrics}"
+    );
+}
+
+#[test]
+fn experimental_vector_storage_sink_bypasses_ingest_queue_and_checkpoints_spool() {
+    let dir = tempdir().unwrap();
+    let mut config = Config::test(dir.path().join("canardstack.duckdb"));
+    config.local_storage_dir = dir.path().join("storage");
+    config.raw_spool_dir = dir.path().join("raw-spool");
+    config.experimental_async_ingest_workers = 1;
+    config.experimental_async_ingest_queue_capacity = 4;
+    config.experimental_vector_storage_sink = true;
+    config.experimental_vector_storage_sink_queue_capacity = 4;
+    let state = AppState::new(config).unwrap();
+    let body = log_fixture(Utc::now().timestamp_nanos_opt().unwrap()).to_string();
+    let response = http::route(
+        "POST",
+        "/v1/logs",
+        &HashMap::new(),
+        &headers(&state),
+        body.as_bytes(),
+        &state,
+    );
+    assert_eq!(response.status(), 202, "{}", response.json_body());
+
+    let deadline = Instant::now() + StdDuration::from_secs(2);
+    while Instant::now() < deadline {
+        let pending = state.ingestor.raw_spool_stats().unwrap().pending_records;
+        let queued = state
+            .ingestor
+            .snapshots()
+            .iter()
+            .find(|snapshot| snapshot.signal == "logs")
+            .map(|snapshot| snapshot.queued_rows)
+            .unwrap_or(usize::MAX);
+        if pending == 0 && queued == 0 {
+            break;
+        }
+        thread::sleep(StdDuration::from_millis(10));
+    }
+
+    assert_eq!(state.ingestor.raw_spool_stats().unwrap().pending_records, 0);
+    assert_eq!(
+        state
+            .ingestor
+            .snapshots()
+            .iter()
+            .find(|snapshot| snapshot.signal == "logs")
+            .map(|snapshot| snapshot.queued_rows),
+        Some(0),
+        "vector storage sink should bypass the normal ingest queue"
+    );
+    let metrics = metrics_text(&state);
+    assert!(
+        metrics.contains(
+            "canardstack_vector_storage_sink_completed_total{signal=\"logs\",status=\"ok\"} 1"
+        ),
+        "{metrics}"
+    );
+}
+
+#[test]
 fn raw_spool_acknowledges_local_spool_write_before_storage_commit() {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));

@@ -242,7 +242,7 @@ fn ingest(
         body,
         &state.storage,
         &state.lanes,
-        &state.metrics,
+        state.metrics.clone(),
     )
 }
 

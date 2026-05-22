@@ -111,6 +111,10 @@ pub struct Config {
     pub raw_spool_append_sync_bytes: usize,
     pub raw_spool_checkpoint_fsync_records: usize,
     pub raw_spool_checkpoint_fsync_delay: Duration,
+    pub experimental_async_ingest_workers: usize,
+    pub experimental_async_ingest_queue_capacity: usize,
+    pub experimental_vector_storage_sink: bool,
+    pub experimental_vector_storage_sink_queue_capacity: usize,
 }
 
 const DEFAULT_CONFIG_PATH: &str = "config.toml";
@@ -300,6 +304,26 @@ impl Config {
                 .unwrap_or(16 * 1024 * 1024),
             raw_spool_checkpoint_fsync_records: 1024,
             raw_spool_checkpoint_fsync_delay: Duration::from_millis(1000),
+            experimental_async_ingest_workers: env_usize(
+                "CANARDSTACK_EXPERIMENTAL_ASYNC_INGEST_WORKERS",
+            )?
+            .or(file.usize(&["experimental", "async_ingest_workers"])?)
+            .unwrap_or(0),
+            experimental_async_ingest_queue_capacity: env_usize(
+                "CANARDSTACK_EXPERIMENTAL_ASYNC_INGEST_QUEUE_CAPACITY",
+            )?
+            .or(file.usize(&["experimental", "async_ingest_queue_capacity"])?)
+            .unwrap_or(1024),
+            experimental_vector_storage_sink: env_bool(
+                "CANARDSTACK_EXPERIMENTAL_VECTOR_STORAGE_SINK",
+            )?
+            .or(file.bool(&["experimental", "vector_storage_sink"])?)
+            .unwrap_or(false),
+            experimental_vector_storage_sink_queue_capacity: env_usize(
+                "CANARDSTACK_EXPERIMENTAL_VECTOR_STORAGE_SINK_QUEUE_CAPACITY",
+            )?
+            .or(file.usize(&["experimental", "vector_storage_sink_queue_capacity"])?)
+            .unwrap_or(1024),
         })
     }
 
@@ -371,6 +395,10 @@ impl Config {
             raw_spool_append_sync_bytes: 16 * 1024 * 1024,
             raw_spool_checkpoint_fsync_records: 1024,
             raw_spool_checkpoint_fsync_delay: Duration::from_millis(1000),
+            experimental_async_ingest_workers: 0,
+            experimental_async_ingest_queue_capacity: 1024,
+            experimental_vector_storage_sink: false,
+            experimental_vector_storage_sink_queue_capacity: 1024,
         }
     }
 
@@ -477,6 +505,18 @@ impl Config {
         }
         if self.raw_spool_checkpoint_fsync_delay.is_zero() {
             anyhow::bail!("raw spool checkpoint fsync delay must be > 0");
+        }
+        if self.experimental_async_ingest_workers > 0
+            && self.experimental_async_ingest_queue_capacity == 0
+        {
+            anyhow::bail!("CANARDSTACK_EXPERIMENTAL_ASYNC_INGEST_QUEUE_CAPACITY must be > 0");
+        }
+        if self.experimental_vector_storage_sink
+            && self.experimental_vector_storage_sink_queue_capacity == 0
+        {
+            anyhow::bail!(
+                "CANARDSTACK_EXPERIMENTAL_VECTOR_STORAGE_SINK_QUEUE_CAPACITY must be > 0"
+            );
         }
         if self.raw_spool_max_record_bytes > self.raw_spool_max_total_bytes {
             anyhow::bail!(

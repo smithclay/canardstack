@@ -58,6 +58,18 @@ pub(super) struct QueuedBatch {
 }
 
 impl QueuedBatch {
+    pub(super) fn from_pending(batch: PendingBatch) -> Self {
+        Self {
+            batch: batch.batch,
+            source_format: batch.source_format,
+            raw_spool_id: batch.raw_spool_id,
+            raw_spool_lane: batch.raw_spool_lane,
+            accepted_at: Instant::now(),
+            approx_bytes: batch.approx_bytes,
+            credit_bytes: batch.credit_bytes,
+        }
+    }
+
     fn split_at(mut self, take_rows: usize) -> (Self, Self) {
         debug_assert!(take_rows > 0);
         debug_assert!(take_rows < self.len());

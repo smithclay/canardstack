@@ -7,29 +7,31 @@ use crate::metrics::Metrics;
 use crate::query::QueryEngine;
 use crate::storage::Storage;
 use anyhow::Result;
+use std::sync::Arc;
 
 pub struct AppState {
     pub config: Config,
-    pub storage: Storage,
-    pub ingestor: Ingestor,
+    pub storage: Arc<Storage>,
+    pub ingestor: Arc<Ingestor>,
     pub lanes: LaneController,
     pub queries: QueryEngine,
     pub metadata: Metadata,
     pub maintenance: Maintenance,
-    pub metrics: Metrics,
+    pub metrics: Arc<Metrics>,
 }
 
 impl AppState {
     pub fn new(config: Config) -> Result<Self> {
-        let storage = Storage::open(&config)?;
-        let ingestor = Ingestor::new(config.clone())?;
+        let storage = Arc::new(Storage::open(&config)?);
+        let ingestor = Arc::new(Ingestor::new(config.clone())?);
         let lanes = LaneController::new(&config);
-        let metrics = Metrics::default();
+        let metrics = Arc::new(Metrics::default());
         if config.serve_role.accepts_ingest() {
             let replayed = ingestor.replay_raw_spool(&storage, &metrics)?;
             if replayed > 0 {
                 tracing::info!(event = "raw_spool_replayed", records = replayed);
             }
+            ingestor.start_experimental_topology(storage.clone(), metrics.clone())?;
         }
         Ok(Self {
             storage,
