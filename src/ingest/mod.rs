@@ -2,7 +2,7 @@ use crate::config::Config;
 use crate::lanes::{FreshnessInputs, LaneController};
 use crate::metrics::Metrics;
 use crate::otlp::{self, Transformed};
-use crate::storage::Storage;
+use crate::storage::{ArrowBatchInsert, ArrowBatchInsertTiming, Storage};
 use crate::validation::{self, ApiError, ApiResult};
 use crate::LockExt;
 use anyhow::{Context, Result};
@@ -20,10 +20,10 @@ use std::time::Instant;
 mod admission;
 mod queue;
 pub mod spool;
-mod topology;
+mod worker;
 
 pub use queue::IngestSnapshot;
-use topology::{IngestTopologyDispatcher, StorageSinkDispatcher, StorageSinkWork};
+use worker::IngestWorkerPool;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize)]
 pub enum Signal {
@@ -67,8 +67,7 @@ pub struct Ingestor {
     raw_spools: BTreeMap<Signal, Writer>,
     metric_raw_spool_next: AtomicUsize,
     raw_spool_flush_refs: Arc<Mutex<BTreeMap<(Signal, RecordId), FlushRef>>>,
-    topology: Mutex<Option<IngestTopologyDispatcher>>,
-    storage_sink: Mutex<Option<StorageSinkDispatcher>>,
+    ingest_workers: Mutex<Option<IngestWorkerPool>>,
     config: Config,
 }
 
@@ -104,8 +103,7 @@ impl Ingestor {
             raw_spools,
             metric_raw_spool_next: AtomicUsize::new(0),
             raw_spool_flush_refs: Arc::new(Mutex::new(BTreeMap::new())),
-            topology: Mutex::new(None),
-            storage_sink: Mutex::new(None),
+            ingest_workers: Mutex::new(None),
             config,
         })
     }
@@ -185,6 +183,10 @@ impl Ingestor {
                     return Err(err);
                 }
             };
+        // Transform already ran on this connection thread, so the accepted row
+        // count is known before the async handoff and can be returned honestly.
+        let accepted_rows = transformed_rows_total(&prepared.transformed);
+        let unsupported_histograms = prepared.transformed.unsupported_histograms;
         let spooled = SpooledIngestWork {
             signal,
             headers: headers.clone(),
@@ -195,14 +197,14 @@ impl Ingestor {
             metrics: async_metrics,
             prepared: Some(prepared),
         };
-        self.dispatch_topology_work(spooled, metrics)
+        self.dispatch_ingest_work(spooled, accepted_rows, unsupported_histograms, metrics)
     }
 
     pub(in crate::ingest) fn process_spooled_ingest(
         &self,
         work: SpooledIngestWork,
-        record_request_status: bool,
-    ) -> ApiResult<Value> {
+        storage: &Storage,
+    ) -> ApiResult<()> {
         let SpooledIngestWork {
             signal,
             headers,
@@ -247,9 +249,6 @@ impl Ingestor {
                     Ok(body) => body,
                     Err(err) => {
                         self.release_queue_credit_reservation(&mut queue_credit_reservation);
-                        if record_request_status {
-                            metrics.ingest_request(signal, err.status, err.reason);
-                        }
                         return Err(err);
                     }
                 };
@@ -259,9 +258,6 @@ impl Ingestor {
                 };
                 if let Err(err) = validation::validate_body_size(body.len(), &self.config) {
                     self.release_queue_credit_reservation(&mut queue_credit_reservation);
-                    if record_request_status {
-                        metrics.ingest_request(signal, err.status, err.reason);
-                    }
                     return Err(err);
                 }
                 let started = Instant::now();
@@ -279,9 +275,6 @@ impl Ingestor {
                     Ok(transformed) => transformed,
                     Err(err) => {
                         self.release_queue_credit_reservation(&mut queue_credit_reservation);
-                        if record_request_status {
-                            metrics.ingest_request(signal, err.status, err.reason);
-                        }
                         return Err(err);
                     }
                 };
@@ -295,9 +288,6 @@ impl Ingestor {
                 );
                 if let Err(err) = skew_result {
                     self.release_queue_credit_reservation(&mut queue_credit_reservation);
-                    if record_request_status {
-                        metrics.ingest_request(signal, err.status, err.reason);
-                    }
                     return Err(err);
                 }
                 let decoded_body_len = body.len();
@@ -320,8 +310,7 @@ impl Ingestor {
         }
 
         let request_bytes = compressed_body.len();
-        let unsupported_histograms = transformed.unsupported_histograms;
-        let mut batches = queue::pending_batches(transformed);
+        let batches = queue::pending_batches(transformed);
         let buffered_totals = pending_batch_totals(&batches);
         let exact_queue_credits = admission::credit_bytes_by_signal(&batches);
         if let Err(err) =
@@ -329,9 +318,6 @@ impl Ingestor {
         {
             self.release_queue_credit_reservation(&mut queue_credit_reservation);
             self.record_queue_metrics(metrics);
-            if record_request_status {
-                metrics.ingest_request(signal, err.status, err.reason);
-            }
             return Err(err);
         }
         let pending_bytes = batches.iter().map(|b| b.approx_bytes).sum::<usize>();
@@ -340,36 +326,74 @@ impl Ingestor {
             .saturating_add(pending_bytes);
         if let Err(err) = runtime_memory_reservation.reserve_at_least(peak_bytes, signal, metrics) {
             self.release_queue_credit_reservation(&mut queue_credit_reservation);
-            if record_request_status {
-                metrics.ingest_request(signal, err.status, err.reason);
-            }
             return Err(err);
         }
         if batches.is_empty() {
             self.release_queue_credit_reservation(&mut queue_credit_reservation);
             self.checkpoint_raw_spool_terminal(raw_spool_ref, signal, "transform_empty", metrics)?;
-        } else {
-            self.track_raw_spool_batches(raw_spool_ref, signal, &mut batches);
+            return Ok(());
         }
+
+        let inserts = batches
+            .iter()
+            .filter(|batch| batch.batch.num_rows() > 0)
+            .map(|batch| ArrowBatchInsert {
+                table: batch.key.signal,
+                batch: &batch.batch,
+                source_format: batch.source_format,
+            })
+            .collect::<Vec<_>>();
+        let insert_started = Instant::now();
+        let insert_result = storage.insert_arrow_batches(&inserts);
+        metrics.observe_phase_seconds(
+            signal.as_str(),
+            "storage_insert",
+            None,
+            insert_started.elapsed().as_secs_f64(),
+        );
+        let insert = match insert_result {
+            Ok(result) => result,
+            Err(err) => {
+                // The rows never reached the immutable buffer and the raw-spool
+                // record was not tracked, so it stays pending and replays on a
+                // future restart (at-least-once). Release the admission credit
+                // and surface a retryable dependency error.
+                self.release_queue_credit_reservation(&mut queue_credit_reservation);
+                self.record_queue_metrics(metrics);
+                metrics.inc(
+                    "canardstack_ingest_storage_insert_total",
+                    &[("signal", signal.as_str()), ("status", "error")],
+                    1,
+                );
+                tracing::warn!(
+                    event = "ingest_storage_insert_failed",
+                    signal = signal.as_str(),
+                    error = %err
+                );
+                return Err(
+                    ApiError::new(503, "storage_insert_failed", "storage insert failed")
+                        .with_retry_after(5),
+                );
+            }
+        };
+        observe_storage_timings(metrics, &insert.timings);
+        metrics.inc(
+            "canardstack_ingest_storage_insert_total",
+            &[("signal", signal.as_str()), ("status", "ok")],
+            1,
+        );
+
+        // Rows are now in the immutable buffer. Track the raw-spool record so the
+        // scheduler checkpoints it after the next durable seal, then release the
+        // admission credit (buffer occupancy is now reflected as buffered bytes
+        // for freshness, not as a held queue credit).
+        self.track_raw_spool_record(raw_spool_ref, signal);
+        self.release_queue_credit_reservation(&mut queue_credit_reservation);
+
         let accepted = buffered_totals
             .values()
             .map(|(rows, _)| *rows)
             .sum::<usize>();
-        let sets = storage_sink_sets(batches);
-        if let Err(err) =
-            self.dispatch_storage_sink(signal, sets, metrics, &mut queue_credit_reservation)
-        {
-            self.untrack_raw_spool_record(raw_spool_ref);
-            self.release_queue_credit_reservation(&mut queue_credit_reservation);
-            self.record_queue_metrics(metrics);
-            if record_request_status {
-                metrics.ingest_request(signal, err.status, err.reason);
-            }
-            return Err(err);
-        }
-        if record_request_status {
-            metrics.ingest_request(signal, 202, "accepted");
-        }
         self.record_accepted_body_metrics(
             signal,
             &headers,
@@ -396,128 +420,36 @@ impl Ingestor {
             );
         }
 
-        Ok(json!({
-            "accepted": true,
-            "records": accepted,
-            "acknowledgement": "locally_spooled_storage_sink",
-            "unsupported_histograms": unsupported_histograms
-        }))
+        Ok(())
     }
 
-    fn dispatch_storage_sink(
-        &self,
-        request_signal: Signal,
-        sets: Vec<(queue::QueueKey, Vec<queue::QueuedBatch>)>,
-        metrics: &Metrics,
-        queue_credit_reservation: &mut admission::QueueCreditReservation,
-    ) -> ApiResult<()> {
-        if sets.iter().all(|(_, batches)| batches.is_empty()) {
-            return Ok(());
-        }
-        let work = StorageSinkWork {
-            request_signal,
-            sets,
-        };
-        let result = {
-            let storage_sink = self.storage_sink.lock_or_poisoned();
-            let Some(dispatcher) = storage_sink.as_ref() else {
-                return Err(ApiError::new(
-                    503,
-                    "storage_sink_unavailable",
-                    "storage sink is not available",
-                )
-                .with_retry_after(5));
-            };
-            let Some(commands) = dispatcher.commands.as_ref() else {
-                return Err(ApiError::new(
-                    503,
-                    "storage_sink_unavailable",
-                    "storage sink is stopped",
-                )
-                .with_retry_after(5));
-            };
-            commands.try_send(work)
-        };
-        match result {
-            Ok(()) => {
-                self.release_queue_credit_reservation(queue_credit_reservation);
-                metrics.inc(
-                    "canardstack_storage_sink_requests_total",
-                    &[("signal", request_signal.as_str()), ("status", "queued")],
-                    1,
-                );
-                Ok(())
-            }
-            Err(TrySendError::Full(work)) => {
-                self.release_queue_credit_reservation(queue_credit_reservation);
-                self.untrack_storage_sink_work(&work);
-                metrics.inc(
-                    "canardstack_storage_sink_requests_total",
-                    &[
-                        ("signal", request_signal.as_str()),
-                        ("status", "buffer_full"),
-                    ],
-                    1,
-                );
-                Err(ApiError::new(
-                    429,
-                    "storage_sink_buffer_full",
-                    "storage sink buffer is full",
-                )
-                .with_retry_after(5))
-            }
-            Err(TrySendError::Disconnected(work)) => {
-                self.release_queue_credit_reservation(queue_credit_reservation);
-                self.untrack_storage_sink_work(&work);
-                metrics.inc(
-                    "canardstack_storage_sink_requests_total",
-                    &[
-                        ("signal", request_signal.as_str()),
-                        ("status", "disconnected"),
-                    ],
-                    1,
-                );
-                Err(
-                    ApiError::new(503, "storage_sink_unavailable", "storage sink is stopped")
-                        .with_retry_after(5),
-                )
-            }
-        }
-    }
-
-    pub(in crate::ingest) fn untrack_storage_sink_work(&self, work: &StorageSinkWork) {
-        let mut refs = self.raw_spool_flush_refs.lock_or_poisoned();
-        for (key, batches) in &work.sets {
-            for batch in batches {
-                if let Some(id) = batch.raw_spool_id {
-                    let lane = batch.raw_spool_lane.unwrap_or(key.signal);
-                    refs.remove(&(lane, id));
-                }
-            }
-        }
-    }
-
-    fn dispatch_topology_work(
+    fn dispatch_ingest_work(
         &self,
         work: SpooledIngestWork,
+        accepted_rows: usize,
+        unsupported_histograms: usize,
         metrics: &Metrics,
     ) -> ApiResult<Value> {
         let signal = work.signal;
-        let send_result = {
-            let mut topology = self.topology.lock_or_poisoned();
-            let Some(dispatcher) = topology.as_mut() else {
+        // Round-robin to the first worker with buffer space. On a successful send
+        // the function returns directly from inside the loop; only the
+        // all-workers-full / all-disconnected paths fall through to the rejection
+        // handling below (so `work` is always still owned there).
+        let send_err = {
+            let mut pool = self.ingest_workers.lock_or_poisoned();
+            let Some(dispatcher) = pool.as_mut() else {
                 return Err(ApiError::new(
                     503,
-                    "ingest_topology_unavailable",
-                    "ingest topology workers are not available",
+                    "ingest_workers_unavailable",
+                    "ingest workers are not available",
                 )
                 .with_retry_after(5));
             };
             if dispatcher.commands.is_empty() {
                 return Err(ApiError::new(
                     503,
-                    "ingest_topology_unavailable",
-                    "ingest topology workers are stopped",
+                    "ingest_workers_unavailable",
+                    "ingest workers are stopped",
                 )
                 .with_retry_after(5));
             }
@@ -529,7 +461,18 @@ impl Ingestor {
                 match dispatcher.commands[worker_idx].try_send(work) {
                     Ok(()) => {
                         dispatcher.next_worker = worker_idx.wrapping_add(1);
-                        return self.topology_work_queued(signal, metrics);
+                        metrics.ingest_request(signal, 202, "accepted");
+                        metrics.inc(
+                            "canardstack_ingest_requests_queued_total",
+                            &[("signal", signal.as_str()), ("status", "queued")],
+                            1,
+                        );
+                        return Ok(json!({
+                            "accepted": true,
+                            "records": accepted_rows,
+                            "acknowledgement": "locally_spooled",
+                            "unsupported_histograms": unsupported_histograms
+                        }));
                     }
                     Err(TrySendError::Full(returned)) => {
                         work = returned;
@@ -541,20 +484,19 @@ impl Ingestor {
                 }
             }
             if disconnected {
-                Err(TrySendError::Disconnected(work))
+                TrySendError::Disconnected(work)
             } else {
-                Err(TrySendError::Full(work))
+                TrySendError::Full(work)
             }
         };
-        match send_result {
-            Ok(value) => Ok(value),
-            Err(TrySendError::Full(work)) => {
+        match send_err {
+            TrySendError::Full(work) => {
                 let mut queue_credit_reservation = work.queue_credit_reservation;
                 self.release_queue_credit_reservation(&mut queue_credit_reservation);
                 self.record_queue_metrics(metrics);
                 metrics.ingest_request(signal, 429, "ingest_buffer_full");
                 metrics.inc(
-                    "canardstack_ingest_topology_requests_total",
+                    "canardstack_ingest_requests_queued_total",
                     &[("signal", signal.as_str()), ("status", "buffer_full")],
                     1,
                 );
@@ -563,38 +505,23 @@ impl Ingestor {
                         .with_retry_after(5),
                 )
             }
-            Err(TrySendError::Disconnected(work)) => {
+            TrySendError::Disconnected(work) => {
                 let mut queue_credit_reservation = work.queue_credit_reservation;
                 self.release_queue_credit_reservation(&mut queue_credit_reservation);
-                metrics.ingest_request(signal, 503, "ingest_topology_unavailable");
+                metrics.ingest_request(signal, 503, "ingest_workers_unavailable");
                 metrics.inc(
-                    "canardstack_ingest_topology_requests_total",
+                    "canardstack_ingest_requests_queued_total",
                     &[("signal", signal.as_str()), ("status", "disconnected")],
                     1,
                 );
                 Err(ApiError::new(
                     503,
-                    "ingest_topology_unavailable",
-                    "ingest topology workers are stopped",
+                    "ingest_workers_unavailable",
+                    "ingest workers are stopped",
                 )
                 .with_retry_after(5))
             }
         }
-    }
-
-    fn topology_work_queued(&self, signal: Signal, metrics: &Metrics) -> ApiResult<Value> {
-        metrics.ingest_request(signal, 202, "accepted");
-        metrics.inc(
-            "canardstack_ingest_topology_requests_total",
-            &[("signal", signal.as_str()), ("status", "queued")],
-            1,
-        );
-        Ok(json!({
-            "accepted": true,
-            "records": 0,
-            "acknowledgement": "locally_spooled_topology_handoff",
-            "unsupported_histograms": 0
-        }))
     }
 
     fn reserve_queue_credit_estimate(
@@ -620,12 +547,14 @@ impl Ingestor {
         inputs.queued_bytes = queued_total;
         inputs.incoming_bytes = projected_total.saturating_sub(queued_total);
         lanes.admit_ingest(inputs, metrics)?;
-        self.queue_credits.lock_or_poisoned().reserve_estimate(
+        let mut reservation = self.queue_credits.lock_or_poisoned().reserve_estimate(
             signal,
             headers,
             compressed_body_bytes,
             self.config.max_body_bytes,
-        )
+        )?;
+        reservation.bind_ledger(Arc::downgrade(&self.queue_credits));
+        Ok(reservation)
     }
 
     fn adjust_queue_credit_reservation(
@@ -894,16 +823,22 @@ impl Ingestor {
     }
 }
 
-fn storage_sink_sets(
-    batches: Vec<queue::PendingBatch>,
-) -> Vec<(queue::QueueKey, Vec<queue::QueuedBatch>)> {
-    let mut sets = HashMap::<queue::QueueKey, Vec<queue::QueuedBatch>>::new();
-    for batch in batches {
-        sets.entry(batch.key)
-            .or_default()
-            .push(queue::QueuedBatch::from_pending(batch));
+fn observe_storage_timings(metrics: &Metrics, timings: &[ArrowBatchInsertTiming]) {
+    for timing in timings {
+        metrics.observe_phase_seconds(
+            timing.table.as_str(),
+            timing.phase.as_str(),
+            None,
+            timing.seconds,
+        );
     }
-    sets.into_iter().collect()
+}
+
+fn transformed_rows_total(transformed: &Transformed) -> usize {
+    transformed_rows_by_signal(transformed)
+        .into_iter()
+        .map(|(_, rows)| rows)
+        .sum()
 }
 
 fn transformed_rows_by_signal(transformed: &Transformed) -> Vec<(Signal, usize)> {

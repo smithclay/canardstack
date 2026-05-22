@@ -1,8 +1,8 @@
 use crate::app::AppState;
 use crate::config::Config;
-use crate::ingest::IngestSnapshot;
+use crate::ingest::{IngestSnapshot, Ingestor};
 use crate::metrics::Metrics;
-use crate::storage::{ArrowBatchInsertTiming, ImmutableFlushOutcome, RetentionPolicy, Storage};
+use crate::storage::{RetentionPolicy, Storage};
 use crate::LockExt;
 use anyhow::Result;
 use serde_json::{json, Value};
@@ -25,9 +25,6 @@ struct FailureRecord {
 #[derive(Clone, Copy, Default)]
 pub struct FlushOptions<'a> {
     pub table: Option<&'a str>,
-    /// Seal every in-memory immutable-segment buffer immediately, ignoring size
-    /// and age thresholds. The scheduler leaves this unset; admin flush sets it.
-    pub force_immutable_segments: bool,
 }
 
 pub struct Maintenance {
@@ -105,14 +102,13 @@ impl Maintenance {
 
     pub fn run_flush(
         &self,
+        ingestor: &Ingestor,
         storage: &Storage,
         metrics: &Metrics,
         options: FlushOptions<'_>,
     ) -> Result<Value> {
         let started = Instant::now();
-        let immutable = storage.flush_immutable_segments(options.force_immutable_segments)?;
-        observe_phase_timings(metrics, &immutable.timings);
-        observe_immutable_flush(metrics, &immutable);
+        let immutable = ingestor.flush_committed_to_storage(storage, metrics)?;
         let ducklake_started = Instant::now();
         let ducklake = storage.flush_inlined_data(options.table)?;
         metrics.observe_seconds(
@@ -184,37 +180,6 @@ impl Maintenance {
     }
 }
 
-fn observe_phase_timings(metrics: &Metrics, timings: &[ArrowBatchInsertTiming]) {
-    for timing in timings {
-        metrics.observe_phase_seconds(
-            timing.table.as_str(),
-            timing.phase.as_str(),
-            None,
-            timing.seconds,
-        );
-    }
-}
-
-fn observe_immutable_flush(metrics: &Metrics, outcome: &ImmutableFlushOutcome) {
-    if outcome.sealed_rows == 0 && outcome.sealed_files == 0 {
-        return;
-    }
-    for timing in &outcome.timings {
-        if timing.phase == crate::storage::TimingPhase::ParquetEncode {
-            metrics.inc(
-                "canardstack_immutable_segments_sealed_files_total",
-                &[("signal", timing.table.as_str())],
-                1,
-            );
-            metrics.inc(
-                "canardstack_immutable_segments_sealed_rows_total",
-                &[("signal", timing.table.as_str())],
-                timing.rows as u64,
-            );
-        }
-    }
-}
-
 pub struct Scheduler {
     stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
@@ -245,12 +210,21 @@ impl Drop for Scheduler {
 }
 
 fn scheduler_loop(state: Arc<AppState>, stop: Arc<AtomicBool>) {
+    let flush_cadence = state.config.scheduler_flush_interval;
+    let segment_target_bytes = state.config.immutable_segment_target_bytes;
+    let segment_max_age_seconds = state.config.immutable_segment_max_age.as_secs_f64();
     let metadata_every = state.config.scheduler_metadata_interval;
     let metrics_every = state.config.scheduler_metrics_interval;
     let retention_every = state.config.scheduler_retention_interval;
-    let tick = metadata_every
-        .min(Duration::from_millis(500))
+    // Poll fast enough to seal on the freshness cadence and to catch a
+    // size-due buffer promptly; the maintenance jobs are gated by their own
+    // (coarse) timers regardless of how often we wake.
+    let tick = flush_cadence
+        .min(metadata_every)
+        .min(Duration::from_millis(250))
         .max(Duration::from_millis(10));
+    let mut next_flush = Instant::now() + flush_cadence;
+    let mut flush_backoff_until = Instant::now();
     let mut next_metadata = Instant::now() + metadata_every;
     let mut next_metrics = Instant::now() + metrics_every;
     let mut next_retention = Instant::now() + retention_every;
@@ -267,6 +241,28 @@ fn scheduler_loop(state: Arc<AppState>, stop: Arc<AtomicBool>) {
 
         if state.maintenance.is_paused() {
             continue;
+        }
+
+        // Single seal driver. Seal when a buffered signal reaches its size/age
+        // threshold, or on the freshness cadence, keeping immutable-buffer age
+        // well under the lane SLA so ingest is never shed for freshness debt. A
+        // failed seal backs off so a broken catalog cannot spin the writer.
+        if now >= flush_backoff_until {
+            let buffers = state.storage.immutable_buffer_metrics();
+            let buffered = buffers.iter().any(|metric| metric.bytes > 0);
+            let threshold_due = buffers.iter().any(|metric| {
+                metric.bytes >= segment_target_bytes
+                    || metric.age_seconds >= segment_max_age_seconds
+            });
+            if buffered && (threshold_due || now >= next_flush) {
+                let ok = run_flush_tick(&state);
+                next_flush = now + flush_cadence;
+                if !ok {
+                    flush_backoff_until = now + flush_cadence;
+                }
+            } else if now >= next_flush {
+                next_flush = now + flush_cadence;
+            }
         }
 
         if now >= next_metadata {
@@ -303,6 +299,27 @@ fn scheduler_loop(state: Arc<AppState>, stop: Arc<AtomicBool>) {
             next_retention = now + next_interval(&state, "retention", retention_every, ok);
         }
     }
+}
+
+fn run_flush_tick(state: &AppState) -> bool {
+    run_job(state, "flush", |s| {
+        let pending_bytes: usize = s
+            .storage
+            .immutable_buffer_metrics()
+            .iter()
+            .map(|metric| metric.bytes)
+            .sum();
+        let mut guard = s
+            .lanes
+            .reserve_flush(&s.metrics)
+            .map_err(|err| anyhow::anyhow!(err.message.clone()))?;
+        guard.record_bytes(pending_bytes);
+        let result =
+            s.maintenance
+                .run_flush(&s.ingestor, &s.storage, &s.metrics, FlushOptions::default());
+        guard.finish(&s.metrics);
+        result
+    })
 }
 
 fn run_job<F>(state: &AppState, job: &'static str, f: F) -> bool

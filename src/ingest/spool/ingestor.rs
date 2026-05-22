@@ -1,8 +1,8 @@
 use super::{full_info, AppendBatchStats, CheckpointBatchStats, Record, RecordId, Writer};
-use crate::ingest::{all_signals, queue, Ingestor, Signal};
+use crate::ingest::{all_signals, Ingestor, Signal};
 use crate::lanes::LaneController;
 use crate::metrics::Metrics;
-use crate::storage::Storage;
+use crate::storage::{ImmutableFlushOutcome, Storage, TimingPhase};
 use crate::validation::{self, ApiError, ApiResult};
 use crate::LockExt;
 use anyhow::{Context, Result};
@@ -14,7 +14,6 @@ use std::time::Instant;
 #[derive(Clone, Copy, Debug)]
 pub(in crate::ingest) struct FlushRef {
     pub(in crate::ingest) signal: Signal,
-    pub(in crate::ingest) remaining_rows: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -157,95 +156,83 @@ impl Ingestor {
             metrics: metrics.clone(),
             prepared: None,
         };
-        self.dispatch_topology_work(work, metrics.as_ref())
+        self.dispatch_ingest_work(work, 0, 0, metrics.as_ref())
             .map(|_| ())
             .map_err(|err| anyhow::anyhow!(err.message.clone()))
     }
 
-    pub(in crate::ingest) fn track_raw_spool_batches(
+    /// Record that a durably-spooled request's rows are now in the storage
+    /// immutable buffer. The scheduler checkpoints the record after the next
+    /// durable seal (see [`Ingestor::flush_committed_to_storage`]). Called only
+    /// after a successful insert so a tracked ref always implies buffered rows.
+    pub(in crate::ingest) fn track_raw_spool_record(
         &self,
         raw_spool_ref: AppendRef,
         signal: Signal,
-        batches: &mut [queue::PendingBatch],
     ) {
-        if batches.is_empty() {
-            return;
-        }
-        for batch in batches.iter_mut() {
-            batch.raw_spool_id = Some(raw_spool_ref.id);
-            batch.raw_spool_lane = Some(raw_spool_ref.lane);
-        }
-        self.raw_spool_flush_refs.lock_or_poisoned().insert(
-            (raw_spool_ref.lane, raw_spool_ref.id),
-            FlushRef {
-                signal,
-                remaining_rows: batches.iter().map(|batch| batch.batch.num_rows()).sum(),
-            },
-        );
-    }
-
-    pub(in crate::ingest) fn untrack_raw_spool_record(&self, raw_spool_ref: AppendRef) {
         self.raw_spool_flush_refs
             .lock_or_poisoned()
-            .remove(&(raw_spool_ref.lane, raw_spool_ref.id));
+            .insert((raw_spool_ref.lane, raw_spool_ref.id), FlushRef { signal });
     }
 
-    pub(in crate::ingest) fn mark_raw_spool_batches_storage_committed(
+    /// Single seal driver: capture the records to checkpoint, force-seal the
+    /// whole immutable buffer to durable storage, then checkpoint exactly the
+    /// captured records. Capturing before sealing is load-bearing for
+    /// at-least-once: a record appended after the capture is not checkpointed
+    /// until a later flush, so we never checkpoint rows that were not sealed.
+    pub fn flush_committed_to_storage(
         &self,
-        sets: &[(queue::QueueKey, Vec<queue::QueuedBatch>)],
-        metrics: Option<&Metrics>,
-    ) -> Result<()> {
-        let mut committed_counts = BTreeMap::<(Signal, RecordId), usize>::new();
-        for (key, batches) in sets {
-            for batch in batches {
-                if let Some(id) = batch.raw_spool_id {
-                    let lane = batch.raw_spool_lane.unwrap_or(key.signal);
-                    *committed_counts.entry((lane, id)).or_default() += batch.len();
-                }
+        storage: &Storage,
+        metrics: &Metrics,
+    ) -> Result<ImmutableFlushOutcome> {
+        let captured = self.capture_committed_refs();
+        let outcome = match storage.flush_immutable_segments(true) {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                self.restore_committed_refs(captured);
+                return Err(err);
             }
-        }
-        if committed_counts.is_empty() {
-            return Ok(());
-        }
-
-        // Single locked pass: decrement remaining rows and remove entries that
-        // reach zero in the same critical section. The removed `FlushRef`
-        // is carried alongside its ref so that, if the subsequent checkpoint
-        // fails, we can restore the entry and keep observable behavior identical
-        // to checkpoint-then-remove.
-        let mut ready_to_checkpoint = Vec::new();
-        let mut removed = Vec::new();
-        {
-            let mut refs = self.raw_spool_flush_refs.lock_or_poisoned();
-            for ((signal, id), committed_rows) in committed_counts {
-                let Some(tracked) = refs.get_mut(&(signal, id)) else {
-                    continue;
-                };
-                if committed_rows >= tracked.remaining_rows {
-                    let key = (signal, id);
-                    let flush_ref = refs.remove(&key).expect("entry just inspected");
-                    ready_to_checkpoint.push((flush_ref.signal, AppendRef { lane: signal, id }));
-                    removed.push((key, flush_ref));
-                } else {
-                    tracked.remaining_rows -= committed_rows;
-                }
-            }
-        }
-
+        };
+        observe_immutable_flush(metrics, &outcome);
         if let Err(err) =
-            self.checkpoint_raw_spool_batch(&ready_to_checkpoint, "storage_committed", metrics)
+            self.checkpoint_raw_spool_batch(&captured, "storage_committed", Some(metrics))
         {
-            // Restore the entries we optimistically removed so the record stays
-            // tracked for retry, matching the prior checkpoint-then-remove order.
-            if !removed.is_empty() {
-                let mut refs = self.raw_spool_flush_refs.lock_or_poisoned();
-                for (key, flush_ref) in removed {
-                    refs.entry(key).or_insert(flush_ref);
-                }
-            }
-            return Err(err);
+            // Rows are durably sealed; only the raw-spool checkpoint failed. The
+            // records stay pending and replay (as duplicates) on a future
+            // restart, which at-least-once allows.
+            tracing::error!(
+                event = "raw_spool_checkpoint_failed",
+                error = %err,
+                "segments sealed but raw spool checkpoint failed; records left pending"
+            );
         }
-        Ok(())
+        Ok(outcome)
+    }
+
+    fn capture_committed_refs(&self) -> Vec<(Signal, AppendRef)> {
+        let mut refs = self.raw_spool_flush_refs.lock_or_poisoned();
+        let captured = refs
+            .iter()
+            .map(|((lane, id), flush_ref)| {
+                (
+                    flush_ref.signal,
+                    AppendRef {
+                        lane: *lane,
+                        id: *id,
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        refs.clear();
+        captured
+    }
+
+    fn restore_committed_refs(&self, captured: Vec<(Signal, AppendRef)>) {
+        let mut refs = self.raw_spool_flush_refs.lock_or_poisoned();
+        for (signal, append_ref) in captured {
+            refs.entry((append_ref.lane, append_ref.id))
+                .or_insert(FlushRef { signal });
+        }
     }
 
     pub(in crate::ingest) fn append_raw_spool(
@@ -887,6 +874,34 @@ impl Ingestor {
             }
         } else {
             signal
+        }
+    }
+}
+
+fn observe_immutable_flush(metrics: &Metrics, outcome: &ImmutableFlushOutcome) {
+    for timing in &outcome.timings {
+        metrics.observe_phase_seconds(
+            timing.table.as_str(),
+            timing.phase.as_str(),
+            None,
+            timing.seconds,
+        );
+    }
+    if outcome.sealed_rows == 0 && outcome.sealed_files == 0 {
+        return;
+    }
+    for timing in &outcome.timings {
+        if timing.phase == TimingPhase::ParquetEncode {
+            metrics.inc(
+                "canardstack_immutable_segments_sealed_files_total",
+                &[("signal", timing.table.as_str())],
+                1,
+            );
+            metrics.inc(
+                "canardstack_immutable_segments_sealed_rows_total",
+                &[("signal", timing.table.as_str())],
+                timing.rows as u64,
+            );
         }
     }
 }

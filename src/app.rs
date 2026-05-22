@@ -27,7 +27,7 @@ impl AppState {
         let lanes = LaneController::new(&config);
         let metrics = Arc::new(Metrics::default());
         if config.serve_role.accepts_ingest() {
-            ingestor.start_topology(storage.clone(), metrics.clone())?;
+            ingestor.start_ingest_workers(storage.clone())?;
             let replayed = ingestor.replay_raw_spool(&storage, &lanes, metrics.clone())?;
             if replayed > 0 {
                 tracing::info!(event = "raw_spool_replayed", records = replayed);

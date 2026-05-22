@@ -1,5 +1,4 @@
 use super::Signal;
-use crate::ingest::spool::RecordId;
 use crate::otlp::Transformed;
 use arrow58::record_batch::RecordBatch;
 use serde::Serialize;
@@ -34,35 +33,10 @@ impl BatchPartition {
     }
 }
 
-#[derive(Clone)]
-pub(super) struct QueuedBatch {
-    pub(super) batch: RecordBatch,
-    pub(super) source_format: &'static str,
-    pub(super) raw_spool_id: Option<RecordId>,
-    pub(super) raw_spool_lane: Option<Signal>,
-}
-
-impl QueuedBatch {
-    pub(super) fn from_pending(batch: PendingBatch) -> Self {
-        Self {
-            batch: batch.batch,
-            source_format: batch.source_format,
-            raw_spool_id: batch.raw_spool_id,
-            raw_spool_lane: batch.raw_spool_lane,
-        }
-    }
-
-    pub(super) fn len(&self) -> usize {
-        self.batch.num_rows()
-    }
-}
-
 pub(super) struct PendingBatch {
     pub(super) key: QueueKey,
     pub(super) batch: RecordBatch,
     pub(super) source_format: &'static str,
-    pub(super) raw_spool_id: Option<RecordId>,
-    pub(super) raw_spool_lane: Option<Signal>,
     pub(super) approx_bytes: usize,
     pub(super) credit_bytes: usize,
 }
@@ -123,8 +97,6 @@ fn push_pending_arrow(
         key: QueueKey::new(signal, source_format),
         batch,
         source_format,
-        raw_spool_id: None,
-        raw_spool_lane: None,
         approx_bytes,
         credit_bytes: approx_bytes,
     });

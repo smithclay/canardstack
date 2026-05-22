@@ -27,7 +27,7 @@ fn main() -> anyhow::Result<()> {
             if !state.config.scheduler_enabled {
                 tracing::warn!(
                     event = "scheduler_disabled",
-                    "scheduler disabled; ingest topology and storage sink continue independently, but maintenance jobs will not run"
+                    "scheduler disabled; ingest workers still accept and buffer requests, but the scheduler is the single seal driver, so buffered rows will not be sealed to DuckLake (and maintenance will not run) until it is enabled or an admin flush is issued"
                 );
             }
             let _scheduler = state

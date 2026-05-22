@@ -51,10 +51,12 @@ pub fn run() -> anyhow::Result<()> {
         &state,
     );
     let deadline = Instant::now() + StdDuration::from_secs(5);
-    while Instant::now() < deadline && state.ingestor.raw_spool_stats()?.pending_records > 0 {
+    while Instant::now() < deadline && state.ingestor.total_reserved_queue_bytes() > 0 {
         thread::sleep(StdDuration::from_millis(20));
     }
-    state.storage.flush_immutable_segments(true)?;
+    state
+        .ingestor
+        .flush_committed_to_storage(&state.storage, &state.metrics)?;
 
     let mut admin_headers = HashMap::new();
     admin_headers.insert(

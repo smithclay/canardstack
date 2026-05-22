@@ -219,7 +219,6 @@ fn route_inner(
                 "admin_flush",
                 crate::maintenance::FlushOptions {
                     table: query.get("table").map(String::as_str),
-                    force_immutable_segments: true,
                 },
             );
             record_maintenance_metrics(state, "flush", &result, started);
@@ -308,7 +307,7 @@ fn run_flush_with_lane(
     let guard = state.lanes.reserve_flush(&state.metrics)?;
     let result = state
         .maintenance
-        .run_flush(&state.storage, &state.metrics, options)
+        .run_flush(&state.ingestor, &state.storage, &state.metrics, options)
         .map_err(storage_error);
     let _ = triggered_by;
     guard.finish(&state.metrics);

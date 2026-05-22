@@ -151,8 +151,12 @@ Size the local data directory for the aggregate budget, not just one lane.
 
 ## Queues And Flush
 
-Ingest transforms inline on the HTTP request thread, then admits Arrow
-`RecordBatch`es into bounded in-process queues. Queue ownership is intentionally
+Ingest transforms inline on the HTTP request thread (so malformed payloads are
+rejected synchronously), then hands the durably-spooled work to a fixed pool of
+ingest workers over a bounded channel. Each worker admits Arrow `RecordBatch`es
+into the per-signal immutable storage buffer. The ingest worker pool is the
+single "parallel ingest across OS threads" concept; there is no separate
+dataflow topology or storage-sink stage. Queue ownership is intentionally
 low-cardinality: signal plus source encoding.
 
 Memory and queue guardrails:
@@ -160,6 +164,9 @@ Memory and queue guardrails:
 - `CANARDSTACK_MAX_BODY_BYTES`, default 8 MiB.
 - `CANARDSTACK_INGEST_MEMORY_BYTES`, default 2 GiB. Per-signal queues derive
   from this total budget.
+- `CANARDSTACK_INGEST_WORKERS`, default 4 ingest workers.
+- `CANARDSTACK_INGEST_BUFFER_CAPACITY`, default 1024 in-flight handoffs, split
+  across workers.
 - Optional `CANARDSTACK_PROCESS_MEMORY_LIMIT_BYTES`.
 
 Flush triggers:
@@ -168,9 +175,18 @@ Flush triggers:
 - `CANARDSTACK_FLUSH_MAX_AGE_SECS` or `_MS`, default 10 seconds. The
   high-pressure age is derived as one fifth of this value, with a 500ms floor.
 
-Flush drains queues, coalesces batches, appends them to immutable segment
-buffers, seals due Parquet files, registers those files in DuckLake, and then
-checkpoints the corresponding raw-spool records.
+A single scheduler flush worker is the only seal driver. It seals on a frequent
+cadence (`CANARDSTACK_FLUSH_INTERVAL_MS`, default 1s) or earlier when a buffered
+signal reaches its size (`CANARDSTACK_SEGMENT_TARGET_BYTES`) or age
+(`CANARDSTACK_SEGMENT_MAX_AGE_*`) threshold. The cadence must stay well under the
+freshness SLA so immutable-buffer age never approaches the lane reject threshold;
+it is deliberately decoupled from the coarse maintenance interval. Each seal
+captures the set of pending raw-spool records, force-seals the immutable buffer
+to Parquet under the flush lane, registers the files in DuckLake, and then
+checkpoints exactly the captured records. Capturing before sealing is
+load-bearing for at-least-once: a record appended after the capture is
+checkpointed on a later flush, never before its rows are durable. Admin flush
+uses the same path on demand.
 
 Freshness-budget admission happens before raw-spool append. The request path
 uses two local debt signals:

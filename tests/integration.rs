@@ -68,16 +68,22 @@ fn metrics_text(state: &AppState) -> String {
 }
 
 fn flush_all(state: &AppState) -> usize {
+    // Wait for in-flight ingest workers to finish inserting (admission credits
+    // released after the buffer insert), then run the single seal+checkpoint path
+    // the scheduler uses so rows become query-visible and the raw spool is
+    // checkpointed. A bare flush_immutable_segments would seal without
+    // checkpointing the raw spool, leaving records pending forever.
     let deadline = Instant::now() + StdDuration::from_secs(5);
     while Instant::now() < deadline {
-        let pending = state.ingestor.raw_spool_stats().unwrap().pending_records;
-        let reserved = state.ingestor.total_reserved_queue_bytes();
-        if pending == 0 && reserved == 0 {
+        if state.ingestor.total_reserved_queue_bytes() == 0 {
             break;
         }
         thread::sleep(StdDuration::from_millis(10));
     }
-    state.storage.flush_immutable_segments(true).unwrap();
+    state
+        .ingestor
+        .flush_committed_to_storage(&state.storage, &state.metrics)
+        .unwrap();
     state
         .storage
         .logical_rows()
@@ -959,21 +965,22 @@ fn ingest_stage_metrics_separate_transform_enqueue_and_storage_visibility() {
     );
     let metrics = metrics_text(&state);
     assert!(
-        metrics.contains("canardstack_storage_sink_rows_total{signal=\"logs\"} 1"),
+        metrics
+            .contains("canardstack_ingest_storage_insert_total{signal=\"logs\",status=\"ok\"} 1"),
         "{metrics}"
     );
     assert!(
-        metrics.contains("canardstack_storage_sink_sealed_rows_total{signal=\"all\"} 1"),
+        metrics.contains("canardstack_immutable_segments_sealed_rows_total{signal=\"logs\"} 1"),
         "{metrics}"
     );
     assert!(
-        metrics.contains("canardstack_storage_sink_sealed_files_total{signal=\"all\"} 1"),
+        metrics.contains("canardstack_immutable_segments_sealed_files_total{signal=\"logs\"} 1"),
         "{metrics}"
     );
 }
 
 #[test]
-fn ingest_topology_returns_202_after_raw_spool_and_handoff() {
+fn ingest_workers_return_202_after_raw_spool_and_handoff() {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
     config.local_storage_dir = dir.path().join("storage");
@@ -990,37 +997,32 @@ fn ingest_topology_returns_202_after_raw_spool_and_handoff() {
         &state,
     );
     assert_eq!(response.status(), 202, "{}", response.json_body());
-    assert_eq!(
-        response.json_body()["acknowledgement"],
-        "locally_spooled_topology_handoff"
-    );
+    assert_eq!(response.json_body()["acknowledgement"], "locally_spooled");
 
     flush_all(&state);
     assert_eq!(log_rows(&state), 1);
     let metrics = metrics_text(&state);
     assert!(
         metrics.contains(
-            "canardstack_ingest_topology_requests_total{signal=\"logs\",status=\"queued\"} 1"
+            "canardstack_ingest_requests_queued_total{signal=\"logs\",status=\"queued\"} 1"
         ),
         "{metrics}"
     );
     assert!(
-        metrics.contains(
-            "canardstack_ingest_transform_completed_total{signal=\"logs\",status=\"ok\"} 1"
-        ),
+        metrics
+            .contains("canardstack_ingest_worker_completed_total{signal=\"logs\",status=\"ok\"} 1"),
         "{metrics}"
     );
 }
 
 #[test]
-fn storage_sink_bypasses_deleted_ingest_queue_and_checkpoints_spool() {
+fn ingest_workers_inserts_storage_buffer_and_checkpoints_spool() {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
     config.local_storage_dir = dir.path().join("storage");
     config.raw_spool_dir = dir.path().join("raw-spool");
     config.ingest_workers = 1;
     config.ingest_buffer_capacity = 4;
-    config.storage_sink_buffer_capacity = 4;
     let state = AppState::new(config).unwrap();
     let body = log_fixture(Utc::now().timestamp_nanos_opt().unwrap()).to_string();
     let response = http::route(
@@ -1044,12 +1046,12 @@ fn storage_sink_bypasses_deleted_ingest_queue_and_checkpoints_spool() {
             .find(|snapshot| snapshot.signal == "logs")
             .map(|snapshot| snapshot.buffered_rows),
         Some(0),
-        "storage sink should bypass the deleted ingest queue"
+        "buffered rows should drain once the scheduler seal path runs"
     );
     let metrics = metrics_text(&state);
     assert!(
         metrics
-            .contains("canardstack_storage_sink_completed_total{signal=\"logs\",status=\"ok\"} 1"),
+            .contains("canardstack_ingest_storage_insert_total{signal=\"logs\",status=\"ok\"} 1"),
         "{metrics}"
     );
 }
@@ -1071,10 +1073,7 @@ fn raw_spool_acknowledges_local_spool_write_before_storage_commit() {
     );
 
     assert_eq!(response.status(), 202, "{}", response.json_body());
-    assert_eq!(
-        response.json_body()["acknowledgement"],
-        "locally_spooled_topology_handoff"
-    );
+    assert_eq!(response.json_body()["acknowledgement"], "locally_spooled");
     let metrics = metrics_text(&state);
     assert!(
         metrics
@@ -1097,11 +1096,48 @@ fn raw_spool_acknowledges_local_spool_write_before_storage_commit() {
 }
 
 #[test]
-fn raw_spool_checkpoints_after_storage_sink_commits_multirow_record() {
+fn ingest_fsyncs_raw_spool_and_reports_real_record_count_before_ack() {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
     config.raw_spool_dir = dir.path().join("raw-spool");
-    config.storage_sink_batch_rows = 10;
+    let state = AppState::new(config).unwrap();
+    let body = log_fixture(Utc::now().timestamp_nanos_opt().unwrap()).to_string();
+    let response = http::route(
+        "POST",
+        "/v1/logs",
+        &HashMap::new(),
+        &headers(&state),
+        body.as_bytes(),
+        &state,
+    );
+
+    assert_eq!(response.status(), 202, "{}", response.json_body());
+    // The async handoff still reports the true row count because transform runs
+    // on the connection thread before the 202 (guards against a records:0
+    // regression on the worker path).
+    assert_eq!(
+        response.json_body()["records"],
+        1,
+        "{}",
+        response.json_body()
+    );
+    assert_eq!(response.json_body()["acknowledgement"], "locally_spooled");
+
+    // The 202 is only returned after the raw request is fsynced to the local
+    // spool. Pin that invariant so future "relax fsync" perf changes cannot
+    // silently regress at-least-once durability.
+    let stats = state.ingestor.raw_spool_stats().unwrap();
+    assert_eq!(
+        stats.unsynced_records, 0,
+        "raw spool must be fsynced before the 202 acknowledgement"
+    );
+}
+
+#[test]
+fn raw_spool_checkpoints_after_seal_commits_multirow_record() {
+    let dir = tempdir().unwrap();
+    let mut config = Config::test(dir.path().join("canardstack.duckdb"));
+    config.raw_spool_dir = dir.path().join("raw-spool");
     let state = AppState::new(config).unwrap();
     let now = Utc::now().timestamp_nanos_opt().unwrap();
     let mut body = log_fixture(now);
@@ -1248,10 +1284,7 @@ fn raw_spool_replays_accepted_unflushed_request_after_restart() {
             &state,
         );
         assert_eq!(response.status(), 202, "{}", response.json_body());
-        assert_eq!(
-            response.json_body()["acknowledgement"],
-            "locally_spooled_topology_handoff"
-        );
+        assert_eq!(response.json_body()["acknowledgement"], "locally_spooled");
         flush_all(&state);
     }
 
@@ -1311,7 +1344,7 @@ fn raw_spool_full_returns_429_before_transform() {
 }
 
 #[test]
-fn topology_handoff_unavailable_preserves_spooled_work_for_replay() {
+fn ingest_workers_unavailable_preserves_spooled_work_for_replay() {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
     config.raw_spool_dir = dir.path().join("raw-spool");
@@ -1338,11 +1371,11 @@ fn topology_handoff_unavailable_preserves_spooled_work_for_replay() {
         )
         .unwrap_err();
     assert_eq!(err.status, 503);
-    assert_eq!(err.reason, "ingest_topology_unavailable");
+    assert_eq!(err.reason, "ingest_workers_unavailable");
     assert_eq!(
         ingestor.raw_spool_stats().unwrap().pending_records,
         1,
-        "spooled work must remain pending when topology handoff fails"
+        "spooled work must remain pending when the ingest worker pool handoff fails"
     );
 }
 
@@ -2514,7 +2547,7 @@ fn remote_ducklake_attach_uri_smoke() {
 }
 
 #[test]
-fn storage_sink_seals_before_raw_spool_checkpoint_survives_restart() {
+fn seal_before_raw_spool_checkpoint_survives_restart() {
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("canardstack.duckdb");
     let mut config = Config::test(db_path.clone());
@@ -2594,18 +2627,17 @@ fn scheduler_health_excludes_hot_ingest_flush_jobs() {
 }
 
 #[test]
-fn storage_sink_drains_threshold_ingest_without_scheduler_flush_worker() {
+fn scheduler_seals_threshold_ingest_into_visible_rows() {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
     config.local_storage_dir = dir.path().join("storage");
-    config.scheduler_enabled = false;
-    config.max_age = StdDuration::from_secs(60);
-    config.high_pressure_max_age = StdDuration::from_secs(60);
+    config.scheduler_enabled = true;
+    config.scheduler_flush_interval = StdDuration::from_millis(20);
     config.immutable_segment_max_age = StdDuration::from_millis(10);
-    config.max_rows_per_flush = 1;
-    config.max_bytes_per_flush = 10_000_000;
+    config.immutable_segment_target_bytes = 1;
 
     let state = Arc::new(AppState::new(config).unwrap());
+    let scheduler = Scheduler::spawn(state.clone());
 
     let now = Utc::now();
     let body = log_fixture(now.timestamp_nanos_opt().unwrap()).to_string();
@@ -2619,7 +2651,7 @@ fn storage_sink_drains_threshold_ingest_without_scheduler_flush_worker() {
     );
     assert_eq!(response.status(), 202);
 
-    let deadline = Instant::now() + StdDuration::from_secs(3);
+    let deadline = Instant::now() + StdDuration::from_secs(5);
     let mut row_count = 0;
     while Instant::now() < deadline {
         thread::sleep(StdDuration::from_millis(20));
@@ -2628,21 +2660,22 @@ fn storage_sink_drains_threshold_ingest_without_scheduler_flush_worker() {
             break;
         }
     }
+    drop(scheduler);
 
     assert!(
         row_count > 0,
-        "storage sink should drain threshold-triggered ingest without scheduler flush"
+        "scheduler flush should seal threshold ingest into visible rows"
     );
     let metrics = state.metrics.render_prometheus();
     assert!(
         metrics
-            .contains("canardstack_storage_sink_completed_total{signal=\"logs\",status=\"ok\"} 1"),
+            .contains("canardstack_ingest_storage_insert_total{signal=\"logs\",status=\"ok\"} 1"),
         "{metrics}"
     );
 }
 
 #[test]
-fn disabled_scheduler_does_not_stop_storage_sink_visibility() {
+fn disabled_scheduler_requires_manual_flush_for_visibility() {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
     config.local_storage_dir = dir.path().join("storage");
@@ -3149,7 +3182,7 @@ fn config_validate_rejects_invalid_raw_spool_limits() {
 }
 
 #[test]
-fn config_validate_rejects_invalid_topology_capacities() {
+fn config_validate_rejects_invalid_ingest_workers_capacities() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("canardstack.duckdb");
     assert!(
@@ -3157,19 +3190,14 @@ fn config_validate_rejects_invalid_topology_capacities() {
         "baseline test config must validate"
     );
 
-    let mutations: [fn(&mut Config); 5] = [
-        |c| c.ingest_workers = 0,
-        |c| c.ingest_buffer_capacity = 0,
-        |c| c.storage_sink_buffer_capacity = 0,
-        |c| c.storage_sink_batch_rows = 0,
-        |c| c.storage_sink_flush_interval = std::time::Duration::ZERO,
-    ];
+    let mutations: [fn(&mut Config); 2] =
+        [|c| c.ingest_workers = 0, |c| c.ingest_buffer_capacity = 0];
     for mutate in mutations {
         let mut config = Config::test(path.clone());
         mutate(&mut config);
         assert!(
             config.validate().is_err(),
-            "invalid topology capacities must fail validation"
+            "invalid ingest worker pool capacities must fail validation"
         );
     }
 }

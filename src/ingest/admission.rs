@@ -4,9 +4,10 @@ use crate::config::Config;
 use crate::metrics::Metrics;
 use crate::runtime::memory;
 use crate::validation::{ApiError, ApiResult};
+use crate::LockExt;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Weak};
 
 const QUEUE_CREDIT_HIGH_WATERMARK_NUMERATOR: usize = 95;
 const QUEUE_CREDIT_LOW_WATERMARK_NUMERATOR: usize = 75;
@@ -221,6 +222,7 @@ impl QueueCreditLedger {
         Ok(QueueCreditReservation {
             credits: bytes_by_signal,
             active: true,
+            ledger: Weak::new(),
         })
     }
 
@@ -351,6 +353,28 @@ impl QueueCreditLedger {
 pub(super) struct QueueCreditReservation {
     credits: BTreeMap<Signal, usize>,
     active: bool,
+    /// Handle back to the owning ledger so an un-released reservation (e.g. a
+    /// ingest worker panics mid-process) returns its credits on drop instead
+    /// of leaking them toward a permanent 429. Explicit release/adjust paths set
+    /// `active = false`, making the drop a no-op.
+    ledger: Weak<Mutex<QueueCreditLedger>>,
+}
+
+impl QueueCreditReservation {
+    pub(super) fn bind_ledger(&mut self, ledger: Weak<Mutex<QueueCreditLedger>>) {
+        self.ledger = ledger;
+    }
+}
+
+impl Drop for QueueCreditReservation {
+    fn drop(&mut self) {
+        if !self.active || self.credits.is_empty() {
+            return;
+        }
+        if let Some(ledger) = self.ledger.upgrade() {
+            ledger.lock_or_poisoned().release_bytes(&self.credits);
+        }
+    }
 }
 
 pub(super) fn credit_bytes_by_signal(batches: &[PendingBatch]) -> BTreeMap<Signal, usize> {
@@ -462,5 +486,31 @@ mod tests {
 
         assert_eq!(estimate.get(&Signal::Logs), Some(&400));
         assert_eq!(estimate.len(), 1);
+    }
+
+    #[test]
+    fn dropping_unreleased_reservation_returns_credits_to_ledger() {
+        use crate::config::Config;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config::test(dir.path().join("canardstack.duckdb"));
+        let ledger = Arc::new(Mutex::new(QueueCreditLedger::new(&config)));
+        let mut reservation = ledger
+            .lock()
+            .unwrap()
+            .reserve_exact(BTreeMap::from([(Signal::Logs, 1_024)]))
+            .unwrap();
+        reservation.bind_ledger(Arc::downgrade(&ledger));
+        assert_eq!(ledger.lock().unwrap().total_reserved_bytes(), 1_024);
+
+        // Simulate a ingest worker panicking before it can explicitly release:
+        // the reservation drops un-released and must return its credits, or ingest
+        // would walk toward a permanent 429.
+        drop(reservation);
+        assert_eq!(
+            ledger.lock().unwrap().total_reserved_bytes(),
+            0,
+            "dropping an unreleased reservation must return its credits"
+        );
     }
 }

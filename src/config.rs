@@ -113,9 +113,6 @@ pub struct Config {
     pub raw_spool_checkpoint_fsync_delay: Duration,
     pub ingest_workers: usize,
     pub ingest_buffer_capacity: usize,
-    pub storage_sink_buffer_capacity: usize,
-    pub storage_sink_batch_rows: usize,
-    pub storage_sink_flush_interval: Duration,
 }
 
 const DEFAULT_CONFIG_PATH: &str = "config.toml";
@@ -264,7 +261,17 @@ impl Config {
                 .or(file.bool(&["scheduler", "enabled"])?)
                 .unwrap_or(true),
             scheduler_watchdog_interval: Duration::from_secs(1),
-            scheduler_flush_interval: maintenance_interval,
+            // Seal cadence for the single flush driver. Decoupled from the coarse
+            // maintenance interval: it must stay well under the freshness SLA so
+            // immutable-buffer age never approaches the lane reject threshold.
+            scheduler_flush_interval: duration_ms_or_secs(
+                &file,
+                &["scheduler", "flush_interval_ms"],
+                &["scheduler", "flush_interval_secs"],
+                "CANARDSTACK_FLUSH_INTERVAL_MS",
+                "CANARDSTACK_FLUSH_INTERVAL_SECS",
+                1,
+            )?,
             scheduler_metadata_interval: maintenance_interval,
             scheduler_metrics_interval: maintenance_interval.saturating_mul(2),
             scheduler_retention_interval: maintenance_interval.saturating_mul(120),
@@ -311,17 +318,6 @@ impl Config {
             ingest_buffer_capacity: env_usize("CANARDSTACK_INGEST_BUFFER_CAPACITY")?
                 .or(file.usize(&["ingest", "buffer_capacity"])?)
                 .unwrap_or(1024),
-            storage_sink_buffer_capacity: env_usize("CANARDSTACK_STORAGE_SINK_BUFFER_CAPACITY")?
-                .or(file.usize(&["storage_sink", "buffer_capacity"])?)
-                .unwrap_or(1024),
-            storage_sink_batch_rows: env_usize("CANARDSTACK_STORAGE_SINK_BATCH_ROWS")?
-                .or(file.usize(&["storage_sink", "batch_rows"])?)
-                .unwrap_or(5_000),
-            storage_sink_flush_interval: Duration::from_millis(
-                env_usize("CANARDSTACK_STORAGE_SINK_FLUSH_INTERVAL_MS")?
-                    .or(file.usize(&["storage_sink", "flush_interval_ms"])?)
-                    .unwrap_or(1000) as u64,
-            ),
         })
     }
 
@@ -395,9 +391,6 @@ impl Config {
             raw_spool_checkpoint_fsync_delay: Duration::from_millis(1000),
             ingest_workers: 4,
             ingest_buffer_capacity: 1024,
-            storage_sink_buffer_capacity: 1024,
-            storage_sink_batch_rows: 5_000,
-            storage_sink_flush_interval: Duration::from_millis(10),
         }
     }
 
@@ -510,15 +503,6 @@ impl Config {
         }
         if self.ingest_buffer_capacity == 0 {
             anyhow::bail!("CANARDSTACK_INGEST_BUFFER_CAPACITY must be > 0");
-        }
-        if self.storage_sink_buffer_capacity == 0 {
-            anyhow::bail!("CANARDSTACK_STORAGE_SINK_BUFFER_CAPACITY must be > 0");
-        }
-        if self.storage_sink_batch_rows == 0 {
-            anyhow::bail!("CANARDSTACK_STORAGE_SINK_BATCH_ROWS must be > 0");
-        }
-        if self.storage_sink_flush_interval.is_zero() {
-            anyhow::bail!("CANARDSTACK_STORAGE_SINK_FLUSH_INTERVAL_MS must be > 0");
         }
         if self.raw_spool_max_record_bytes > self.raw_spool_max_total_bytes {
             anyhow::bail!(
@@ -873,17 +857,13 @@ days = 5
 [scheduler]
 enabled = false
 maintenance_interval_secs = 40
+flush_interval_ms = 250
 
 [raw_spool]
 capacity_bytes = 16384
 group_commit_ms = 3
 append_sync_ms = 250
 append_sync_bytes = 8192
-
-[storage_sink]
-buffer_capacity = 44
-batch_rows = 55
-flush_interval_ms = 66
 
 [bench]
 http_keepalive = true
@@ -934,7 +914,7 @@ http_keepalive = true
         assert_eq!(config.logs_retention_days, 5);
         assert_eq!(config.metrics_retention_days, 5);
         assert!(!config.scheduler_enabled);
-        assert_eq!(config.scheduler_flush_interval, Duration::from_secs(40));
+        assert_eq!(config.scheduler_flush_interval, Duration::from_millis(250));
         assert_eq!(config.scheduler_metadata_interval, Duration::from_secs(40));
         assert_eq!(config.scheduler_metrics_interval, Duration::from_secs(80));
         assert_eq!(
@@ -960,12 +940,6 @@ http_keepalive = true
         );
         assert_eq!(config.ingest_workers, 3);
         assert_eq!(config.ingest_buffer_capacity, 33);
-        assert_eq!(config.storage_sink_buffer_capacity, 44);
-        assert_eq!(config.storage_sink_batch_rows, 55);
-        assert_eq!(
-            config.storage_sink_flush_interval,
-            Duration::from_millis(66)
-        );
         assert!(config.bench_http_keepalive);
     }
 
