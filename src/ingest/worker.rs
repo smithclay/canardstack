@@ -8,7 +8,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
 /// Parallel ingest across OS threads: a fixed pool of worker threads that turn
-/// durably-spooled requests into buffered Arrow rows. Each worker inserts into
+/// durably-spooled requests into buffered Arrow rows. Each worker appends into
 /// the storage immutable buffer; the scheduler is the single seal driver (see
 /// `Ingestor::flush_committed_to_storage`).
 pub(super) struct IngestWorkerPool {

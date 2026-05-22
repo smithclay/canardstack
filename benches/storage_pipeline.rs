@@ -6,7 +6,7 @@ use arrow58::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow58::record_batch::RecordBatch;
 use canardstack::config::Config;
 use canardstack::ingest::Signal;
-use canardstack::storage::{ArrowBatchInsert, ArrowBatchInsertTiming, Storage};
+use canardstack::storage::{ArrowBatchBuffer, ArrowBatchBufferTiming, Storage};
 use chrono::Utc;
 use std::collections::BTreeMap;
 use std::env;
@@ -63,7 +63,7 @@ fn run() -> Result<()> {
 
         let started = Instant::now();
         for (signal, batch) in generated {
-            let result = storage.insert_arrow_batches(&[ArrowBatchInsert {
+            let result = storage.buffer_arrow_batches(&[ArrowBatchBuffer {
                 table: signal,
                 batch: &batch,
                 source_format: "storage_pipeline_bench",
@@ -148,7 +148,7 @@ struct PhaseStat {
 }
 
 impl PhaseStats {
-    fn record_timings(&mut self, timings: Vec<ArrowBatchInsertTiming>) {
+    fn record_timings(&mut self, timings: Vec<ArrowBatchBufferTiming>) {
         for timing in timings {
             let key = (timing.table.as_str().to_string(), timing.phase.to_string());
             let stat = self.by_phase.entry(key).or_default();

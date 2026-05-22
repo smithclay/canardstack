@@ -57,13 +57,13 @@ Do not label metrics by `service_name`, trace id, query text, API key, or arbitr
 | `canardstack_ingest_records_total` | Counter | `signal` | Records accepted into the immutable buffer. |
 | `canardstack_ingest_transformed_rows_total` | Counter | `signal`, `request_signal` | Rows produced by worker-side `otlp2records` transform. |
 | `canardstack_ingest_unsupported_histograms_total` | Counter | `signal` | Histogram datapoints observed and dropped by the v0 metrics transformer. Emitted only when nonzero. |
-| `canardstack_ingest_buffered_rows_total` | Counter | `signal` | Rows inserted into the storage immutable buffer. |
-| `canardstack_ingest_buffered_bytes_total` | Counter | `signal` | Approximate Arrow bytes inserted into the storage immutable buffer. |
-| `canardstack_ingest_inflight_bytes` | Gauge | `signal` | Bytes admitted (spooled, handed to a worker) but not yet inserted into the immutable buffer. |
+| `canardstack_ingest_buffered_rows_total` | Counter | `signal` | Rows appended to the storage immutable buffer. |
+| `canardstack_ingest_buffered_bytes_total` | Counter | `signal` | Approximate Arrow bytes appended to the storage immutable buffer. |
+| `canardstack_ingest_inflight_bytes` | Gauge | `signal` | Bytes admitted (spooled, handed to a worker) but not yet appended to the immutable buffer. |
 | `canardstack_ingest_inflight_capacity_bytes` | Gauge | `signal` | Per-signal in-flight ceiling. |
 | `canardstack_ingest_inflight_pressure` | Gauge | `signal` | In-flight bytes as a fraction of the per-signal ceiling (`0..1`). |
 | `canardstack_ingest_worker_queue_capacity` | Gauge | `state=capacity` | Configured bounded worker channel capacity. |
-| `canardstack_ingest_storage_insert_total` | Counter | `signal`, `status` | Worker inserts of Arrow batches into the immutable buffer. |
+| `canardstack_ingest_storage_insert_total` | Counter | `signal`, `status` | Worker appends of Arrow batches into the immutable buffer. |
 | `canardstack_ingest_worker_completed_total` | Counter | `signal`, `status` | Ingest worker tasks completed, by outcome. |
 | `canardstack_ingest_rejections_total` | Counter | `signal`, `status`, `reason` | Admission-control rejections (subset of `_ingest_requests_total`). |
 | `canardstack_ingest_freshness_budget_rejections_total` | Counter | none | Requests rejected before raw-spool append because projected visibility exceeded the freshness SLA. |
@@ -93,9 +93,7 @@ storage proof phases with `signal` and `phase` labels:
 `storage_prepare`, `storage_buffer`, `storage_partition_split`,
 `storage_parquet_encode`, `storage_file_write`, `storage_file_fsync`,
 `storage_file_rename`, `storage_parquet_write`,
-`storage_ducklake_register`, `storage_ducklake_commit`, and
-`storage_insert`. `storage_insert` is retained for flush accounting and
-backward-compatible benchmark parsing.
+`storage_ducklake_register`, and `storage_ducklake_commit`.
 
 `/api/admin/health/ingest` returns queue snapshots, raw-spool stats
 (`segment_count`, `segment_bytes`, `pending_records`, `pending_bytes`,

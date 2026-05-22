@@ -6,7 +6,7 @@ use super::immutable::{
     ImmutableFlushOutcome, ImmutableSealResult, SealedSegment,
 };
 use super::{
-    ArrowBatchInsert, ArrowBatchInsertResult, ArrowBatchInsertTiming, ImmutableBufferMetric,
+    ArrowBatchBuffer, ArrowBatchBufferResult, ArrowBatchBufferTiming, ImmutableBufferMetric,
     ImmutableSegmentBuffer, PreparedArrowBatch, Signal, Storage, TimingPhase,
 };
 use crate::LockExt;
@@ -20,7 +20,7 @@ use std::time::Instant;
 
 struct SealedBuffer {
     segments: Vec<SealedSegment>,
-    timings: Vec<ArrowBatchInsertTiming>,
+    timings: Vec<ArrowBatchBufferTiming>,
     affected_days: BTreeSet<String>,
 }
 
@@ -38,13 +38,13 @@ impl Storage {
             .collect()
     }
 
-    pub fn insert_arrow_records(
+    pub fn buffer_arrow_records(
         &self,
         table: Signal,
         batch: &RecordBatch,
         source_format: &str,
     ) -> Result<usize> {
-        let result = self.insert_arrow_batches(&[ArrowBatchInsert {
+        let result = self.buffer_arrow_batches(&[ArrowBatchBuffer {
             table,
             batch,
             source_format,
@@ -52,10 +52,10 @@ impl Storage {
         Ok(result.rows)
     }
 
-    pub fn insert_arrow_batches(
+    pub fn buffer_arrow_batches(
         &self,
-        batches: &[ArrowBatchInsert<'_>],
-    ) -> Result<ArrowBatchInsertResult> {
+        batches: &[ArrowBatchBuffer<'_>],
+    ) -> Result<ArrowBatchBufferResult> {
         let mut prepared = Vec::new();
         let mut prepare_timings = Vec::new();
         let mut attempted_rows = 0;
@@ -74,7 +74,7 @@ impl Storage {
             let rows = batches.iter().map(|batch| batch.num_rows()).sum();
             let coalesce_started = Instant::now();
             let batch = coalesce_storage_batches(table, &batches)?;
-            prepare_timings.push(ArrowBatchInsertTiming {
+            prepare_timings.push(ArrowBatchBufferTiming {
                 table,
                 phase: TimingPhase::Coalesce,
                 rows,
@@ -90,7 +90,7 @@ impl Storage {
                 rows,
                 timestamp_days,
             });
-            prepare_timings.push(ArrowBatchInsertTiming {
+            prepare_timings.push(ArrowBatchBufferTiming {
                 table,
                 phase: TimingPhase::Prepare,
                 rows,
@@ -99,21 +99,21 @@ impl Storage {
         }
 
         if prepared.is_empty() {
-            return Ok(ArrowBatchInsertResult {
+            return Ok(ArrowBatchBufferResult {
                 rows: 0,
                 timings: Vec::new(),
             });
         }
 
-        self.insert_immutable_segments(prepared, prepare_timings, attempted_rows)
+        self.buffer_immutable_segments(prepared, prepare_timings, attempted_rows)
     }
 
-    fn insert_immutable_segments(
+    fn buffer_immutable_segments(
         &self,
         prepared: Vec<PreparedArrowBatch>,
-        prepare_timings: Vec<ArrowBatchInsertTiming>,
+        prepare_timings: Vec<ArrowBatchBufferTiming>,
         attempted_rows: usize,
-    ) -> Result<ArrowBatchInsertResult> {
+    ) -> Result<ArrowBatchBufferResult> {
         if !self.ducklake_available {
             anyhow::bail!("immutable segment ingest requires DuckLake storage");
         }
@@ -133,7 +133,7 @@ impl Storage {
                     .or_insert_with(|| ImmutableSegmentBuffer::new(started))
                     .push(batch);
             }
-            timings.push(ArrowBatchInsertTiming {
+            timings.push(ArrowBatchBufferTiming {
                 table: error_table,
                 phase: TimingPhase::Buffer,
                 rows: attempted_rows,
@@ -141,7 +141,7 @@ impl Storage {
             });
         }
         *self.last_error.lock_or_poisoned() = None;
-        Ok(ArrowBatchInsertResult {
+        Ok(ArrowBatchBufferResult {
             rows: attempted_rows,
             timings,
         })
@@ -257,15 +257,9 @@ impl Storage {
                     &segment.path,
                 )?;
                 let register_seconds = started.elapsed().as_secs_f64();
-                timings.push(ArrowBatchInsertTiming {
+                timings.push(ArrowBatchBufferTiming {
                     table: segment.table,
                     phase: TimingPhase::DucklakeRegister,
-                    rows: segment.rows,
-                    seconds: register_seconds,
-                });
-                timings.push(ArrowBatchInsertTiming {
-                    table: segment.table,
-                    phase: TimingPhase::Insert,
                     rows: segment.rows,
                     seconds: register_seconds,
                 });
@@ -325,7 +319,7 @@ fn seal_immutable_buffer(
 ) -> Result<SealedBuffer> {
     let coalesce_started = Instant::now();
     let batch = buffer.record_batch(table)?;
-    let mut timings = vec![ArrowBatchInsertTiming {
+    let mut timings = vec![ArrowBatchBufferTiming {
         table,
         phase: TimingPhase::ImmutableCoalesce,
         rows: buffer.rows,
@@ -333,7 +327,7 @@ fn seal_immutable_buffer(
     }];
     let started = Instant::now();
     let partitions = split_batch_by_immutable_partition(&batch)?;
-    timings.push(ArrowBatchInsertTiming {
+    timings.push(ArrowBatchBufferTiming {
         table,
         phase: TimingPhase::PartitionSplit,
         rows: buffer.rows,
@@ -345,7 +339,7 @@ fn seal_immutable_buffer(
         timings.extend(write.timings);
         segments.push(write.segment);
     }
-    timings.push(ArrowBatchInsertTiming {
+    timings.push(ArrowBatchBufferTiming {
         table,
         phase: TimingPhase::ParquetWrite,
         rows: buffer.rows,

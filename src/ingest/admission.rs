@@ -90,7 +90,7 @@ impl Drop for RuntimeMemoryReservation {
 }
 
 /// Per-signal accounting of bytes that have been admitted (durably spooled and
-/// handed to an ingest worker) but not yet inserted into the immutable buffer.
+/// handed to an ingest worker) but not yet appended to the immutable buffer.
 ///
 /// Freshness-first admission in [`crate::lanes::LaneController::admit_ingest`] is
 /// the single authority that sheds ingest under projected-visibility pressure.
@@ -176,7 +176,6 @@ impl InflightBytes {
         Ok(InflightReservation {
             tracker: Arc::clone(self),
             bytes: estimate,
-            active: true,
         })
     }
 }
@@ -193,19 +192,15 @@ fn signal_index(signal: Signal) -> usize {
 pub(super) struct InflightReservation {
     tracker: Arc<InflightBytes>,
     bytes: BTreeMap<Signal, usize>,
-    active: bool,
 }
 
 impl InflightReservation {
     /// Correct the admission estimate to the exact buffered Arrow bytes once the
     /// payload has been transformed, keeping the in-flight total accurate while
-    /// the rows wait for the worker storage insert. Infallible: the request is
+    /// the rows wait for the worker storage buffer append. Infallible: the request is
     /// already durably spooled, so accurate accounting must not be able to
     /// reject it here.
     pub(super) fn adjust(&mut self, exact: BTreeMap<Signal, usize>) {
-        if !self.active {
-            return;
-        }
         let exact = normalized_bytes(exact);
         for signal in Signal::ALL {
             let current = self.bytes.get(&signal).copied().unwrap_or(0);
@@ -222,21 +217,13 @@ impl InflightReservation {
         }
         self.bytes = exact;
     }
-
-    pub(super) fn release(&mut self) {
-        if !self.active {
-            return;
-        }
-        for (signal, bytes) in std::mem::take(&mut self.bytes) {
-            sub_saturating(&self.tracker.counters[signal_index(signal)], bytes);
-        }
-        self.active = false;
-    }
 }
 
 impl Drop for InflightReservation {
     fn drop(&mut self) {
-        self.release();
+        for (signal, bytes) in std::mem::take(&mut self.bytes) {
+            sub_saturating(&self.tracker.counters[signal_index(signal)], bytes);
+        }
     }
 }
 
@@ -404,7 +391,7 @@ mod tests {
     }
 
     #[test]
-    fn adjust_then_release_returns_exact_bytes() {
+    fn adjust_then_drop_returns_exact_bytes() {
         use crate::config::Config;
 
         let dir = tempfile::tempdir().unwrap();
@@ -415,7 +402,7 @@ mod tests {
             .unwrap();
         reservation.adjust(BTreeMap::from([(Signal::Logs, 250)]));
         assert_eq!(tracker.signal_bytes(Signal::Logs), 250);
-        reservation.release();
+        drop(reservation);
         assert_eq!(tracker.total_bytes(), 0);
     }
 }

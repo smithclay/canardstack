@@ -162,7 +162,7 @@ impl std::fmt::Display for InsertRecordsError {
 
 impl std::error::Error for InsertRecordsError {}
 
-pub struct ArrowBatchInsert<'a> {
+pub struct ArrowBatchBuffer<'a> {
     pub table: Signal,
     pub batch: &'a RecordBatch,
     pub source_format: &'a str,
@@ -182,7 +182,6 @@ pub enum TimingPhase {
     FileRename,
     DucklakeRegister,
     DucklakeCommit,
-    Insert,
 }
 
 impl TimingPhase {
@@ -200,7 +199,6 @@ impl TimingPhase {
             TimingPhase::FileRename => "storage_file_rename",
             TimingPhase::DucklakeRegister => "storage_ducklake_register",
             TimingPhase::DucklakeCommit => "storage_ducklake_commit",
-            TimingPhase::Insert => "storage_insert",
         }
     }
 }
@@ -212,7 +210,7 @@ impl std::fmt::Display for TimingPhase {
 }
 
 #[derive(Clone, Debug)]
-pub struct ArrowBatchInsertTiming {
+pub struct ArrowBatchBufferTiming {
     pub table: Signal,
     pub phase: TimingPhase,
     pub rows: usize,
@@ -220,9 +218,9 @@ pub struct ArrowBatchInsertTiming {
 }
 
 #[derive(Clone, Debug)]
-pub struct ArrowBatchInsertResult {
+pub struct ArrowBatchBufferResult {
     pub rows: usize,
-    pub timings: Vec<ArrowBatchInsertTiming>,
+    pub timings: Vec<ArrowBatchBufferTiming>,
 }
 
 struct PreparedArrowBatch {

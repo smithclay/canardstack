@@ -68,8 +68,8 @@ fn metrics_text(state: &AppState) -> String {
 }
 
 fn flush_all(state: &AppState) -> usize {
-    // Wait for in-flight ingest workers to finish inserting (admission credits
-    // released after the buffer insert), then run the single seal+checkpoint path
+    // Wait for in-flight ingest workers to finish buffering (admission credits
+    // released after the buffer append), then run the single seal+checkpoint path
     // the scheduler uses so rows become query-visible and the raw spool is
     // checkpointed. A bare flush_immutable_segments would seal without
     // checkpointing the raw spool, leaving records pending forever.
@@ -359,7 +359,7 @@ fn append_gauge_rows(state: &AppState, rows: &[(i64, &str, f64, &str)], source_f
     .unwrap();
     state
         .storage
-        .insert_arrow_records(Signal::MetricGauge, &batch, source_format)
+        .buffer_arrow_records(Signal::MetricGauge, &batch, source_format)
         .unwrap();
     state.storage.flush_immutable_segments(true).unwrap();
 }
@@ -420,7 +420,7 @@ fn append_log_rows(state: &AppState, rows: &[(i64, &str, &str)], source_format: 
     .unwrap();
     state
         .storage
-        .insert_arrow_records(Signal::Logs, &batch, source_format)
+        .buffer_arrow_records(Signal::Logs, &batch, source_format)
         .unwrap();
     state.storage.flush_immutable_segments(true).unwrap();
     state.storage.refresh_metadata().unwrap();
@@ -1122,7 +1122,7 @@ fn ingest_workers_return_202_after_raw_spool_and_handoff() {
 }
 
 #[test]
-fn ingest_workers_inserts_storage_buffer_and_checkpoints_spool() {
+fn ingest_workers_buffer_storage_rows_and_checkpoint_spool() {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
     config.local_storage_dir = dir.path().join("storage");
@@ -1829,7 +1829,7 @@ fn metric_due_flush_preserves_gauge_sum_pairing() {
 }
 
 #[test]
-fn storage_large_metric_arrow_insert_commits_large_batch() {
+fn storage_large_metric_arrow_buffer_commits_large_batch() {
     let (_dir, state) = app();
     let now = Utc::now().timestamp_millis();
     let rows = (0..6_001)

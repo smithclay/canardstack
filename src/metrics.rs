@@ -343,7 +343,7 @@ impl Metrics {
         let mut rows = 0;
         if !counters.is_empty() {
             let batch = metric_samples_batch(&counters, Signal::MetricSum)?;
-            rows += storage.insert_arrow_records(
+            rows += storage.buffer_arrow_records(
                 Signal::MetricSum,
                 &batch,
                 "canardstack_operator_metrics",
@@ -351,7 +351,7 @@ impl Metrics {
         }
         if !gauges.is_empty() {
             let batch = metric_samples_batch(&gauges, Signal::MetricGauge)?;
-            rows += storage.insert_arrow_records(
+            rows += storage.buffer_arrow_records(
                 Signal::MetricGauge,
                 &batch,
                 "canardstack_operator_metrics",

@@ -166,7 +166,7 @@ impl Ingestor {
     /// Record that a durably-spooled request's rows are now in the storage
     /// immutable buffer. The scheduler checkpoints the record after the next
     /// durable seal (see [`Ingestor::flush_committed_to_storage`]). Called only
-    /// after a successful insert so a tracked ref always implies buffered rows.
+    /// after a successful buffer append so a tracked ref always implies buffered rows.
     pub(in crate::ingest) fn track_raw_spool_record(
         &self,
         raw_spool_ref: AppendRef,

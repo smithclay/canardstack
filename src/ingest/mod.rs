@@ -2,7 +2,7 @@ use crate::config::Config;
 use crate::lanes::{FreshnessInputs, LaneController};
 use crate::metrics::Metrics;
 use crate::otlp::{self, Transformed};
-use crate::storage::{ArrowBatchInsert, ArrowBatchInsertTiming, Storage};
+use crate::storage::{ArrowBatchBuffer, ArrowBatchBufferTiming, Storage};
 use crate::validation::{self, ApiError, ApiResult};
 use crate::LockExt;
 use anyhow::{Context, Result};
@@ -163,7 +163,7 @@ impl Ingestor {
             )
             .with_retry_after(10));
         }
-        let mut inflight_reservation = match self.reserve_inflight(
+        let inflight_reservation = match self.reserve_inflight(
             signal,
             headers,
             compressed_body.len(),
@@ -182,15 +182,11 @@ impl Ingestor {
             match self.admit_runtime_memory(signal, headers, compressed_body.len(), metrics) {
                 Ok(reservation) => reservation,
                 Err(err) => {
-                    inflight_reservation.release();
-                    self.record_inflight_metrics(metrics);
                     metrics.ingest_request(route.as_str(), err.status, err.reason);
                     return Err(err);
                 }
             };
         if let Err(err) = self.ensure_ingest_workers_available(signal, metrics) {
-            inflight_reservation.release();
-            self.record_inflight_metrics(metrics);
             metrics.ingest_request(route.as_str(), err.status, err.reason);
             return Err(err);
         }
@@ -198,8 +194,6 @@ impl Ingestor {
             match self.append_raw_spool(signal, headers, compressed_body, metrics) {
                 Ok(appended) => appended,
                 Err(err) => {
-                    inflight_reservation.release();
-                    self.record_inflight_metrics(metrics);
                     metrics.ingest_request(route.as_str(), err.status, err.reason);
                     return Err(err);
                 }
@@ -246,7 +240,6 @@ impl Ingestor {
         let body = match body_result {
             Ok(body) => body,
             Err(err) => {
-                inflight_reservation.release();
                 let reason = if err.reason == "payload_too_large" {
                     "body_size_invalid"
                 } else {
@@ -261,7 +254,6 @@ impl Ingestor {
             std::borrow::Cow::Owned(bytes) => bytes.len(),
         };
         if let Err(err) = validation::validate_body_size(body.len(), &self.config) {
-            inflight_reservation.release();
             self.checkpoint_raw_spool_terminal(
                 raw_spool_ref,
                 signal,
@@ -284,7 +276,6 @@ impl Ingestor {
         let transformed = match transformed_result {
             Ok(transformed) => transformed,
             Err(err) => {
-                inflight_reservation.release();
                 self.checkpoint_raw_spool_terminal(
                     raw_spool_ref,
                     signal,
@@ -304,7 +295,6 @@ impl Ingestor {
             started.elapsed().as_secs_f64(),
         );
         if let Err(err) = skew_result {
-            inflight_reservation.release();
             self.checkpoint_raw_spool_terminal(
                 raw_spool_ref,
                 signal,
@@ -337,42 +327,38 @@ impl Ingestor {
             .saturating_add(decoded_body_materialized_bytes)
             .saturating_add(pending_bytes);
         if let Err(err) = runtime_memory_reservation.reserve_at_least(peak_bytes, signal, metrics) {
-            inflight_reservation.release();
             self.checkpoint_raw_spool_terminal(raw_spool_ref, signal, "memory_rejected", metrics)?;
             return Err(err);
         }
         if batches.is_empty() {
-            inflight_reservation.release();
             self.checkpoint_raw_spool_terminal(raw_spool_ref, signal, "transform_empty", metrics)?;
             return Ok(());
         }
 
-        let inserts = batches
+        let buffers = batches
             .iter()
             .filter(|batch| batch.batch.num_rows() > 0)
-            .map(|batch| ArrowBatchInsert {
+            .map(|batch| ArrowBatchBuffer {
                 table: batch.signal,
                 batch: &batch.batch,
                 source_format: batch.source_format,
             })
             .collect::<Vec<_>>();
-        let insert_started = Instant::now();
-        let insert_result = storage.insert_arrow_batches(&inserts);
+        let buffer_started = Instant::now();
+        let buffer_result = storage.buffer_arrow_batches(&buffers);
         metrics.observe_phase_seconds(
             signal.as_str(),
-            "storage_insert",
+            "storage_buffer",
             None,
-            insert_started.elapsed().as_secs_f64(),
+            buffer_started.elapsed().as_secs_f64(),
         );
-        let insert = match insert_result {
+        let buffered = match buffer_result {
             Ok(result) => result,
             Err(err) => {
                 // The rows never reached the immutable buffer and the raw-spool
                 // record was not tracked, so it stays pending and replays on a
-                // future restart (at-least-once). Release the admission credit
-                // and surface a retryable dependency error.
-                inflight_reservation.release();
-                self.record_inflight_metrics(metrics);
+                // future restart (at-least-once). Surface a retryable
+                // dependency error; the admission credit drops with this scope.
                 metrics.inc(
                     "canardstack_ingest_storage_insert_total",
                     &[("signal", signal.as_str()), ("status", "error")],
@@ -389,7 +375,7 @@ impl Ingestor {
                 );
             }
         };
-        observe_storage_timings(metrics, &insert.timings);
+        observe_storage_timings(metrics, &buffered.timings);
         metrics.inc(
             "canardstack_ingest_storage_insert_total",
             &[("signal", signal.as_str()), ("status", "ok")],
@@ -401,7 +387,7 @@ impl Ingestor {
         // admission credit (buffer occupancy is now reflected as buffered bytes
         // for freshness, not as a held queue credit).
         self.track_raw_spool_record(raw_spool_ref, signal);
-        inflight_reservation.release();
+        drop(inflight_reservation);
 
         let accepted = buffered_totals
             .values()
@@ -510,11 +496,13 @@ impl Ingestor {
         };
         match send_err {
             TrySendError::Full(work) => {
-                let SpooledIngestWork {
-                    mut inflight_reservation,
-                    ..
-                } = work;
-                inflight_reservation.release();
+                {
+                    let SpooledIngestWork {
+                        inflight_reservation: _inflight_reservation,
+                        runtime_memory_reservation: _runtime_memory_reservation,
+                        ..
+                    } = work;
+                }
                 self.record_inflight_metrics(metrics);
                 metrics.inc(
                     "canardstack_ingest_requests_queued_total",
@@ -535,11 +523,14 @@ impl Ingestor {
                 }
             }
             TrySendError::Disconnected(work) => {
-                let SpooledIngestWork {
-                    mut inflight_reservation,
-                    ..
-                } = work;
-                inflight_reservation.release();
+                {
+                    let SpooledIngestWork {
+                        inflight_reservation: _inflight_reservation,
+                        runtime_memory_reservation: _runtime_memory_reservation,
+                        ..
+                    } = work;
+                }
+                self.record_inflight_metrics(metrics);
                 metrics.inc(
                     "canardstack_ingest_requests_queued_total",
                     &[("signal", signal.as_str()), ("status", "disconnected")],
@@ -774,7 +765,7 @@ impl Ingestor {
     }
 }
 
-fn observe_storage_timings(metrics: &Metrics, timings: &[ArrowBatchInsertTiming]) {
+fn observe_storage_timings(metrics: &Metrics, timings: &[ArrowBatchBufferTiming]) {
     for timing in timings {
         metrics.observe_phase_seconds(
             timing.table.as_str(),
