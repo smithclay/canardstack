@@ -3,7 +3,7 @@ use super::codec::{
 };
 use super::writer::{
     collect_append_batch, handle_append_batch, handle_checkpoint_batch, AppendCommand,
-    CheckpointCommand, Command, WriterDepths,
+    CheckpointCommand, Command,
 };
 use super::*;
 use std::collections::VecDeque;
@@ -49,7 +49,6 @@ fn append_command(
         AppendCommand {
             record,
             queued_at: Instant::now(),
-            enqueue_depth: Default::default(),
             reply,
         },
         rx,
@@ -67,7 +66,6 @@ fn checkpoint_command(
         CheckpointCommand {
             ids,
             queued_at: Instant::now(),
-            enqueue_depth: Default::default(),
             reply,
         },
         rx,
@@ -117,7 +115,6 @@ fn raw_spool_writer_reports_batch_wait_stats_once() {
     let (second, second_rx) = append_command(b"second", 2);
     tx.send(Command::Append(second)).unwrap();
     let mut deferred = VecDeque::new();
-    let depths = WriterDepths::default();
 
     handle_append_batch(
         &mut spool,
@@ -126,7 +123,6 @@ fn raw_spool_writer_reports_batch_wait_stats_once() {
         &mut deferred,
         2,
         Duration::from_secs(5),
-        &depths,
     );
 
     let first_ack = first_rx.recv().unwrap().unwrap();
@@ -150,7 +146,6 @@ fn raw_spool_writer_batches_checkpoint_commands_and_reports_stats_once() {
     let (tx, rx) = mpsc::sync_channel(4);
     tx.send(Command::Checkpoint(second_command)).unwrap();
     let mut deferred = VecDeque::new();
-    let depths = WriterDepths::default();
 
     handle_checkpoint_batch(
         &mut spool,
@@ -159,7 +154,6 @@ fn raw_spool_writer_batches_checkpoint_commands_and_reports_stats_once() {
         &mut deferred,
         2,
         Duration::from_secs(5),
-        &depths,
     );
 
     let first_stats = first_rx.recv().unwrap().unwrap();
@@ -186,7 +180,6 @@ fn raw_spool_writer_batches_deferred_checkpoint_commands() {
         Command::Checkpoint(third_command),
     ]);
     let (_tx, rx) = mpsc::sync_channel(4);
-    let depths = WriterDepths::default();
 
     handle_checkpoint_batch(
         &mut spool,
@@ -195,7 +188,6 @@ fn raw_spool_writer_batches_deferred_checkpoint_commands() {
         &mut deferred,
         64,
         Duration::from_millis(1),
-        &depths,
     );
 
     let first_stats = first_rx.recv().unwrap().unwrap();
@@ -602,7 +594,6 @@ fn raw_spool_append_batch_defers_checkpoint_and_keeps_collecting_appends() {
             sequence: 1,
         }],
         queued_at: Instant::now(),
-        enqueue_depth: Default::default(),
         reply: checkpoint_reply,
     }))
     .unwrap();

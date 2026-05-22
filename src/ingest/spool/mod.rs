@@ -58,9 +58,6 @@ pub struct AppendBatchStats {
     pub write_seconds: f64,
     pub fsync_seconds: f64,
     pub fsync_count: u64,
-    pub max_pending_commands_at_enqueue: usize,
-    pub max_pending_append_commands_at_enqueue: usize,
-    pub max_pending_checkpoint_commands_at_enqueue: usize,
     pub deferred_checkpoint_commands: usize,
 }
 
@@ -70,9 +67,6 @@ pub struct CheckpointBatchStats {
     pub commands: usize,
     pub queue_seconds: f64,
     pub wait_seconds: f64,
-    pub max_pending_commands_at_enqueue: usize,
-    pub max_pending_append_commands_at_enqueue: usize,
-    pub max_pending_checkpoint_commands_at_enqueue: usize,
     pub deferred_append_commands: usize,
 }
 
@@ -142,16 +136,6 @@ pub struct Stats {
     pub append_sync_failures_total: u64,
     pub append_sync_seconds_total: f64,
     pub append_sync_file_fsyncs_total: u64,
-    pub writer_pending_commands: usize,
-    pub writer_pending_append_commands: usize,
-    pub writer_pending_checkpoint_commands: usize,
-    pub writer_pending_commands_max: usize,
-    pub writer_pending_append_commands_max: usize,
-    pub writer_pending_checkpoint_commands_max: usize,
-    pub writer_append_commands_total: u64,
-    pub writer_checkpoint_commands_total: u64,
-    pub writer_recover_commands_total: u64,
-    pub writer_stats_commands_total: u64,
     pub healthy: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -392,9 +376,6 @@ impl Spool {
                     write_seconds: 0.0,
                     fsync_seconds: 0.0,
                     fsync_count: 0,
-                    max_pending_commands_at_enqueue: 0,
-                    max_pending_append_commands_at_enqueue: 0,
-                    max_pending_checkpoint_commands_at_enqueue: 0,
                     deferred_checkpoint_commands: 0,
                 },
             });
@@ -456,9 +437,6 @@ impl Spool {
                 write_seconds,
                 fsync_seconds: 0.0,
                 fsync_count: 0,
-                max_pending_commands_at_enqueue: 0,
-                max_pending_append_commands_at_enqueue: 0,
-                max_pending_checkpoint_commands_at_enqueue: 0,
                 deferred_checkpoint_commands: 0,
             },
             ids,
@@ -522,7 +500,6 @@ impl Spool {
             append_sync_file_fsyncs_total: self.append_sync_file_fsyncs_total,
             healthy: self.fatal_error.is_none(),
             error: self.fatal_error.clone(),
-            ..Default::default()
         })
     }
 
