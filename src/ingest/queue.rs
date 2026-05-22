@@ -1,5 +1,5 @@
 use super::Signal;
-use crate::ingest::spool::RawSpoolRecordId;
+use crate::ingest::spool::RecordId;
 use crate::otlp::Transformed;
 use arrow58::record_batch::RecordBatch;
 use serde::Serialize;
@@ -38,7 +38,7 @@ impl BatchPartition {
 pub(super) struct QueuedBatch {
     pub(super) batch: RecordBatch,
     pub(super) source_format: &'static str,
-    pub(super) raw_spool_id: Option<RawSpoolRecordId>,
+    pub(super) raw_spool_id: Option<RecordId>,
     pub(super) raw_spool_lane: Option<Signal>,
 }
 
@@ -61,7 +61,7 @@ pub(super) struct PendingBatch {
     pub(super) key: QueueKey,
     pub(super) batch: RecordBatch,
     pub(super) source_format: &'static str,
-    pub(super) raw_spool_id: Option<RawSpoolRecordId>,
+    pub(super) raw_spool_id: Option<RecordId>,
     pub(super) raw_spool_lane: Option<Signal>,
     pub(super) approx_bytes: usize,
     pub(super) credit_bytes: usize,

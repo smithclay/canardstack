@@ -1,7 +1,5 @@
 use super::super::Signal;
-use super::{
-    RawSpoolRecord, RawSpoolRecordId, RecoveredRawSpoolRecord, RECORD_HEADER_BYTES, RECORD_MAGIC,
-};
+use super::{Record, RecordId, RecoveredRecord, RECORD_HEADER_BYTES, RECORD_MAGIC};
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -11,21 +9,21 @@ use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug)]
-pub(super) struct EncodedRawSpoolRecord {
+pub(super) struct EncodedRecord {
     pub(super) sequence: u64,
     pub(super) body_len: u64,
     pub(super) bytes: Vec<u8>,
 }
 
 #[derive(Debug)]
-pub(super) struct PreparedRawSpoolRecord {
-    pub(super) record: RawSpoolRecord,
+pub(super) struct PreparedRecord {
+    pub(super) record: Record,
     pub(super) body_len: u64,
     body_checksum: u64,
 }
 
 #[derive(Serialize, Deserialize)]
-struct RawSpoolHeader {
+struct Header {
     sequence: u64,
     signal: String,
     content_type: String,
@@ -35,9 +33,9 @@ struct RawSpoolHeader {
 }
 
 pub(super) fn prepare_append_records(
-    records: Vec<RawSpoolRecord>,
+    records: Vec<Record>,
     max_record_bytes: u64,
-) -> Result<Vec<PreparedRawSpoolRecord>> {
+) -> Result<Vec<PreparedRecord>> {
     let mut prepared = Vec::with_capacity(records.len());
     for mut record in records {
         if record.accepted_at_micros == 0 {
@@ -52,7 +50,7 @@ pub(super) fn prepare_append_records(
         }
         let body_len = record.compressed_body.len() as u64;
         let body_checksum = checksum(&record.compressed_body);
-        prepared.push(PreparedRawSpoolRecord {
+        prepared.push(PreparedRecord {
             record,
             body_len,
             body_checksum,
@@ -62,16 +60,16 @@ pub(super) fn prepare_append_records(
 }
 
 pub(super) fn encode_prepared_records(
-    records: Vec<PreparedRawSpoolRecord>,
+    records: Vec<PreparedRecord>,
     base_sequence: u64,
-) -> Result<(Vec<EncodedRawSpoolRecord>, Vec<Vec<u8>>)> {
+) -> Result<(Vec<EncodedRecord>, Vec<Vec<u8>>)> {
     let mut encoded = Vec::with_capacity(records.len());
     let mut compressed_bodies = Vec::with_capacity(records.len());
     for record in records {
         let sequence = base_sequence.saturating_add(encoded.len() as u64);
         let bytes = encode_prepared_record(sequence, &record)?;
         let compressed_body = record.record.compressed_body;
-        encoded.push(EncodedRawSpoolRecord {
+        encoded.push(EncodedRecord {
             sequence,
             body_len: record.body_len,
             bytes,
@@ -82,8 +80,8 @@ pub(super) fn encode_prepared_records(
 }
 
 #[cfg(test)]
-pub(super) fn encode_record(sequence: u64, record: &RawSpoolRecord) -> Result<Vec<u8>> {
-    let prepared = PreparedRawSpoolRecord {
+pub(super) fn encode_record(sequence: u64, record: &Record) -> Result<Vec<u8>> {
+    let prepared = PreparedRecord {
         body_len: record.compressed_body.len() as u64,
         body_checksum: checksum(&record.compressed_body),
         record: record.clone(),
@@ -91,8 +89,8 @@ pub(super) fn encode_record(sequence: u64, record: &RawSpoolRecord) -> Result<Ve
     encode_prepared_record(sequence, &prepared)
 }
 
-fn encode_prepared_record(sequence: u64, prepared: &PreparedRawSpoolRecord) -> Result<Vec<u8>> {
-    let header = RawSpoolHeader {
+fn encode_prepared_record(sequence: u64, prepared: &PreparedRecord) -> Result<Vec<u8>> {
+    let header = Header {
         sequence,
         signal: prepared.record.signal.as_str().to_string(),
         content_type: prepared.record.content_type.clone(),
@@ -125,7 +123,7 @@ pub(super) fn scan_segment(
     segment: u64,
     max_record_bytes: u64,
     completed: &BTreeSet<u64>,
-    mut pending: Option<&mut Vec<RecoveredRawSpoolRecord>>,
+    mut pending: Option<&mut Vec<RecoveredRecord>>,
 ) -> Result<SegmentScan> {
     let mut file =
         File::open(path).with_context(|| format!("open raw spool segment {}", path.display()))?;
@@ -142,15 +140,32 @@ pub(super) fn scan_segment(
                 scan.record_count += 1;
                 if !completed.contains(&sequence) {
                     if let Some(out) = pending.as_deref_mut() {
-                        out.push(RecoveredRawSpoolRecord {
-                            id: RawSpoolRecordId { segment, sequence },
+                        out.push(RecoveredRecord {
+                            id: RecordId { segment, sequence },
                             record,
                         });
                     }
                 }
             }
             Ok(None) => break,
-            Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => {
+            Err(err)
+                if err.kind() == io::ErrorKind::UnexpectedEof
+                    || err.kind() == io::ErrorKind::InvalidData =>
+            {
+                // A torn tail (clean EOF) is the common steady-state case and is
+                // expected after a partial write, so it stays quiet. A corrupt
+                // record (InvalidData) was never acknowledged to a client, so we
+                // drop it and everything after it (framing past a corrupt frame
+                // in an append-only log cannot be trusted) and surface it loudly
+                // instead of failing the whole boot.
+                if err.kind() == io::ErrorKind::InvalidData {
+                    tracing::warn!(
+                        segment = %path.display(),
+                        offset,
+                        error = %err,
+                        "raw spool record corrupt; truncating segment at offset and recovering preceding records"
+                    );
+                }
                 file.seek(SeekFrom::Start(offset)).ok();
                 break;
             }
@@ -166,7 +181,7 @@ pub(super) fn scan_segment(
 fn read_record_at(
     file: &mut File,
     max_record_bytes: u64,
-) -> io::Result<Option<(u64, RawSpoolRecord, u64)>> {
+) -> io::Result<Option<(u64, Record, u64)>> {
     let mut magic = [0u8; 8];
     let mut read = 0usize;
     while read < magic.len() {
@@ -207,7 +222,7 @@ fn read_record_at(
     let mut body = vec![0; body_len as usize];
     file.read_exact(&mut body)?;
 
-    let header: RawSpoolHeader = serde_json::from_slice(&header)
+    let header: Header = serde_json::from_slice(&header)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
     if header.body_checksum != checksum(&body) {
         return Err(io::Error::new(
@@ -219,7 +234,7 @@ fn read_record_at(
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid raw spool signal"))?;
     Ok(Some((
         header.sequence,
-        RawSpoolRecord {
+        Record {
             signal,
             content_type: header.content_type,
             content_encoding: header.content_encoding,

@@ -1,8 +1,5 @@
-use super::spool::{
-    self, raw_spool_full_info, RawSpoolAppendBatchStats, RawSpoolCheckpointBatchStats,
-    RawSpoolRecord, RawSpoolRecordId, RawSpoolWriter,
-};
-use super::{all_signals, queue, Ingestor, Signal};
+use super::{full_info, AppendBatchStats, CheckpointBatchStats, Record, RecordId, Writer};
+use crate::ingest::{all_signals, queue, Ingestor, Signal};
 use crate::lanes::LaneController;
 use crate::metrics::Metrics;
 use crate::storage::Storage;
@@ -15,19 +12,19 @@ use std::sync::Arc;
 use std::time::Instant;
 
 #[derive(Clone, Copy, Debug)]
-pub(super) struct RawSpoolFlushRef {
-    pub(super) signal: Signal,
-    pub(super) remaining_rows: usize,
+pub(in crate::ingest) struct FlushRef {
+    pub(in crate::ingest) signal: Signal,
+    pub(in crate::ingest) remaining_rows: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
-pub(super) struct RawSpoolAppendRef {
-    pub(super) lane: Signal,
-    pub(super) id: RawSpoolRecordId,
+pub(in crate::ingest) struct AppendRef {
+    pub(in crate::ingest) lane: Signal,
+    pub(in crate::ingest) id: RecordId,
 }
 
-struct RecoveredRawSpoolWork {
-    raw_spool_ref: RawSpoolAppendRef,
+struct RecoveredWork {
+    raw_spool_ref: AppendRef,
     signal: Signal,
     headers: HashMap<String, String>,
     compressed_body: Vec<u8>,
@@ -64,8 +61,8 @@ impl Ingestor {
                     1,
                 );
                 match self.ingest_replayed_raw_record(
-                    RecoveredRawSpoolWork {
-                        raw_spool_ref: RawSpoolAppendRef {
+                    RecoveredWork {
+                        raw_spool_ref: AppendRef {
                             lane: signal,
                             id: recovered.id,
                         },
@@ -97,7 +94,18 @@ impl Ingestor {
                             ],
                             1,
                         );
-                        return Err(err).context("replay raw spool record");
+                        // Best-effort replay: a single failing record must never abort
+                        // boot. The record stays un-checkpointed (still pending) and is
+                        // retried on a future startup, preserving at-least-once delivery.
+                        tracing::warn!(
+                            event = "raw_spool_replay_record_failed",
+                            signal = recovered.record.signal.as_str(),
+                            record_segment = recovered.id.segment,
+                            record_sequence = recovered.id.sequence,
+                            error = %err,
+                            "skipping raw spool replay record; left pending for retry"
+                        );
+                        continue;
                     }
                 }
             }
@@ -108,12 +116,12 @@ impl Ingestor {
 
     fn ingest_replayed_raw_record(
         &self,
-        recovered: RecoveredRawSpoolWork,
+        recovered: RecoveredWork,
         storage: &Storage,
         lanes: &LaneController,
         metrics: Arc<Metrics>,
     ) -> Result<()> {
-        let RecoveredRawSpoolWork {
+        let RecoveredWork {
             raw_spool_ref,
             signal,
             headers,
@@ -139,7 +147,7 @@ impl Ingestor {
         let runtime_memory_reservation = self
             .admit_runtime_memory(signal, &headers, compressed_body.len(), metrics.as_ref())
             .map_err(|err| anyhow::anyhow!(err.message.clone()))?;
-        let work = super::SpooledIngestWork {
+        let work = crate::ingest::SpooledIngestWork {
             signal,
             headers: headers.clone(),
             compressed_body,
@@ -147,15 +155,16 @@ impl Ingestor {
             queue_credit_reservation,
             runtime_memory_reservation,
             metrics: metrics.clone(),
+            prepared: None,
         };
         self.dispatch_topology_work(work, metrics.as_ref())
             .map(|_| ())
             .map_err(|err| anyhow::anyhow!(err.message.clone()))
     }
 
-    pub(super) fn track_raw_spool_batches(
+    pub(in crate::ingest) fn track_raw_spool_batches(
         &self,
-        raw_spool_ref: RawSpoolAppendRef,
+        raw_spool_ref: AppendRef,
         signal: Signal,
         batches: &mut [queue::PendingBatch],
     ) {
@@ -168,25 +177,25 @@ impl Ingestor {
         }
         self.raw_spool_flush_refs.lock_or_poisoned().insert(
             (raw_spool_ref.lane, raw_spool_ref.id),
-            RawSpoolFlushRef {
+            FlushRef {
                 signal,
                 remaining_rows: batches.iter().map(|batch| batch.batch.num_rows()).sum(),
             },
         );
     }
 
-    pub(super) fn untrack_raw_spool_record(&self, raw_spool_ref: RawSpoolAppendRef) {
+    pub(in crate::ingest) fn untrack_raw_spool_record(&self, raw_spool_ref: AppendRef) {
         self.raw_spool_flush_refs
             .lock_or_poisoned()
             .remove(&(raw_spool_ref.lane, raw_spool_ref.id));
     }
 
-    pub(super) fn mark_raw_spool_batches_storage_committed(
+    pub(in crate::ingest) fn mark_raw_spool_batches_storage_committed(
         &self,
         sets: &[(queue::QueueKey, Vec<queue::QueuedBatch>)],
         metrics: Option<&Metrics>,
     ) -> Result<()> {
-        let mut committed_counts = BTreeMap::<(Signal, RawSpoolRecordId), usize>::new();
+        let mut committed_counts = BTreeMap::<(Signal, RecordId), usize>::new();
         for (key, batches) in sets {
             for batch in batches {
                 if let Some(id) = batch.raw_spool_id {
@@ -199,7 +208,13 @@ impl Ingestor {
             return Ok(());
         }
 
+        // Single locked pass: decrement remaining rows and remove entries that
+        // reach zero in the same critical section. The removed `FlushRef`
+        // is carried alongside its ref so that, if the subsequent checkpoint
+        // fails, we can restore the entry and keep observable behavior identical
+        // to checkpoint-then-remove.
         let mut ready_to_checkpoint = Vec::new();
+        let mut removed = Vec::new();
         {
             let mut refs = self.raw_spool_flush_refs.lock_or_poisoned();
             for ((signal, id), committed_rows) in committed_counts {
@@ -207,46 +222,45 @@ impl Ingestor {
                     continue;
                 };
                 if committed_rows >= tracked.remaining_rows {
-                    ready_to_checkpoint
-                        .push((tracked.signal, RawSpoolAppendRef { lane: signal, id }));
+                    let key = (signal, id);
+                    let flush_ref = refs.remove(&key).expect("entry just inspected");
+                    ready_to_checkpoint.push((flush_ref.signal, AppendRef { lane: signal, id }));
+                    removed.push((key, flush_ref));
                 } else {
                     tracked.remaining_rows -= committed_rows;
                 }
             }
         }
 
-        self.checkpoint_raw_spool_batch(&ready_to_checkpoint, "storage_committed", metrics)?;
-        if !ready_to_checkpoint.is_empty() {
-            let mut refs = self.raw_spool_flush_refs.lock_or_poisoned();
-            for (_, raw_spool_ref) in ready_to_checkpoint {
-                refs.remove(&(raw_spool_ref.lane, raw_spool_ref.id));
+        if let Err(err) =
+            self.checkpoint_raw_spool_batch(&ready_to_checkpoint, "storage_committed", metrics)
+        {
+            // Restore the entries we optimistically removed so the record stays
+            // tracked for retry, matching the prior checkpoint-then-remove order.
+            if !removed.is_empty() {
+                let mut refs = self.raw_spool_flush_refs.lock_or_poisoned();
+                for (key, flush_ref) in removed {
+                    refs.entry(key).or_insert(flush_ref);
+                }
             }
+            return Err(err);
         }
         Ok(())
     }
 
-    pub(super) fn append_raw_spool(
+    pub(in crate::ingest) fn append_raw_spool(
         &self,
         signal: Signal,
         headers: &HashMap<String, String>,
         compressed_body: Vec<u8>,
         metrics: &Metrics,
-    ) -> ApiResult<(RawSpoolAppendRef, Vec<u8>)> {
+    ) -> ApiResult<(AppendRef, Vec<u8>)> {
         let lane = self.raw_spool_lane_for_append(signal);
         let content_type = headers.get("content-type").cloned().unwrap_or_default();
         let content_encoding = headers.get("content-encoding").cloned();
         let compressed_body_len = compressed_body.len();
         let started = Instant::now();
-        let record = RawSpoolRecord::new(signal, content_type, content_encoding, compressed_body);
-        metrics.inc(
-            "canardstack_ingest_materialized_bytes_total",
-            &[
-                ("signal", lane.as_str()),
-                ("component", "raw_spool_record"),
-                ("kind", "body_clone"),
-            ],
-            0,
-        );
+        let record = Record::new(signal, content_type, content_encoding, compressed_body);
         let result = self
             .raw_spool_for(lane)
             .and_then(|raw_spool| raw_spool.append(record));
@@ -271,10 +285,10 @@ impl Ingestor {
                     &[("signal", lane.as_str())],
                     compressed_body_len as u64,
                 );
-                Ok((RawSpoolAppendRef { lane, id: ack.id }, ack.compressed_body))
+                Ok((AppendRef { lane, id: ack.id }, ack.compressed_body))
             }
             Err(err) => {
-                if raw_spool_full_info(&err).is_some() {
+                if full_info(&err).is_some() {
                     metrics.inc(
                         "canardstack_raw_spool_records_total",
                         &[("signal", lane.as_str()), ("status", "full")],
@@ -305,7 +319,7 @@ impl Ingestor {
     fn record_raw_spool_append_batch_metrics(
         metrics: &Metrics,
         signal: Signal,
-        stats: RawSpoolAppendBatchStats,
+        stats: AppendBatchStats,
     ) {
         metrics.inc(
             "canardstack_raw_spool_append_batches_total",
@@ -414,7 +428,7 @@ impl Ingestor {
     fn record_raw_spool_checkpoint_batch_metrics(
         metrics: &Metrics,
         signal: Signal,
-        stats: RawSpoolCheckpointBatchStats,
+        stats: CheckpointBatchStats,
     ) {
         if stats.records == 0 {
             return;
@@ -492,9 +506,9 @@ impl Ingestor {
         }
     }
 
-    pub(super) fn checkpoint_raw_spool_terminal(
+    pub(in crate::ingest) fn checkpoint_raw_spool_terminal(
         &self,
-        raw_spool_ref: RawSpoolAppendRef,
+        raw_spool_ref: AppendRef,
         signal: Signal,
         reason: &'static str,
         metrics: &Metrics,
@@ -512,7 +526,7 @@ impl Ingestor {
 
     fn checkpoint_raw_spool(
         &self,
-        raw_spool_ref: RawSpoolAppendRef,
+        raw_spool_ref: AppendRef,
         signal: Signal,
         reason: &'static str,
         metrics: Option<&Metrics>,
@@ -546,7 +560,7 @@ impl Ingestor {
 
     fn checkpoint_raw_spool_batch(
         &self,
-        records: &[(Signal, RawSpoolAppendRef)],
+        records: &[(Signal, AppendRef)],
         reason: &'static str,
         metrics: Option<&Metrics>,
     ) -> Result<()> {
@@ -554,7 +568,7 @@ impl Ingestor {
             return Ok(());
         }
         let started = Instant::now();
-        let mut by_signal_ids = BTreeMap::<Signal, Vec<RawSpoolRecordId>>::new();
+        let mut by_signal_ids = BTreeMap::<Signal, Vec<RecordId>>::new();
         for (_, raw_spool_ref) in records {
             by_signal_ids
                 .entry(raw_spool_ref.lane)
@@ -592,8 +606,8 @@ impl Ingestor {
         Ok(())
     }
 
-    pub fn raw_spool_stats(&self) -> Result<spool::RawSpoolStats> {
-        let mut aggregate = spool::RawSpoolStats {
+    pub fn raw_spool_stats(&self) -> Result<super::Stats> {
+        let mut aggregate = super::Stats {
             healthy: true,
             ..Default::default()
         };
@@ -607,9 +621,7 @@ impl Ingestor {
         Ok(aggregate)
     }
 
-    pub fn raw_spool_stats_by_signal(
-        &self,
-    ) -> Result<BTreeMap<&'static str, spool::RawSpoolStats>> {
+    pub fn raw_spool_stats_by_signal(&self) -> Result<BTreeMap<&'static str, super::Stats>> {
         let mut stats_by_signal = BTreeMap::new();
         for signal in all_signals() {
             stats_by_signal.insert(
@@ -620,6 +632,44 @@ impl Ingestor {
             );
         }
         Ok(stats_by_signal)
+    }
+
+    /// True only when every per-signal raw-spool writer is healthy. A writer
+    /// that cannot read its stats (thread stopped/poisoned) or is in the fatal
+    /// append/fsync latch counts as unhealthy so readiness reports NOT ready.
+    pub fn raw_spool_healthy(&self) -> bool {
+        all_signals().into_iter().all(|signal| {
+            self.raw_spool_for(signal)
+                .and_then(|spool| spool.stats())
+                .map(|stats| stats.healthy)
+                .unwrap_or(false)
+        })
+    }
+
+    /// Force a single signal's raw-spool writer into the fatal/unhealthy latch,
+    /// mirroring a real append/fsync failure. Intended for tests that exercise
+    /// readiness wiring; gated to debug builds.
+    #[doc(hidden)]
+    pub fn force_raw_spool_unhealthy(
+        &self,
+        signal: Signal,
+        message: impl Into<String>,
+    ) -> Result<()> {
+        self.raw_spool_for(signal)?.inject_fatal(message)
+    }
+
+    /// Per-signal raw-spool writer health, with the latched error message for
+    /// any unhealthy signal so the health JSON can show which signal is wedged.
+    pub fn raw_spool_health_by_signal(&self) -> BTreeMap<&'static str, (bool, Option<String>)> {
+        let mut health = BTreeMap::new();
+        for signal in all_signals() {
+            let entry = match self.raw_spool_for(signal).and_then(|spool| spool.stats()) {
+                Ok(stats) => (stats.healthy, stats.error),
+                Err(err) => (false, Some(err.to_string())),
+            };
+            health.insert(signal.as_str(), entry);
+        }
+        health
     }
 
     pub fn record_raw_spool_metrics(&self, metrics: &Metrics) {
@@ -752,7 +802,7 @@ impl Ingestor {
     fn record_raw_spool_writer_metrics(
         metrics: &Metrics,
         signal: Option<&str>,
-        stats: &spool::RawSpoolStats,
+        stats: &super::Stats,
     ) {
         for (kind, current, max) in [
             (
@@ -818,7 +868,7 @@ impl Ingestor {
         }
     }
 
-    fn raw_spool_for(&self, signal: Signal) -> Result<&RawSpoolWriter> {
+    fn raw_spool_for(&self, signal: Signal) -> Result<&Writer> {
         self.raw_spools
             .get(&signal)
             .with_context(|| format!("raw spool writer for {signal} is unavailable"))
@@ -841,7 +891,7 @@ impl Ingestor {
     }
 }
 
-fn merge_raw_spool_stats(aggregate: &mut spool::RawSpoolStats, stats: &spool::RawSpoolStats) {
+fn merge_raw_spool_stats(aggregate: &mut super::Stats, stats: &super::Stats) {
     aggregate.segment_count += stats.segment_count;
     aggregate.segment_bytes = aggregate.segment_bytes.saturating_add(stats.segment_bytes);
     aggregate.pending_records += stats.pending_records;

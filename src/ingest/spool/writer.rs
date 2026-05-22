@@ -1,7 +1,7 @@
-use super::codec::{prepare_append_records, PreparedRawSpoolRecord};
+use super::codec::{prepare_append_records, PreparedRecord};
 use super::{
-    raw_spool_full_info, RawSpool, RawSpoolAppendAck, RawSpoolCheckpointBatchStats,
-    RawSpoolOptions, RawSpoolRecord, RawSpoolRecordId, RawSpoolStats, RecoveredRawSpoolRecord,
+    full_info, AppendAck, CheckpointBatchStats, Options, Record, RecordId, RecoveredRecord, Spool,
+    Stats,
 };
 use anyhow::{Context, Result};
 use std::collections::VecDeque;
@@ -11,21 +11,21 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-pub struct RawSpoolWriter {
-    commands: Option<SyncSender<RawSpoolCommand>>,
-    depths: Arc<RawSpoolWriterDepths>,
+pub struct Writer {
+    commands: Option<SyncSender<Command>>,
+    depths: Arc<WriterDepths>,
     handle: Option<JoinHandle<()>>,
     max_record_bytes: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-pub(super) struct RawSpoolCommandDepthSnapshot {
+pub(super) struct CommandDepthSnapshot {
     pending_commands: usize,
     pending_append_commands: usize,
     pending_checkpoint_commands: usize,
 }
 
-impl RawSpoolCommandDepthSnapshot {
+impl CommandDepthSnapshot {
     fn max(self, other: Self) -> Self {
         Self {
             pending_commands: self.pending_commands.max(other.pending_commands),
@@ -40,7 +40,7 @@ impl RawSpoolCommandDepthSnapshot {
 }
 
 #[derive(Default)]
-pub(super) struct RawSpoolWriterDepths {
+pub(super) struct WriterDepths {
     pending_commands: AtomicUsize,
     pending_append_commands: AtomicUsize,
     pending_checkpoint_commands: AtomicUsize,
@@ -54,22 +54,22 @@ pub(super) struct RawSpoolWriterDepths {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub(super) enum RawSpoolCommandKind {
+pub(super) enum CommandKind {
     Append,
     Checkpoint,
     Recover,
     Stats,
 }
 
-impl RawSpoolWriterDepths {
-    fn enqueue(&self, kind: RawSpoolCommandKind) -> RawSpoolCommandDepthSnapshot {
-        let mut snapshot = RawSpoolCommandDepthSnapshot {
+impl WriterDepths {
+    fn enqueue(&self, kind: CommandKind) -> CommandDepthSnapshot {
+        let mut snapshot = CommandDepthSnapshot {
             pending_commands: self.pending_commands.load(Ordering::Acquire),
             pending_append_commands: self.pending_append_commands.load(Ordering::Acquire),
             pending_checkpoint_commands: self.pending_checkpoint_commands.load(Ordering::Acquire),
         };
         match kind {
-            RawSpoolCommandKind::Append => {
+            CommandKind::Append => {
                 snapshot.pending_commands =
                     self.pending_commands.fetch_add(1, Ordering::AcqRel) + 1;
                 self.pending_commands_max
@@ -79,7 +79,7 @@ impl RawSpoolWriterDepths {
                 self.pending_append_commands_max
                     .fetch_max(snapshot.pending_append_commands, Ordering::AcqRel);
             }
-            RawSpoolCommandKind::Checkpoint => {
+            CommandKind::Checkpoint => {
                 snapshot.pending_commands =
                     self.pending_commands.fetch_add(1, Ordering::AcqRel) + 1;
                 self.pending_commands_max
@@ -91,48 +91,48 @@ impl RawSpoolWriterDepths {
                 self.pending_checkpoint_commands_max
                     .fetch_max(snapshot.pending_checkpoint_commands, Ordering::AcqRel);
             }
-            RawSpoolCommandKind::Recover | RawSpoolCommandKind::Stats => {}
+            CommandKind::Recover | CommandKind::Stats => {}
         }
         snapshot
     }
 
-    fn command_sent(&self, kind: RawSpoolCommandKind) {
+    fn command_sent(&self, kind: CommandKind) {
         match kind {
-            RawSpoolCommandKind::Append => {
+            CommandKind::Append => {
                 self.append_commands_total.fetch_add(1, Ordering::AcqRel);
             }
-            RawSpoolCommandKind::Checkpoint => {
+            CommandKind::Checkpoint => {
                 self.checkpoint_commands_total
                     .fetch_add(1, Ordering::AcqRel);
             }
-            RawSpoolCommandKind::Recover => {
+            CommandKind::Recover => {
                 self.recover_commands_total.fetch_add(1, Ordering::AcqRel);
             }
-            RawSpoolCommandKind::Stats => {
+            CommandKind::Stats => {
                 self.stats_commands_total.fetch_add(1, Ordering::AcqRel);
             }
         }
     }
 
-    fn command_send_failed(&self, kind: RawSpoolCommandKind) {
+    fn command_send_failed(&self, kind: CommandKind) {
         self.command_started(kind);
     }
 
-    fn command_started(&self, kind: RawSpoolCommandKind) {
+    fn command_started(&self, kind: CommandKind) {
         match kind {
-            RawSpoolCommandKind::Append => {
+            CommandKind::Append => {
                 decrement_pending(&self.pending_commands);
                 decrement_pending(&self.pending_append_commands);
             }
-            RawSpoolCommandKind::Checkpoint => {
+            CommandKind::Checkpoint => {
                 decrement_pending(&self.pending_commands);
                 decrement_pending(&self.pending_checkpoint_commands);
             }
-            RawSpoolCommandKind::Recover | RawSpoolCommandKind::Stats => {}
+            CommandKind::Recover | CommandKind::Stats => {}
         }
     }
 
-    fn record_stats(&self, stats: &mut RawSpoolStats) {
+    fn record_stats(&self, stats: &mut Stats) {
         stats.writer_pending_commands = self.pending_commands.load(Ordering::Acquire);
         stats.writer_pending_append_commands = self.pending_append_commands.load(Ordering::Acquire);
         stats.writer_pending_checkpoint_commands =
@@ -157,52 +157,57 @@ fn decrement_pending(pending: &AtomicUsize) {
 }
 
 pub(super) struct AppendCommand {
-    pub(super) record: PreparedRawSpoolRecord,
+    pub(super) record: PreparedRecord,
     pub(super) queued_at: Instant,
-    pub(super) enqueue_depth: RawSpoolCommandDepthSnapshot,
-    pub(super) reply: mpsc::Sender<Result<RawSpoolAppendAck>>,
+    pub(super) enqueue_depth: CommandDepthSnapshot,
+    pub(super) reply: mpsc::Sender<Result<AppendAck>>,
 }
 
 pub(super) struct CheckpointCommand {
-    pub(super) ids: Vec<RawSpoolRecordId>,
+    pub(super) ids: Vec<RecordId>,
     pub(super) queued_at: Instant,
-    pub(super) enqueue_depth: RawSpoolCommandDepthSnapshot,
-    pub(super) reply: mpsc::Sender<Result<RawSpoolCheckpointBatchStats>>,
+    pub(super) enqueue_depth: CommandDepthSnapshot,
+    pub(super) reply: mpsc::Sender<Result<CheckpointBatchStats>>,
 }
 
-pub(super) enum RawSpoolCommand {
+pub(super) enum Command {
     Append(AppendCommand),
     Checkpoint(CheckpointCommand),
     RecoverPending {
-        reply: mpsc::Sender<Result<Vec<RecoveredRawSpoolRecord>>>,
+        reply: mpsc::Sender<Result<Vec<RecoveredRecord>>>,
     },
     Stats {
-        reply: mpsc::Sender<Result<RawSpoolStats>>,
+        reply: mpsc::Sender<Result<Stats>>,
+    },
+    InjectFatal {
+        message: String,
+        reply: mpsc::Sender<()>,
     },
 }
 
-impl RawSpoolCommand {
-    fn kind(&self) -> RawSpoolCommandKind {
+impl Command {
+    fn kind(&self) -> CommandKind {
         match self {
-            RawSpoolCommand::Append(_) => RawSpoolCommandKind::Append,
-            RawSpoolCommand::Checkpoint(_) => RawSpoolCommandKind::Checkpoint,
-            RawSpoolCommand::RecoverPending { .. } => RawSpoolCommandKind::Recover,
-            RawSpoolCommand::Stats { .. } => RawSpoolCommandKind::Stats,
+            Command::Append(_) => CommandKind::Append,
+            Command::Checkpoint(_) => CommandKind::Checkpoint,
+            Command::RecoverPending { .. } => CommandKind::Recover,
+            Command::Stats { .. } => CommandKind::Stats,
+            Command::InjectFatal { .. } => CommandKind::Stats,
         }
     }
 }
 
-impl RawSpoolWriter {
+impl Writer {
     pub fn spawn(
-        options: RawSpoolOptions,
+        options: Options,
         queue_capacity: usize,
         max_batch_records: usize,
         max_batch_delay: Duration,
     ) -> Result<Self> {
-        let spool = RawSpool::open(options)?;
+        let spool = Spool::open(options)?;
         let max_record_bytes = spool.max_record_bytes;
         let (commands, receiver) = mpsc::sync_channel(queue_capacity.max(1));
-        let depths = Arc::new(RawSpoolWriterDepths::default());
+        let depths = Arc::new(WriterDepths::default());
         let writer_depths = Arc::clone(&depths);
         let handle = thread::Builder::new()
             .name("canardstack-raw-spool-writer".to_string())
@@ -224,7 +229,7 @@ impl RawSpoolWriter {
         })
     }
 
-    pub fn append(&self, record: RawSpoolRecord) -> Result<RawSpoolAppendAck> {
+    pub fn append(&self, record: Record) -> Result<AppendAck> {
         let (reply, rx) = mpsc::channel();
         let record = prepare_append_records(vec![record], self.max_record_bytes)?
             .into_iter()
@@ -234,10 +239,10 @@ impl RawSpoolWriter {
             .commands
             .as_ref()
             .context("raw spool writer is stopped")?;
-        let kind = RawSpoolCommandKind::Append;
+        let kind = CommandKind::Append;
         let enqueue_depth = self.depths.enqueue(kind);
         commands
-            .send(RawSpoolCommand::Append(AppendCommand {
+            .send(Command::Append(AppendCommand {
                 record,
                 queued_at: Instant::now(),
                 enqueue_depth,
@@ -251,26 +256,23 @@ impl RawSpoolWriter {
         rx.recv().context("receive raw spool append result")?
     }
 
-    pub fn mark_committed(&self, id: RawSpoolRecordId) -> Result<RawSpoolCheckpointBatchStats> {
+    pub fn mark_committed(&self, id: RecordId) -> Result<CheckpointBatchStats> {
         self.mark_committed_batch(&[id])
     }
 
-    pub fn mark_committed_batch(
-        &self,
-        ids: &[RawSpoolRecordId],
-    ) -> Result<RawSpoolCheckpointBatchStats> {
+    pub fn mark_committed_batch(&self, ids: &[RecordId]) -> Result<CheckpointBatchStats> {
         if ids.is_empty() {
-            return Ok(RawSpoolCheckpointBatchStats::default());
+            return Ok(CheckpointBatchStats::default());
         }
         let (reply, rx) = mpsc::channel();
         let commands = self
             .commands
             .as_ref()
             .context("raw spool writer is stopped")?;
-        let kind = RawSpoolCommandKind::Checkpoint;
+        let kind = CommandKind::Checkpoint;
         let enqueue_depth = self.depths.enqueue(kind);
         commands
-            .send(RawSpoolCommand::Checkpoint(CheckpointCommand {
+            .send(Command::Checkpoint(CheckpointCommand {
                 ids: ids.to_vec(),
                 queued_at: Instant::now(),
                 enqueue_depth,
@@ -284,16 +286,16 @@ impl RawSpoolWriter {
         rx.recv().context("receive raw spool checkpoint result")?
     }
 
-    pub fn recover_pending(&self) -> Result<Vec<RecoveredRawSpoolRecord>> {
+    pub fn recover_pending(&self) -> Result<Vec<RecoveredRecord>> {
         let (reply, rx) = mpsc::channel();
         let commands = self
             .commands
             .as_ref()
             .context("raw spool writer is stopped")?;
-        let kind = RawSpoolCommandKind::Recover;
+        let kind = CommandKind::Recover;
         self.depths.enqueue(kind);
         commands
-            .send(RawSpoolCommand::RecoverPending { reply })
+            .send(Command::RecoverPending { reply })
             .inspect_err(|_| {
                 self.depths.command_send_failed(kind);
             })
@@ -302,16 +304,16 @@ impl RawSpoolWriter {
         rx.recv().context("receive raw spool recovery result")?
     }
 
-    pub fn stats(&self) -> Result<RawSpoolStats> {
+    pub fn stats(&self) -> Result<Stats> {
         let (reply, rx) = mpsc::channel();
         let commands = self
             .commands
             .as_ref()
             .context("raw spool writer is stopped")?;
-        let kind = RawSpoolCommandKind::Stats;
+        let kind = CommandKind::Stats;
         self.depths.enqueue(kind);
         commands
-            .send(RawSpoolCommand::Stats { reply })
+            .send(Command::Stats { reply })
             .inspect_err(|_| {
                 self.depths.command_send_failed(kind);
             })
@@ -319,9 +321,28 @@ impl RawSpoolWriter {
         self.depths.command_sent(kind);
         rx.recv().context("receive raw spool stats result")?
     }
+
+    /// Drive this writer into the fatal/unhealthy latch for tests, mirroring a
+    /// real append/fsync failure. Blocks until the writer thread applies it so
+    /// a subsequent `stats()` observes `healthy=false`.
+    #[doc(hidden)]
+    pub fn inject_fatal(&self, message: impl Into<String>) -> Result<()> {
+        let (reply, rx) = mpsc::channel();
+        let commands = self
+            .commands
+            .as_ref()
+            .context("raw spool writer is stopped")?;
+        commands
+            .send(Command::InjectFatal {
+                message: message.into(),
+                reply,
+            })
+            .context("send raw spool inject-fatal command")?;
+        rx.recv().context("receive raw spool inject-fatal ack")
+    }
 }
 
-impl Drop for RawSpoolWriter {
+impl Drop for Writer {
     fn drop(&mut self) {
         self.commands.take();
         if let Some(handle) = self.handle.take() {
@@ -331,11 +352,11 @@ impl Drop for RawSpoolWriter {
 }
 
 pub(super) fn run_raw_spool_writer(
-    mut spool: RawSpool,
-    receiver: Receiver<RawSpoolCommand>,
+    mut spool: Spool,
+    receiver: Receiver<Command>,
     max_batch_records: usize,
     max_batch_delay: Duration,
-    depths: Arc<RawSpoolWriterDepths>,
+    depths: Arc<WriterDepths>,
 ) {
     let mut deferred = VecDeque::new();
     loop {
@@ -367,7 +388,7 @@ pub(super) fn run_raw_spool_writer(
         };
         depths.command_started(command.kind());
         match command {
-            RawSpoolCommand::Append(first) => handle_append_batch(
+            Command::Append(first) => handle_append_batch(
                 &mut spool,
                 first,
                 &receiver,
@@ -376,7 +397,7 @@ pub(super) fn run_raw_spool_writer(
                 max_batch_delay,
                 &depths,
             ),
-            RawSpoolCommand::Checkpoint(first) => handle_checkpoint_batch(
+            Command::Checkpoint(first) => handle_checkpoint_batch(
                 &mut spool,
                 first,
                 &receiver,
@@ -385,22 +406,26 @@ pub(super) fn run_raw_spool_writer(
                 max_batch_delay,
                 &depths,
             ),
-            RawSpoolCommand::RecoverPending { reply } => {
+            Command::RecoverPending { reply } => {
                 let _ = reply.send(spool.recover_pending());
             }
-            RawSpoolCommand::Stats { reply } => {
+            Command::Stats { reply } => {
                 let result = spool.stats().map(|mut stats| {
                     depths.record_stats(&mut stats);
                     stats
                 });
                 let _ = reply.send(result);
             }
+            Command::InjectFatal { message, reply } => {
+                spool.inject_fatal(message);
+                let _ = reply.send(());
+            }
         }
         let _ = spool.sync_append_if_due(false);
     }
 }
 
-pub(super) fn next_writer_timeout(spool: &RawSpool) -> Option<Duration> {
+pub(super) fn next_writer_timeout(spool: &Spool) -> Option<Duration> {
     match (spool.append_sync_due_in(), spool.checkpoint_sync_due_in()) {
         (Some(append), Some(checkpoint)) => Some(append.min(checkpoint)),
         (Some(append), None) => Some(append),
@@ -410,13 +435,13 @@ pub(super) fn next_writer_timeout(spool: &RawSpool) -> Option<Duration> {
 }
 
 pub(super) fn handle_append_batch(
-    spool: &mut RawSpool,
+    spool: &mut Spool,
     first: AppendCommand,
-    receiver: &Receiver<RawSpoolCommand>,
-    deferred: &mut VecDeque<RawSpoolCommand>,
+    receiver: &Receiver<Command>,
+    deferred: &mut VecDeque<Command>,
     max_batch_records: usize,
     max_batch_delay: Duration,
-    depths: &RawSpoolWriterDepths,
+    depths: &WriterDepths,
 ) {
     let mut batch = vec![first];
     let collect_started = Instant::now();
@@ -432,9 +457,7 @@ pub(super) fn handle_append_batch(
     let max_enqueue_depth = batch
         .iter()
         .map(|command| command.enqueue_depth)
-        .fold(RawSpoolCommandDepthSnapshot::default(), |max, depth| {
-            max.max(depth)
-        });
+        .fold(CommandDepthSnapshot::default(), |max, depth| max.max(depth));
     let queue_seconds = batch
         .iter()
         .map(|command| {
@@ -481,7 +504,7 @@ pub(super) fn handle_append_batch(
                 .zip(appended.ids)
                 .zip(appended.compressed_bodies)
             {
-                let _ = reply.send(Ok(RawSpoolAppendAck {
+                let _ = reply.send(Ok(AppendAck {
                     id,
                     compressed_body,
                     batch_stats: stats.take(),
@@ -490,7 +513,7 @@ pub(super) fn handle_append_batch(
         }
         Err(err) => {
             let message = err.to_string();
-            let is_full = raw_spool_full_info(&err).copied();
+            let is_full = full_info(&err).copied();
             for reply in replies {
                 let result = match is_full {
                     Some(full) => Err(anyhow::Error::new(full)),
@@ -504,13 +527,13 @@ pub(super) fn handle_append_batch(
 
 #[cfg(test)]
 pub(super) fn collect_append_batch(
-    receiver: &Receiver<RawSpoolCommand>,
-    deferred: &mut VecDeque<RawSpoolCommand>,
+    receiver: &Receiver<Command>,
+    deferred: &mut VecDeque<Command>,
     max_batch_records: usize,
     max_batch_delay: Duration,
     batch: &mut Vec<AppendCommand>,
 ) -> usize {
-    let depths = RawSpoolWriterDepths::default();
+    let depths = WriterDepths::default();
     collect_append_batch_with_depths(
         receiver,
         deferred,
@@ -522,12 +545,12 @@ pub(super) fn collect_append_batch(
 }
 
 pub(super) fn collect_append_batch_with_depths(
-    receiver: &Receiver<RawSpoolCommand>,
-    deferred: &mut VecDeque<RawSpoolCommand>,
+    receiver: &Receiver<Command>,
+    deferred: &mut VecDeque<Command>,
     max_batch_records: usize,
     max_batch_delay: Duration,
     batch: &mut Vec<AppendCommand>,
-    depths: &RawSpoolWriterDepths,
+    depths: &WriterDepths,
 ) -> usize {
     let deadline = Instant::now() + max_batch_delay;
     let mut deferred_checkpoint_commands = 0usize;
@@ -548,12 +571,12 @@ pub(super) fn collect_append_batch_with_depths(
             }
         };
         match command {
-            RawSpoolCommand::Append(append) => {
-                depths.command_started(RawSpoolCommandKind::Append);
+            Command::Append(append) => {
+                depths.command_started(CommandKind::Append);
                 batch.push(append);
             }
             other => {
-                if matches!(other, RawSpoolCommand::Checkpoint(_)) {
+                if matches!(other, Command::Checkpoint(_)) {
                     deferred_checkpoint_commands += 1;
                 }
                 deferred.push_back(other);
@@ -564,13 +587,13 @@ pub(super) fn collect_append_batch_with_depths(
 }
 
 pub(super) fn handle_checkpoint_batch(
-    spool: &mut RawSpool,
+    spool: &mut Spool,
     first: CheckpointCommand,
-    receiver: &Receiver<RawSpoolCommand>,
-    deferred: &mut VecDeque<RawSpoolCommand>,
+    receiver: &Receiver<Command>,
+    deferred: &mut VecDeque<Command>,
     max_batch_records: usize,
     max_batch_delay: Duration,
-    depths: &RawSpoolWriterDepths,
+    depths: &WriterDepths,
 ) {
     let mut batch = vec![first];
     let collect_started = Instant::now();
@@ -588,9 +611,7 @@ pub(super) fn handle_checkpoint_batch(
     let max_enqueue_depth = batch
         .iter()
         .map(|command| command.enqueue_depth)
-        .fold(RawSpoolCommandDepthSnapshot::default(), |max, depth| {
-            max.max(depth)
-        });
+        .fold(CommandDepthSnapshot::default(), |max, depth| max.max(depth));
     let records = batch.iter().map(|command| command.ids.len()).sum::<usize>();
     for command in &batch {
         queue_seconds += collect_started
@@ -599,7 +620,7 @@ pub(super) fn handle_checkpoint_batch(
             * command.ids.len() as f64;
         ids.extend(command.ids.iter().copied());
     }
-    let stats = RawSpoolCheckpointBatchStats {
+    let stats = CheckpointBatchStats {
         records,
         commands: batch.len(),
         queue_seconds,
@@ -626,30 +647,30 @@ pub(super) fn handle_checkpoint_batch(
 }
 
 fn drain_deferred_checkpoints(
-    deferred: &mut VecDeque<RawSpoolCommand>,
+    deferred: &mut VecDeque<Command>,
     max_batch_records: usize,
     batch: &mut Vec<CheckpointCommand>,
-    depths: &RawSpoolWriterDepths,
+    depths: &WriterDepths,
 ) {
     while batch.len() < max_batch_records {
-        let Some(RawSpoolCommand::Checkpoint(_)) = deferred.front() else {
+        let Some(Command::Checkpoint(_)) = deferred.front() else {
             break;
         };
-        let Some(RawSpoolCommand::Checkpoint(checkpoint)) = deferred.pop_front() else {
+        let Some(Command::Checkpoint(checkpoint)) = deferred.pop_front() else {
             unreachable!("front matched checkpoint");
         };
-        depths.command_started(RawSpoolCommandKind::Checkpoint);
+        depths.command_started(CommandKind::Checkpoint);
         batch.push(checkpoint);
     }
 }
 
 fn collect_checkpoint_batch(
-    receiver: &Receiver<RawSpoolCommand>,
-    deferred: &mut VecDeque<RawSpoolCommand>,
+    receiver: &Receiver<Command>,
+    deferred: &mut VecDeque<Command>,
     max_batch_records: usize,
     max_batch_delay: Duration,
     batch: &mut Vec<CheckpointCommand>,
-    depths: &RawSpoolWriterDepths,
+    depths: &WriterDepths,
 ) -> usize {
     let deadline = Instant::now() + max_batch_delay;
     let mut deferred_append_commands = 0usize;
@@ -670,12 +691,12 @@ fn collect_checkpoint_batch(
             }
         };
         match command {
-            RawSpoolCommand::Checkpoint(checkpoint) => {
-                depths.command_started(RawSpoolCommandKind::Checkpoint);
+            Command::Checkpoint(checkpoint) => {
+                depths.command_started(CommandKind::Checkpoint);
                 batch.push(checkpoint);
             }
             other => {
-                if matches!(other, RawSpoolCommand::Append(_)) {
+                if matches!(other, Command::Append(_)) {
                     deferred_append_commands += 1;
                 }
                 deferred.push_back(other);

@@ -88,14 +88,26 @@ fn route_inner(
     let result = match (method, path) {
         ("GET", "/healthz") => {
             let probe = state.storage.probe();
-            let ok = probe.is_ready();
-            return HttpResponse::json(
-                if ok { 200 } else { 503 },
-                json!({
-                    "status": if ok { "ok" } else { "error" },
-                    "storage": probe
-                }),
-            );
+            // A wedged raw-spool writer 503s ingest for its signal forever, so
+            // the node must report NOT ready even when storage is fine.
+            let unhealthy_spools: Vec<Value> = state
+                .ingestor
+                .raw_spool_health_by_signal()
+                .into_iter()
+                .filter(|(_, (healthy, _))| !healthy)
+                .map(|(signal, (_, error))| json!({"signal": signal, "error": error}))
+                .collect();
+            let raw_spool_healthy = unhealthy_spools.is_empty();
+            let ok = probe.is_ready() && raw_spool_healthy;
+            let mut body = json!({
+                "status": if ok { "ok" } else { "error" },
+                "storage": probe,
+                "raw_spool_healthy": raw_spool_healthy,
+            });
+            if !raw_spool_healthy {
+                body["raw_spool_unhealthy"] = json!(unhealthy_spools);
+            }
+            return HttpResponse::json(if ok { 200 } else { 503 }, body);
         }
         ("GET", "/metrics") => {
             record_operator_gauges(state);
@@ -141,33 +153,38 @@ fn route_inner(
                 (health.is_ready(), json!(health))
             });
         }
-        ("GET", "/api/admin/health/ingest") => admin(headers, state, || {
-            let raw_spool = state
-                .ingestor
-                .raw_spool_stats()
-                .map(|stats| json!(stats))
-                .unwrap_or_else(|err| json!({"error": err.to_string()}));
-            let raw_spool_by_signal = state
-                .ingestor
-                .raw_spool_stats_by_signal()
-                .map(|stats| json!(stats))
-                .unwrap_or_else(|err| json!({"error": err.to_string()}));
-            Ok(json!({
-                "queues": state.ingestor.snapshots(),
-                "lanes": state.lanes.snapshot_for(state.ingestor.lane_freshness_inputs(&state.storage)),
-                "raw_spool": raw_spool,
-                "raw_spool_by_signal": raw_spool_by_signal,
-                "raw_spool_config": {
-                    "writer_queue_capacity": state.config.raw_spool_writer_queue_capacity,
-                    "group_commit_records": state.config.raw_spool_group_commit_records,
-                    "group_commit_ms": state.config.raw_spool_group_commit_delay.as_millis(),
-                    "append_sync_ms": state.config.raw_spool_append_sync_interval.as_millis(),
-                    "append_sync_bytes": state.config.raw_spool_append_sync_bytes,
-                    "checkpoint_fsync_records": state.config.raw_spool_checkpoint_fsync_records,
-                    "checkpoint_fsync_ms": state.config.raw_spool_checkpoint_fsync_delay.as_millis()
-                }
-            }))
-        }),
+        ("GET", "/api/admin/health/ingest") => {
+            return admin_health_response(headers, state, || {
+                let raw_spool_healthy = state.ingestor.raw_spool_healthy();
+                let raw_spool = state
+                    .ingestor
+                    .raw_spool_stats()
+                    .map(|stats| json!(stats))
+                    .unwrap_or_else(|err| json!({"error": err.to_string()}));
+                let raw_spool_by_signal = state
+                    .ingestor
+                    .raw_spool_stats_by_signal()
+                    .map(|stats| json!(stats))
+                    .unwrap_or_else(|err| json!({"error": err.to_string()}));
+                let body = json!({
+                    "raw_spool_healthy": raw_spool_healthy,
+                    "queues": state.ingestor.snapshots(),
+                    "lanes": state.lanes.snapshot_for(state.ingestor.lane_freshness_inputs(&state.storage)),
+                    "raw_spool": raw_spool,
+                    "raw_spool_by_signal": raw_spool_by_signal,
+                    "raw_spool_config": {
+                        "writer_queue_capacity": state.config.raw_spool_writer_queue_capacity,
+                        "group_commit_records": state.config.raw_spool_group_commit_records,
+                        "group_commit_ms": state.config.raw_spool_group_commit_delay.as_millis(),
+                        "append_sync_ms": state.config.raw_spool_append_sync_interval.as_millis(),
+                        "append_sync_bytes": state.config.raw_spool_append_sync_bytes,
+                        "checkpoint_fsync_records": state.config.raw_spool_checkpoint_fsync_records,
+                        "checkpoint_fsync_ms": state.config.raw_spool_checkpoint_fsync_delay.as_millis()
+                    }
+                });
+                (raw_spool_healthy, body)
+            });
+        }
         ("GET", "/api/admin/health/maintenance") => {
             return admin_health_response(headers, state, || {
                 (state.maintenance.is_ready(), state.maintenance.health())

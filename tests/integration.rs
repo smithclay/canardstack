@@ -1,6 +1,6 @@
 use canardstack::config::ServeRole;
 use canardstack::http;
-use canardstack::ingest::spool::{RawSpool, RawSpoolOptions, RawSpoolRecord};
+use canardstack::ingest::spool::{Options, Record, Spool};
 use canardstack::ingest::{Ingestor, Signal};
 use canardstack::lanes::LaneController;
 use canardstack::metrics::Metrics;
@@ -599,6 +599,74 @@ fn admin_ingest_health_includes_raw_spool_backlog() {
 }
 
 #[test]
+fn unhealthy_raw_spool_writer_makes_readiness_not_ready() {
+    let dir = tempdir().unwrap();
+    let mut config = Config::test(dir.path().join("canardstack.duckdb"));
+    config.raw_spool_dir = dir.path().join("raw-spool");
+    let state = AppState::new(config).unwrap();
+
+    // Baseline: storage and every spool writer healthy, so readiness is ready.
+    let healthy = http::route(
+        "GET",
+        "/healthz",
+        &HashMap::new(),
+        &HashMap::new(),
+        &[],
+        &state,
+    );
+    assert_eq!(healthy.status(), 200, "{}", healthy.json_body());
+    assert_eq!(healthy.json_body()["raw_spool_healthy"], true);
+
+    // Wedge one signal's spool writer (mirrors a fatal append/fsync failure).
+    state
+        .ingestor
+        .force_raw_spool_unhealthy(Signal::Logs, "injected fatal for test")
+        .unwrap();
+
+    // /healthz must now report NOT ready and name the wedged signal.
+    let response = http::route(
+        "GET",
+        "/healthz",
+        &HashMap::new(),
+        &HashMap::new(),
+        &[],
+        &state,
+    );
+    assert_eq!(response.status(), 503, "{}", response.json_body());
+    assert_eq!(response.json_body()["status"], "error");
+    assert_eq!(response.json_body()["raw_spool_healthy"], false);
+    let unhealthy = response.json_body()["raw_spool_unhealthy"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        unhealthy.iter().any(|entry| entry["signal"] == "logs"),
+        "expected logs signal listed as unhealthy: {}",
+        response.json_body()
+    );
+
+    // The ingest health route must surface the same not-ready state.
+    let ingest_health = http::route(
+        "GET",
+        "/api/admin/health/ingest",
+        &HashMap::new(),
+        &admin_headers(&state),
+        &[],
+        &state,
+    );
+    assert_eq!(ingest_health.status(), 503, "{}", ingest_health.json_body());
+    assert_eq!(ingest_health.json_body()["raw_spool_healthy"], false);
+    assert_eq!(
+        ingest_health.json_body()["raw_spool_by_signal"]["logs"]["healthy"],
+        false
+    );
+    assert_eq!(
+        ingest_health.json_body()["raw_spool_by_signal"]["spans"]["healthy"],
+        true
+    );
+}
+
+#[test]
 fn invalid_payload_returns_400() {
     let (_dir, state) = app();
     let response = http::route(
@@ -1067,7 +1135,7 @@ fn raw_spool_replays_pending_request_on_startup() {
     config.raw_spool_dir = dir.path().join("raw-spool");
     let body = log_fixture(Utc::now().timestamp_nanos_opt().unwrap()).to_string();
     {
-        let mut spool = RawSpool::open(RawSpoolOptions {
+        let mut spool = Spool::open(Options {
             dir: config.raw_spool_dir.join(Signal::Logs.as_str()),
             max_segment_bytes: config.raw_spool_max_segment_bytes as u64,
             max_record_bytes: config.raw_spool_max_record_bytes as u64,
@@ -1079,7 +1147,7 @@ fn raw_spool_replays_pending_request_on_startup() {
         })
         .unwrap();
         spool
-            .append(RawSpoolRecord::new(
+            .append(Record::new(
                 Signal::Logs,
                 "application/json",
                 None,
@@ -1117,6 +1185,50 @@ fn raw_spool_replays_pending_request_on_startup() {
         metrics.contains("canardstack_raw_spool_pending_records 0.000000"),
         "{metrics}"
     );
+}
+
+#[test]
+fn raw_spool_replay_failure_does_not_abort_boot() {
+    let dir = tempdir().unwrap();
+    let mut config = Config::test(dir.path().join("canardstack.duckdb"));
+    config.raw_spool_dir = dir.path().join("raw-spool");
+    let body = log_fixture(Utc::now().timestamp_nanos_opt().unwrap()).to_string();
+    {
+        let mut spool = Spool::open(Options {
+            dir: config.raw_spool_dir.join(Signal::Logs.as_str()),
+            max_segment_bytes: config.raw_spool_max_segment_bytes as u64,
+            max_record_bytes: config.raw_spool_max_record_bytes as u64,
+            max_total_bytes: config.raw_spool_max_total_bytes as u64,
+            append_sync_interval: config.raw_spool_append_sync_interval,
+            append_sync_bytes: config.raw_spool_append_sync_bytes as u64,
+            checkpoint_fsync_records: config.raw_spool_checkpoint_fsync_records,
+            checkpoint_fsync_delay: config.raw_spool_checkpoint_fsync_delay,
+        })
+        .unwrap();
+        spool
+            .append(Record::new(
+                Signal::Logs,
+                "application/json",
+                None,
+                body.as_bytes(),
+            ))
+            .unwrap();
+    }
+
+    // Force every replay attempt to fail by marking the storage dependency unhealthy.
+    // Boot must still succeed: the failing record stays pending for a later retry.
+    config.force_dependency_unhealthy = true;
+    let state = AppState::new(config).expect("boot must succeed despite replay failures");
+
+    let metrics = metrics_text(&state);
+    assert!(
+        metrics.contains(
+            "canardstack_raw_spool_replayed_records_total{signal=\"logs\",status=\"failed\"} 1"
+        ),
+        "{metrics}"
+    );
+    // The record was not checkpointed, so it remains pending for a future boot.
+    assert_eq!(state.ingestor.raw_spool_stats().unwrap().pending_records, 1);
 }
 
 #[test]

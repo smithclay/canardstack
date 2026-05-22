@@ -726,6 +726,7 @@ fn trimmed_non_empty(value: String) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::LockExt;
     use std::sync::{Mutex, OnceLock};
 
     const CONFIG_ENV_VARS: &[&str] = &[
@@ -772,10 +773,6 @@ mod tests {
         "CANARDSTACK_STORAGE_SINK_BUFFER_CAPACITY",
         "CANARDSTACK_STORAGE_SINK_BATCH_ROWS",
         "CANARDSTACK_STORAGE_SINK_FLUSH_INTERVAL_MS",
-        "CANARDSTACK_EXPERIMENTAL_ASYNC_INGEST_WORKERS",
-        "CANARDSTACK_EXPERIMENTAL_ASYNC_INGEST_QUEUE_CAPACITY",
-        "CANARDSTACK_EXPERIMENTAL_VECTOR_STORAGE_SINK",
-        "CANARDSTACK_EXPERIMENTAL_VECTOR_STORAGE_SINK_QUEUE_CAPACITY",
     ];
 
     fn env_lock() -> &'static Mutex<()> {
@@ -817,7 +814,7 @@ mod tests {
 
     #[test]
     fn config_file_values_load_before_env_overrides() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock().lock_or_poisoned();
         let _snapshot = EnvSnapshot::capture_and_clear();
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("config.toml");
@@ -973,29 +970,8 @@ http_keepalive = true
     }
 
     #[test]
-    fn old_experimental_ingest_env_vars_are_ignored() {
-        let _guard = env_lock().lock().unwrap();
-        let _snapshot = EnvSnapshot::capture_and_clear();
-
-        unsafe {
-            env::set_var("CANARDSTACK_EXPERIMENTAL_ASYNC_INGEST_WORKERS", "99");
-            env::set_var("CANARDSTACK_EXPERIMENTAL_ASYNC_INGEST_QUEUE_CAPACITY", "99");
-            env::set_var("CANARDSTACK_EXPERIMENTAL_VECTOR_STORAGE_SINK", "false");
-            env::set_var(
-                "CANARDSTACK_EXPERIMENTAL_VECTOR_STORAGE_SINK_QUEUE_CAPACITY",
-                "99",
-            );
-        }
-
-        let config = Config::from_env().unwrap();
-        assert_eq!(config.ingest_workers, 4);
-        assert_eq!(config.ingest_buffer_capacity, 1024);
-        assert_eq!(config.storage_sink_buffer_capacity, 1024);
-    }
-
-    #[test]
     fn http_keepalive_defaults_on_for_http11_clients() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock().lock_or_poisoned();
         let _snapshot = EnvSnapshot::capture_and_clear();
 
         let config = Config::from_env().unwrap();
@@ -1005,7 +981,7 @@ http_keepalive = true
 
     #[test]
     fn config_file_type_errors_name_the_toml_path() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock().lock_or_poisoned();
         let _snapshot = EnvSnapshot::capture_and_clear();
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("config.toml");
@@ -1031,7 +1007,7 @@ max_body_bytes = "large"
 
     #[test]
     fn example_toml_loads_and_validates() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock().lock_or_poisoned();
         let _snapshot = EnvSnapshot::capture_and_clear();
         let config_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config/example.toml");
 

@@ -3,16 +3,17 @@ use super::codec::{
 };
 use super::writer::{
     collect_append_batch, handle_append_batch, handle_checkpoint_batch, AppendCommand,
-    CheckpointCommand, RawSpoolCommand, RawSpoolWriterDepths,
+    CheckpointCommand, Command, WriterDepths,
 };
 use super::*;
 use std::collections::VecDeque;
+use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::mpsc;
 use tempfile::tempdir;
 
-fn options(dir: &Path) -> RawSpoolOptions {
-    RawSpoolOptions {
+fn options(dir: &Path) -> Options {
+    Options {
         dir: dir.to_path_buf(),
         max_segment_bytes: 256,
         max_record_bytes: 1024,
@@ -24,8 +25,8 @@ fn options(dir: &Path) -> RawSpoolOptions {
     }
 }
 
-fn record(body: &[u8]) -> RawSpoolRecord {
-    RawSpoolRecord {
+fn record(body: &[u8]) -> Record {
+    Record {
         signal: Signal::Logs,
         content_type: "application/x-protobuf".to_string(),
         content_encoding: Some("gzip".to_string()),
@@ -37,7 +38,7 @@ fn record(body: &[u8]) -> RawSpoolRecord {
 fn append_command(
     body: &[u8],
     _sequence: u64,
-) -> (AppendCommand, mpsc::Receiver<Result<RawSpoolAppendAck>>) {
+) -> (AppendCommand, mpsc::Receiver<Result<AppendAck>>) {
     let (reply, rx) = mpsc::channel();
     let record = prepare_append_records(vec![record(body)], 1024)
         .unwrap()
@@ -56,10 +57,10 @@ fn append_command(
 }
 
 fn checkpoint_command(
-    ids: Vec<RawSpoolRecordId>,
+    ids: Vec<RecordId>,
 ) -> (
     CheckpointCommand,
-    mpsc::Receiver<Result<RawSpoolCheckpointBatchStats>>,
+    mpsc::Receiver<Result<CheckpointBatchStats>>,
 ) {
     let (reply, rx) = mpsc::channel();
     (
@@ -76,11 +77,11 @@ fn checkpoint_command(
 #[test]
 fn raw_spool_recovers_written_uncommitted_records() {
     let dir = tempdir().unwrap();
-    let mut spool = RawSpool::open(options(dir.path())).unwrap();
+    let mut spool = Spool::open(options(dir.path())).unwrap();
     let id = spool.append(record(b"request-body")).unwrap();
     drop(spool);
 
-    let spool = RawSpool::open(options(dir.path())).unwrap();
+    let spool = Spool::open(options(dir.path())).unwrap();
     let pending = spool.recover_pending().unwrap();
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].id, id);
@@ -90,7 +91,7 @@ fn raw_spool_recovers_written_uncommitted_records() {
 #[test]
 fn raw_spool_append_batch_reports_write_stats_without_fsyncing() {
     let dir = tempdir().unwrap();
-    let mut spool = RawSpool::open(options(dir.path())).unwrap();
+    let mut spool = Spool::open(options(dir.path())).unwrap();
     let appended = spool
         .append_batch(vec![record(b"first"), record(b"second")])
         .unwrap();
@@ -110,13 +111,13 @@ fn raw_spool_append_batch_reports_write_stats_without_fsyncing() {
 #[test]
 fn raw_spool_writer_reports_batch_wait_stats_once() {
     let dir = tempdir().unwrap();
-    let mut spool = RawSpool::open(options(dir.path())).unwrap();
+    let mut spool = Spool::open(options(dir.path())).unwrap();
     let (first, first_rx) = append_command(b"first", 1);
     let (tx, rx) = mpsc::sync_channel(4);
     let (second, second_rx) = append_command(b"second", 2);
-    tx.send(RawSpoolCommand::Append(second)).unwrap();
+    tx.send(Command::Append(second)).unwrap();
     let mut deferred = VecDeque::new();
-    let depths = RawSpoolWriterDepths::default();
+    let depths = WriterDepths::default();
 
     handle_append_batch(
         &mut spool,
@@ -141,16 +142,15 @@ fn raw_spool_writer_reports_batch_wait_stats_once() {
 #[test]
 fn raw_spool_writer_batches_checkpoint_commands_and_reports_stats_once() {
     let dir = tempdir().unwrap();
-    let mut spool = RawSpool::open(options(dir.path())).unwrap();
+    let mut spool = Spool::open(options(dir.path())).unwrap();
     let first = spool.append(record(b"first")).unwrap();
     let second = spool.append(record(b"second")).unwrap();
     let (first_command, first_rx) = checkpoint_command(vec![first]);
     let (second_command, second_rx) = checkpoint_command(vec![second]);
     let (tx, rx) = mpsc::sync_channel(4);
-    tx.send(RawSpoolCommand::Checkpoint(second_command))
-        .unwrap();
+    tx.send(Command::Checkpoint(second_command)).unwrap();
     let mut deferred = VecDeque::new();
-    let depths = RawSpoolWriterDepths::default();
+    let depths = WriterDepths::default();
 
     handle_checkpoint_batch(
         &mut spool,
@@ -174,7 +174,7 @@ fn raw_spool_writer_batches_checkpoint_commands_and_reports_stats_once() {
 #[test]
 fn raw_spool_writer_batches_deferred_checkpoint_commands() {
     let dir = tempdir().unwrap();
-    let mut spool = RawSpool::open(options(dir.path())).unwrap();
+    let mut spool = Spool::open(options(dir.path())).unwrap();
     let first = spool.append(record(b"first")).unwrap();
     let second = spool.append(record(b"second")).unwrap();
     let third = spool.append(record(b"third")).unwrap();
@@ -182,11 +182,11 @@ fn raw_spool_writer_batches_deferred_checkpoint_commands() {
     let (second_command, second_rx) = checkpoint_command(vec![second]);
     let (third_command, third_rx) = checkpoint_command(vec![third]);
     let mut deferred = VecDeque::from([
-        RawSpoolCommand::Checkpoint(second_command),
-        RawSpoolCommand::Checkpoint(third_command),
+        Command::Checkpoint(second_command),
+        Command::Checkpoint(third_command),
     ]);
     let (_tx, rx) = mpsc::sync_channel(4);
-    let depths = RawSpoolWriterDepths::default();
+    let depths = WriterDepths::default();
 
     handle_checkpoint_batch(
         &mut spool,
@@ -215,7 +215,7 @@ fn raw_spool_periodic_append_sync_clears_unsynced_accounting() {
     let mut opts = options(dir.path());
     opts.append_sync_interval = Duration::from_millis(500);
     opts.append_sync_bytes = 1024 * 1024;
-    let mut spool = RawSpool::open(opts).unwrap();
+    let mut spool = Spool::open(opts).unwrap();
 
     spool.append(record(b"first")).unwrap();
     spool.append_dirty_since = Some(Instant::now() - Duration::from_secs(1));
@@ -237,7 +237,7 @@ fn raw_spool_append_sync_byte_threshold_clears_unsynced_accounting() {
     let mut opts = options(dir.path());
     opts.append_sync_interval = Duration::from_secs(60);
     opts.append_sync_bytes = 1;
-    let mut spool = RawSpool::open(opts).unwrap();
+    let mut spool = Spool::open(opts).unwrap();
 
     spool.append(record(b"first")).unwrap();
     let sync = spool.sync_append_if_due(false).unwrap().unwrap();
@@ -255,7 +255,7 @@ fn raw_spool_forced_append_sync_on_shutdown_clears_unsynced_accounting() {
     let mut opts = options(dir.path());
     opts.append_sync_interval = Duration::from_secs(60);
     opts.append_sync_bytes = 1024 * 1024;
-    let mut spool = RawSpool::open(opts).unwrap();
+    let mut spool = Spool::open(opts).unwrap();
 
     spool.append(record(b"first")).unwrap();
     assert_eq!(spool.stats().unwrap().unsynced_records, 1);
@@ -270,7 +270,7 @@ fn raw_spool_forced_append_sync_on_shutdown_clears_unsynced_accounting() {
 #[test]
 fn raw_spool_append_sync_failure_marks_unhealthy_and_blocks_appends() {
     let dir = tempdir().unwrap();
-    let mut spool = RawSpool::open(options(dir.path())).unwrap();
+    let mut spool = Spool::open(options(dir.path())).unwrap();
 
     spool.append(record(b"first")).unwrap();
     spool.fail_next_append_sync();
@@ -295,13 +295,13 @@ fn raw_spool_append_sync_failure_marks_unhealthy_and_blocks_appends() {
 #[test]
 fn raw_spool_checkpoint_skips_committed_records() {
     let dir = tempdir().unwrap();
-    let mut spool = RawSpool::open(options(dir.path())).unwrap();
+    let mut spool = Spool::open(options(dir.path())).unwrap();
     let first = spool.append(record(b"first")).unwrap();
     let second = spool.append(record(b"second")).unwrap();
     spool.mark_committed(first).unwrap();
     drop(spool);
 
-    let spool = RawSpool::open(options(dir.path())).unwrap();
+    let spool = Spool::open(options(dir.path())).unwrap();
     let pending = spool.recover_pending().unwrap();
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].id, second);
@@ -314,7 +314,7 @@ fn raw_spool_checkpoint_fsync_can_be_delayed_until_record_threshold() {
     let mut opts = options(dir.path());
     opts.checkpoint_fsync_records = 2;
     opts.checkpoint_fsync_delay = Duration::from_secs(60);
-    let mut spool = RawSpool::open(opts).unwrap();
+    let mut spool = Spool::open(opts).unwrap();
     let first = spool.append(record(b"first")).unwrap();
     let second = spool.append(record(b"second")).unwrap();
 
@@ -331,7 +331,7 @@ fn raw_spool_checkpoint_fsync_can_be_forced_on_shutdown() {
     let mut opts = options(dir.path());
     opts.checkpoint_fsync_records = 1024;
     opts.checkpoint_fsync_delay = Duration::from_secs(60);
-    let mut spool = RawSpool::open(opts).unwrap();
+    let mut spool = Spool::open(opts).unwrap();
     let first = spool.append(record(b"first")).unwrap();
 
     spool.mark_committed(first).unwrap();
@@ -344,7 +344,7 @@ fn raw_spool_checkpoint_fsync_can_be_forced_on_shutdown() {
 #[test]
 fn raw_spool_ignores_and_truncates_torn_tail() {
     let dir = tempdir().unwrap();
-    let mut spool = RawSpool::open(options(dir.path())).unwrap();
+    let mut spool = Spool::open(options(dir.path())).unwrap();
     let id = spool.append(record(b"complete")).unwrap();
     let path = spool.segment_path(id.segment);
     drop(spool);
@@ -356,7 +356,7 @@ fn raw_spool_ignores_and_truncates_torn_tail() {
         .write_all(&RECORD_MAGIC[..4])
         .unwrap();
 
-    let spool = RawSpool::open(options(dir.path())).unwrap();
+    let spool = Spool::open(options(dir.path())).unwrap();
     let pending = spool.recover_pending().unwrap();
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].id, id);
@@ -369,11 +369,111 @@ fn raw_spool_ignores_and_truncates_torn_tail() {
 }
 
 #[test]
+fn raw_spool_ignores_and_truncates_corrupt_body_checksum() {
+    let dir = tempdir().unwrap();
+    let mut opts = options(dir.path());
+    // Keep both records in a single segment so the corrupt second record sits
+    // immediately after the good first record on disk.
+    opts.max_segment_bytes = 4096;
+    let mut spool = Spool::open(opts).unwrap();
+    let first = spool.append(record(b"complete")).unwrap();
+    let second = spool.append(record(b"corrupt-me")).unwrap();
+    assert_eq!(first.segment, second.segment);
+    let path = spool.segment_path(first.segment);
+    drop(spool);
+
+    // The first record's encoded length is exactly where the second record
+    // begins; the last byte of the file is the final body byte of the second
+    // record, so flipping it corrupts only the second record's body checksum.
+    let first_len = encode_record(first.sequence, &record(b"complete"))
+        .unwrap()
+        .len() as u64;
+    let total_len = fs::metadata(&path).unwrap().len();
+    let mut file = OpenOptions::new().write(true).open(&path).unwrap();
+    file.seek(SeekFrom::Start(total_len - 1)).unwrap();
+    file.write_all(&[0xFF]).unwrap();
+    drop(file);
+
+    let spool = Spool::open(options(dir.path())).unwrap();
+    let pending = spool.recover_pending().unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].id, first);
+    assert_eq!(pending[0].record, record(b"complete"));
+    // The corrupt second record and everything after it is truncated, leaving
+    // only the good leading record on disk.
+    assert_eq!(fs::metadata(&path).unwrap().len(), first_len);
+}
+
+#[test]
+fn raw_spool_ignores_and_truncates_false_magic_midstream() {
+    let dir = tempdir().unwrap();
+    let mut spool = Spool::open(options(dir.path())).unwrap();
+    let id = spool.append(record(b"complete")).unwrap();
+    let path = spool.segment_path(id.segment);
+    drop(spool);
+
+    let good_len = encode_record(id.sequence, &record(b"complete"))
+        .unwrap()
+        .len() as u64;
+
+    // Append a full record's worth of bytes with a valid-length magic prefix
+    // but garbage framing: this trips the bad-magic InvalidData path mid-stream
+    // rather than a clean EOF.
+    let mut bogus = b"NOTMAGIC".to_vec();
+    bogus.extend_from_slice(&[0xAB; 32]);
+    OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(&bogus)
+        .unwrap();
+
+    let spool = Spool::open(options(dir.path())).unwrap();
+    let pending = spool.recover_pending().unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].id, id);
+    assert_eq!(pending[0].record, record(b"complete"));
+    assert_eq!(fs::metadata(&path).unwrap().len(), good_len);
+}
+
+#[test]
+fn raw_spool_ignores_and_truncates_truncated_body() {
+    let dir = tempdir().unwrap();
+    let mut spool = Spool::open(options(dir.path())).unwrap();
+    let id = spool.append(record(b"complete")).unwrap();
+    let path = spool.segment_path(id.segment);
+    drop(spool);
+
+    let good_len = encode_record(id.sequence, &record(b"complete"))
+        .unwrap()
+        .len() as u64;
+
+    // A second record framed with valid magic + a header claiming a body that
+    // is never fully written: the header parses but the body read hits EOF,
+    // which must still recover the good leading record rather than fail boot.
+    let mut next = encode_record(id.sequence + 1, &record(b"second-body")).unwrap();
+    next.truncate(next.len() - 3);
+    OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(&next)
+        .unwrap();
+
+    let spool = Spool::open(options(dir.path())).unwrap();
+    let pending = spool.recover_pending().unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].id, id);
+    assert_eq!(pending[0].record, record(b"complete"));
+    assert_eq!(fs::metadata(&path).unwrap().len(), good_len);
+}
+
+#[test]
 fn raw_spool_reclaims_fully_committed_closed_segments() {
     let dir = tempdir().unwrap();
     let mut opts = options(dir.path());
     opts.max_segment_bytes = 128;
-    let mut spool = RawSpool::open(opts.clone()).unwrap();
+    let mut spool = Spool::open(opts.clone()).unwrap();
     let first = spool.append(record(b"first-payload")).unwrap();
     let second = spool.append(record(b"second-payload")).unwrap();
     assert_ne!(first.segment, second.segment);
@@ -395,7 +495,7 @@ fn raw_spool_reclaims_committed_closed_segments_before_full() {
     let mut opts = options(dir.path());
     opts.max_segment_bytes = 128;
     opts.max_total_bytes = 500;
-    let mut spool = RawSpool::open(opts).unwrap();
+    let mut spool = Spool::open(opts).unwrap();
 
     for _ in 0..5 {
         let id = spool.append(record(b"committed-payload")).unwrap();
@@ -414,7 +514,7 @@ fn raw_spool_compacts_checkpoint_on_reclaim() {
     let dir = tempdir().unwrap();
     let mut opts = options(dir.path());
     opts.max_segment_bytes = 128;
-    let mut spool = RawSpool::open(opts.clone()).unwrap();
+    let mut spool = Spool::open(opts.clone()).unwrap();
 
     let first = spool.append(record(b"first-payload")).unwrap();
     let second = spool.append(record(b"second-payload")).unwrap();
@@ -439,7 +539,7 @@ fn raw_spool_compacts_checkpoint_on_reclaim() {
     assert_eq!(stats.pending_records, 0);
 
     // reopening reflects the compacted checkpoint without re-recovering pruned records
-    let reopened = RawSpool::open(opts).unwrap();
+    let reopened = Spool::open(opts).unwrap();
     assert_eq!(reopened.completed, spool.completed);
     assert_eq!(reopened.recover_pending().unwrap().len(), 0);
 }
@@ -447,7 +547,7 @@ fn raw_spool_compacts_checkpoint_on_reclaim() {
 #[test]
 fn raw_spool_stats_track_pending_incrementally() {
     let dir = tempdir().unwrap();
-    let mut spool = RawSpool::open(options(dir.path())).unwrap();
+    let mut spool = Spool::open(options(dir.path())).unwrap();
 
     let first = spool.append(record(b"first")).unwrap();
     let _second = spool.append(record(b"second")).unwrap();
@@ -469,9 +569,9 @@ fn raw_spool_rejects_records_over_total_byte_limit() {
     let dir = tempdir().unwrap();
     let mut opts = options(dir.path());
     opts.max_total_bytes = 32;
-    let mut spool = RawSpool::open(opts).unwrap();
+    let mut spool = Spool::open(opts).unwrap();
     let err = spool.append(record(b"too-large-for-limit")).unwrap_err();
-    assert!(raw_spool_full_info(&err).is_some(), "{err:?}");
+    assert!(full_info(&err).is_some(), "{err:?}");
 }
 
 #[test]
@@ -479,7 +579,7 @@ fn raw_spool_group_commit_collects_until_record_limit() {
     let (first, _first_rx) = append_command(b"first", 1);
     let (tx, rx) = mpsc::sync_channel(4);
     let (second, _second_rx) = append_command(b"second", 2);
-    tx.send(RawSpoolCommand::Append(second)).unwrap();
+    tx.send(Command::Append(second)).unwrap();
 
     let mut deferred = VecDeque::new();
     let mut batch = vec![first];
@@ -496,8 +596,8 @@ fn raw_spool_append_batch_defers_checkpoint_and_keeps_collecting_appends() {
     let (first, _first_rx) = append_command(b"first", 1);
     let (tx, rx) = mpsc::sync_channel(4);
     let (checkpoint_reply, _checkpoint_rx) = mpsc::channel();
-    tx.send(RawSpoolCommand::Checkpoint(CheckpointCommand {
-        ids: vec![RawSpoolRecordId {
+    tx.send(Command::Checkpoint(CheckpointCommand {
+        ids: vec![RecordId {
             segment: 1,
             sequence: 1,
         }],
@@ -507,7 +607,7 @@ fn raw_spool_append_batch_defers_checkpoint_and_keeps_collecting_appends() {
     }))
     .unwrap();
     let (second, _second_rx) = append_command(b"second", 2);
-    tx.send(RawSpoolCommand::Append(second)).unwrap();
+    tx.send(Command::Append(second)).unwrap();
 
     let mut deferred = VecDeque::new();
     let mut batch = vec![first];
@@ -517,10 +617,7 @@ fn raw_spool_append_batch_defers_checkpoint_and_keeps_collecting_appends() {
     assert_eq!(batch.len(), 2);
     assert_eq!(deferred_checkpoints, 1);
     assert_eq!(deferred.len(), 1);
-    assert!(matches!(
-        deferred.front(),
-        Some(RawSpoolCommand::Checkpoint(_))
-    ));
+    assert!(matches!(deferred.front(), Some(Command::Checkpoint(_))));
 }
 
 #[test]

@@ -9,16 +9,18 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 mod codec;
+mod ingestor;
 #[cfg(test)]
 mod tests;
 mod writer;
 
 use codec::{
     checkpoint_path, encode_prepared_records, open_segment_append, prepare_append_records,
-    read_completed_sequences, scan_segment, segment_ids, segment_path, sync_dir,
-    EncodedRawSpoolRecord, PreparedRawSpoolRecord,
+    read_completed_sequences, scan_segment, segment_ids, segment_path, sync_dir, EncodedRecord,
+    PreparedRecord,
 };
-pub use writer::RawSpoolWriter;
+pub(in crate::ingest) use ingestor::{AppendRef, FlushRef};
+pub use writer::Writer;
 
 const RECORD_MAGIC: &[u8; 8] = b"CSRAW01\n";
 const RECORD_HEADER_BYTES: u64 = 8 + 4 + 8;
@@ -26,13 +28,13 @@ const DEFAULT_MAX_SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
 const DEFAULT_MAX_RECORD_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
-pub struct RawSpoolRecordId {
+pub struct RecordId {
     pub segment: u64,
     pub sequence: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RawSpoolRecord {
+pub struct Record {
     pub signal: Signal,
     pub content_type: String,
     pub content_encoding: Option<String>,
@@ -41,13 +43,13 @@ pub struct RawSpoolRecord {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RecoveredRawSpoolRecord {
-    pub id: RawSpoolRecordId,
-    pub record: RawSpoolRecord,
+pub struct RecoveredRecord {
+    pub id: RecordId,
+    pub record: Record,
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct RawSpoolAppendBatchStats {
+pub struct AppendBatchStats {
     pub records: usize,
     pub encoded_bytes: u64,
     pub queue_seconds: f64,
@@ -63,7 +65,7 @@ pub struct RawSpoolAppendBatchStats {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-pub struct RawSpoolCheckpointBatchStats {
+pub struct CheckpointBatchStats {
     pub records: usize,
     pub commands: usize,
     pub queue_seconds: f64,
@@ -75,33 +77,33 @@ pub struct RawSpoolCheckpointBatchStats {
 }
 
 #[derive(Clone, Debug)]
-pub struct RawSpoolAppendAck {
-    pub id: RawSpoolRecordId,
+pub struct AppendAck {
+    pub id: RecordId,
     pub compressed_body: Vec<u8>,
-    pub batch_stats: Option<RawSpoolAppendBatchStats>,
+    pub batch_stats: Option<AppendBatchStats>,
 }
 
-pub struct RawSpoolAppendBatch {
-    pub ids: Vec<RawSpoolRecordId>,
+pub struct AppendBatch {
+    pub ids: Vec<RecordId>,
     pub compressed_bodies: Vec<Vec<u8>>,
-    pub stats: RawSpoolAppendBatchStats,
+    pub stats: AppendBatchStats,
 }
 
 #[derive(Clone, Copy, Debug)]
-struct AppendedRawSpoolRecord {
-    id: RawSpoolRecordId,
+struct AppendedRecord {
+    id: RecordId,
     body_len: u64,
     written: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-pub struct RawSpoolAppendSyncStats {
+pub struct AppendSyncStats {
     pub seconds: f64,
     pub file_count: u64,
 }
 
 #[derive(Clone, Debug)]
-pub struct RawSpoolOptions {
+pub struct Options {
     pub dir: PathBuf,
     pub max_segment_bytes: u64,
     pub max_record_bytes: u64,
@@ -112,7 +114,7 @@ pub struct RawSpoolOptions {
     pub checkpoint_fsync_delay: Duration,
 }
 
-impl RawSpoolOptions {
+impl Options {
     pub fn new(dir: impl Into<PathBuf>) -> Self {
         Self {
             dir: dir.into(),
@@ -128,7 +130,7 @@ impl RawSpoolOptions {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
-pub struct RawSpoolStats {
+pub struct Stats {
     pub segment_count: usize,
     pub segment_bytes: u64,
     pub pending_records: usize,
@@ -156,12 +158,12 @@ pub struct RawSpoolStats {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct RawSpoolFull {
+pub struct Full {
     pub required_bytes: u64,
     pub max_bytes: u64,
 }
 
-impl std::fmt::Display for RawSpoolFull {
+impl std::fmt::Display for Full {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
@@ -171,7 +173,7 @@ impl std::fmt::Display for RawSpoolFull {
     }
 }
 
-impl std::error::Error for RawSpoolFull {}
+impl std::error::Error for Full {}
 
 #[derive(Clone, Copy, Debug, Default)]
 struct SegmentState {
@@ -181,14 +183,15 @@ struct SegmentState {
     seq_hi: u64,
 }
 
-pub struct RawSpool {
+pub struct Spool {
     dir: PathBuf,
+    signal_label: String,
     max_segment_bytes: u64,
     max_record_bytes: u64,
     max_total_bytes: u64,
     completed: BTreeSet<u64>,
     segments: BTreeMap<u64, SegmentState>,
-    pending: BTreeMap<RawSpoolRecordId, u64>,
+    pending: BTreeMap<RecordId, u64>,
     total_segment_bytes: u64,
     total_pending_bytes: u64,
     active_segment: u64,
@@ -214,8 +217,8 @@ pub struct RawSpool {
     fail_next_append_sync: bool,
 }
 
-impl RawSpool {
-    pub fn open(options: RawSpoolOptions) -> Result<Self> {
+impl Spool {
+    pub fn open(options: Options) -> Result<Self> {
         let max_segment_bytes = options.max_segment_bytes.max(RECORD_HEADER_BYTES + 1);
         let max_record_bytes = options.max_record_bytes.max(1);
         let max_total_bytes = options.max_total_bytes.max(1);
@@ -303,8 +306,18 @@ impl RawSpool {
             .open(&checkpoint_path)
             .with_context(|| format!("open raw spool checkpoint {}", checkpoint_path.display()))?;
 
+        // The spool directory's final component is the signal name (see
+        // `spawn_raw_spool_writer`), so derive a stable label for diagnostics
+        // without threading a `Signal` through `Options`.
+        let signal_label = options
+            .dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("unknown")
+            .to_string();
         Ok(Self {
             dir: options.dir,
+            signal_label,
             max_segment_bytes,
             max_record_bytes,
             max_total_bytes,
@@ -337,7 +350,7 @@ impl RawSpool {
         })
     }
 
-    pub fn append(&mut self, record: RawSpoolRecord) -> Result<RawSpoolRecordId> {
+    pub fn append(&mut self, record: Record) -> Result<RecordId> {
         self.append_batch(vec![record]).map(|batch| {
             batch
                 .ids
@@ -347,15 +360,12 @@ impl RawSpool {
         })
     }
 
-    pub fn append_batch(&mut self, records: Vec<RawSpoolRecord>) -> Result<RawSpoolAppendBatch> {
+    pub fn append_batch(&mut self, records: Vec<Record>) -> Result<AppendBatch> {
         let prepared = prepare_append_records(records, self.max_record_bytes)?;
         self.append_prepared_batch(prepared)
     }
 
-    fn append_prepared_batch(
-        &mut self,
-        records: Vec<PreparedRawSpoolRecord>,
-    ) -> Result<RawSpoolAppendBatch> {
+    fn append_prepared_batch(&mut self, records: Vec<PreparedRecord>) -> Result<AppendBatch> {
         let base_sequence = self.next_sequence;
         let encode_started = Instant::now();
         let (encoded, compressed_bodies) = encode_prepared_records(records, base_sequence)?;
@@ -367,16 +377,13 @@ impl RawSpool {
         Ok(appended)
     }
 
-    fn append_encoded_batch(
-        &mut self,
-        encoded: Vec<EncodedRawSpoolRecord>,
-    ) -> Result<RawSpoolAppendBatch> {
+    fn append_encoded_batch(&mut self, encoded: Vec<EncodedRecord>) -> Result<AppendBatch> {
         self.ensure_healthy()?;
         if encoded.is_empty() {
-            return Ok(RawSpoolAppendBatch {
+            return Ok(AppendBatch {
                 ids: Vec::new(),
                 compressed_bodies: Vec::new(),
-                stats: RawSpoolAppendBatchStats {
+                stats: AppendBatchStats {
                     records: 0,
                     encoded_bytes: 0,
                     queue_seconds: 0.0,
@@ -403,7 +410,7 @@ impl RawSpool {
             required_bytes = self.total_segment_bytes.saturating_add(encoded_bytes);
         }
         if required_bytes > self.max_total_bytes {
-            return Err(RawSpoolFull {
+            return Err(Full {
                 required_bytes,
                 max_bytes: self.max_total_bytes,
             }
@@ -425,13 +432,13 @@ impl RawSpool {
                 self.flush_append_group(&mut group, &mut group_records, &mut write_seconds)?;
                 self.rotate()?;
             }
-            let id = RawSpoolRecordId {
+            let id = RecordId {
                 segment: self.active_segment,
                 sequence: record.sequence,
             };
             let written = record.bytes.len() as u64;
             group.extend_from_slice(&record.bytes);
-            group_records.push(AppendedRawSpoolRecord {
+            group_records.push(AppendedRecord {
                 id,
                 body_len: record.body_len,
                 written,
@@ -439,8 +446,8 @@ impl RawSpool {
             ids.push(id);
         }
         self.flush_append_group(&mut group, &mut group_records, &mut write_seconds)?;
-        Ok(RawSpoolAppendBatch {
-            stats: RawSpoolAppendBatchStats {
+        Ok(AppendBatch {
+            stats: AppendBatchStats {
                 records: ids.len(),
                 encoded_bytes,
                 queue_seconds: 0.0,
@@ -462,7 +469,7 @@ impl RawSpool {
     fn flush_append_group(
         &mut self,
         group: &mut Vec<u8>,
-        records: &mut Vec<AppendedRawSpoolRecord>,
+        records: &mut Vec<AppendedRecord>,
         write_seconds: &mut f64,
     ) -> Result<()> {
         if records.is_empty() {
@@ -480,7 +487,7 @@ impl RawSpool {
         Ok(())
     }
 
-    fn record_appended(&mut self, record: AppendedRawSpoolRecord) {
+    fn record_appended(&mut self, record: AppendedRecord) {
         let state = self
             .segments
             .get_mut(&record.id.segment)
@@ -497,8 +504,8 @@ impl RawSpool {
         self.mark_append_dirty(record.id.segment, record.written);
     }
 
-    pub fn stats(&self) -> Result<RawSpoolStats> {
-        Ok(RawSpoolStats {
+    pub fn stats(&self) -> Result<Stats> {
+        Ok(Stats {
             segment_count: self.segments.len(),
             segment_bytes: self.total_segment_bytes,
             pending_records: self.pending.len(),
@@ -519,7 +526,7 @@ impl RawSpool {
         })
     }
 
-    pub fn recover_pending(&self) -> Result<Vec<RecoveredRawSpoolRecord>> {
+    pub fn recover_pending(&self) -> Result<Vec<RecoveredRecord>> {
         let mut pending = Vec::new();
         for segment in self.segments.keys() {
             let path = segment_path(&self.dir, *segment);
@@ -534,11 +541,11 @@ impl RawSpool {
         Ok(pending)
     }
 
-    pub fn mark_committed(&mut self, id: RawSpoolRecordId) -> Result<()> {
+    pub fn mark_committed(&mut self, id: RecordId) -> Result<()> {
         self.mark_committed_batch(vec![id])
     }
 
-    pub fn mark_committed_batch(&mut self, ids: Vec<RawSpoolRecordId>) -> Result<()> {
+    pub fn mark_committed_batch(&mut self, ids: Vec<RecordId>) -> Result<()> {
         self.ensure_healthy()?;
         for id in ids {
             if !self.completed.insert(id.sequence) {
@@ -589,7 +596,7 @@ impl RawSpool {
             .map(|started| self.append_sync_interval.saturating_sub(started.elapsed()))
     }
 
-    fn sync_append_if_due(&mut self, force: bool) -> Result<Option<RawSpoolAppendSyncStats>> {
+    fn sync_append_if_due(&mut self, force: bool) -> Result<Option<AppendSyncStats>> {
         if self.append_dirty_records == 0 {
             return Ok(None);
         }
@@ -605,10 +612,10 @@ impl RawSpool {
         Ok(None)
     }
 
-    fn sync_append(&mut self) -> Result<RawSpoolAppendSyncStats> {
+    fn sync_append(&mut self) -> Result<AppendSyncStats> {
         self.ensure_healthy()?;
         if self.append_dirty_records == 0 {
-            return Ok(RawSpoolAppendSyncStats::default());
+            return Ok(AppendSyncStats::default());
         }
         let started = Instant::now();
         let dirty_segments = self
@@ -652,7 +659,7 @@ impl RawSpool {
                 self.append_sync_file_fsyncs_total = self
                     .append_sync_file_fsyncs_total
                     .saturating_add(file_count);
-                Ok(RawSpoolAppendSyncStats {
+                Ok(AppendSyncStats {
                     seconds: started.elapsed().as_secs_f64(),
                     file_count,
                 })
@@ -660,6 +667,21 @@ impl RawSpool {
             Err(err) => {
                 self.append_sync_failures_total = self.append_sync_failures_total.saturating_add(1);
                 let message = err.to_string();
+                // Log loudly on first transition into the fatal latch so the
+                // wedged signal is visible in logs, not just the
+                // `canardstack_raw_spool_healthy` gauge / readiness probe.
+                // TODO(M4): supervised writer restart — recovery (clearing the
+                // latch on a later successful append+fsync) would go here, but a
+                // self-healing retry path is intentionally deferred to avoid
+                // weakening the durability contract or reopening files mid-flight.
+                if self.fatal_error.is_none() {
+                    tracing::error!(
+                        event = "raw_spool_writer_fatal",
+                        signal = self.signal_label.as_str(),
+                        error = %message,
+                        "raw spool writer entered fatal state; appends for this signal will 503 until restart"
+                    );
+                }
                 self.fatal_error = Some(message.clone());
                 Err(anyhow::anyhow!(message))
             }
@@ -709,11 +731,11 @@ impl RawSpool {
     }
 
     fn segment_has_pending(&self, segment: u64) -> bool {
-        let lo = RawSpoolRecordId {
+        let lo = RecordId {
             segment,
             sequence: 0,
         };
-        let hi = RawSpoolRecordId {
+        let hi = RecordId {
             segment,
             sequence: u64::MAX,
         };
@@ -787,17 +809,34 @@ impl RawSpool {
         Ok(())
     }
 
+    /// Force the writer into the fatal/unhealthy latch. Drives the same
+    /// observable state as a genuine append/fsync failure (latched
+    /// `fatal_error`, `healthy=false`, loud first-transition log) so tests can
+    /// exercise readiness wiring without provoking real disk I/O failures.
+    #[doc(hidden)]
+    pub(super) fn inject_fatal(&mut self, message: String) {
+        if self.fatal_error.is_none() {
+            tracing::error!(
+                event = "raw_spool_writer_fatal",
+                signal = self.signal_label.as_str(),
+                error = %message,
+                "raw spool writer entered fatal state; appends for this signal will 503 until restart"
+            );
+        }
+        self.fatal_error = Some(message);
+    }
+
     #[cfg(test)]
     fn fail_next_append_sync(&mut self) {
         self.fail_next_append_sync = true;
     }
 }
 
-pub fn raw_spool_full_info(err: &anyhow::Error) -> Option<&RawSpoolFull> {
-    err.downcast_ref::<RawSpoolFull>()
+pub fn full_info(err: &anyhow::Error) -> Option<&Full> {
+    err.downcast_ref::<Full>()
 }
 
-impl RawSpoolRecord {
+impl Record {
     pub fn new(
         signal: Signal,
         content_type: impl Into<String>,
