@@ -984,6 +984,11 @@ fn freshness_budget_rejects_before_raw_spool_append() {
     config.freshness_budget_sla = StdDuration::from_millis(1);
     config.seal_rate_seed_window = StdDuration::from_secs(1);
     config.seal_rate_seed_bytes = 1_000;
+    // The observed seal-rate EWMA is seeded from max(seal-rate seed,
+    // target/max-age); pin the buffer drain rate to the same 1000 B/s so the
+    // tiny incoming log still projects over the 1ms freshness budget.
+    config.arrow_write_buffer_target_bytes = 1_000;
+    config.arrow_write_buffer_max_age = StdDuration::from_secs(1);
     let state = AppState::new(config).unwrap();
     let body = log_fixture(Utc::now().timestamp_nanos_opt().unwrap()).to_string();
     let response = http::route(

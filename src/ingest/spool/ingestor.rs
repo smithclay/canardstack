@@ -137,7 +137,7 @@ impl Ingestor {
             anyhow::bail!("storage dependency is unhealthy");
         }
         let inflight_reservation = self
-            .reserve_inflight(
+            .admit_and_reserve_inflight(
                 route,
                 &headers,
                 compressed_body.len(),

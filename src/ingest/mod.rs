@@ -144,7 +144,7 @@ impl Ingestor {
             )
             .with_retry_after(10));
         }
-        let inflight_reservation = match self.reserve_inflight(
+        let inflight_reservation = match self.admit_and_reserve_inflight(
             route,
             headers,
             compressed_body.len(),
@@ -527,7 +527,7 @@ impl Ingestor {
     /// budget (the freshness-first authority), then take a per-storage-signal
     /// in-flight reservation as a cheap isolation ceiling. Both run before the
     /// durable raw-spool append, so a rejection never spools.
-    fn reserve_inflight(
+    fn admit_and_reserve_inflight(
         &self,
         route: OtlpRequestKind,
         headers: &HashMap<String, String>,
@@ -646,10 +646,6 @@ impl Ingestor {
         FreshnessBudgetInputs {
             inflight_bytes: self.inflight_bytes(),
             incoming_bytes: 0,
-            // Admitted bytes move straight from the worker into the Arrow write
-            // buffer; there is no separate in-memory queue to age out, so queue
-            // dwell is zero and buffer age is carried by oldest_buffer_age_seconds.
-            oldest_queue_age_seconds: 0.0,
             buffered_bytes,
             buffered_active_count,
             oldest_buffer_age_seconds,

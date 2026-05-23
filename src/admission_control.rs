@@ -1,3 +1,36 @@
+//! Freshness-first admission control.
+//!
+//! Every admission decision is driven by one projection of how far behind the
+//! seal pipeline is, expressed in seconds of expected query-visibility delay:
+//!
+//! ```text
+//! projected_seal_seconds   = (inflight_bytes + incoming_bytes) / observed_seal_rate
+//! projected_buffer_seconds = buffer_size_debt + buffer_age_debt
+//!     buffer_size_debt = max(0, buffered_bytes - target*active) / observed_seal_rate
+//!     buffer_age_debt  = max(0, oldest_buffer_age - buffer_max_age)
+//! projected_visibility_seconds = max(projected_seal_seconds, projected_buffer_seconds)
+//! ```
+//!
+//! `observed_seal_rate` is a single EWMA of measured seal throughput
+//! (`ewma_seal_bytes_per_second`), seeded from `max(seal_rate_seed, target/max_age)`
+//! and used by BOTH the seal debt and the buffer-size debt so the two terms
+//! share one drain estimate.
+//!
+//! The projection feeds a single freshness band, relative to the configured SLA
+//! (`freshness_budget_sla_seconds`):
+//!
+//! - Ingest is admitted while projected visibility stays under 0.95x the SLA
+//!   ([`FreshnessModel::INGEST_FRESHNESS_BUDGET_FRACTION`]), tightened to 0.90x
+//!   while a heavy query is in flight
+//!   ([`FreshnessModel::INGEST_FRESHNESS_BUDGET_WITH_HEAVY_FRACTION`]); over the
+//!   budget it returns 429.
+//! - Heavy queries keep full capacity below the SLA, degrade to reduced capacity
+//!   at >= 1.0x the SLA ([`FreshnessModel::HEAVY_QUERY_DEGRADE_FRACTION`]), and
+//!   are rejected outright at >= 1.5x the SLA
+//!   ([`FreshnessModel::HEAVY_QUERY_REJECT_FRACTION`]).
+//! - Cheap queries keep protected admission and seal capacity is reserved ahead
+//!   of all query capacity.
+
 use crate::config::Config;
 use crate::metrics::Metrics;
 use crate::validation::{ApiError, ApiResult};
@@ -6,11 +39,27 @@ use serde::Serialize;
 use std::sync::Mutex;
 use std::time::Instant;
 
-const EWMA_ALPHA: f64 = 0.20;
-const HEAVY_QUERY_DEGRADE_FRACTION: f64 = 1.00;
-const HEAVY_QUERY_REJECT_FRACTION: f64 = 1.50;
-const INGEST_FRESHNESS_BUDGET_FRACTION: f64 = 0.95;
-const INGEST_FRESHNESS_BUDGET_WITH_HEAVY_FRACTION: f64 = 0.90;
+/// Compile-time tuning of the freshness projection and admission band.
+///
+/// These are deliberately constants, not config knobs: they define the SHAPE of
+/// the band, not an operator-tunable budget. The band, in plain language:
+/// ingest accepts while projected visibility stays under 0.95x the SLA (0.90x
+/// when a heavy query is in flight); heavy queries degrade to reduced capacity
+/// at >= 1.0x the SLA and are rejected outright at >= 1.5x the SLA.
+struct FreshnessModel;
+
+impl FreshnessModel {
+    /// Smoothing factor for the observed seal-rate EWMA.
+    const EWMA_ALPHA: f64 = 0.20;
+    /// Heavy queries degrade to reduced capacity at >= this multiple of the SLA.
+    const HEAVY_QUERY_DEGRADE_FRACTION: f64 = 1.00;
+    /// Heavy queries are rejected outright at >= this multiple of the SLA.
+    const HEAVY_QUERY_REJECT_FRACTION: f64 = 1.50;
+    /// Ingest headroom: accept while projected visibility < this multiple of SLA.
+    const INGEST_FRESHNESS_BUDGET_FRACTION: f64 = 0.95;
+    /// Tighter ingest headroom while a heavy query is in flight.
+    const INGEST_FRESHNESS_BUDGET_WITH_HEAVY_FRACTION: f64 = 0.90;
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum QueryClass {
@@ -31,7 +80,6 @@ impl QueryClass {
 pub struct FreshnessBudgetInputs {
     pub inflight_bytes: usize,
     pub incoming_bytes: usize,
-    pub oldest_queue_age_seconds: f64,
     pub buffered_bytes: usize,
     pub buffered_active_count: usize,
     pub oldest_buffer_age_seconds: f64,
@@ -66,7 +114,6 @@ pub struct AdmissionController {
     freshness_budget_sla_seconds: f64,
     visibility_buffer_target_bytes: usize,
     visibility_buffer_max_age_seconds: f64,
-    visibility_seal_bytes_per_second: f64,
 }
 
 #[derive(Debug)]
@@ -101,10 +148,15 @@ impl AdmissionController {
             .heavy_query_degraded_capacity
             .min(heavy_query_capacity)
             .max(1);
-        let initial_seal_bytes_per_second = config.seal_rate_seed_bytes as f64
+        // Seed the single observed seal-rate EWMA from the larger of the seed
+        // rate and the target/max-age drain rate, so the buffer-size debt (which
+        // also divides by this EWMA, see update_projection_locked) starts no
+        // slower than the static drain target.
+        let seal_rate_seed_rate = config.seal_rate_seed_bytes as f64
             / config.seal_rate_seed_window.as_secs_f64().max(0.001);
-        let visibility_seal_bytes_per_second = config.arrow_write_buffer_target_bytes as f64
+        let visibility_drain_rate = config.arrow_write_buffer_target_bytes as f64
             / config.arrow_write_buffer_max_age.as_secs_f64().max(0.001);
+        let initial_seal_bytes_per_second = seal_rate_seed_rate.max(visibility_drain_rate);
         Self {
             inner: Mutex::new(AdmissionState {
                 seal_active: 0,
@@ -126,7 +178,6 @@ impl AdmissionController {
             freshness_budget_sla_seconds: config.freshness_budget_sla.as_secs_f64(),
             visibility_buffer_target_bytes: config.arrow_write_buffer_target_bytes.max(1),
             visibility_buffer_max_age_seconds: config.arrow_write_buffer_max_age.as_secs_f64(),
-            visibility_seal_bytes_per_second: visibility_seal_bytes_per_second.max(1.0),
         }
     }
 
@@ -215,9 +266,9 @@ impl AdmissionController {
         let mut state = self.inner.lock_or_poisoned();
         self.update_projection_locked(&mut state, inputs);
         let budget_fraction = if state.heavy_query_active > 0 {
-            INGEST_FRESHNESS_BUDGET_WITH_HEAVY_FRACTION
+            FreshnessModel::INGEST_FRESHNESS_BUDGET_WITH_HEAVY_FRACTION
         } else {
-            INGEST_FRESHNESS_BUDGET_FRACTION
+            FreshnessModel::INGEST_FRESHNESS_BUDGET_FRACTION
         };
         let budget = self.freshness_budget_sla_seconds * budget_fraction;
         if state.projected_visibility_seconds > budget {
@@ -267,8 +318,8 @@ impl AdmissionController {
         }
         let observed = bytes as f64 / seconds.max(0.001);
         let mut state = self.inner.lock_or_poisoned();
-        state.ewma_seal_bytes_per_second =
-            EWMA_ALPHA * observed + (1.0 - EWMA_ALPHA) * state.ewma_seal_bytes_per_second;
+        state.ewma_seal_bytes_per_second = FreshnessModel::EWMA_ALPHA * observed
+            + (1.0 - FreshnessModel::EWMA_ALPHA) * state.ewma_seal_bytes_per_second;
         drop(state);
         self.record_metrics(metrics, FreshnessBudgetInputs::default());
     }
@@ -363,7 +414,7 @@ impl AdmissionController {
 
     fn effective_heavy_capacity_locked(&self, state: &AdmissionState) -> usize {
         if state.projected_visibility_seconds
-            >= self.freshness_budget_sla_seconds * HEAVY_QUERY_DEGRADE_FRACTION
+            >= self.freshness_budget_sla_seconds * FreshnessModel::HEAVY_QUERY_DEGRADE_FRACTION
         {
             self.heavy_query_degraded_capacity
         } else {
@@ -373,27 +424,26 @@ impl AdmissionController {
 
     fn freshness_at_risk_locked(&self, state: &AdmissionState) -> bool {
         state.projected_visibility_seconds
-            >= self.freshness_budget_sla_seconds * HEAVY_QUERY_REJECT_FRACTION
+            >= self.freshness_budget_sla_seconds * FreshnessModel::HEAVY_QUERY_REJECT_FRACTION
     }
 
     fn update_projection_locked(&self, state: &mut AdmissionState, inputs: FreshnessBudgetInputs) {
         let projected_bytes = inputs.inflight_bytes.saturating_add(inputs.incoming_bytes);
         state.projected_seal_seconds =
             projected_bytes as f64 / state.ewma_seal_bytes_per_second.max(1.0);
-        let queue_visibility_seconds =
-            inputs.oldest_queue_age_seconds + state.projected_seal_seconds;
         let allowed_buffer_bytes = self
             .visibility_buffer_target_bytes
             .saturating_mul(inputs.buffered_active_count);
         let excess_buffer_bytes = inputs.buffered_bytes.saturating_sub(allowed_buffer_bytes);
+        // Buffer-size debt drains at the same observed seal rate as seal debt.
         let buffer_size_debt_seconds =
-            excess_buffer_bytes as f64 / self.visibility_seal_bytes_per_second.max(1.0);
+            excess_buffer_bytes as f64 / state.ewma_seal_bytes_per_second.max(1.0);
         let buffer_age_debt_seconds =
             (inputs.oldest_buffer_age_seconds - self.visibility_buffer_max_age_seconds).max(0.0);
         state.projected_buffer_seconds = buffer_size_debt_seconds + buffer_age_debt_seconds;
-        let buffer_visibility_seconds = state.projected_buffer_seconds;
-        state.projected_visibility_seconds =
-            queue_visibility_seconds.max(buffer_visibility_seconds);
+        state.projected_visibility_seconds = state
+            .projected_seal_seconds
+            .max(state.projected_buffer_seconds);
     }
 }
 
@@ -402,7 +452,6 @@ impl Default for FreshnessBudgetInputs {
         Self {
             inflight_bytes: 0,
             incoming_bytes: 0,
-            oldest_queue_age_seconds: 0.0,
             buffered_bytes: 0,
             buffered_active_count: 0,
             oldest_buffer_age_seconds: 0.0,
@@ -554,7 +603,6 @@ mod tests {
         let inputs = FreshnessBudgetInputs {
             inflight_bytes: 16_000,
             incoming_bytes: 0,
-            oldest_queue_age_seconds: 0.0,
             ..FreshnessBudgetInputs::default()
         };
         let err = match admission.reserve_query(QueryClass::Heavy, inputs, &metrics) {
@@ -573,7 +621,6 @@ mod tests {
         let inputs = FreshnessBudgetInputs {
             inflight_bytes: 16_000,
             incoming_bytes: 0,
-            oldest_queue_age_seconds: 0.0,
             ..FreshnessBudgetInputs::default()
         };
 
@@ -589,7 +636,6 @@ mod tests {
         let inputs = FreshnessBudgetInputs {
             inflight_bytes: 9_000,
             incoming_bytes: 0,
-            oldest_queue_age_seconds: 0.0,
             ..FreshnessBudgetInputs::default()
         };
 
@@ -608,7 +654,6 @@ mod tests {
         let inputs = FreshnessBudgetInputs {
             inflight_bytes: 12_000,
             incoming_bytes: 0,
-            oldest_queue_age_seconds: 0.0,
             ..FreshnessBudgetInputs::default()
         };
 
@@ -633,7 +678,6 @@ mod tests {
                 FreshnessBudgetInputs {
                     inflight_bytes: 60_000,
                     incoming_bytes: 1,
-                    oldest_queue_age_seconds: 0.0,
                     ..FreshnessBudgetInputs::default()
                 },
                 &metrics,
@@ -654,7 +698,6 @@ mod tests {
                     inflight_bytes: 0,
                     buffered_bytes: 12_000,
                     incoming_bytes: 1,
-                    oldest_queue_age_seconds: 0.0,
                     ..FreshnessBudgetInputs::default()
                 },
                 &metrics,
@@ -676,7 +719,6 @@ mod tests {
                 FreshnessBudgetInputs {
                     inflight_bytes: 0,
                     incoming_bytes: 1,
-                    oldest_queue_age_seconds: 0.0,
                     ..FreshnessBudgetInputs::default()
                 },
                 &metrics,
@@ -695,7 +737,6 @@ mod tests {
                 FreshnessBudgetInputs {
                     inflight_bytes: 1,
                     incoming_bytes: 1,
-                    oldest_queue_age_seconds: 0.0,
                     ..FreshnessBudgetInputs::default()
                 },
                 &metrics,
@@ -704,36 +745,38 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
-    // Golden characterization of admission behavior BEFORE A-refactor.
+    // Golden characterization of admission behavior AFTER A-refactor.
     //
-    // A1 removes the (already-zero) queue term; A2 unifies the buffer-drain
-    // rate to the EWMA -- under A2 the buffer-SIZE-debt scenarios will change
-    // and these expected values must be updated deliberately, with a comment
-    // per change.
+    // A1 removed the (always-zero) queue term; A2 unified the buffer-drain rate
+    // onto the single observed seal EWMA. The two buffer-SIZE-debt rows below
+    // changed accordingly (their projected_buffer halved as the 2000 B/s EWMA
+    // replaced the static 1000 B/s drain rate) and are annotated inline. The
+    // seal-debt and buffer-AGE-debt rows were left unchanged, as A2 required.
     //
-    // The whole point of this grid is to pin the *current* numeric outputs so
-    // the next phase reveals its behavior delta as explicit, reviewed
-    // expected-value edits rather than as a silent shift.
+    // The whole point of this grid is to pin the numeric outputs so future
+    // changes reveal their behavior delta as explicit, reviewed expected-value
+    // edits rather than as a silent shift.
     // ---------------------------------------------------------------------
     mod characterization {
         use super::*;
 
         const EPSILON: f64 = 1e-6;
 
-        /// A characterization controller wired with DIVERGENT byte-rate
-        /// estimates so the upcoming A2 rate-unification is observable:
+        /// A characterization controller whose seed config DIVERGED across the
+        /// two former byte-rate estimates, which is what made A2's unification
+        /// observable:
         ///
-        /// - EWMA seal rate = `seal_rate_seed_bytes / seal_rate_seed_window` =
-        ///   2000 / 1s = 2000 B/s (drives `projected_seal`).
-        /// - static buffer rate = `arrow_write_buffer_target_bytes / max_age` =
-        ///   1000 / 1s = 1000 B/s (drives buffer-SIZE debt).
+        /// - seed seal rate = `seal_rate_seed_bytes / seal_rate_seed_window` =
+        ///   2000 / 1s = 2000 B/s.
+        /// - target/max-age drain rate = `arrow_write_buffer_target_bytes /
+        ///   max_age` = 1000 / 1s = 1000 B/s.
         ///
-        /// These rates intentionally DIFFER (2000 vs 1000). Buffer-size debt
-        /// today divides by the static 1000 B/s rate; A2 will make it divide by
-        /// the observed 2000 B/s EWMA instead. The buffer-SIZE-debt scenarios
-        /// below therefore characterize exactly the term A2 changes, while the
-        /// seal-debt and buffer-AGE-debt scenarios characterize terms A2 must
-        /// leave alone.
+        /// Pre-A2, seal debt divided by 2000 B/s (the EWMA) while buffer-SIZE
+        /// debt divided by the static 1000 B/s. Post-A2 there is ONE rate: the
+        /// EWMA seeded from `max(2000, 1000) = 2000 B/s`, used by both debts. So
+        /// the buffer-SIZE-debt rows now divide by 2000 instead of 1000 (their
+        /// debt halves), while the seal-debt and buffer-AGE-debt rows are
+        /// unaffected.
         ///
         /// Capacity math for this config (concurrency=4, seal=1, cheap=1,
         /// degraded=1): heavy full capacity = 4 - (1 + 1) = 2, heavy degraded
@@ -744,10 +787,12 @@ mod tests {
             let mut config = Config::test(dir.path().join("canardstack.duckdb"));
             config.query_interactive.concurrency = 4;
             config.freshness_budget_sla = std::time::Duration::from_secs(10);
-            // EWMA seal rate = 2000 / 1s = 2000 B/s.
+            // Seed seal rate = 2000 / 1s = 2000 B/s; post-A2 this is the single
+            // observed rate (seeded from max(2000, target/max-age=1000)).
             config.seal_rate_seed_bytes = 2_000;
             config.seal_rate_seed_window = std::time::Duration::from_secs(1);
-            // Static buffer-drain rate = 1000 / 1s = 1000 B/s (diverges from EWMA).
+            // target/max-age = 1000 / 1s = 1000 B/s; pre-A2 this drove buffer
+            // size debt, post-A2 it only floors the EWMA seed (max wins -> 2000).
             config.arrow_write_buffer_target_bytes = 1_000;
             config.arrow_write_buffer_max_age = std::time::Duration::from_secs(1);
             AdmissionController::new(&config)
@@ -768,9 +813,8 @@ mod tests {
 
         struct Scenario {
             label: &'static str,
-            // Inputs. `oldest_queue_age_seconds` is intentionally pinned at the
-            // Default (0.0): A1 removes that field and this grid must stay valid
-            // through it, so it is never set here.
+            // Inputs. A1 removed the always-zero queue-age input; this grid
+            // intentionally never relied on it.
             inflight_bytes: usize,
             incoming_bytes: usize,
             buffered_bytes: usize,
@@ -792,8 +836,6 @@ mod tests {
                     buffered_bytes: self.buffered_bytes,
                     buffered_active_count: self.buffered_active_count,
                     oldest_buffer_age_seconds: self.oldest_buffer_age_seconds,
-                    // Pinned at Default; never varied (see struct comment / A1).
-                    ..FreshnessBudgetInputs::default()
                 }
             }
         }
@@ -872,10 +914,11 @@ mod tests {
         // Each row is independent: a fresh controller is built per assertion so
         // accumulated counters / EWMA drift cannot leak between rows.
         //
-        // FLIP-UNDER-A2 marker: rows whose projected_buffer is driven by SIZE
-        // debt (excess bytes / drain rate) will change once A2 swaps the 1000
-        // B/s static rate for the 2000 B/s EWMA. Rows driven by seal debt or
-        // buffer-AGE debt must stay fixed.
+        // A2 history: the two rows whose projected_buffer is driven by SIZE debt
+        // (excess bytes / drain rate) changed when A2 swapped the static 1000
+        // B/s rate for the single observed 2000 B/s EWMA -- they are annotated
+        // "CHANGED BY A2" inline. Rows driven by seal debt or buffer-AGE debt
+        // were unaffected.
         fn scenarios() -> Vec<Scenario> {
             vec![
                 // idle: everything ~0. Stays fixed under A2.
@@ -910,8 +953,11 @@ mod tests {
                 },
                 // buffer-SIZE-debt dominated (age small): buffered 5000 with 1
                 // active slot -> allowed = 1000, excess = 4000.
-                // buffer_size_debt = 4000 / 1000 (STATIC) = 4.0s today.
-                // FLIP-UNDER-A2: A2 divides by 2000 -> 2.0s. visibility flips too.
+                // CHANGED BY A2: buffer-size debt now divides by the single
+                // observed seal rate (EWMA 2000 B/s) instead of the static
+                // 1000 B/s drain rate, so 4000 / 2000 = 2.0s (was 4.0s);
+                // visibility tracks it to 2.0s. Decisions unchanged (still
+                // Accept / AcceptFull, well under the band).
                 Scenario {
                     label: "buffer_size_debt_dominated",
                     inflight_bytes: 0,
@@ -922,8 +968,8 @@ mod tests {
                     expected_ingest: IngestOutcome::Accept,
                     expected_heavy: HeavyOutcome::AcceptFull,
                     expected_projected_seal_seconds: 0.0,
-                    expected_projected_buffer_seconds: 4.0,
-                    expected_projected_visibility_seconds: 4.0,
+                    expected_projected_buffer_seconds: 2.0,
+                    expected_projected_visibility_seconds: 2.0,
                 },
                 // buffer-AGE-debt dominated (small bytes, large age): bytes within
                 // allowance so size debt = 0; age 6s - max_age 1s = 5.0s.
@@ -1006,11 +1052,14 @@ mod tests {
                     expected_projected_buffer_seconds: 0.0,
                     expected_projected_visibility_seconds: 16.0,
                 },
-                // buffer-SIZE-debt pushed into the heavy-reject band via the
-                // STATIC drain rate. buffered 17000 over 1 slot -> excess 16000,
-                // size debt = 16000 / 1000 = 16.0s -> heavy rejects today.
-                // FLIP-UNDER-A2: A2 divides by 2000 -> 8.0s, which is below
-                // 1.0*sla, so heavy would accept FULL and ingest would accept.
+                // buffer-SIZE-debt that USED to be pushed into the heavy-reject
+                // band by the static drain rate. buffered 17000 over 1 slot ->
+                // excess 16000.
+                // CHANGED BY A2: dividing by the single observed seal rate (EWMA
+                // 2000 B/s) instead of the static 1000 B/s halves the size debt:
+                // 16000 / 2000 = 8.0s (was 16.0s). 8.0s is below the 0.95*sla
+                // ingest budget (9.5s) and below 1.0*sla (10s), so the decisions
+                // FLIP: ingest Reject -> Accept and heavy Reject -> AcceptFull.
                 // This row is the sharpest A2 signal.
                 Scenario {
                     label: "buffer_size_debt_into_reject_band",
@@ -1019,11 +1068,11 @@ mod tests {
                     buffered_bytes: 17_000,
                     buffered_active_count: 1,
                     oldest_buffer_age_seconds: 0.0,
-                    expected_ingest: IngestOutcome::RejectFreshnessBudget,
-                    expected_heavy: HeavyOutcome::RejectFreshnessDebt,
+                    expected_ingest: IngestOutcome::Accept,
+                    expected_heavy: HeavyOutcome::AcceptFull,
                     expected_projected_seal_seconds: 0.0,
-                    expected_projected_buffer_seconds: 16.0,
-                    expected_projected_visibility_seconds: 16.0,
+                    expected_projected_buffer_seconds: 8.0,
+                    expected_projected_visibility_seconds: 8.0,
                 },
             ]
         }
