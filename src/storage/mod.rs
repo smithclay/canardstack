@@ -204,23 +204,24 @@ struct PreparedArrowBatch {
 
 impl Storage {
     pub fn open(config: &Config) -> Result<Self> {
-        if let Some(parent) = config.duckdb_path.parent() {
+        if let Some(parent) = config.operator.duckdb_path.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::create_dir_all(&config.local_storage_dir)?;
+        fs::create_dir_all(&config.operator.local_storage_dir)?;
 
-        let writer = Connection::open(&config.duckdb_path)
-            .with_context(|| format!("open DuckDB file {}", config.duckdb_path.display()))?;
+        let writer = Connection::open(&config.operator.duckdb_path).with_context(|| {
+            format!("open DuckDB file {}", config.operator.duckdb_path.display())
+        })?;
         configure_base_connection(&writer)?;
-        configure_write_connection(&writer, &config.duckdb_write_memory_limit)?;
+        configure_write_connection(&writer, &config.operator.duckdb_write_memory_limit)?;
 
         attach_ducklake_connection(
             &writer,
-            config.postgres_dsn.as_deref(),
-            config.ducklake_attach_uri.as_deref(),
-            &config.duckdb_path,
-            &config.local_storage_dir,
-            config.duckdb_extension_dir.as_deref(),
+            config.operator.postgres_dsn.as_deref(),
+            config.operator.ducklake_attach_uri.as_deref(),
+            &config.operator.duckdb_path,
+            &config.operator.local_storage_dir,
+            config.operator.duckdb_extension_dir.as_deref(),
         )
         .context(
             "DuckLake attach failed. Fix the catalog config (URI, token, network, or extension path) and restart.",
@@ -248,14 +249,14 @@ impl Storage {
             ducklake_available: true,
             #[cfg(debug_assertions)]
             force_dependency_unhealthy: AtomicBool::new(false),
-            postgres_catalog_configured: config.postgres_dsn.is_some(),
-            local_storage_dir: config.local_storage_dir.clone(),
+            postgres_catalog_configured: config.operator.postgres_dsn.is_some(),
+            local_storage_dir: config.operator.local_storage_dir.clone(),
             ducklake_required: true,
             ducklake_managed_maintenance,
-            arrow_write_buffer_target_bytes: config.arrow_write_buffer_target_bytes,
-            arrow_write_buffer_max_age: config.arrow_write_buffer_max_age,
+            arrow_write_buffer_target_bytes: config.mechanics.arrow_write_buffer_target_bytes,
+            arrow_write_buffer_max_age: config.mechanics.arrow_write_buffer_max_age,
             arrow_write_buffers: Mutex::new(BTreeMap::new()),
-            write_memory_limit: config.duckdb_write_memory_limit.clone(),
+            write_memory_limit: config.operator.duckdb_write_memory_limit.clone(),
             last_error: Mutex::new(None),
             metadata_generation: AtomicU64::new(0),
             dirty_metadata: Mutex::new(BTreeMap::new()),

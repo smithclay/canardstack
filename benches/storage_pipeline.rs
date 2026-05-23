@@ -45,6 +45,7 @@ fn run() -> Result<()> {
         args.rows,
         args.iterations,
         config
+            .operator
             .duckdb_path
             .parent()
             .unwrap_or_else(|| std::path::Path::new("."))
@@ -96,16 +97,16 @@ fn storage_config(args: &Args) -> Result<(Config, Option<TempDir>)> {
         std::fs::create_dir_all(data_dir)
             .with_context(|| format!("create data dir {}", data_dir.display()))?;
         let mut config = Config::test(data_dir.join("canardstack.duckdb"));
-        config.local_storage_dir = data_dir.join("storage");
-        config.arrow_write_buffer_target_bytes = args.arrow_buffer_target_bytes;
-        config.arrow_write_buffer_max_age = Duration::from_secs(3_600);
+        config.operator.local_storage_dir = data_dir.join("storage");
+        config.mechanics.arrow_write_buffer_target_bytes = args.arrow_buffer_target_bytes;
+        config.mechanics.arrow_write_buffer_max_age = Duration::from_secs(3_600);
         return Ok((config, None));
     }
 
     let tempdir = tempfile::tempdir().context("create temporary storage benchmark dir")?;
     let mut config = Config::test(tempdir.path().join("canardstack.duckdb"));
-    config.arrow_write_buffer_target_bytes = args.arrow_buffer_target_bytes;
-    config.arrow_write_buffer_max_age = Duration::from_secs(3_600);
+    config.mechanics.arrow_write_buffer_target_bytes = args.arrow_buffer_target_bytes;
+    config.mechanics.arrow_write_buffer_max_age = Duration::from_secs(3_600);
     Ok((config, Some(tempdir)))
 }
 

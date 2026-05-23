@@ -22,8 +22,8 @@ pub fn run(args: impl Iterator<Item = String>) -> Result<()> {
     }
 
     let config = Config::from_env()?;
-    let api_key = config.api_key;
-    let admin_key = config.admin_api_key;
+    let api_key = config.operator.api_key;
+    let admin_key = config.operator.admin_api_key;
     let client = Client::new(&base_url)?;
 
     ensure_service_healthy(&client)?;

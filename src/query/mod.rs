@@ -46,8 +46,10 @@ pub struct QueryEngine {
 impl QueryEngine {
     pub fn new(config: &Config) -> Self {
         Self {
-            interactive_timeout: Duration::from_secs(config.query_interactive.timeout_secs),
-            interactive_memory_limit: config.query_interactive.memory_limit.clone(),
+            interactive_timeout: Duration::from_secs(
+                config.operator.query_interactive.timeout_secs,
+            ),
+            interactive_memory_limit: config.operator.query_interactive.memory_limit.clone(),
         }
     }
 

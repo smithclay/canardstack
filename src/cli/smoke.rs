@@ -15,7 +15,7 @@ pub fn run() -> anyhow::Result<()> {
     let mut headers = HashMap::new();
     headers.insert(
         "authorization".to_string(),
-        format!("Bearer {}", state.config.api_key),
+        format!("Bearer {}", state.config.operator.api_key),
     );
     headers.insert("content-type".to_string(), "application/json".to_string());
 
@@ -61,7 +61,7 @@ pub fn run() -> anyhow::Result<()> {
     let mut admin_headers = HashMap::new();
     admin_headers.insert(
         "authorization".to_string(),
-        format!("Bearer {}", state.config.admin_api_key),
+        format!("Bearer {}", state.config.operator.admin_api_key),
     );
     let health = http::route(
         "GET",

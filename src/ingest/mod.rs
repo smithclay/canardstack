@@ -220,8 +220,11 @@ impl Ingestor {
             stage = stage.as_str(),
         );
         let started = Instant::now();
-        let body_result =
-            otlp::decompress_if_needed(&headers, &compressed_body, self.config.max_body_bytes);
+        let body_result = otlp::decompress_if_needed(
+            &headers,
+            &compressed_body,
+            self.config.operator.max_body_bytes,
+        );
         metrics.observe_request_phase_seconds(
             route.as_str(),
             "decompress",
@@ -634,7 +637,7 @@ impl Ingestor {
             route,
             headers,
             compressed_body_bytes,
-            self.config.max_body_bytes,
+            self.config.operator.max_body_bytes,
         );
         let mut inputs = self.freshness_budget_inputs(storage);
         inputs.incoming_bytes = estimate.values().sum::<usize>();
@@ -652,7 +655,7 @@ impl Ingestor {
         let mut reservation = admission::RuntimeMemoryReservation::disabled(
             self.runtime_memory_reserved_bytes.clone(),
         );
-        let Some(limit) = self.config.runtime_memory_limit_bytes else {
+        let Some(limit) = self.config.operator.runtime_memory_limit_bytes else {
             return Ok(reservation);
         };
         reservation = reservation.with_limit(limit);
@@ -660,7 +663,7 @@ impl Ingestor {
             admission::decode_reservation_bytes(
                 headers,
                 compressed_body_bytes,
-                self.config.max_body_bytes,
+                self.config.operator.max_body_bytes,
             ),
             route,
             metrics,
@@ -692,7 +695,7 @@ impl Ingestor {
         metrics.gauge(
             "canardstack_ingest_worker_queue_capacity",
             &[("state", "capacity")],
-            self.config.ingest_worker_channel_capacity as f64,
+            self.config.mechanics.ingest_worker_channel_capacity as f64,
         );
     }
 
@@ -779,18 +782,18 @@ fn transformed_rows_by_signal(transformed: &Transformed) -> Vec<(StorageSignal, 
 fn spawn_raw_spool_writer(config: &Config, request_kind: OtlpRequestKind) -> Result<Writer> {
     Writer::spawn(
         Options {
-            dir: config.raw_spool_dir.join(request_kind.as_str()),
-            max_segment_bytes: config.raw_spool_max_segment_bytes as u64,
-            max_record_bytes: config.raw_spool_max_record_bytes as u64,
-            max_total_bytes: config.raw_spool_max_total_bytes as u64,
-            append_sync_interval: config.raw_spool_append_sync_interval,
-            append_sync_bytes: config.raw_spool_append_sync_bytes as u64,
+            dir: config.mechanics.raw_spool_dir.join(request_kind.as_str()),
+            max_segment_bytes: config.mechanics.raw_spool_max_segment_bytes as u64,
+            max_record_bytes: config.mechanics.raw_spool_max_record_bytes as u64,
+            max_total_bytes: config.mechanics.raw_spool_max_total_bytes as u64,
+            append_sync_interval: config.mechanics.raw_spool_append_sync_interval,
+            append_sync_bytes: config.mechanics.raw_spool_append_sync_bytes as u64,
             checkpoint_fsync_records: spool::RAW_SPOOL_CHECKPOINT_FSYNC_RECORDS,
             checkpoint_fsync_delay: spool::RAW_SPOOL_CHECKPOINT_FSYNC_DELAY,
         },
         spool::RAW_SPOOL_WRITER_QUEUE_CAPACITY,
         spool::RAW_SPOOL_GROUP_COMMIT_RECORDS,
-        config.raw_spool_group_commit_delay,
+        config.mechanics.raw_spool_group_commit_delay,
     )
     .with_context(|| format!("spawn {request_kind} raw spool writer"))
 }

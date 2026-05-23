@@ -36,7 +36,7 @@ impl Drop for IngestWorkerPool {
 
 impl Ingestor {
     pub fn start_ingest_workers(self: &Arc<Self>, storage: Arc<Storage>) -> Result<()> {
-        let worker_count = self.config.ingest_workers;
+        let worker_count = self.config.mechanics.ingest_workers;
         let mut pool = self.ingest_workers.lock_or_poisoned();
         if pool.is_some() {
             return Ok(());
@@ -44,6 +44,7 @@ impl Ingestor {
         let weak = Arc::downgrade(self);
         let per_worker_capacity = self
             .config
+            .mechanics
             .ingest_worker_channel_capacity
             .div_ceil(worker_count)
             .max(1);
@@ -63,7 +64,7 @@ impl Ingestor {
         tracing::info!(
             event = "ingest_workers_started",
             workers = worker_count,
-            worker_channel_capacity = self.config.ingest_worker_channel_capacity,
+            worker_channel_capacity = self.config.mechanics.ingest_worker_channel_capacity,
             per_worker_channel_capacity = per_worker_capacity
         );
         *pool = Some(IngestWorkerPool {

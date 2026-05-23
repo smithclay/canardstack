@@ -76,7 +76,9 @@ fn route_inner(
     state: &AppState,
 ) -> HttpResponse {
     if let Some(matched) = match_compat_route(method, path) {
-        if matched.role_category().serves_queries() && !state.config.serve_role.serves_queries() {
+        if matched.role_category().serves_queries()
+            && !state.config.operator.serve_role.serves_queries()
+        {
             return HttpResponse::from_api_error(&ApiError::new(
                 404,
                 "not_found",
@@ -119,7 +121,7 @@ fn route_inner(
             );
         }
         ("POST", "/v1/logs") => {
-            if !state.config.serve_role.accepts_ingest() {
+            if !state.config.operator.serve_role.accepts_ingest() {
                 return HttpResponse::from_api_error(&ApiError::new(
                     404,
                     "not_found",
@@ -134,7 +136,7 @@ fn route_inner(
             ));
         }
         ("POST", "/v1/traces") => {
-            if !state.config.serve_role.accepts_ingest() {
+            if !state.config.operator.serve_role.accepts_ingest() {
                 return HttpResponse::from_api_error(&ApiError::new(
                     404,
                     "not_found",
@@ -149,7 +151,7 @@ fn route_inner(
             ));
         }
         ("POST", "/v1/metrics") => {
-            if !state.config.serve_role.accepts_ingest() {
+            if !state.config.operator.serve_role.accepts_ingest() {
                 return HttpResponse::from_api_error(&ApiError::new(
                     404,
                     "not_found",
@@ -191,9 +193,9 @@ fn route_inner(
                     "raw_spool_config": {
                         "writer_queue_capacity": crate::ingest::spool::RAW_SPOOL_WRITER_QUEUE_CAPACITY,
                         "group_commit_records": crate::ingest::spool::RAW_SPOOL_GROUP_COMMIT_RECORDS,
-                        "group_commit_ms": state.config.raw_spool_group_commit_delay.as_millis(),
-                        "append_sync_ms": state.config.raw_spool_append_sync_interval.as_millis(),
-                        "append_sync_bytes": state.config.raw_spool_append_sync_bytes,
+                        "group_commit_ms": state.config.mechanics.raw_spool_group_commit_delay.as_millis(),
+                        "append_sync_ms": state.config.mechanics.raw_spool_append_sync_interval.as_millis(),
+                        "append_sync_bytes": state.config.mechanics.raw_spool_append_sync_bytes,
                         "checkpoint_fsync_records": crate::ingest::spool::RAW_SPOOL_CHECKPOINT_FSYNC_RECORDS,
                         "checkpoint_fsync_ms": crate::ingest::spool::RAW_SPOOL_CHECKPOINT_FSYNC_DELAY.as_millis()
                     }
@@ -310,7 +312,12 @@ fn run_maintenance_job(
 }
 
 fn ensure_maintenance_allowed(state: &AppState) -> Result<(), ApiError> {
-    if state.config.serve_role.allows_maintenance_mutation() {
+    if state
+        .config
+        .operator
+        .serve_role
+        .allows_maintenance_mutation()
+    {
         Ok(())
     } else {
         Err(ApiError::new(
@@ -468,7 +475,7 @@ mod tests {
     fn ingest_role_disables_every_registered_compat_route() {
         let dir = tempdir().unwrap();
         let mut config = Config::test(dir.path().join("canardstack.duckdb"));
-        config.serve_role = ServeRole::Ingest;
+        config.operator.serve_role = ServeRole::Ingest;
         let state = AppState::new(config).unwrap();
 
         for (method, path) in super::super::compat_routes::compat_route_examples_for_tests() {

@@ -35,7 +35,7 @@
 //! [`AdmissionController::admit_ingest`] is the SOLE enforced ingest gate. The
 //! former per-signal in-flight ceiling was removed, and the process RSS hard cap
 //! ([`crate::ingest`]'s `RuntimeMemoryReservation`) is opt-in and OFF by default
-//! (`config.runtime_memory_limit_bytes: None`). Because admit_ingest rejects when
+//! (`config.operator.runtime_memory_limit_bytes: None`). Because admit_ingest rejects when
 //! `projected_seal_seconds = inflight_bytes / observed_seal_rate` exceeds
 //! `INGEST_FRESHNESS_BUDGET_FRACTION` (~0.95) of the SLA, it transitively bounds
 //! in-flight bytes at approximately
@@ -147,18 +147,21 @@ struct AdmissionState {
 
 impl AdmissionController {
     pub fn new(config: &Config) -> Self {
-        let seal_capacity = config.seal_admission_capacity.max(1);
+        let seal_capacity = config.operator.seal_admission_capacity.max(1);
         let cheap_query_capacity = config
+            .operator
             .cheap_query_admission_capacity
-            .min(config.query_interactive.concurrency)
+            .min(config.operator.query_interactive.concurrency)
             .max(1);
         let reserved_query_capacity = seal_capacity.saturating_add(cheap_query_capacity);
         let heavy_query_capacity = config
+            .operator
             .query_interactive
             .concurrency
             .saturating_sub(reserved_query_capacity)
             .max(1);
         let heavy_query_degraded_capacity = config
+            .operator
             .heavy_query_degraded_capacity
             .min(heavy_query_capacity)
             .max(1);
@@ -166,10 +169,18 @@ impl AdmissionController {
         // rate and the target/max-age drain rate, so the buffer-size debt (which
         // also divides by this EWMA, see update_projection_locked) starts no
         // slower than the static drain target.
-        let seal_rate_seed_rate = config.seal_rate_seed_bytes as f64
-            / config.seal_rate_seed_window.as_secs_f64().max(0.001);
-        let visibility_drain_rate = config.arrow_write_buffer_target_bytes as f64
-            / config.arrow_write_buffer_max_age.as_secs_f64().max(0.001);
+        let seal_rate_seed_rate = config.mechanics.seal_rate_seed_bytes as f64
+            / config
+                .mechanics
+                .seal_rate_seed_window
+                .as_secs_f64()
+                .max(0.001);
+        let visibility_drain_rate = config.mechanics.arrow_write_buffer_target_bytes as f64
+            / config
+                .mechanics
+                .arrow_write_buffer_max_age
+                .as_secs_f64()
+                .max(0.001);
         let initial_seal_bytes_per_second = seal_rate_seed_rate.max(visibility_drain_rate);
         Self {
             inner: Mutex::new(AdmissionState {
@@ -189,9 +200,15 @@ impl AdmissionController {
             cheap_query_capacity,
             heavy_query_capacity,
             heavy_query_degraded_capacity,
-            freshness_budget_sla_seconds: config.freshness_budget_sla.as_secs_f64(),
-            arrow_write_buffer_target_bytes: config.arrow_write_buffer_target_bytes.max(1),
-            arrow_write_buffer_max_age_seconds: config.arrow_write_buffer_max_age.as_secs_f64(),
+            freshness_budget_sla_seconds: config.operator.freshness_budget_sla.as_secs_f64(),
+            arrow_write_buffer_target_bytes: config
+                .mechanics
+                .arrow_write_buffer_target_bytes
+                .max(1),
+            arrow_write_buffer_max_age_seconds: config
+                .mechanics
+                .arrow_write_buffer_max_age
+                .as_secs_f64(),
         }
     }
 
@@ -581,12 +598,12 @@ mod tests {
     fn controller() -> AdmissionController {
         let dir = tempdir().unwrap();
         let mut config = Config::test(dir.path().join("canardstack.duckdb"));
-        config.query_interactive.concurrency = 4;
-        config.freshness_budget_sla = std::time::Duration::from_secs(10);
-        config.seal_rate_seed_bytes = 1_000;
-        config.seal_rate_seed_window = std::time::Duration::from_secs(1);
-        config.arrow_write_buffer_target_bytes = 1_000;
-        config.arrow_write_buffer_max_age = std::time::Duration::from_secs(1);
+        config.operator.query_interactive.concurrency = 4;
+        config.operator.freshness_budget_sla = std::time::Duration::from_secs(10);
+        config.mechanics.seal_rate_seed_bytes = 1_000;
+        config.mechanics.seal_rate_seed_window = std::time::Duration::from_secs(1);
+        config.mechanics.arrow_write_buffer_target_bytes = 1_000;
+        config.mechanics.arrow_write_buffer_max_age = std::time::Duration::from_secs(1);
         AdmissionController::new(&config)
     }
 
@@ -794,16 +811,16 @@ mod tests {
         fn characterization_controller() -> AdmissionController {
             let dir = tempdir().unwrap();
             let mut config = Config::test(dir.path().join("canardstack.duckdb"));
-            config.query_interactive.concurrency = 4;
-            config.freshness_budget_sla = std::time::Duration::from_secs(10);
+            config.operator.query_interactive.concurrency = 4;
+            config.operator.freshness_budget_sla = std::time::Duration::from_secs(10);
             // Seed seal rate = 2000 / 1s = 2000 B/s; post-A2 this is the single
             // observed rate (seeded from max(2000, target/max-age=1000)).
-            config.seal_rate_seed_bytes = 2_000;
-            config.seal_rate_seed_window = std::time::Duration::from_secs(1);
+            config.mechanics.seal_rate_seed_bytes = 2_000;
+            config.mechanics.seal_rate_seed_window = std::time::Duration::from_secs(1);
             // target/max-age = 1000 / 1s = 1000 B/s; pre-A2 this drove buffer
             // size debt, post-A2 it only floors the EWMA seed (max wins -> 2000).
-            config.arrow_write_buffer_target_bytes = 1_000;
-            config.arrow_write_buffer_max_age = std::time::Duration::from_secs(1);
+            config.mechanics.arrow_write_buffer_target_bytes = 1_000;
+            config.mechanics.arrow_write_buffer_max_age = std::time::Duration::from_secs(1);
             AdmissionController::new(&config)
         }
 

@@ -44,9 +44,9 @@ impl Maintenance {
             last_runs: Mutex::new(BTreeMap::new()),
             last_failures: Mutex::new(BTreeMap::new()),
             retention: RetentionPolicy {
-                logs_days: config.logs_retention_days,
-                spans_days: config.spans_retention_days,
-                metrics_days: config.metrics_retention_days,
+                logs_days: config.operator.logs_retention_days,
+                spans_days: config.operator.spans_retention_days,
+                metrics_days: config.operator.metrics_retention_days,
             },
         }
     }
@@ -208,13 +208,17 @@ impl Drop for Scheduler {
 }
 
 fn scheduler_loop(state: Arc<AppState>, stop: Arc<AtomicBool>) {
-    let seal_cadence = state.config.scheduler_seal_interval;
-    let buffer_target_bytes = state.config.arrow_write_buffer_target_bytes;
-    let buffer_max_age_seconds = state.config.arrow_write_buffer_max_age.as_secs_f64();
-    let metadata_every = state.config.scheduler_metadata_interval;
-    let metrics_every = state.config.scheduler_metrics_interval;
-    let retention_every = state.config.scheduler_retention_interval;
-    let freshness_budget_sla_seconds = state.config.freshness_budget_sla.as_secs_f64();
+    let seal_cadence = state.config.mechanics.scheduler_seal_interval;
+    let buffer_target_bytes = state.config.mechanics.arrow_write_buffer_target_bytes;
+    let buffer_max_age_seconds = state
+        .config
+        .mechanics
+        .arrow_write_buffer_max_age
+        .as_secs_f64();
+    let metadata_every = state.config.mechanics.scheduler_metadata_interval;
+    let metrics_every = state.config.mechanics.scheduler_metrics_interval;
+    let retention_every = state.config.mechanics.scheduler_retention_interval;
+    let freshness_budget_sla_seconds = state.config.operator.freshness_budget_sla.as_secs_f64();
     // Poll fast enough to seal on the freshness cadence and to catch a
     // size-due buffer promptly; the maintenance jobs are gated by their own
     // (coarse) timers regardless of how often we wake.
@@ -310,7 +314,7 @@ fn scheduler_loop(state: Arc<AppState>, stop: Arc<AtomicBool>) {
                 // into the metric_gauge / metric_sum storage tables is opt-in to
                 // avoid the extra write load and the canardstack_operator_metrics
                 // rows by default.
-                if s.config.operator_metrics_to_storage {
+                if s.config.mechanics.operator_metrics_to_storage {
                     let rows = s.metrics.write_snapshot_to_storage(&s.storage)?;
                     Ok(json!({"status": "ok", "rows": rows}))
                 } else {

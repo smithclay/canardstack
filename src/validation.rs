@@ -43,9 +43,9 @@ pub fn validate_api_key(
     admin: bool,
 ) -> ApiResult<()> {
     let expected = if admin {
-        &config.admin_api_key
+        &config.operator.admin_api_key
     } else {
-        &config.api_key
+        &config.operator.api_key
     };
     // Defense-in-depth: even if Config::validate() didn't run, never accept an
     // empty configured key. An empty `expected` would otherwise match the
@@ -126,13 +126,13 @@ pub fn validate_content_type(headers: &HashMap<String, String>) -> ApiResult<()>
 }
 
 pub fn validate_body_size(body_len: usize, config: &Config) -> ApiResult<()> {
-    if body_len > config.max_body_bytes {
+    if body_len > config.operator.max_body_bytes {
         Err(ApiError::new(
             400,
             "payload_too_large",
             format!(
                 "payload has {body_len} bytes; max is {}",
-                config.max_body_bytes
+                config.operator.max_body_bytes
             ),
         ))
     } else {
@@ -196,8 +196,8 @@ pub fn validate_arrow_timestamp_skew(
     config: &Config,
 ) -> ApiResult<()> {
     let now_ms = Utc::now().timestamp_millis();
-    let min_ms = now_ms - config.late_accept_secs * 1000;
-    let max_ms = now_ms + config.future_accept_secs * 1000;
+    let min_ms = now_ms - config.operator.late_accept_secs * 1000;
+    let max_ms = now_ms + config.operator.future_accept_secs * 1000;
     let timestamp = arrow_timestamp_micros(batch, signal)?;
     for row in 0..timestamp.len() {
         if timestamp.is_null(row) {

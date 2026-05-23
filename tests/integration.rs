@@ -33,7 +33,7 @@ use tempfile::tempdir;
 fn app() -> (tempfile::TempDir, AppState) {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
-    config.local_storage_dir = dir.path().join("storage");
+    config.operator.local_storage_dir = dir.path().join("storage");
     (dir, AppState::new(config).unwrap())
 }
 
@@ -41,7 +41,7 @@ fn headers(state: &AppState) -> HashMap<String, String> {
     HashMap::from([
         (
             "authorization".to_string(),
-            format!("Bearer {}", state.config.api_key),
+            format!("Bearer {}", state.config.operator.api_key),
         ),
         ("content-type".to_string(), "application/json".to_string()),
         ("accept".to_string(), "application/json".to_string()),
@@ -51,7 +51,7 @@ fn headers(state: &AppState) -> HashMap<String, String> {
 fn admin_headers(state: &AppState) -> HashMap<String, String> {
     HashMap::from([(
         "authorization".to_string(),
-        format!("Bearer {}", state.config.admin_api_key),
+        format!("Bearer {}", state.config.operator.admin_api_key),
     )])
 }
 
@@ -644,7 +644,7 @@ fn healthz_is_cheap_and_unauthenticated() {
 fn admin_ingest_health_includes_raw_spool_backlog() {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
-    config.raw_spool_dir = dir.path().join("raw-spool");
+    config.mechanics.raw_spool_dir = dir.path().join("raw-spool");
     let state = AppState::new(config).unwrap();
     let body = log_fixture(Utc::now().timestamp_nanos_opt().unwrap()).to_string();
     let ingest = http::route(
@@ -712,7 +712,7 @@ fn admin_ingest_health_includes_raw_spool_backlog() {
 fn unhealthy_raw_spool_writer_makes_readiness_not_ready() {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
-    config.raw_spool_dir = dir.path().join("raw-spool");
+    config.mechanics.raw_spool_dir = dir.path().join("raw-spool");
     let state = AppState::new(config).unwrap();
 
     // Baseline: storage and every spool writer healthy, so readiness is ready.
@@ -858,13 +858,13 @@ fn ingest_terminal_checkpoints_missing_event_timestamps_after_acceptance() {
 fn gzip_payloads_over_decoded_limit_are_terminal_checkpointed() {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
-    config.max_body_bytes = 128;
+    config.operator.max_body_bytes = 128;
     let state = AppState::new(config).unwrap();
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
     encoder.write_all(&vec![b' '; 4096]).unwrap();
     let compressed = encoder.finish().unwrap();
     assert!(
-        compressed.len() <= state.config.max_body_bytes,
+        compressed.len() <= state.config.operator.max_body_bytes,
         "test fixture must be compressed below the request limit"
     );
 
@@ -956,11 +956,11 @@ fn ingest_pressure_returns_429_and_holds_no_inflight() {
     // leaves no in-flight bytes reserved.
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
-    config.freshness_budget_sla = StdDuration::from_millis(1);
-    config.seal_rate_seed_window = StdDuration::from_secs(1);
-    config.seal_rate_seed_bytes = 1_000;
-    config.arrow_write_buffer_target_bytes = 1_000;
-    config.arrow_write_buffer_max_age = StdDuration::from_secs(1);
+    config.operator.freshness_budget_sla = StdDuration::from_millis(1);
+    config.mechanics.seal_rate_seed_window = StdDuration::from_secs(1);
+    config.mechanics.seal_rate_seed_bytes = 1_000;
+    config.mechanics.arrow_write_buffer_target_bytes = 1_000;
+    config.mechanics.arrow_write_buffer_max_age = StdDuration::from_secs(1);
     let state = AppState::new(config).unwrap();
     let body = log_fixture(Utc::now().timestamp_nanos_opt().unwrap()).to_string();
     let response = http::route(
@@ -993,15 +993,15 @@ fn ingest_pressure_returns_429_and_holds_no_inflight() {
 fn freshness_budget_rejects_before_raw_spool_append() {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
-    config.raw_spool_dir = dir.path().join("raw-spool");
-    config.freshness_budget_sla = StdDuration::from_millis(1);
-    config.seal_rate_seed_window = StdDuration::from_secs(1);
-    config.seal_rate_seed_bytes = 1_000;
+    config.mechanics.raw_spool_dir = dir.path().join("raw-spool");
+    config.operator.freshness_budget_sla = StdDuration::from_millis(1);
+    config.mechanics.seal_rate_seed_window = StdDuration::from_secs(1);
+    config.mechanics.seal_rate_seed_bytes = 1_000;
     // The observed seal-rate EWMA is seeded from max(seal-rate seed,
     // target/max-age); pin the buffer drain rate to the same 1000 B/s so the
     // tiny incoming log still projects over the 1ms freshness budget.
-    config.arrow_write_buffer_target_bytes = 1_000;
-    config.arrow_write_buffer_max_age = StdDuration::from_secs(1);
+    config.mechanics.arrow_write_buffer_target_bytes = 1_000;
+    config.mechanics.arrow_write_buffer_max_age = StdDuration::from_secs(1);
     let state = AppState::new(config).unwrap();
     let body = log_fixture(Utc::now().timestamp_nanos_opt().unwrap()).to_string();
     let response = http::route(
@@ -1026,7 +1026,7 @@ fn freshness_budget_rejects_before_raw_spool_append() {
 fn runtime_memory_pressure_returns_429_before_enqueue() {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
-    config.runtime_memory_limit_bytes = Some(1);
+    config.operator.runtime_memory_limit_bytes = Some(1);
     let state = AppState::new(config).unwrap();
     let body = log_fixture(Utc::now().timestamp_nanos_opt().unwrap()).to_string();
     let response = http::route(
@@ -1066,7 +1066,7 @@ fn runtime_memory_pressure_returns_429_before_enqueue() {
 fn serve_roles_partition_ingest_and_query_routes() {
     let dir = tempdir().unwrap();
     let mut ingest_config = Config::test(dir.path().join("ingest.duckdb"));
-    ingest_config.serve_role = ServeRole::Ingest;
+    ingest_config.operator.serve_role = ServeRole::Ingest;
     let ingest_state = AppState::new(ingest_config).unwrap();
     let query = http::route(
         "GET",
@@ -1089,7 +1089,7 @@ fn serve_roles_partition_ingest_and_query_routes() {
 
     let dir = tempdir().unwrap();
     let mut query_config = Config::test(dir.path().join("query.duckdb"));
-    query_config.serve_role = ServeRole::Query;
+    query_config.operator.serve_role = ServeRole::Query;
     let query_state = AppState::new(query_config).unwrap();
     let body = log_fixture(Utc::now().timestamp_nanos_opt().unwrap()).to_string();
     let ingest = http::route(
@@ -1211,9 +1211,9 @@ fn ingest_stage_metrics_separate_transform_enqueue_and_storage_visibility() {
 fn ingest_workers_return_202_after_raw_spool_and_handoff() {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
-    config.local_storage_dir = dir.path().join("storage");
-    config.ingest_workers = 1;
-    config.ingest_worker_channel_capacity = 4;
+    config.operator.local_storage_dir = dir.path().join("storage");
+    config.mechanics.ingest_workers = 1;
+    config.mechanics.ingest_worker_channel_capacity = 4;
     let state = AppState::new(config).unwrap();
     let body = log_fixture(Utc::now().timestamp_nanos_opt().unwrap()).to_string();
     let response = http::route(
@@ -1248,10 +1248,10 @@ fn ingest_workers_return_202_after_raw_spool_and_handoff() {
 fn ingest_workers_buffer_storage_rows_and_checkpoint_spool() {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
-    config.local_storage_dir = dir.path().join("storage");
-    config.raw_spool_dir = dir.path().join("raw-spool");
-    config.ingest_workers = 1;
-    config.ingest_worker_channel_capacity = 4;
+    config.operator.local_storage_dir = dir.path().join("storage");
+    config.mechanics.raw_spool_dir = dir.path().join("raw-spool");
+    config.mechanics.ingest_workers = 1;
+    config.mechanics.ingest_worker_channel_capacity = 4;
     let state = AppState::new(config).unwrap();
     let body = log_fixture(Utc::now().timestamp_nanos_opt().unwrap()).to_string();
     let response = http::route(
@@ -1290,7 +1290,7 @@ fn ingest_workers_buffer_storage_rows_and_checkpoint_spool() {
 fn raw_spool_acknowledges_local_spool_write_before_storage_commit() {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
-    config.raw_spool_dir = dir.path().join("raw-spool");
+    config.mechanics.raw_spool_dir = dir.path().join("raw-spool");
     let state = AppState::new(config).unwrap();
     let body = log_fixture(Utc::now().timestamp_nanos_opt().unwrap()).to_string();
     let response = http::route(
@@ -1330,7 +1330,7 @@ fn raw_spool_acknowledges_local_spool_write_before_storage_commit() {
 fn ingest_fsyncs_raw_spool_before_ack_without_claiming_record_count() {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
-    config.raw_spool_dir = dir.path().join("raw-spool");
+    config.mechanics.raw_spool_dir = dir.path().join("raw-spool");
     let state = AppState::new(config).unwrap();
     let body = log_fixture(Utc::now().timestamp_nanos_opt().unwrap()).to_string();
     let response = http::route(
@@ -1361,7 +1361,7 @@ fn ingest_fsyncs_raw_spool_before_ack_without_claiming_record_count() {
 fn raw_spool_checkpoints_after_seal_commits_multirow_record() {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
-    config.raw_spool_dir = dir.path().join("raw-spool");
+    config.mechanics.raw_spool_dir = dir.path().join("raw-spool");
     let state = AppState::new(config).unwrap();
     let now = Utc::now().timestamp_nanos_opt().unwrap();
     let mut body = log_fixture(now);
@@ -1392,16 +1392,19 @@ fn raw_spool_checkpoints_after_seal_commits_multirow_record() {
 fn raw_spool_replays_pending_request_on_startup() {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
-    config.raw_spool_dir = dir.path().join("raw-spool");
+    config.mechanics.raw_spool_dir = dir.path().join("raw-spool");
     let body = log_fixture(Utc::now().timestamp_nanos_opt().unwrap()).to_string();
     {
         let mut spool = Spool::open(Options {
-            dir: config.raw_spool_dir.join(OtlpRequestKind::Logs.as_str()),
-            max_segment_bytes: config.raw_spool_max_segment_bytes as u64,
-            max_record_bytes: config.raw_spool_max_record_bytes as u64,
-            max_total_bytes: config.raw_spool_max_total_bytes as u64,
-            append_sync_interval: config.raw_spool_append_sync_interval,
-            append_sync_bytes: config.raw_spool_append_sync_bytes as u64,
+            dir: config
+                .mechanics
+                .raw_spool_dir
+                .join(OtlpRequestKind::Logs.as_str()),
+            max_segment_bytes: config.mechanics.raw_spool_max_segment_bytes as u64,
+            max_record_bytes: config.mechanics.raw_spool_max_record_bytes as u64,
+            max_total_bytes: config.mechanics.raw_spool_max_total_bytes as u64,
+            append_sync_interval: config.mechanics.raw_spool_append_sync_interval,
+            append_sync_bytes: config.mechanics.raw_spool_append_sync_bytes as u64,
             checkpoint_fsync_records: 1024,
             checkpoint_fsync_delay: std::time::Duration::from_millis(1000),
         })
@@ -1451,16 +1454,19 @@ fn raw_spool_replays_pending_request_on_startup() {
 fn raw_spool_replays_one_metrics_request_into_gauge_and_sum_tables() {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
-    config.raw_spool_dir = dir.path().join("raw-spool");
+    config.mechanics.raw_spool_dir = dir.path().join("raw-spool");
     let body = metric_fixture(Utc::now().timestamp_nanos_opt().unwrap()).to_string();
     {
         let mut spool = Spool::open(Options {
-            dir: config.raw_spool_dir.join(OtlpRequestKind::Metrics.as_str()),
-            max_segment_bytes: config.raw_spool_max_segment_bytes as u64,
-            max_record_bytes: config.raw_spool_max_record_bytes as u64,
-            max_total_bytes: config.raw_spool_max_total_bytes as u64,
-            append_sync_interval: config.raw_spool_append_sync_interval,
-            append_sync_bytes: config.raw_spool_append_sync_bytes as u64,
+            dir: config
+                .mechanics
+                .raw_spool_dir
+                .join(OtlpRequestKind::Metrics.as_str()),
+            max_segment_bytes: config.mechanics.raw_spool_max_segment_bytes as u64,
+            max_record_bytes: config.mechanics.raw_spool_max_record_bytes as u64,
+            max_total_bytes: config.mechanics.raw_spool_max_total_bytes as u64,
+            append_sync_interval: config.mechanics.raw_spool_append_sync_interval,
+            append_sync_bytes: config.mechanics.raw_spool_append_sync_bytes as u64,
             checkpoint_fsync_records: 1024,
             checkpoint_fsync_delay: std::time::Duration::from_millis(1000),
         })
@@ -1499,16 +1505,19 @@ fn raw_spool_replays_one_metrics_request_into_gauge_and_sum_tables() {
 fn raw_spool_replay_failure_does_not_abort_boot() {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
-    config.raw_spool_dir = dir.path().join("raw-spool");
+    config.mechanics.raw_spool_dir = dir.path().join("raw-spool");
     let body = log_fixture(Utc::now().timestamp_nanos_opt().unwrap()).to_string();
     {
         let mut spool = Spool::open(Options {
-            dir: config.raw_spool_dir.join(OtlpRequestKind::Logs.as_str()),
-            max_segment_bytes: config.raw_spool_max_segment_bytes as u64,
-            max_record_bytes: config.raw_spool_max_record_bytes as u64,
-            max_total_bytes: config.raw_spool_max_total_bytes as u64,
-            append_sync_interval: config.raw_spool_append_sync_interval,
-            append_sync_bytes: config.raw_spool_append_sync_bytes as u64,
+            dir: config
+                .mechanics
+                .raw_spool_dir
+                .join(OtlpRequestKind::Logs.as_str()),
+            max_segment_bytes: config.mechanics.raw_spool_max_segment_bytes as u64,
+            max_record_bytes: config.mechanics.raw_spool_max_record_bytes as u64,
+            max_total_bytes: config.mechanics.raw_spool_max_total_bytes as u64,
+            append_sync_interval: config.mechanics.raw_spool_append_sync_interval,
+            append_sync_bytes: config.mechanics.raw_spool_append_sync_bytes as u64,
             checkpoint_fsync_records: 1024,
             checkpoint_fsync_delay: std::time::Duration::from_millis(1000),
         })
@@ -1545,7 +1554,7 @@ fn raw_spool_replay_failure_does_not_abort_boot() {
 fn raw_spool_replays_accepted_uncommitted_request_after_restart() {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
-    config.raw_spool_dir = dir.path().join("raw-spool");
+    config.mechanics.raw_spool_dir = dir.path().join("raw-spool");
     let body = log_fixture(Utc::now().timestamp_nanos_opt().unwrap()).to_string();
     {
         let state = AppState::new(config.clone()).unwrap();
@@ -1576,10 +1585,10 @@ fn raw_spool_replays_accepted_uncommitted_request_after_restart() {
 fn raw_spool_full_returns_429_before_transform() {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
-    config.raw_spool_dir = dir.path().join("raw-spool");
-    config.raw_spool_max_segment_bytes = 16 * 1024;
-    config.raw_spool_max_record_bytes = 16 * 1024;
-    config.raw_spool_max_total_bytes = 1;
+    config.mechanics.raw_spool_dir = dir.path().join("raw-spool");
+    config.mechanics.raw_spool_max_segment_bytes = 16 * 1024;
+    config.mechanics.raw_spool_max_record_bytes = 16 * 1024;
+    config.mechanics.raw_spool_max_total_bytes = 1;
     let state = AppState::new(config).unwrap();
     let body = log_fixture(Utc::now().timestamp_nanos_opt().unwrap()).to_string();
 
@@ -1618,7 +1627,7 @@ fn raw_spool_full_returns_429_before_transform() {
 fn ingest_workers_unavailable_rejects_before_raw_spool_append() {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
-    config.raw_spool_dir = dir.path().join("raw-spool");
+    config.mechanics.raw_spool_dir = dir.path().join("raw-spool");
     let storage = Storage::open(&config).unwrap();
     let admission = AdmissionController::new(&config);
     let metrics = Arc::new(Metrics::default());
@@ -1958,8 +1967,8 @@ fn prometheus_query_range_supports_explicit_grouping_over_promoted_labels() {
 fn metric_seal_drains_oversized_batch_and_preserves_queue_accounting() {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
-    config.local_storage_dir = dir.path().join("storage");
-    config.seal_rate_seed_bytes = 10 * 1024 * 1024;
+    config.operator.local_storage_dir = dir.path().join("storage");
+    config.mechanics.seal_rate_seed_bytes = 10 * 1024 * 1024;
     let state = AppState::new(config).unwrap();
     let body = gauge_payload(Utc::now().timestamp_nanos_opt().unwrap(), 5).to_string();
 
@@ -1983,8 +1992,8 @@ fn metric_seal_drains_oversized_batch_and_preserves_queue_accounting() {
 fn metric_due_seal_preserves_gauge_sum_pairing() {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
-    config.local_storage_dir = dir.path().join("storage");
-    config.seal_rate_seed_bytes = 10_000_000;
+    config.operator.local_storage_dir = dir.path().join("storage");
+    config.mechanics.seal_rate_seed_bytes = 10_000_000;
     let state = AppState::new(config).unwrap();
     let body = metric_fixture(Utc::now().timestamp_nanos_opt().unwrap()).to_string();
 
@@ -2766,13 +2775,13 @@ fn ingest_seal_and_query_vertical_slice() {
 fn remote_ducklake_attach_uri_smoke() {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
-    config.local_storage_dir = dir.path().join("storage");
-    config.ducklake_attach_uri = Some(
+    config.operator.local_storage_dir = dir.path().join("storage");
+    config.operator.ducklake_attach_uri = Some(
         env::var("CANARDSTACK_DUCKLAKE_ATTACH_URI")
             .unwrap_or_else(|_| "md:test-ducklake".to_string()),
     );
     if let Ok(extension_dir) = env::var("CANARDSTACK_DUCKDB_EXTENSION_DIR") {
-        config.duckdb_extension_dir = Some(extension_dir.into());
+        config.operator.duckdb_extension_dir = Some(extension_dir.into());
     }
 
     let state = AppState::new(config).unwrap();
@@ -2870,8 +2879,8 @@ fn seal_before_raw_spool_checkpoint_survives_restart() {
 fn scheduler_health_excludes_ingest_visibility_jobs() {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
-    config.local_storage_dir = dir.path().join("storage");
-    config.scheduler_enabled = true;
+    config.operator.local_storage_dir = dir.path().join("storage");
+    config.operator.scheduler_enabled = true;
     let state = Arc::new(AppState::new(config).unwrap());
     let scheduler = Scheduler::spawn(state.clone());
 
@@ -2900,11 +2909,11 @@ fn scheduler_health_excludes_ingest_visibility_jobs() {
 fn scheduler_seals_threshold_ingest_into_visible_rows() {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
-    config.local_storage_dir = dir.path().join("storage");
-    config.scheduler_enabled = true;
-    config.scheduler_seal_interval = StdDuration::from_millis(20);
-    config.arrow_write_buffer_max_age = StdDuration::from_millis(10);
-    config.arrow_write_buffer_target_bytes = 1;
+    config.operator.local_storage_dir = dir.path().join("storage");
+    config.operator.scheduler_enabled = true;
+    config.mechanics.scheduler_seal_interval = StdDuration::from_millis(20);
+    config.mechanics.arrow_write_buffer_max_age = StdDuration::from_millis(10);
+    config.mechanics.arrow_write_buffer_target_bytes = 1;
 
     let state = Arc::new(AppState::new(config).unwrap());
     let scheduler = Scheduler::spawn(state.clone());
@@ -2949,10 +2958,10 @@ fn scheduler_seals_threshold_ingest_into_visible_rows() {
 fn disabled_scheduler_requires_manual_seal_for_visibility() {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
-    config.local_storage_dir = dir.path().join("storage");
-    config.scheduler_enabled = false;
-    config.seal_rate_seed_window = StdDuration::from_secs(60);
-    config.seal_rate_seed_bytes = 10_000_000;
+    config.operator.local_storage_dir = dir.path().join("storage");
+    config.operator.scheduler_enabled = false;
+    config.mechanics.seal_rate_seed_window = StdDuration::from_secs(60);
+    config.mechanics.seal_rate_seed_bytes = 10_000_000;
 
     let state = AppState::new(config).unwrap();
     let body = log_fixture(Utc::now().timestamp_nanos_opt().unwrap()).to_string();
@@ -2973,8 +2982,8 @@ fn disabled_scheduler_requires_manual_seal_for_visibility() {
 fn retention_run_deletes_whole_day_eligible_rows() {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
-    config.local_storage_dir = dir.path().join("storage");
-    config.logs_retention_days = 1;
+    config.operator.local_storage_dir = dir.path().join("storage");
+    config.operator.logs_retention_days = 1;
     let state = AppState::new(config).unwrap();
     let old_ms = (Utc::now() - Duration::days(3)).timestamp_millis();
     let fresh_ms = Utc::now().timestamp_millis();
@@ -3165,12 +3174,15 @@ fn admin_endpoints_reject_data_key_and_unauthenticated_requests() {
 
     let data_bearer = HashMap::from([(
         "authorization".to_string(),
-        format!("Bearer {}", state.config.api_key),
+        format!("Bearer {}", state.config.operator.api_key),
     )]);
-    let data_xapi = HashMap::from([("x-api-key".to_string(), state.config.api_key.clone())]);
+    let data_xapi = HashMap::from([(
+        "x-api-key".to_string(),
+        state.config.operator.api_key.clone(),
+    )]);
     let admin_bearer = HashMap::from([(
         "authorization".to_string(),
-        format!("Bearer {}", state.config.admin_api_key),
+        format!("Bearer {}", state.config.operator.admin_api_key),
     )]);
 
     for (method, path) in admin_routes {
@@ -3217,7 +3229,7 @@ fn admin_endpoints_reject_data_key_and_unauthenticated_requests() {
 fn loki_query_range_backward_uses_standard_log_query() {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
-    config.local_storage_dir = dir.path().join("storage");
+    config.operator.local_storage_dir = dir.path().join("storage");
     let state = AppState::new(config).unwrap();
     let headers = headers(&state);
     let now = Utc::now();
@@ -3302,7 +3314,7 @@ fn empty_configured_api_key_fails_closed() {
     // Simulate the misconfiguration: a deployment that wiped api_key without
     // realizing it. The runtime must refuse to authorize *any* request, even
     // one whose Authorization header strips down to an empty bearer token.
-    state.config.api_key = String::new();
+    state.config.operator.api_key = String::new();
     let unauth_headers = HashMap::from([
         ("authorization".to_string(), "Bearer ".to_string()),
         ("content-type".to_string(), "application/json".to_string()),
@@ -3324,23 +3336,23 @@ fn config_validate_rejects_empty_keys_and_collisions() {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
 
-    config.api_key = String::new();
+    config.operator.api_key = String::new();
     assert!(config.validate().is_err(), "empty api_key must fail");
 
-    config.api_key = "data-key".to_string();
-    config.admin_api_key = String::new();
+    config.operator.api_key = "data-key".to_string();
+    config.operator.admin_api_key = String::new();
     assert!(config.validate().is_err(), "empty admin_api_key must fail");
 
-    config.admin_api_key = "data-key".to_string();
+    config.operator.admin_api_key = "data-key".to_string();
     assert!(
         config.validate().is_err(),
         "api_key == admin_api_key must fail to keep the admin gate meaningful"
     );
 
-    config.admin_api_key = "admin-key".to_string();
+    config.operator.admin_api_key = "admin-key".to_string();
     assert!(config.validate().is_ok());
 
-    config.query_interactive.concurrency = 0;
+    config.operator.query_interactive.concurrency = 0;
     assert!(
         config.validate().is_err(),
         "zero query concurrency must fail"
@@ -3357,10 +3369,10 @@ fn config_validate_rejects_zero_scheduler_intervals() {
     );
 
     let mutations: [fn(&mut Config); 4] = [
-        |c| c.scheduler_seal_interval = std::time::Duration::ZERO,
-        |c| c.scheduler_metadata_interval = std::time::Duration::ZERO,
-        |c| c.scheduler_metrics_interval = std::time::Duration::ZERO,
-        |c| c.scheduler_retention_interval = std::time::Duration::ZERO,
+        |c| c.mechanics.scheduler_seal_interval = std::time::Duration::ZERO,
+        |c| c.mechanics.scheduler_metadata_interval = std::time::Duration::ZERO,
+        |c| c.mechanics.scheduler_metrics_interval = std::time::Duration::ZERO,
+        |c| c.mechanics.scheduler_retention_interval = std::time::Duration::ZERO,
     ];
     for mutate in mutations {
         let mut config = Config::test(path.clone());
@@ -3382,8 +3394,8 @@ fn config_validate_rejects_zero_seal_freshness_ages() {
     );
 
     let mutations: [fn(&mut Config); 2] = [
-        |c| c.seal_rate_seed_window = std::time::Duration::ZERO,
-        |c| c.arrow_write_buffer_max_age = std::time::Duration::ZERO,
+        |c| c.mechanics.seal_rate_seed_window = std::time::Duration::ZERO,
+        |c| c.mechanics.arrow_write_buffer_max_age = std::time::Duration::ZERO,
     ];
     for mutate in mutations {
         let mut config = Config::test(path.clone());
@@ -3405,13 +3417,13 @@ fn config_validate_rejects_invalid_raw_spool_limits() {
     );
 
     let mutations: [fn(&mut Config); 7] = [
-        |c| c.raw_spool_max_segment_bytes = 0,
-        |c| c.raw_spool_max_record_bytes = 0,
-        |c| c.raw_spool_max_total_bytes = 0,
-        |c| c.raw_spool_group_commit_delay = std::time::Duration::ZERO,
-        |c| c.raw_spool_append_sync_interval = std::time::Duration::ZERO,
-        |c| c.raw_spool_append_sync_bytes = 0,
-        |c| c.raw_spool_max_record_bytes = c.raw_spool_max_total_bytes + 1,
+        |c| c.mechanics.raw_spool_max_segment_bytes = 0,
+        |c| c.mechanics.raw_spool_max_record_bytes = 0,
+        |c| c.mechanics.raw_spool_max_total_bytes = 0,
+        |c| c.mechanics.raw_spool_group_commit_delay = std::time::Duration::ZERO,
+        |c| c.mechanics.raw_spool_append_sync_interval = std::time::Duration::ZERO,
+        |c| c.mechanics.raw_spool_append_sync_bytes = 0,
+        |c| c.mechanics.raw_spool_max_record_bytes = c.mechanics.raw_spool_max_total_bytes + 1,
     ];
     for mutate in mutations {
         let mut config = Config::test(path.clone());
@@ -3433,8 +3445,8 @@ fn config_validate_rejects_invalid_ingest_workers_capacities() {
     );
 
     let mutations: [fn(&mut Config); 2] = [
-        |c| c.ingest_workers = 0,
-        |c| c.ingest_worker_channel_capacity = 0,
+        |c| c.mechanics.ingest_workers = 0,
+        |c| c.mechanics.ingest_worker_channel_capacity = 0,
     ];
     for mutate in mutations {
         let mut config = Config::test(path.clone());
