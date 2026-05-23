@@ -472,7 +472,7 @@ impl Config {
             anyhow::bail!("CANARDSTACK_INGEST_WORKERS must be > 0");
         }
         if self.ingest_worker_channel_capacity == 0 {
-            anyhow::bail!("CANARDSTACK_INGEST_WORKER_CHANNEL_CAPACITY must be > 0");
+            anyhow::bail!("ingest worker channel capacity must be > 0");
         }
         if self.raw_spool_max_record_bytes > self.raw_spool_max_total_bytes {
             anyhow::bail!(
