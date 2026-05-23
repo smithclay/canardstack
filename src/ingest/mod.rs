@@ -534,9 +534,10 @@ impl Ingestor {
     }
 
     /// Single ingest admission gate: project visibility through the freshness
-    /// budget (the freshness-first authority), then take a per-storage-signal
-    /// in-flight reservation as a cheap isolation ceiling. Both run before the
-    /// durable raw-spool append, so a rejection never spools.
+    /// budget (the sole soft shed) before the durable raw-spool append, so a
+    /// rejection never spools. On admission, take the per-storage-signal
+    /// in-flight reservation — pure accounting that feeds the freshness total and
+    /// the pressure gauges; it never rejects.
     fn admit_and_reserve_inflight(
         &self,
         route: OtlpRequestKind,
@@ -555,7 +556,7 @@ impl Ingestor {
         let mut inputs = self.freshness_budget_inputs(storage);
         inputs.incoming_bytes = estimate.values().sum::<usize>();
         admission.admit_ingest(inputs, metrics)?;
-        self.inflight.reserve(estimate)
+        Ok(self.inflight.reserve(estimate))
     }
 
     fn admit_runtime_memory(

@@ -86,8 +86,8 @@ Do not label metrics by `service_name`, trace id, query text, API key, or arbitr
 | `canardstack_ingest_buffered_rows_total` | Counter | `storage_signal` | Rows appended to the Arrow write buffer. |
 | `canardstack_ingest_buffered_bytes_total` | Counter | `storage_signal` | Approximate Arrow bytes appended to the Arrow write buffer. |
 | `canardstack_ingest_inflight_bytes` | Gauge | `storage_signal` | Bytes admitted (spooled, handed to a worker) but not yet appended to the Arrow write buffer. Peaks are derivable with `max_over_time()`. |
-| `canardstack_ingest_inflight_capacity_bytes` | Gauge | `storage_signal` | Per-storage-signal in-flight ceiling. |
-| `canardstack_ingest_inflight_pressure` | Gauge | `storage_signal` | In-flight bytes as a fraction of the per-storage-signal ceiling (`0..1`). Peaks are derivable with `max_over_time()`. |
+| `canardstack_ingest_inflight_capacity_bytes` | Gauge | `storage_signal` | Per-storage-signal in-flight pressure reference (the `inflight_pressure` denominator). Not an admission ceiling — freshness-first admission is the sole soft shed. |
+| `canardstack_ingest_inflight_pressure` | Gauge | `storage_signal` | In-flight bytes as a fraction of the per-storage-signal pressure reference (`0..1`). Peaks are derivable with `max_over_time()`. |
 | `canardstack_ingest_worker_queue_capacity` | Gauge | `state=capacity` | Configured bounded worker channel capacity. |
 | `canardstack_ingest_worker_dispatch_total` | Counter | `request_kind`, `outcome` | Worker-channel handoff outcomes: `queued`, `processed_inline`, or `workers_unavailable`. |
 | `canardstack_ingest_storage_insert_total` | Counter | `request_kind`, `status` | Worker appends of Arrow batches into the Arrow write buffer. |

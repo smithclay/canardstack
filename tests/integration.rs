@@ -948,12 +948,18 @@ fn dependency_unhealthy_returns_503() {
 }
 
 #[test]
-fn queue_pressure_returns_429() {
+fn ingest_pressure_returns_429_and_holds_no_inflight() {
+    // Freshness-first admission is the sole soft shed. Pin the freshness
+    // projection so even one small incoming log projects over the budget, and
+    // assert the request is rejected before the durable raw-spool append and
+    // leaves no in-flight bytes reserved.
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
-    config.per_signal_inflight_bytes = 16;
-    config.ingest_memory_budget_bytes = 64;
-    config.seal_rate_seed_bytes = 10_000;
+    config.freshness_budget_sla = StdDuration::from_millis(1);
+    config.seal_rate_seed_window = StdDuration::from_secs(1);
+    config.seal_rate_seed_bytes = 1_000;
+    config.arrow_write_buffer_target_bytes = 1_000;
+    config.arrow_write_buffer_max_age = StdDuration::from_secs(1);
     let state = AppState::new(config).unwrap();
     let body = log_fixture(Utc::now().timestamp_nanos_opt().unwrap()).to_string();
     let response = http::route(
@@ -965,10 +971,11 @@ fn queue_pressure_returns_429() {
         &state,
     );
     assert_eq!(response.status(), 429);
+    assert_eq!(response.json_body()["error"], "freshness_budget_exceeded");
     assert_eq!(
         state.ingestor.raw_spool_stats().unwrap().pending_records,
         0,
-        "queue credit rejection should happen before durable raw spool append"
+        "freshness rejection should happen before durable raw spool append"
     );
     assert_eq!(
         state

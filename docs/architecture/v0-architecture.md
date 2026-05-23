@@ -59,13 +59,17 @@ flowchart LR
 
 Admission is freshness-first: before the durable raw-spool append, the request
 projects seal visibility through the admission controller and is shed with `429`
-when projected visibility exceeds the freshness budget. A cheap per-storage-signal
-in-flight ceiling (`signal_inflight_full`) keeps one storage signal's burst from
-monopolizing the accepted-but-not-yet-buffered window. There is no separate
-in-memory queue and no separate storage-sink worker: ingest workers insert
-directly into the Arrow write buffer, and a single scheduler-driven seal driver
-is the only path that flushes that buffer to DuckLake and checkpoints the raw
-spool.
+when projected visibility exceeds the freshness budget. That freshness
+projection is the sole soft shed; the optional process RSS limit
+(`runtime_memory_full`) is the sole hard cap. The per-storage-signal in-flight
+bytes are pure accounting plus a soft pressure reference: the freshness
+projection consumes their total, and the
+`canardstack_ingest_inflight_pressure` / `canardstack_ingest_inflight_capacity_bytes`
+gauges expose per-signal occupancy against that reference. They no longer gate
+admission. There is no separate in-memory queue and no separate storage-sink
+worker: ingest workers insert directly into the Arrow write buffer, and a single
+scheduler-driven seal driver is the only path that flushes that buffer to
+DuckLake and checkpoints the raw spool.
 
 ## Ingest Semantics
 
@@ -237,8 +241,10 @@ remain bounded and retryable.
 
 The process has one small admission controller with three distinct primitives:
 
-- freshness budget: checks projected visibility plus a per-storage-signal
-  in-flight ceiling before durable raw-spool append.
+- freshness budget: checks projected visibility before durable raw-spool append
+  and is the sole soft ingest shed. The per-storage-signal in-flight bytes are
+  accounting plus a soft pressure reference that feeds that projection, not an
+  admission ceiling.
 - seal admission: reserves capacity for the scheduled seal driver and manual
   seal before query capacity is considered.
 - query admission: splits compatibility routes into cheap and heavy classes.
