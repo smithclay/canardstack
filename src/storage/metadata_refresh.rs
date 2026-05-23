@@ -10,7 +10,7 @@
 //! ```text
 //! seal commit -> mark_metadata_dirty (dirty signal/date buckets)
 //!   -> scheduler `metadata_refresh` job (bounded per tick, yields under
-//!      seal/freshness pressure, re-queues drained buckets on failure)
+//!      seal/freshness pressure, re-marks drained buckets dirty on failure)
 //!   -> refresh_metadata_limited -> refresh_metadata_summaries_on (this module)
 //!      re-aggregates `metadata_summary` for the affected buckets
 //!   -> bumps the storage `metadata_generation`
@@ -20,7 +20,7 @@
 //! Running off the commit path keeps ingest cheap and bounded: discovery
 //! re-aggregation is scheduled, capped per tick, and yields to the writer when a
 //! seal is approaching its freshness budget, so it can never delay a due seal.
-//! Eventual visibility is preserved because the scheduler job re-queues any
+//! Eventual visibility is preserved because the scheduler job re-marks dirty any
 //! buckets it failed to refresh. `crate::metadata` is the read side of this same
 //! stage.
 

@@ -345,12 +345,12 @@ cleanly when `serve` exits.
 
 `src/admission_control.rs` owns seal admission, query admission, and freshness
 budget projection. It is intentionally not a generic scheduler. The request path
-asks it one direct question before raw-spool append: will the process queue debt
+asks it one direct question before raw-spool append: will the in-flight seal debt
 plus Arrow write-buffer visibility debt stay within
 `CANARDSTACK_FRESHNESS_BUDGET_SLA_SECS` or `_MS`?
 
 Seal jobs reserve seal admission before doing DuckDB/DuckLake work and record
-successful queue-byte drain into the EWMA. Compatibility routes reserve either
+successful seal-byte drain into the EWMA. Compatibility routes reserve either
 cheap query admission (labels, metadata, probe, instant-ish queries) or heavy
 query admission (range/search/trace lookups). Heavy query capacity is reduced
 first under freshness debt and then rejected with the normal protocol error

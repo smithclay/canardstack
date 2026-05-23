@@ -159,9 +159,9 @@ because accepted requests are fsynced before acknowledgement.
 | `canardstack_admission_rejections_total` | Counter | `admission`, `reason` | Rejections at the admission controller, including seal saturation, cheap/heavy query saturation, freshness debt, and `admission="freshness_budget"` ingest rejections. |
 | `canardstack_admission_reductions_total` | Counter | none | Heavy query admissions that ran at the degraded capacity because freshness debt was elevated. |
 | `canardstack_seal_ewma_bytes_per_second` | Gauge | none | EWMA seal throughput used for freshness-budget admission. |
-| `canardstack_projected_seal_seconds` | Gauge | none | Queue byte debt divided by EWMA seal throughput. |
+| `canardstack_projected_seal_seconds` | Gauge | none | In-flight plus incoming byte debt divided by EWMA seal throughput. |
 | `canardstack_projected_buffer_seconds` | Gauge | none | Arrow write-buffer visibility debt past configured buffer target or max age. |
-| `canardstack_projected_visibility_seconds` | Gauge | none | Max of process-queue visibility debt and Arrow write-buffer visibility debt. |
+| `canardstack_projected_visibility_seconds` | Gauge | none | Max of in-flight seal visibility debt and Arrow write-buffer visibility debt. |
 | `canardstack_observed_freshness_lag_seconds` | Gauge | none | Max cached query-visible freshness lag from the last operator gauge refresh. |
 | `canardstack_ingest_inflight_memory_bound_bytes` | Gauge | none | Approximate in-flight byte bound implied by freshness-first admission (`0.95 x freshness_budget_sla_seconds x ewma_seal_bytes_per_second`). The 0.95 is the headline `INGEST_FRESHNESS_BUDGET_FRACTION`; the with-heavy-query path tightens to 0.90. During EWMA warm-up it rides on the configured seal-rate seed. This is the implicit memory backstop now that the per-signal in-flight ceiling is gone and the RSS hard cap is opt-in. |
 

@@ -31,7 +31,7 @@ impl Storage {
     /// metadata discovery work cannot monopolize the writer connection while
     /// ingest is under load. The `metadata_refresh` scheduler job passes a small
     /// limit; pass `usize::MAX` to drain every pending bucket in one pass. On
-    /// failure the drained buckets are re-queued so the next call retries them —
+    /// failure the drained buckets are re-marked dirty so the next call retries them —
     /// committed telemetry must not stay invisible to the discovery APIs.
     pub fn refresh_metadata_limited(&self, max_buckets: usize) -> Result<MetadataRefreshOutcome> {
         let affected = {

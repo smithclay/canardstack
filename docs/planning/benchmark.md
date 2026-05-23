@@ -43,7 +43,7 @@ The MVP gates prove these behaviors:
   least `128 MiB` pending raw spool data if the fixture reaches that first.
 - **Operator surface:** `/metrics`, `/healthz`, and
   `/api/admin/health/ingest` distinguish accepted, raw-spooled, pending replay,
-  queued, Arrow-flushed, DuckLake-visible, checkpointed, spool full, and
+  buffered, Arrow-flushed, DuckLake-visible, checkpointed, spool full, and
   storage unavailable states.
 - **Query path:** backward Loki `query_range` and Tempo search/lookup use
   bounded logical DuckLake queries. There is no active raw-file shadow mode

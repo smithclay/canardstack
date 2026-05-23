@@ -136,7 +136,8 @@ Before handing work back, confirm the requested behavior is implemented and the 
   writer command channel and the worker handoff). The single per-signal metric
   label for the ingest/raw-spool surface is `request_kind` (`logs`/`traces`/`metrics`);
   `spool_lane` was retired. Fine spool phase micro-timings are gated behind the
-  `detailed-metrics` cargo feature (off by default).
+  `detailed-metrics` cargo feature (off by default). See
+  `docs/architecture/glossary.md` for one definition per core term.
 
 Examples:
 

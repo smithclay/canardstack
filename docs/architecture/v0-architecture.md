@@ -251,22 +251,28 @@ its rows are durable. Admin seal uses the same path on demand.
 Freshness-budget admission happens before raw-spool append. The request path
 uses two local debt signals:
 
-- in-flight debt: accepted-but-not-yet-buffered (in-flight) bytes and oldest
-  age before ingest workers move batches into storage buffers.
+- in-flight debt: accepted-but-not-yet-buffered (in-flight) bytes, plus the
+  incoming request bytes, before ingest workers move batches into the Arrow
+  write buffer.
 - visibility-buffer debt: Arrow write-buffer bytes and age beyond the
   configured buffer target and max age, before rows are DuckLake-committed.
 
 The admission controller estimates freshness budget:
 
 ```text
-projected_seal_seconds = inflight_bytes / ewma_seal_bytes_per_sec
-projected_buffer_seconds =
-  excess_buffer_bytes / arrow_write_buffer_bytes_per_sec
-  + max(0, oldest_buffer_age_seconds - arrow_write_buffer_max_age_seconds)
-projected_visibility_seconds =
-  max(oldest_queue_age_seconds + projected_seal_seconds,
-      projected_buffer_seconds)
+projected_seal_seconds   = (inflight_bytes + incoming_bytes) / ewma_seal_bytes_per_second
+projected_buffer_seconds = buffer_size_debt + buffer_age_debt
+    buffer_size_debt = max(0, buffered_bytes - arrow_write_buffer_target_bytes * buffered_active_count)
+                       / ewma_seal_bytes_per_second
+    buffer_age_debt  = max(0, oldest_buffer_age_seconds - arrow_write_buffer_max_age_seconds)
+projected_visibility_seconds = max(projected_seal_seconds, projected_buffer_seconds)
 ```
+
+The inputs are the `FreshnessBudgetInputs` fields (`inflight_bytes`,
+`incoming_bytes`, `buffered_bytes`, `buffered_active_count`,
+`oldest_buffer_age_seconds`). A single observed seal-rate EWMA
+(`ewma_seal_bytes_per_second`) drains BOTH the seal debt and the buffer-size
+debt, so the two share one drain estimate.
 
 If projected visibility exceeds `CANARDSTACK_FRESHNESS_BUDGET_SLA_SECS` or
 `_MS`, the request returns retryable `429 freshness_budget_exceeded` and does
@@ -380,7 +386,7 @@ The operator surface distinguishes:
 - accepted requests
 - raw-spooled records and bytes
 - pending replay records and bytes
-- queued rows and bytes
+- buffered (Arrow write-buffer) rows and bytes
 - Arrow-appended and DuckLake-flushed rows
 - DuckLake-visible rows and active data files
 - checkpointed raw-spool records
