@@ -67,5 +67,17 @@ maintenance_interval_secs = 30
 # Arrow write-buffer age never approaches the freshness-budget reject threshold (default 1000ms).
 # seal_interval_ms = 1000
 
+[metrics]
+# Persist a snapshot of operator metrics into the metric_gauge / metric_sum
+# storage tables so canardstack's own metrics are queryable via the compat
+# path. Off by default to avoid the extra write load and the
+# canardstack_operator_metrics rows; /metrics still serves the live surface.
+# operator_metrics_to_storage = false
+#
+# Fine-grained spool phase micro-timings (raw_spool_append_*/raw_spool_checkpoint_*)
+# are a compile-time opt-in, not a config knob: build with
+# `cargo build --features detailed-metrics` to emit them. The coarse phases are
+# always on.
+
 [bench]
 http_keepalive = true

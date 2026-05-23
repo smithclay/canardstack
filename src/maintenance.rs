@@ -307,8 +307,20 @@ fn scheduler_loop(state: Arc<AppState>, stop: Arc<AtomicBool>) {
             let ok = run_job(&state, "metrics_snapshot", |s| {
                 crate::http::record_operator_gauges(s);
                 crate::http::record_storage_operator_gauges(s);
-                let rows = s.metrics.write_snapshot_to_storage(&s.storage)?;
-                Ok(json!({"status": "ok", "rows": rows}))
+                // The operator gauges above always refresh. Persisting a snapshot
+                // into the metric_gauge / metric_sum storage tables is opt-in to
+                // avoid the extra write load and the canardstack_operator_metrics
+                // rows by default.
+                if s.config.operator_metrics_to_storage {
+                    let rows = s.metrics.write_snapshot_to_storage(&s.storage)?;
+                    Ok(json!({"status": "ok", "rows": rows}))
+                } else {
+                    Ok(json!({
+                        "status": "ok",
+                        "rows": 0,
+                        "operator_metrics_to_storage": false
+                    }))
+                }
             });
             next_metrics = now + next_interval(&state, "metrics_snapshot", metrics_every, ok);
         }

@@ -112,6 +112,12 @@ pub struct Config {
     pub raw_spool_checkpoint_fsync_delay: Duration,
     pub ingest_workers: usize,
     pub ingest_worker_channel_capacity: usize,
+    /// When true, the scheduler's metrics-snapshot job writes a snapshot of the
+    /// current operator metrics into the `metric_gauge` / `metric_sum` storage
+    /// tables (queryable via the Prometheus-compatible path). Off by default to
+    /// avoid the extra write load and the `canardstack_operator_metrics` rows;
+    /// the operator gauges still refresh and `/metrics` still serves them.
+    pub operator_metrics_to_storage: bool,
 }
 
 const DEFAULT_CONFIG_PATH: &str = "config.toml";
@@ -312,6 +318,9 @@ impl Config {
             )?
             .or(file.usize(&["ingest", "worker_channel_capacity"])?)
             .unwrap_or(1024),
+            operator_metrics_to_storage: env_bool("CANARDSTACK_OPERATOR_METRICS_TO_STORAGE")?
+                .or(file.bool(&["metrics", "operator_metrics_to_storage"])?)
+                .unwrap_or(false),
         })
     }
 
@@ -375,6 +384,7 @@ impl Config {
             raw_spool_checkpoint_fsync_delay: Duration::from_millis(1000),
             ingest_workers: 4,
             ingest_worker_channel_capacity: 1024,
+            operator_metrics_to_storage: false,
         }
     }
 
@@ -732,6 +742,7 @@ mod tests {
         "CANARDSTACK_RAW_SPOOL_GROUP_COMMIT_MS",
         "CANARDSTACK_INGEST_WORKERS",
         "CANARDSTACK_INGEST_WORKER_CHANNEL_CAPACITY",
+        "CANARDSTACK_OPERATOR_METRICS_TO_STORAGE",
     ];
 
     fn env_lock() -> &'static Mutex<()> {
@@ -973,6 +984,16 @@ max_body_bytes = "large"
         }
 
         Config::from_env().unwrap().validate().unwrap();
+    }
+
+    #[test]
+    fn operator_metrics_to_storage_defaults_off() {
+        let _guard = env_lock().lock_or_poisoned();
+        let _snapshot = EnvSnapshot::capture_and_clear();
+
+        let config = Config::from_env().unwrap();
+
+        assert!(!config.operator_metrics_to_storage);
     }
 
     #[test]

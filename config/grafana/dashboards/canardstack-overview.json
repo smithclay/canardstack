@@ -391,13 +391,13 @@
             "uid": "canardstack-prometheus"
           },
           "editorMode": "code",
-          "expr": "max({__name__=\"canardstack_ingest_queue_rows\",service_name=\"canardstack\"})",
-          "legendFormat": "queued rows",
+          "expr": "sum({__name__=\"canardstack_raw_spool_pending_records\",service_name=\"canardstack\"})",
+          "legendFormat": "pending records",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "Queued Rows",
+      "title": "Raw Spool Pending Records",
       "type": "stat"
     }
   ],

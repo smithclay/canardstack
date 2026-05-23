@@ -54,7 +54,6 @@ impl Ingestor {
                     "canardstack_raw_spool_replayed_records_total",
                     &[
                         ("request_kind", recovered.record.request_kind.as_str()),
-                        ("spool_lane", lane.as_str()),
                         ("status", "attempted"),
                     ],
                     1,
@@ -79,7 +78,6 @@ impl Ingestor {
                             "canardstack_raw_spool_replayed_records_total",
                             &[
                                 ("request_kind", recovered.record.request_kind.as_str()),
-                                ("spool_lane", lane.as_str()),
                                 ("status", "ok"),
                             ],
                             1,
@@ -90,7 +88,6 @@ impl Ingestor {
                             "canardstack_raw_spool_replayed_records_total",
                             &[
                                 ("request_kind", recovered.record.request_kind.as_str()),
-                                ("spool_lane", lane.as_str()),
                                 ("status", "failed"),
                             ],
                             1,
@@ -260,7 +257,7 @@ impl Ingestor {
         let result = self
             .raw_spool_for(spool)
             .and_then(|raw_spool| raw_spool.append(record));
-        metrics.observe_spool_lane_phase_seconds(
+        metrics.observe_request_phase_seconds(
             spool.as_str(),
             "raw_spool_append",
             started.elapsed().as_secs_f64(),
@@ -272,12 +269,12 @@ impl Ingestor {
                 }
                 metrics.inc(
                     "canardstack_raw_spool_records_total",
-                    &[("spool_lane", spool.as_str()), ("status", "spooled")],
+                    &[("request_kind", spool.as_str()), ("status", "spooled")],
                     1,
                 );
                 metrics.inc(
                     "canardstack_raw_spool_bytes_total",
-                    &[("spool_lane", spool.as_str())],
+                    &[("request_kind", spool.as_str())],
                     compressed_body_len as u64,
                 );
                 Ok((AppendRef { spool, id: ack.id }, ack.compressed_body))
@@ -286,7 +283,7 @@ impl Ingestor {
                 if full_info(&err).is_some() {
                     metrics.inc(
                         "canardstack_raw_spool_records_total",
-                        &[("spool_lane", spool.as_str()), ("status", "full")],
+                        &[("request_kind", spool.as_str()), ("status", "full")],
                         1,
                     );
                     Err(ApiError::new(
@@ -297,7 +294,7 @@ impl Ingestor {
                 } else if err.to_string().contains("raw spool writer queue is full") {
                     metrics.inc(
                         "canardstack_raw_spool_records_total",
-                        &[("spool_lane", spool.as_str()), ("status", "queue_full")],
+                        &[("request_kind", spool.as_str()), ("status", "queue_full")],
                         1,
                     );
                     Err(ApiError::new(
@@ -309,7 +306,7 @@ impl Ingestor {
                 } else {
                     metrics.inc(
                         "canardstack_raw_spool_records_total",
-                        &[("spool_lane", spool.as_str()), ("status", "error")],
+                        &[("request_kind", spool.as_str()), ("status", "error")],
                         1,
                     );
                     Err(ApiError::new(
@@ -330,70 +327,56 @@ impl Ingestor {
     ) {
         metrics.inc(
             "canardstack_raw_spool_append_batches_total",
-            &[("spool_lane", lane.as_str())],
+            &[("request_kind", lane.as_str())],
             1,
         );
         metrics.inc(
             "canardstack_raw_spool_append_batch_records_total",
-            &[("spool_lane", lane.as_str())],
+            &[("request_kind", lane.as_str())],
             stats.records as u64,
         );
         metrics.inc(
             "canardstack_raw_spool_append_batch_encoded_bytes_total",
-            &[("spool_lane", lane.as_str())],
+            &[("request_kind", lane.as_str())],
             stats.encoded_bytes,
         );
         metrics.inc(
             "canardstack_raw_spool_append_file_fsyncs_total",
-            &[("spool_lane", lane.as_str())],
+            &[("request_kind", lane.as_str())],
             stats.fsync_count,
         );
-        metrics.gauge(
-            "canardstack_raw_spool_append_batch_records",
-            &[("spool_lane", lane.as_str()), ("stat", "last")],
-            stats.records as f64,
-        );
-        metrics.gauge_max(
-            "canardstack_raw_spool_append_batch_records",
-            &[("spool_lane", lane.as_str()), ("stat", "max")],
-            stats.records as f64,
-        );
-        metrics.gauge(
-            "canardstack_raw_spool_append_batch_encoded_bytes",
-            &[("spool_lane", lane.as_str()), ("stat", "last")],
-            stats.encoded_bytes as f64,
-        );
-        metrics.gauge_max(
-            "canardstack_raw_spool_append_batch_encoded_bytes",
-            &[("spool_lane", lane.as_str()), ("stat", "max")],
-            stats.encoded_bytes as f64,
-        );
-        metrics.observe_spool_lane_phase_seconds_n(
-            lane.as_str(),
-            "raw_spool_append_queue_wait",
-            stats.records as u64,
-            stats.queue_seconds,
-        );
-        metrics.observe_spool_lane_phase_seconds(
-            lane.as_str(),
-            "raw_spool_append_batch_wait",
-            stats.wait_seconds,
-        );
-        metrics.observe_spool_lane_phase_seconds(
-            lane.as_str(),
-            "raw_spool_append_encode",
-            stats.encode_seconds,
-        );
-        metrics.observe_spool_lane_phase_seconds(
-            lane.as_str(),
-            "raw_spool_append_write",
-            stats.write_seconds,
-        );
-        metrics.observe_spool_lane_phase_seconds(
-            lane.as_str(),
-            "raw_spool_append_fsync",
-            stats.fsync_seconds,
-        );
+        // Fine-grained spool append phase micro-timings are gated behind the
+        // `detailed-metrics` feature: the coarse `raw_spool_append` phase
+        // (emitted in `append_raw_spool`) stays always-on for visibility.
+        #[cfg(feature = "detailed-metrics")]
+        {
+            metrics.observe_request_phase_seconds_n(
+                lane.as_str(),
+                "raw_spool_append_queue_wait",
+                stats.records as u64,
+                stats.queue_seconds,
+            );
+            metrics.observe_request_phase_seconds(
+                lane.as_str(),
+                "raw_spool_append_batch_wait",
+                stats.wait_seconds,
+            );
+            metrics.observe_request_phase_seconds(
+                lane.as_str(),
+                "raw_spool_append_encode",
+                stats.encode_seconds,
+            );
+            metrics.observe_request_phase_seconds(
+                lane.as_str(),
+                "raw_spool_append_write",
+                stats.write_seconds,
+            );
+            metrics.observe_request_phase_seconds(
+                lane.as_str(),
+                "raw_spool_append_fsync",
+                stats.fsync_seconds,
+            );
+        }
     }
 
     fn record_raw_spool_checkpoint_batch_metrics(
@@ -406,30 +389,35 @@ impl Ingestor {
         }
         metrics.inc(
             "canardstack_raw_spool_checkpoint_batches_total",
-            &[("spool_lane", lane.as_str())],
+            &[("request_kind", lane.as_str())],
             1,
         );
         metrics.inc(
             "canardstack_raw_spool_checkpoint_batch_records_total",
-            &[("spool_lane", lane.as_str())],
+            &[("request_kind", lane.as_str())],
             stats.records as u64,
         );
         metrics.inc(
             "canardstack_raw_spool_checkpoint_batch_commands_total",
-            &[("spool_lane", lane.as_str())],
+            &[("request_kind", lane.as_str())],
             stats.commands as u64,
         );
-        metrics.observe_spool_lane_phase_seconds_n(
-            lane.as_str(),
-            "raw_spool_checkpoint_queue_wait",
-            stats.records as u64,
-            stats.queue_seconds,
-        );
-        metrics.observe_spool_lane_phase_seconds(
-            lane.as_str(),
-            "raw_spool_checkpoint_batch_wait",
-            stats.wait_seconds,
-        );
+        // Gated like the append micro-timings; the coarse
+        // `raw_spool_checkpoint` phase remains always-on.
+        #[cfg(feature = "detailed-metrics")]
+        {
+            metrics.observe_request_phase_seconds_n(
+                lane.as_str(),
+                "raw_spool_checkpoint_queue_wait",
+                stats.records as u64,
+                stats.queue_seconds,
+            );
+            metrics.observe_request_phase_seconds(
+                lane.as_str(),
+                "raw_spool_checkpoint_batch_wait",
+                stats.wait_seconds,
+            );
+        }
     }
 
     pub(in crate::ingest) fn checkpoint_raw_spool_terminal(
@@ -511,9 +499,9 @@ impl Ingestor {
             }
         }
         if let Some(metrics) = metrics {
-            metrics.observe_spool_lane_phase_seconds(
-                "all",
-                "raw_spool_checkpoint",
+            metrics.observe_seconds(
+                "canardstack_phase_duration_seconds",
+                &[("phase", "raw_spool_checkpoint")],
                 started.elapsed().as_secs_f64(),
             );
             let mut by_request_kind = BTreeMap::<OtlpRequestKind, u64>::new();
@@ -598,132 +586,74 @@ impl Ingestor {
     }
 
     pub fn record_raw_spool_metrics(&self, metrics: &Metrics) {
-        if let Ok(stats) = self.raw_spool_stats() {
-            metrics.gauge(
-                "canardstack_raw_spool_segment_bytes",
-                &[],
-                stats.segment_bytes as f64,
-            );
-            metrics.gauge(
-                "canardstack_raw_spool_segments",
-                &[],
-                stats.segment_count as f64,
-            );
-            metrics.gauge(
-                "canardstack_raw_spool_pending_records",
-                &[],
-                stats.pending_records as f64,
-            );
-            metrics.gauge(
-                "canardstack_raw_spool_pending_bytes",
-                &[],
-                stats.pending_bytes as f64,
-            );
-            metrics.gauge(
-                "canardstack_raw_spool_unsynced_records",
-                &[],
-                stats.unsynced_records as f64,
-            );
-            metrics.gauge(
-                "canardstack_raw_spool_unsynced_bytes",
-                &[],
-                stats.unsynced_bytes as f64,
-            );
-            metrics.gauge(
-                "canardstack_raw_spool_unsynced_age_seconds",
-                &[],
-                stats.unsynced_age_seconds,
-            );
-            metrics.gauge(
-                "canardstack_raw_spool_healthy",
-                &[],
-                if stats.healthy { 1.0 } else { 0.0 },
-            );
-            metrics.set_counter(
-                "canardstack_raw_spool_append_syncs_total",
-                &[],
-                stats.append_syncs_total,
-            );
-            metrics.set_counter(
-                "canardstack_raw_spool_append_sync_failures_total",
-                &[],
-                stats.append_sync_failures_total,
-            );
-            metrics.set_counter(
-                "canardstack_raw_spool_append_file_fsyncs_total",
-                &[],
-                stats.append_sync_file_fsyncs_total,
-            );
-            metrics.set_observation(
-                "canardstack_phase_duration_seconds",
-                &[("spool_lane", "all"), ("phase", "raw_spool_append_fsync")],
-                stats.append_syncs_total,
-                stats.append_sync_seconds_total,
-            );
-        }
+        // Only per-lane series are emitted; the aggregate is derivable as
+        // `sum without(request_kind)` and was dropped in the metrics diet.
         for lane in OtlpRequestKind::ALL {
             let Ok(stats) = self.raw_spool_for(lane).and_then(|spool| spool.stats()) else {
                 continue;
             };
             metrics.gauge(
                 "canardstack_raw_spool_segment_bytes",
-                &[("spool_lane", lane.as_str())],
+                &[("request_kind", lane.as_str())],
                 stats.segment_bytes as f64,
             );
             metrics.gauge(
                 "canardstack_raw_spool_segments",
-                &[("spool_lane", lane.as_str())],
+                &[("request_kind", lane.as_str())],
                 stats.segment_count as f64,
             );
             metrics.gauge(
                 "canardstack_raw_spool_pending_records",
-                &[("spool_lane", lane.as_str())],
+                &[("request_kind", lane.as_str())],
                 stats.pending_records as f64,
             );
             metrics.gauge(
                 "canardstack_raw_spool_pending_bytes",
-                &[("spool_lane", lane.as_str())],
+                &[("request_kind", lane.as_str())],
                 stats.pending_bytes as f64,
             );
             metrics.gauge(
                 "canardstack_raw_spool_unsynced_records",
-                &[("spool_lane", lane.as_str())],
+                &[("request_kind", lane.as_str())],
                 stats.unsynced_records as f64,
             );
             metrics.gauge(
                 "canardstack_raw_spool_unsynced_bytes",
-                &[("spool_lane", lane.as_str())],
+                &[("request_kind", lane.as_str())],
                 stats.unsynced_bytes as f64,
             );
             metrics.gauge(
                 "canardstack_raw_spool_unsynced_age_seconds",
-                &[("spool_lane", lane.as_str())],
+                &[("request_kind", lane.as_str())],
                 stats.unsynced_age_seconds,
             );
             metrics.gauge(
                 "canardstack_raw_spool_healthy",
-                &[("spool_lane", lane.as_str())],
+                &[("request_kind", lane.as_str())],
                 if stats.healthy { 1.0 } else { 0.0 },
             );
             metrics.set_counter(
                 "canardstack_raw_spool_append_syncs_total",
-                &[("spool_lane", lane.as_str())],
+                &[("request_kind", lane.as_str())],
                 stats.append_syncs_total,
             );
             metrics.set_counter(
                 "canardstack_raw_spool_append_sync_failures_total",
-                &[("spool_lane", lane.as_str())],
+                &[("request_kind", lane.as_str())],
                 stats.append_sync_failures_total,
             );
             metrics.set_counter(
                 "canardstack_raw_spool_append_file_fsyncs_total",
-                &[("spool_lane", lane.as_str())],
+                &[("request_kind", lane.as_str())],
                 stats.append_sync_file_fsyncs_total,
             );
+            // The per-lane fsync phase observation is a fine micro-timing; gate
+            // it behind `detailed-metrics` alongside the other spool internals.
+            #[cfg(feature = "detailed-metrics")]
             metrics.set_observation(
                 "canardstack_phase_duration_seconds",
                 &[
-                    ("spool_lane", lane.as_str()),
+                    ("request_kind", lane.as_str()),
                     ("phase", "raw_spool_append_fsync"),
                 ],
                 stats.append_syncs_total,

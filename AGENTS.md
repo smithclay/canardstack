@@ -131,6 +131,11 @@ Before handing work back, confirm the requested behavior is implemented and the 
 - CI treats clippy warnings as errors with `-D warnings`; match that locally before pushing.
 - Prefer existing module patterns and helper APIs over new abstractions.
 - Keep edits scoped. Do not refactor unrelated code while fixing a narrow issue.
+- Vocabulary: "queue" means exactly one thing — a bounded mpsc channel (the spool
+  writer command channel and the worker handoff). The single per-signal metric
+  label for the ingest/raw-spool surface is `request_kind` (`logs`/`traces`/`metrics`);
+  `spool_lane` was retired. Fine spool phase micro-timings are gated behind the
+  `detailed-metrics` cargo feature (off by default).
 
 Examples:
 

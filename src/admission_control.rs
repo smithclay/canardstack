@@ -274,15 +274,6 @@ impl AdmissionController {
         if state.projected_visibility_seconds > budget {
             state.ingest_freshness_rejections_total += 1;
             metrics.inc(
-                "canardstack_ingest_rejections_total",
-                &[
-                    ("request_kind", "all"),
-                    ("status", "429"),
-                    ("reason", "freshness_budget_exceeded"),
-                ],
-                1,
-            );
-            metrics.inc(
                 "canardstack_admission_rejections_total",
                 &[
                     ("admission", "freshness_budget"),
@@ -396,19 +387,9 @@ impl AdmissionController {
             snapshot.observed_freshness_lag_seconds,
         );
         metrics.set_counter(
-            "canardstack_query_admission_reductions_total",
+            "canardstack_admission_reductions_total",
             &[],
             snapshot.heavy_query_reductions_total,
-        );
-        metrics.set_counter(
-            "canardstack_query_admission_rejections_total",
-            &[],
-            snapshot.query_rejections_total,
-        );
-        metrics.set_counter(
-            "canardstack_ingest_freshness_budget_rejections_total",
-            &[],
-            snapshot.ingest_freshness_rejections_total,
         );
     }
 

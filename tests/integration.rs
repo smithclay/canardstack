@@ -1034,7 +1034,7 @@ fn runtime_memory_pressure_returns_429_before_enqueue() {
     let metrics = metrics_text(&state);
     assert!(
         metrics.contains(
-            "canardstack_ingest_rejections_total{request_kind=\"logs\",status=\"429\",reason=\"runtime_memory_full\"} 1"
+            "canardstack_ingest_requests_total{request_kind=\"logs\",status=\"429\",reason=\"runtime_memory_full\"} 1"
         ),
         "{metrics}"
     );
@@ -1174,7 +1174,7 @@ fn ingest_workers_return_202_after_raw_spool_and_handoff() {
     let metrics = metrics_text(&state);
     assert!(
         metrics.contains(
-            "canardstack_ingest_requests_queued_total{request_kind=\"logs\",status=\"queued\"} 1"
+            "canardstack_ingest_worker_dispatch_total{request_kind=\"logs\",outcome=\"queued\"} 1"
         ),
         "{metrics}"
     );
@@ -1249,7 +1249,7 @@ fn raw_spool_acknowledges_local_spool_write_before_storage_commit() {
     let metrics = metrics_text(&state);
     assert!(
         metrics.contains(
-            "canardstack_raw_spool_records_total{spool_lane=\"logs\",status=\"spooled\"} 1"
+            "canardstack_raw_spool_records_total{request_kind=\"logs\",status=\"spooled\"} 1"
         ),
         "{metrics}"
     );
@@ -1263,7 +1263,7 @@ fn raw_spool_acknowledges_local_spool_write_before_storage_commit() {
         "{metrics}"
     );
     assert!(
-        metrics.contains("canardstack_raw_spool_pending_records 0.000000"),
+        metrics.contains("canardstack_raw_spool_pending_records{request_kind=\"logs\"} 0.000000"),
         "{metrics}"
     );
 }
@@ -1325,7 +1325,7 @@ fn raw_spool_checkpoints_after_seal_commits_multirow_record() {
     assert_eq!(log_rows(&state), 2);
     let metrics = metrics_text(&state);
     assert!(
-        metrics.contains("canardstack_raw_spool_pending_records 0.000000"),
+        metrics.contains("canardstack_raw_spool_pending_records{request_kind=\"logs\"} 0.000000"),
         "{metrics}"
     );
 }
@@ -1373,7 +1373,7 @@ fn raw_spool_replays_pending_request_on_startup() {
     let metrics = metrics_text(&state);
     assert!(
         metrics.contains(
-            "canardstack_raw_spool_replayed_records_total{request_kind=\"logs\",spool_lane=\"logs\",status=\"ok\"} 1"
+            "canardstack_raw_spool_replayed_records_total{request_kind=\"logs\",status=\"ok\"} 1"
         ),
         "{metrics}"
     );
@@ -1384,7 +1384,7 @@ fn raw_spool_replays_pending_request_on_startup() {
         "{metrics}"
     );
     assert!(
-        metrics.contains("canardstack_raw_spool_pending_records 0.000000"),
+        metrics.contains("canardstack_raw_spool_pending_records{request_kind=\"logs\"} 0.000000"),
         "{metrics}"
     );
 }
@@ -1425,7 +1425,7 @@ fn raw_spool_replays_one_metrics_request_into_gauge_and_sum_tables() {
     let metrics = metrics_text(&state);
     assert!(
         metrics.contains(
-            "canardstack_raw_spool_replayed_records_total{request_kind=\"metrics\",spool_lane=\"metrics\",status=\"ok\"} 1"
+            "canardstack_raw_spool_replayed_records_total{request_kind=\"metrics\",status=\"ok\"} 1"
         ),
         "{metrics}"
     );
@@ -1475,7 +1475,7 @@ fn raw_spool_replay_failure_does_not_abort_boot() {
     let metrics = metrics_text(&state);
     assert!(
         metrics.contains(
-            "canardstack_raw_spool_replayed_records_total{request_kind=\"logs\",spool_lane=\"logs\",status=\"failed\"} 1"
+            "canardstack_raw_spool_replayed_records_total{request_kind=\"logs\",status=\"failed\"} 1"
         ),
         "{metrics}"
     );
@@ -1509,7 +1509,7 @@ fn raw_spool_replays_accepted_uncommitted_request_after_restart() {
     assert_eq!(log_rows(&restarted), 1);
     let metrics = metrics_text(&restarted);
     assert!(
-        metrics.contains("canardstack_raw_spool_pending_records 0.000000"),
+        metrics.contains("canardstack_raw_spool_pending_records{request_kind=\"logs\"} 0.000000"),
         "{metrics}"
     );
 }
@@ -1542,13 +1542,14 @@ fn raw_spool_full_returns_429_before_transform() {
     );
     let metrics = state.metrics.render_prometheus();
     assert!(
-        metrics
-            .contains("canardstack_raw_spool_records_total{spool_lane=\"logs\",status=\"full\"} 1"),
+        metrics.contains(
+            "canardstack_raw_spool_records_total{request_kind=\"logs\",status=\"full\"} 1"
+        ),
         "{metrics}"
     );
     assert!(
         metrics.contains(
-            "canardstack_ingest_rejections_total{request_kind=\"logs\",status=\"429\",reason=\"raw_spool_full\"} 1"
+            "canardstack_ingest_requests_total{request_kind=\"logs\",status=\"429\",reason=\"raw_spool_full\"} 1"
         ),
         "{metrics}"
     );

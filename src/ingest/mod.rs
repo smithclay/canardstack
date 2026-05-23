@@ -425,8 +425,8 @@ impl Ingestor {
                                 metrics.ingest_request(route.as_str(), 202, "accepted");
                                 self.record_worker_queue_metrics(metrics);
                                 metrics.inc(
-                                    "canardstack_ingest_requests_queued_total",
-                                    &[("request_kind", route.as_str()), ("status", "queued")],
+                                    "canardstack_ingest_worker_dispatch_total",
+                                    &[("request_kind", route.as_str()), ("outcome", "queued")],
                                     1,
                                 );
                                 return Ok(json!({
@@ -449,10 +449,10 @@ impl Ingestor {
         // buffer now, not only after the next process restart) and applies
         // natural backpressure: request latency rises under worker saturation.
         metrics.inc(
-            "canardstack_ingest_requests_queued_total",
+            "canardstack_ingest_worker_dispatch_total",
             &[
                 ("request_kind", route.as_str()),
-                ("status", "processed_inline"),
+                ("outcome", "processed_inline"),
             ],
             1,
         );
@@ -489,10 +489,10 @@ impl Ingestor {
             let pool = self.ingest_workers.lock_or_poisoned();
             let Some(dispatcher) = pool.as_ref() else {
                 metrics.inc(
-                    "canardstack_ingest_requests_queued_total",
+                    "canardstack_ingest_worker_dispatch_total",
                     &[
                         ("request_kind", route.as_str()),
-                        ("status", "workers_unavailable"),
+                        ("outcome", "workers_unavailable"),
                     ],
                     1,
                 );
@@ -505,10 +505,10 @@ impl Ingestor {
             };
             if dispatcher.commands.is_empty() {
                 metrics.inc(
-                    "canardstack_ingest_requests_queued_total",
+                    "canardstack_ingest_worker_dispatch_total",
                     &[
                         ("request_kind", route.as_str()),
-                        ("status", "workers_unavailable"),
+                        ("outcome", "workers_unavailable"),
                     ],
                     1,
                 );
@@ -601,18 +601,8 @@ impl Ingestor {
                 &[("storage_signal", snapshot.storage_signal)],
                 snapshot.inflight_bytes as f64,
             );
-            metrics.gauge_max(
-                "canardstack_ingest_inflight_bytes_max",
-                &[("storage_signal", snapshot.storage_signal)],
-                snapshot.inflight_bytes as f64,
-            );
             metrics.gauge(
                 "canardstack_ingest_inflight_pressure",
-                &[("storage_signal", snapshot.storage_signal)],
-                snapshot.inflight_pressure,
-            );
-            metrics.gauge_max(
-                "canardstack_ingest_inflight_pressure_max",
                 &[("storage_signal", snapshot.storage_signal)],
                 snapshot.inflight_pressure,
             );

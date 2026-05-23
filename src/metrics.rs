@@ -147,13 +147,6 @@ impl Metrics {
             .insert(metric_id, value);
     }
 
-    pub fn gauge_max(&self, name: &str, labels: &[(&str, &str)], value: f64) {
-        let metric_id = MetricId::new(name, labels);
-        let mut inner = self.shard_for(&metric_id).lock_or_poisoned();
-        let current = inner.gauges.get(&metric_id).copied().unwrap_or(value);
-        inner.gauges.insert(metric_id, current.max(value));
-    }
-
     pub fn observe_seconds(&self, name: &str, labels: &[(&str, &str)], seconds: f64) {
         self.observe_seconds_n(name, labels, 1, seconds);
     }
@@ -214,20 +207,6 @@ impl Metrics {
         self.observe_labeled_phase_seconds(&[("storage_signal", storage_signal)], phase, seconds);
     }
 
-    pub fn observe_spool_lane_phase_seconds(&self, spool_lane: &str, phase: &str, seconds: f64) {
-        self.observe_labeled_phase_seconds(&[("spool_lane", spool_lane)], phase, seconds);
-    }
-
-    pub fn observe_spool_lane_phase_seconds_n(
-        &self,
-        spool_lane: &str,
-        phase: &str,
-        count: u64,
-        seconds: f64,
-    ) {
-        self.observe_labeled_phase_seconds_n(&[("spool_lane", spool_lane)], phase, count, seconds);
-    }
-
     pub fn observe_query_route_phase_seconds(
         &self,
         route_template: &str,
@@ -270,17 +249,6 @@ impl Metrics {
             ],
             1,
         );
-        if status == "429" || status == "503" {
-            self.inc(
-                "canardstack_ingest_rejections_total",
-                &[
-                    ("request_kind", request_kind),
-                    ("status", status.as_ref()),
-                    ("reason", reason),
-                ],
-                1,
-            );
-        }
     }
 
     pub fn query_request(&self, route_template: &str, status: u16, reason: &str, seconds: f64) {
@@ -299,13 +267,6 @@ impl Metrics {
             &[("route_template", route_template)],
             seconds,
         );
-        if status == "429" {
-            self.inc(
-                "canardstack_query_rejections_total",
-                &[("route_template", route_template), ("reason", reason)],
-                1,
-            );
-        }
         if reason == "query_timeout" {
             self.inc(
                 "canardstack_query_timeouts_total",
@@ -539,4 +500,569 @@ fn labels_json(labels: &BTreeMap<String, String>) -> Value {
         map.insert(k.clone(), Value::String(v.clone()));
     }
     Value::Object(map)
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    /// Reduce a rendered `/metrics` line to its metric base name: drop the value,
+    /// drop the `{labels}`, and collapse the histogram `_count`/`_sum` pair onto
+    /// the base name so a histogram counts as one metric.
+    fn base_name(line: &str) -> Option<String> {
+        let head = line.split([' ', '{']).next()?;
+        if !head.starts_with("canardstack_") {
+            return None;
+        }
+        let base = head
+            .strip_suffix("_count")
+            .or_else(|| head.strip_suffix("_sum"))
+            .unwrap_or(head);
+        Some(base.to_string())
+    }
+
+    fn rendered_base_names(metrics: &Metrics) -> BTreeSet<String> {
+        metrics
+            .render_prometheus()
+            .lines()
+            .filter_map(base_name)
+            .collect()
+    }
+
+    /// Drive a fixed, representative sequence of metric emissions that mirrors
+    /// what production code emits (one sample per metric name), so the rendered
+    /// surface can be pinned exactly. This is the post-diet contract guard: any
+    /// future add/drop of a metric name must update this set deliberately.
+    fn emit_representative_surface(metrics: &Metrics) {
+        // Ingest request + query request envelopes.
+        metrics.ingest_request("logs", 202, "accepted");
+        metrics.ingest_request("logs", 429, "raw_spool_full");
+        metrics.query_request("/api/v1/query_range", 200, "ok", 0.1);
+        metrics.query_request("/api/v1/query_range", 504, "query_timeout", 0.1);
+
+        // Worker dispatch + worker completion + storage insert.
+        metrics.inc(
+            "canardstack_ingest_worker_dispatch_total",
+            &[("request_kind", "logs"), ("outcome", "queued")],
+            1,
+        );
+        metrics.inc(
+            "canardstack_ingest_worker_completed_total",
+            &[("request_kind", "logs"), ("status", "ok")],
+            1,
+        );
+        metrics.inc(
+            "canardstack_ingest_storage_insert_total",
+            &[("request_kind", "logs"), ("status", "ok")],
+            1,
+        );
+        metrics.gauge(
+            "canardstack_ingest_worker_queue_capacity",
+            &[("state", "capacity")],
+            1024.0,
+        );
+
+        // Accepted-body + transform + buffered counters.
+        metrics.inc(
+            "canardstack_ingest_request_bytes_total",
+            &[("request_kind", "logs"), ("encoding", "identity")],
+            10,
+        );
+        metrics.inc(
+            "canardstack_ingest_decoded_bytes_total",
+            &[("request_kind", "logs"), ("encoding", "identity")],
+            10,
+        );
+        metrics.inc(
+            "canardstack_ingest_records_total",
+            &[("request_kind", "logs")],
+            1,
+        );
+        metrics.inc(
+            "canardstack_ingest_transformed_rows_total",
+            &[("storage_signal", "logs"), ("request_kind", "logs")],
+            1,
+        );
+        metrics.inc(
+            "canardstack_ingest_unsupported_histograms_total",
+            &[("request_kind", "metrics")],
+            1,
+        );
+        metrics.inc(
+            "canardstack_ingest_buffered_rows_total",
+            &[("storage_signal", "logs")],
+            1,
+        );
+        metrics.inc(
+            "canardstack_ingest_buffered_bytes_total",
+            &[("storage_signal", "logs")],
+            10,
+        );
+
+        // In-flight gauges (the `_max` derivatives were dropped).
+        metrics.gauge(
+            "canardstack_ingest_inflight_bytes",
+            &[("storage_signal", "logs")],
+            0.0,
+        );
+        metrics.gauge(
+            "canardstack_ingest_inflight_pressure",
+            &[("storage_signal", "logs")],
+            0.0,
+        );
+        metrics.gauge(
+            "canardstack_ingest_inflight_capacity_bytes",
+            &[("storage_signal", "logs")],
+            1.0,
+        );
+
+        // Runtime memory.
+        metrics.gauge("canardstack_runtime_rss_bytes", &[], 1.0);
+        metrics.gauge("canardstack_runtime_memory_limit_bytes", &[], 1.0);
+        metrics.inc(
+            "canardstack_ingest_runtime_memory_unknown_total",
+            &[("request_kind", "logs")],
+            1,
+        );
+
+        // Raw spool per-`request_kind` surface (aggregate no-label copies dropped).
+        metrics.inc(
+            "canardstack_raw_spool_records_total",
+            &[("request_kind", "logs"), ("status", "spooled")],
+            1,
+        );
+        metrics.inc(
+            "canardstack_raw_spool_bytes_total",
+            &[("request_kind", "logs")],
+            10,
+        );
+        metrics.inc(
+            "canardstack_raw_spool_append_batches_total",
+            &[("request_kind", "logs")],
+            1,
+        );
+        metrics.inc(
+            "canardstack_raw_spool_append_batch_records_total",
+            &[("request_kind", "logs")],
+            1,
+        );
+        metrics.inc(
+            "canardstack_raw_spool_append_batch_encoded_bytes_total",
+            &[("request_kind", "logs")],
+            10,
+        );
+        metrics.set_counter(
+            "canardstack_raw_spool_append_syncs_total",
+            &[("request_kind", "logs")],
+            1,
+        );
+        metrics.set_counter(
+            "canardstack_raw_spool_append_sync_failures_total",
+            &[("request_kind", "logs")],
+            0,
+        );
+        metrics.set_counter(
+            "canardstack_raw_spool_append_file_fsyncs_total",
+            &[("request_kind", "logs")],
+            1,
+        );
+        metrics.inc(
+            "canardstack_raw_spool_checkpoint_batches_total",
+            &[("request_kind", "logs")],
+            1,
+        );
+        metrics.inc(
+            "canardstack_raw_spool_checkpoint_batch_records_total",
+            &[("request_kind", "logs")],
+            1,
+        );
+        metrics.inc(
+            "canardstack_raw_spool_checkpoint_batch_commands_total",
+            &[("request_kind", "logs")],
+            1,
+        );
+        metrics.inc(
+            "canardstack_raw_spool_replayed_records_total",
+            &[("request_kind", "logs"), ("status", "ok")],
+            1,
+        );
+        metrics.inc(
+            "canardstack_raw_spool_checkpointed_records_total",
+            &[("request_kind", "logs"), ("reason", "storage_committed")],
+            1,
+        );
+        for name in [
+            "canardstack_raw_spool_segment_bytes",
+            "canardstack_raw_spool_segments",
+            "canardstack_raw_spool_pending_records",
+            "canardstack_raw_spool_pending_bytes",
+            "canardstack_raw_spool_unsynced_records",
+            "canardstack_raw_spool_unsynced_bytes",
+            "canardstack_raw_spool_unsynced_age_seconds",
+            "canardstack_raw_spool_healthy",
+        ] {
+            metrics.gauge(name, &[("request_kind", "logs")], 0.0);
+        }
+
+        // Coarse always-on phases (the fine spool micro-timings are gated).
+        for phase in [
+            "decompress",
+            "otlp_transform",
+            "timestamp_validation",
+            "storage_buffer",
+            "ingest_worker",
+            "raw_spool_append",
+            "raw_spool_checkpoint",
+            "query_execute",
+            "writer_lock_wait",
+        ] {
+            metrics.observe_request_phase_seconds("logs", phase, 0.001);
+        }
+        for phase in [
+            "storage_prepare",
+            "storage_arrow_write_buffer",
+            "storage_duckdb_arrow_append",
+            "storage_ducklake_commit",
+        ] {
+            metrics.observe_storage_signal_phase_seconds("logs", phase, 0.001);
+        }
+        // The coarse batch-checkpoint phase is emitted once, label-free.
+        metrics.observe_seconds(
+            "canardstack_phase_duration_seconds",
+            &[("phase", "raw_spool_checkpoint")],
+            0.001,
+        );
+
+        // Fine spool micro-timings: only emitted with `detailed-metrics`.
+        #[cfg(feature = "detailed-metrics")]
+        for phase in [
+            "raw_spool_append_queue_wait",
+            "raw_spool_append_batch_wait",
+            "raw_spool_append_encode",
+            "raw_spool_append_write",
+            "raw_spool_append_fsync",
+            "raw_spool_checkpoint_queue_wait",
+            "raw_spool_checkpoint_batch_wait",
+        ] {
+            metrics.observe_request_phase_seconds("logs", phase, 0.001);
+        }
+
+        // DuckDB / Arrow flush counters.
+        metrics.inc(
+            "canardstack_duckdb_arrow_appends_total",
+            &[("storage_signal", "logs")],
+            1,
+        );
+        metrics.inc(
+            "canardstack_duckdb_arrow_appended_rows_total",
+            &[("storage_signal", "logs")],
+            1,
+        );
+        metrics.inc(
+            "canardstack_arrow_flushes_total",
+            &[("storage_signal", "logs")],
+            1,
+        );
+        metrics.inc(
+            "canardstack_arrow_flush_rows_total",
+            &[("storage_signal", "logs")],
+            1,
+        );
+
+        // Admission surface (the per-kind rejection/reduction snapshot counters
+        // were consolidated into the live inc-counter + one reductions counter).
+        metrics.gauge(
+            "canardstack_admission_capacity",
+            &[("admission", "seal")],
+            1.0,
+        );
+        metrics.gauge(
+            "canardstack_admission_in_use",
+            &[("admission", "seal")],
+            0.0,
+        );
+        metrics.inc(
+            "canardstack_admission_rejections_total",
+            &[("admission", "query"), ("reason", "freshness_debt")],
+            1,
+        );
+        metrics.set_counter("canardstack_admission_reductions_total", &[], 1);
+        metrics.gauge("canardstack_seal_ewma_bytes_per_second", &[], 1.0);
+        metrics.gauge("canardstack_projected_seal_seconds", &[], 0.0);
+        metrics.gauge("canardstack_projected_buffer_seconds", &[], 0.0);
+        metrics.gauge("canardstack_projected_visibility_seconds", &[], 0.0);
+        metrics.gauge("canardstack_observed_freshness_lag_seconds", &[], 0.0);
+
+        // Maintenance.
+        metrics.maintenance_run("seal", "ok", "ok", 0.01);
+        metrics.inc(
+            "canardstack_maintenance_failures_total",
+            &[("job", "seal"), ("reason", "seal_failed")],
+            1,
+        );
+        metrics.gauge(
+            "canardstack_maintenance_consecutive_failures",
+            &[("job", "seal")],
+            0.0,
+        );
+        metrics.gauge("canardstack_maintenance_paused", &[], 0.0);
+
+        // Arrow write buffer operator gauges.
+        metrics.gauge(
+            "canardstack_arrow_write_buffer_rows",
+            &[("storage_signal", "logs")],
+            0.0,
+        );
+        metrics.gauge(
+            "canardstack_arrow_write_buffer_bytes",
+            &[("storage_signal", "logs")],
+            0.0,
+        );
+        metrics.gauge(
+            "canardstack_arrow_write_buffer_age_seconds",
+            &[("storage_signal", "logs")],
+            0.0,
+        );
+
+        // Storage / freshness operator gauges.
+        metrics.gauge(
+            "canardstack_storage_physical_bytes",
+            &[("table", "all")],
+            0.0,
+        );
+        metrics.gauge(
+            "canardstack_storage_logical_rows",
+            &[("table", "logs")],
+            0.0,
+        );
+        metrics.gauge(
+            "canardstack_ducklake_active_data_files",
+            &[("table", "logs")],
+            0.0,
+        );
+        metrics.gauge(
+            "canardstack_ducklake_active_data_file_rows",
+            &[("table", "logs")],
+            0.0,
+        );
+        metrics.gauge(
+            "canardstack_freshness_watermark_timestamp",
+            &[("table", "logs")],
+            0.0,
+        );
+        metrics.gauge(
+            "canardstack_ingest_to_query_lag_seconds",
+            &[("table", "logs")],
+            0.0,
+        );
+
+        // HTTP connection counters.
+        metrics.inc(
+            "canardstack_http_connection_requests_total",
+            &[("mode", "keep_alive")],
+            1,
+        );
+        metrics.inc(
+            "canardstack_http_connection_closes_total",
+            &[("reason", "client")],
+            1,
+        );
+        metrics.inc(
+            "canardstack_http_connection_errors_total",
+            &[("reason", "io_error")],
+            1,
+        );
+    }
+
+    /// The exact post-diet metric base-name set the lean default build renders.
+    fn expected_lean_surface() -> BTreeSet<String> {
+        [
+            "canardstack_admission_capacity",
+            "canardstack_admission_in_use",
+            "canardstack_admission_reductions_total",
+            "canardstack_admission_rejections_total",
+            "canardstack_arrow_flush_rows_total",
+            "canardstack_arrow_flushes_total",
+            "canardstack_arrow_write_buffer_age_seconds",
+            "canardstack_arrow_write_buffer_bytes",
+            "canardstack_arrow_write_buffer_rows",
+            "canardstack_duckdb_arrow_appended_rows_total",
+            "canardstack_duckdb_arrow_appends_total",
+            "canardstack_ducklake_active_data_file_rows",
+            "canardstack_ducklake_active_data_files",
+            "canardstack_freshness_watermark_timestamp",
+            "canardstack_http_connection_closes_total",
+            "canardstack_http_connection_errors_total",
+            "canardstack_http_connection_requests_total",
+            "canardstack_ingest_buffered_bytes_total",
+            "canardstack_ingest_buffered_rows_total",
+            "canardstack_ingest_decoded_bytes_total",
+            "canardstack_ingest_inflight_bytes",
+            "canardstack_ingest_inflight_capacity_bytes",
+            "canardstack_ingest_inflight_pressure",
+            "canardstack_ingest_records_total",
+            "canardstack_ingest_request_bytes_total",
+            "canardstack_ingest_requests_total",
+            "canardstack_ingest_runtime_memory_unknown_total",
+            "canardstack_ingest_storage_insert_total",
+            "canardstack_ingest_to_query_lag_seconds",
+            "canardstack_ingest_transformed_rows_total",
+            "canardstack_ingest_unsupported_histograms_total",
+            "canardstack_ingest_worker_completed_total",
+            "canardstack_ingest_worker_dispatch_total",
+            "canardstack_ingest_worker_queue_capacity",
+            "canardstack_maintenance_consecutive_failures",
+            "canardstack_maintenance_duration_seconds",
+            "canardstack_maintenance_failures_total",
+            "canardstack_maintenance_paused",
+            "canardstack_maintenance_runs_total",
+            "canardstack_observed_freshness_lag_seconds",
+            "canardstack_phase_duration_seconds",
+            "canardstack_projected_buffer_seconds",
+            "canardstack_projected_seal_seconds",
+            "canardstack_projected_visibility_seconds",
+            "canardstack_query_duration_seconds",
+            "canardstack_query_requests_total",
+            "canardstack_query_timeouts_total",
+            "canardstack_raw_spool_append_batch_encoded_bytes_total",
+            "canardstack_raw_spool_append_batch_records_total",
+            "canardstack_raw_spool_append_batches_total",
+            "canardstack_raw_spool_append_file_fsyncs_total",
+            "canardstack_raw_spool_append_sync_failures_total",
+            "canardstack_raw_spool_append_syncs_total",
+            "canardstack_raw_spool_bytes_total",
+            "canardstack_raw_spool_checkpoint_batch_commands_total",
+            "canardstack_raw_spool_checkpoint_batch_records_total",
+            "canardstack_raw_spool_checkpoint_batches_total",
+            "canardstack_raw_spool_checkpointed_records_total",
+            "canardstack_raw_spool_healthy",
+            "canardstack_raw_spool_pending_bytes",
+            "canardstack_raw_spool_pending_records",
+            "canardstack_raw_spool_records_total",
+            "canardstack_raw_spool_replayed_records_total",
+            "canardstack_raw_spool_segment_bytes",
+            "canardstack_raw_spool_segments",
+            "canardstack_raw_spool_unsynced_age_seconds",
+            "canardstack_raw_spool_unsynced_bytes",
+            "canardstack_raw_spool_unsynced_records",
+            "canardstack_runtime_memory_limit_bytes",
+            "canardstack_runtime_rss_bytes",
+            "canardstack_seal_ewma_bytes_per_second",
+            "canardstack_storage_logical_rows",
+            "canardstack_storage_physical_bytes",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+    }
+
+    /// Metric names removed by the diet must never reappear on the surface.
+    const DROPPED_NAMES: &[&str] = &[
+        "canardstack_ingest_inflight_bytes_max",
+        "canardstack_ingest_inflight_pressure_max",
+        "canardstack_raw_spool_append_batch_records",
+        "canardstack_raw_spool_append_batch_encoded_bytes",
+        "canardstack_ingest_rejections_total",
+        "canardstack_query_rejections_total",
+        "canardstack_query_admission_rejections_total",
+        "canardstack_query_admission_reductions_total",
+        "canardstack_ingest_freshness_budget_rejections_total",
+        "canardstack_ingest_requests_queued_total",
+    ];
+
+    #[test]
+    fn render_prometheus_matches_post_diet_surface() {
+        let metrics = Metrics::default();
+        emit_representative_surface(&metrics);
+        let rendered = metrics.render_prometheus();
+        let names = rendered_base_names(&metrics);
+
+        assert_eq!(
+            names,
+            expected_lean_surface(),
+            "metric base-name surface drifted from the pinned post-diet set"
+        );
+
+        // Match each dropped name at a metric-name boundary (`{` for a labeled
+        // series or ` ` for a bare one) so a surviving longer name that merely
+        // shares a prefix (e.g. `_total`) is not a false positive.
+        for dropped in DROPPED_NAMES {
+            let with_labels = format!("{dropped}{{");
+            let bare = format!("{dropped} ");
+            assert!(
+                !rendered.contains(&with_labels) && !rendered.contains(&bare),
+                "dropped metric `{dropped}` reappeared on the surface"
+            );
+        }
+
+        // The retired `spool_lane` label key must be gone everywhere.
+        assert!(
+            !rendered.contains("spool_lane="),
+            "retired `spool_lane` label key is still emitted"
+        );
+    }
+
+    #[test]
+    fn coarse_phases_are_always_present() {
+        let metrics = Metrics::default();
+        emit_representative_surface(&metrics);
+        let rendered = metrics.render_prometheus();
+        for phase in [
+            "phase=\"decompress\"",
+            "phase=\"otlp_transform\"",
+            "phase=\"storage_buffer\"",
+            "phase=\"ingest_worker\"",
+            "phase=\"raw_spool_append\"",
+            "phase=\"raw_spool_checkpoint\"",
+            "phase=\"query_execute\"",
+            "phase=\"writer_lock_wait\"",
+        ] {
+            assert!(rendered.contains(phase), "missing coarse phase {phase}");
+        }
+    }
+
+    #[cfg(not(feature = "detailed-metrics"))]
+    #[test]
+    fn fine_phases_absent_in_lean_build() {
+        let metrics = Metrics::default();
+        emit_representative_surface(&metrics);
+        let rendered = metrics.render_prometheus();
+        for phase in [
+            "phase=\"raw_spool_append_queue_wait\"",
+            "phase=\"raw_spool_append_batch_wait\"",
+            "phase=\"raw_spool_append_encode\"",
+            "phase=\"raw_spool_append_write\"",
+            "phase=\"raw_spool_append_fsync\"",
+            "phase=\"raw_spool_checkpoint_queue_wait\"",
+            "phase=\"raw_spool_checkpoint_batch_wait\"",
+        ] {
+            assert!(
+                !rendered.contains(phase),
+                "fine phase {phase} must be gated out of the lean build"
+            );
+        }
+    }
+
+    #[cfg(feature = "detailed-metrics")]
+    #[test]
+    fn fine_phases_present_with_detailed_metrics() {
+        let metrics = Metrics::default();
+        emit_representative_surface(&metrics);
+        let rendered = metrics.render_prometheus();
+        for phase in [
+            "phase=\"raw_spool_append_queue_wait\"",
+            "phase=\"raw_spool_append_batch_wait\"",
+            "phase=\"raw_spool_append_encode\"",
+            "phase=\"raw_spool_append_write\"",
+            "phase=\"raw_spool_append_fsync\"",
+            "phase=\"raw_spool_checkpoint_queue_wait\"",
+            "phase=\"raw_spool_checkpoint_batch_wait\"",
+        ] {
+            assert!(
+                rendered.contains(phase),
+                "fine phase {phase} must be present with detailed-metrics"
+            );
+        }
+    }
 }
