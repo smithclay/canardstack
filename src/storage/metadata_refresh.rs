@@ -1,3 +1,29 @@
+//! Derived metadata refresh stage (the write side).
+//!
+//! This is a FIRST-CLASS derived-metadata pipeline stage, not part of the
+//! ingest commit path. Ingest never re-aggregates discovery metadata inline:
+//! when a seal flush commits rows, the storage layer only records which
+//! signal/date buckets changed (`Storage::mark_metadata_dirty`). This stage
+//! later re-derives the bounded `metadata_summary` rows for those buckets, off
+//! the commit path:
+//!
+//! ```text
+//! seal commit -> mark_metadata_dirty (dirty signal/date buckets)
+//!   -> scheduler `metadata_refresh` job (bounded per tick, yields under
+//!      seal/freshness pressure, re-queues drained buckets on failure)
+//!   -> refresh_metadata_limited -> refresh_metadata_summaries_on (this module)
+//!      re-aggregates `metadata_summary` for the affected buckets
+//!   -> bumps the storage `metadata_generation`
+//!   -> generation-keyed discovery cache in `crate::metadata` is invalidated
+//! ```
+//!
+//! Running off the commit path keeps ingest cheap and bounded: discovery
+//! re-aggregation is scheduled, capped per tick, and yields to the writer when a
+//! seal is approaching its freshness budget, so it can never delay a due seal.
+//! Eventual visibility is preserved because the scheduler job re-queues any
+//! buckets it failed to refresh. `crate::metadata` is the read side of this same
+//! stage.
+
 use crate::db::sql::{
     logs_deployment_environment_expr, logs_http_method_expr, logs_http_route_expr,
     metrics_deployment_environment_expr, quote as sql_quote, spans_http_route_expr,

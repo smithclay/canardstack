@@ -1,3 +1,18 @@
+//! Derived metadata refresh stage (the read side).
+//!
+//! These are the bounded discovery adapters for the Prometheus, Loki, and Tempo
+//! compatibility surfaces (label/tag values, series, metric metadata). They read
+//! the pre-aggregated `metadata_summary` table that the derived metadata refresh
+//! stage maintains off the commit path (see
+//! [`crate::storage::metadata_refresh`]); they never scan the raw telemetry
+//! tables or run unbounded discovery scans.
+//!
+//! Reads are served through a small generation-keyed in-process cache. Each
+//! cached entry is tagged with the storage `metadata_generation`; the refresh
+//! stage bumps that generation whenever it re-aggregates `metadata_summary`, so
+//! a generation mismatch invalidates the cached answer and the adapter rebuilds
+//! it from the latest summary rows.
+
 use crate::db::sql::quote as sql_quote;
 use crate::query::QueryEngine;
 use crate::storage::Storage;

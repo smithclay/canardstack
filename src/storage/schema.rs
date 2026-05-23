@@ -1,3 +1,20 @@
+//! Static v0 storage schema.
+//!
+//! The table schema is STATIC in v0: every column list is a fixed `const`
+//! (`LOGS_COLUMNS`, `SPANS_COLUMNS`, `METRIC_GAUGE_COLUMNS`,
+//! `METRIC_SUM_COLUMNS`, `METADATA_SUMMARY_COLUMNS`) and tables are created with
+//! `CREATE TABLE IF NOT EXISTS`. There is no online schema evolution, no
+//! migration tool, and no `ALTER TABLE ... ADD COLUMN` path. Changing a column
+//! set is a deliberate v0 non-goal: it requires a coordinated manual migration
+//! against the DuckLake catalog (or starting from a fresh catalog).
+//!
+//! Incoming OTLP fields that have no dedicated typed column are NOT promoted to
+//! new columns. Resource/scope/record attributes are carried as JSON in the
+//! `*_attributes` columns (`resource_attributes`, `scope_attributes`,
+//! `log_attributes`, `span_attributes`, `metric_attributes`); the compatibility
+//! layer extracts the few well-known keys it needs from that JSON at query time
+//! (see `crate::db::sql`) instead of widening the schema.
+
 use crate::signal::StorageSignal;
 use anyhow::{Context, Result};
 use duckdb::Connection;

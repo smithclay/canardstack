@@ -25,6 +25,35 @@ canardstack must not maintain a custom manifest duplicating DuckLake membership.
 Metrics are supported for ingest and bounded compatibility behavior, but the
 current sustained MVP performance envelope is only claimed for logs and traces.
 
+## Punts / Non-Goals (v0)
+
+These are deliberate v0 non-goals, called out so they are not mistaken for
+oversights. Each is documented in full in its own section below.
+
+- Physical file compaction — disabled until proven stable. DuckLake
+  `ducklake_merge_adjacent_files` is intentionally not called; v0 tolerates many
+  small Parquet segment files, with the Arrow write buffer's size/age coalescing
+  as the only file-count mitigation. See [Retention](#retention).
+- Online schema evolution — the storage schema is static. Columns are fixed
+  const lists created with `CREATE TABLE IF NOT EXISTS`; there is no migration
+  tool or `ALTER ... ADD COLUMN` path. Changing columns requires a coordinated
+  manual migration (or a fresh catalog). OTLP fields without a typed column are
+  carried as JSON in the `*_attributes` columns, not promoted to new columns.
+  See [Storage](#storage).
+- Row-level dedup — ingest is at-least-once, so crash-replay can produce
+  duplicate rows and v0 surfaces them verbatim. See the delivery-semantics note
+  under [Ingest Semantics](#ingest-semantics); not duplicated here.
+- Single in-process scheduler / single writer — there is no Postgres-backed
+  maintenance lease yet, so assume exactly one scheduler thread and one DuckDB
+  writer. See [Maintenance](#maintenance).
+
+NOT a punt: metadata refresh is a first-class derived pipeline stage, not a
+deferred feature. It runs off the ingest commit path — dirty signal/date buckets
+recorded at seal commit are re-aggregated into `metadata_summary` by the bounded
+`metadata_refresh` scheduler job, which bumps the storage `metadata_generation`
+to invalidate the generation-keyed discovery cache. See
+[Maintenance](#maintenance) and [Operator Surface](#operator-surface).
+
 ## Data Flow
 
 ```text

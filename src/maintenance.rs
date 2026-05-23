@@ -129,6 +129,14 @@ impl Maintenance {
             "dry_run": dry_run,
             "retention": retention,
             "snapshot_expiration": snapshot_expiration,
+            // Physical file compaction is a deliberate v0 non-goal, reported as
+            // `supported:false, enabled:false` rather than implemented. DuckLake's
+            // `ducklake_merge_adjacent_files` is intentionally NOT called: it stays
+            // disabled until proven stable for this append/seal write pattern.
+            // v0 therefore tolerates many small Parquet segment files; the Arrow
+            // write buffer's size/age coalescing (one seal -> one segment per
+            // signal) is the only file-count mitigation. Do not add a compaction
+            // code path here without revisiting that decision.
             "physical_file_compaction": {
                 "supported": false,
                 "enabled": false,
