@@ -1,6 +1,6 @@
 use super::{full_info, AppendBatchStats, CheckpointBatchStats, Record, RecordId, Writer};
 use crate::admission_control::AdmissionController;
-use crate::ingest::{Ingestor, OtlpRequestKind};
+use crate::ingest::{IngestStage, Ingestor, OtlpRequestKind};
 use crate::metrics::Metrics;
 use crate::storage::{ArrowFlushOutcome, Storage, TimingPhase};
 use crate::validation::{self, ApiError, ApiResult};
@@ -155,6 +155,9 @@ impl Ingestor {
             inflight_reservation,
             runtime_memory_reservation,
             metrics: metrics.clone(),
+            // Replayed from the durable raw spool, so the record is already
+            // fsynced. See `crate::ingest::lifecycle`.
+            stage: IngestStage::DurablySpooled,
         };
         self.dispatch_ingest_work(work, storage, metrics.as_ref())
             .map(|_| ())
@@ -162,10 +165,11 @@ impl Ingestor {
     }
 
     /// Record that a durably-spooled request's rows are now in the Arrow write
-    /// buffer. The scheduler checkpoints the record after the next durable
-    /// DuckLake commit (see [`Ingestor::seal_committed_to_storage`]). Called
-    /// only after a successful buffer append so a tracked ref always implies
-    /// buffered rows.
+    /// buffer (the [`IngestStage::ArrowBuffered`] hop in
+    /// [`crate::ingest::lifecycle`]). The scheduler checkpoints the record after
+    /// the next durable DuckLake commit (see
+    /// [`Ingestor::seal_committed_to_storage`]). Called only after a successful
+    /// buffer append so a tracked ref always implies buffered rows.
     pub(in crate::ingest) fn track_raw_spool_record(
         &self,
         raw_spool_ref: AppendRef,
@@ -179,18 +183,26 @@ impl Ingestor {
         );
     }
 
-    /// Single seal driver: capture the records to checkpoint, force-flush the
-    /// whole Arrow write buffer to durable DuckLake storage, then checkpoint
-    /// exactly the captured records. Capturing before flushing is load-bearing
-    /// for at-least-once: a record appended after the capture is not
-    /// checkpointed until a later seal, so we never checkpoint rows that were
-    /// not storage-committed.
+    /// Single seal driver, walking the seal-phase stages in
+    /// [`crate::ingest::lifecycle`]: capture the records to checkpoint
+    /// ([`IngestStage::CapturedForSeal`]), force-flush the whole Arrow write
+    /// buffer to durable DuckLake storage ([`IngestStage::DuckLakeCommitted`]),
+    /// then checkpoint exactly the captured records
+    /// ([`IngestStage::RawSpoolCheckpointed`]). Capturing before flushing is
+    /// load-bearing for at-least-once: a record appended after the capture is not
+    /// checkpointed until a later seal, so we never checkpoint rows that were not
+    /// storage-committed.
     pub fn seal_committed_to_storage(
         &self,
         storage: &Storage,
         metrics: &Metrics,
     ) -> Result<ArrowFlushOutcome> {
         let captured = self.capture_committed_refs();
+        tracing::debug!(
+            event = "seal_captured_refs",
+            stage = IngestStage::CapturedForSeal.as_str(),
+            captured_records = captured.len(),
+        );
         let outcome = match storage.flush_arrow_write_buffer(true) {
             Ok(outcome) => outcome,
             Err(err) => {
@@ -198,23 +210,37 @@ impl Ingestor {
                 return Err(err);
             }
         };
+        tracing::debug!(
+            event = "seal_ducklake_committed",
+            stage = IngestStage::DuckLakeCommitted.as_str(),
+            flushed_rows = outcome.flushed_rows,
+        );
         observe_arrow_flush(metrics, &outcome);
-        if let Err(err) =
-            self.checkpoint_raw_spool_batch(&captured, "storage_committed", Some(metrics))
-        {
-            // Rows are durably committed; only the raw-spool checkpoint failed.
-            // The records stay pending and replay (as duplicate ROWS in storage)
-            // on a future restart. This is the at-least-once contract: the spool
-            // checkpoint deliberately follows the DuckLake COMMIT (capture before
-            // flush, checkpoint after commit), so any crash or checkpoint failure
-            // between commit and checkpoint re-ingests already-committed records.
-            // v0 does NOT dedup, so those duplicate rows are surfaced verbatim to
-            // queries after crash-replay.
-            tracing::error!(
-                event = "raw_spool_checkpoint_failed",
-                error = %err,
-                "Arrow flush committed but raw spool checkpoint failed; records left pending"
-            );
+        match self.checkpoint_raw_spool_batch(&captured, "storage_committed", Some(metrics)) {
+            Ok(()) => {
+                tracing::debug!(
+                    event = "seal_raw_spool_checkpointed",
+                    stage = IngestStage::RawSpoolCheckpointed.as_str(),
+                    checkpointed_records = captured.len(),
+                );
+            }
+            Err(err) => {
+                // Rows are durably committed; only the raw-spool checkpoint
+                // failed. This is the `CommittedNotCheckpointed` duplicate-risk
+                // stage: the records stay pending and replay as duplicate ROWS in
+                // storage on a future restart. The checkpoint deliberately
+                // follows the DuckLake COMMIT (capture before flush, checkpoint
+                // after commit), so any crash or checkpoint failure between commit
+                // and checkpoint re-ingests already-committed records. v0 does NOT
+                // dedup, so those duplicate rows are surfaced verbatim to queries
+                // after crash-replay. See `crate::ingest::lifecycle`.
+                tracing::error!(
+                    event = "raw_spool_checkpoint_failed",
+                    stage = IngestStage::CommittedNotCheckpointed.as_str(),
+                    error = %err,
+                    "Arrow flush committed but raw spool checkpoint failed; records left pending"
+                );
+            }
         }
         Ok(outcome)
     }
@@ -424,6 +450,12 @@ impl Ingestor {
         }
     }
 
+    /// Terminal disposition for a payload that can never succeed: checkpoint the
+    /// raw-spool record so it will not replay. This is the
+    /// [`IngestStage::TerminallyRejectedCheckpointed`] hop in
+    /// [`crate::ingest::lifecycle`]; the caller returns the rejection afterward.
+    /// (Retryable storage faults do NOT take this path — they leave the record
+    /// pending so it replays on restart.)
     pub(in crate::ingest) fn checkpoint_raw_spool_terminal(
         &self,
         raw_spool_ref: AppendRef,
@@ -431,6 +463,12 @@ impl Ingestor {
         reason: &'static str,
         metrics: &Metrics,
     ) -> ApiResult<()> {
+        tracing::debug!(
+            event = "ingest_terminally_rejected",
+            request_kind = route.as_str(),
+            stage = IngestStage::TerminallyRejectedCheckpointed.as_str(),
+            reason,
+        );
         self.checkpoint_raw_spool(raw_spool_ref, route, reason, Some(metrics))
             .map_err(|err| {
                 ApiError::new(

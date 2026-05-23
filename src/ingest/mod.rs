@@ -19,10 +19,12 @@ use std::time::Instant;
 
 mod admission;
 mod batches;
+mod lifecycle;
 pub mod spool;
 mod worker;
 
 pub use batches::IngestSnapshot;
+pub(in crate::ingest) use lifecycle::IngestStage;
 use worker::IngestWorkerPool;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize)]
@@ -81,6 +83,9 @@ pub(in crate::ingest) struct SpooledIngestWork {
     inflight_reservation: admission::InflightReservation,
     runtime_memory_reservation: admission::RuntimeMemoryReservation,
     pub(in crate::ingest) metrics: Arc<Metrics>,
+    /// Explicit lifecycle stage for tracing. See [`crate::ingest::lifecycle`]
+    /// for the authoritative stage map. Advancing it never changes control flow.
+    pub(in crate::ingest) stage: IngestStage,
 }
 
 impl Ingestor {
@@ -155,6 +160,13 @@ impl Ingestor {
             metrics.ingest_request(route.as_str(), err.status, err.reason);
             return Err(err);
         }
+        // Every request-path gate passed; the request is admitted but not yet
+        // durably spooled. See `crate::ingest::lifecycle`.
+        tracing::trace!(
+            event = "ingest_admitted",
+            request_kind = route.as_str(),
+            stage = IngestStage::AdmittedNotSpooled.as_str(),
+        );
         let (raw_spool_ref, compressed_body) =
             match self.append_raw_spool(route, headers, compressed_body, metrics) {
                 Ok(appended) => appended,
@@ -171,6 +183,8 @@ impl Ingestor {
             inflight_reservation,
             runtime_memory_reservation,
             metrics: async_metrics,
+            // `append_raw_spool` succeeded above, so the raw request is fsynced.
+            stage: IngestStage::DurablySpooled,
         };
         self.dispatch_ingest_work(spooled, storage, metrics)
     }
@@ -188,9 +202,22 @@ impl Ingestor {
             mut inflight_reservation,
             mut runtime_memory_reservation,
             metrics,
+            // Lifecycle stage on entry: `DurablySpooled` (set at construction),
+            // or `WorkerDispatched` / `InlineProcessed` if `dispatch_ingest_work`
+            // stamped a dispatch decision. Advanced below as the request walks
+            // toward `ArrowBuffered`; see `crate::ingest::lifecycle`.
+            mut stage,
         } = work;
         let metrics_arc = metrics;
         let metrics = metrics_arc.as_ref();
+        // Record the dispatch decision (`WorkerDispatched` / `InlineProcessed`,
+        // or `DurablySpooled` on replay) before it is advanced through the
+        // per-request stages. See `crate::ingest::lifecycle`.
+        tracing::trace!(
+            event = "ingest_processing_started",
+            request_kind = route.as_str(),
+            stage = stage.as_str(),
+        );
         let started = Instant::now();
         let body_result =
             otlp::decompress_if_needed(&headers, &compressed_body, self.config.max_body_bytes);
@@ -241,6 +268,8 @@ impl Ingestor {
                 return Err(err);
             }
         };
+        // otlp2records produced Arrow batches; see `crate::ingest::lifecycle`.
+        stage = IngestStage::Transformed;
         let unsupported_histograms = transformed.unsupported_histograms;
         let started = Instant::now();
         let skew_result = self.validate_skew(&transformed);
@@ -321,6 +350,7 @@ impl Ingestor {
                 tracing::warn!(
                     event = "ingest_storage_insert_failed",
                     request_kind = route.as_str(),
+                    stage = stage.as_str(),
                     error = %err
                 );
                 return Err(
@@ -329,6 +359,9 @@ impl Ingestor {
                 );
             }
         };
+        // Rows reached the Arrow write buffer; the per-request phase terminus.
+        // See `crate::ingest::lifecycle`.
+        stage = IngestStage::ArrowBuffered;
         observe_storage_timings(metrics, &buffered.timings);
         metrics.inc(
             "canardstack_ingest_storage_insert_total",
@@ -339,9 +372,15 @@ impl Ingestor {
         // Rows are now in the Arrow write buffer. Track the raw-spool record so the
         // scheduler checkpoints it after the next durable DuckLake commit, then release the
         // admission credit (buffer occupancy is now reflected as buffered bytes
-        // for freshness, not as a held queue credit).
+        // for freshness, not as a held queue credit). See `crate::ingest::lifecycle`
+        // for the seal-side hops that take the tracked record to a checkpoint.
         self.track_raw_spool_record(raw_spool_ref, route);
         drop(inflight_reservation);
+        tracing::debug!(
+            event = "ingest_buffered",
+            request_kind = route.as_str(),
+            stage = stage.as_str(),
+        );
 
         let accepted = buffered_totals
             .values()
@@ -393,8 +432,9 @@ impl Ingestor {
         // Round-robin to the first worker with buffer space. On a successful send
         // the function returns directly from inside the loop; if every worker is
         // full (or the pool is gone) the still-owned `work` falls through to the
-        // caller-runs path below.
-        let work = {
+        // caller-runs path below. The two outcomes (`WorkerDispatched` vs
+        // `InlineProcessed`) are the dispatch hop in `crate::ingest::lifecycle`.
+        let mut work = {
             let mut pool = self.ingest_workers.lock_or_poisoned();
             let mut work = work;
             if let Some(dispatcher) = pool.as_mut() {
@@ -403,6 +443,11 @@ impl Ingestor {
                     let start = dispatcher.next_worker % worker_count;
                     for offset in 0..worker_count {
                         let worker_idx = (start + offset) % worker_count;
+                        // Stamp the dispatch decision before the value moves into
+                        // the worker channel. See `crate::ingest::lifecycle`. A
+                        // `Full`/`Disconnected` send returns `work` unchanged, so a
+                        // later inline fall-through restamps it `InlineProcessed`.
+                        work.stage = IngestStage::WorkerDispatched;
                         match dispatcher.commands[worker_idx].try_send(work) {
                             Ok(()) => {
                                 dispatcher.next_worker = worker_idx.wrapping_add(1);
@@ -465,6 +510,10 @@ impl Ingestor {
                 "ingest worker pool saturated; processing inline on the connection thread (back-pressure via latency)"
             );
         }
+        // Caller-runs path: restamp the dispatch decision (the worker-send attempt
+        // above set `WorkerDispatched`, but no worker took it). See
+        // `crate::ingest::lifecycle`.
+        work.stage = IngestStage::InlineProcessed;
         let result = self.process_spooled_ingest(work, storage);
         self.record_inflight_metrics(metrics);
         // The raw request is durably spooled, so the 202 acknowledgement holds
