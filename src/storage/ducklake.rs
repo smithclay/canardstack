@@ -24,16 +24,10 @@ pub(super) fn attach_ducklake_connection(
     duckdb_path: &Path,
     local_storage_dir: &Path,
     extension_dir: Option<&Path>,
-    data_inlining_row_limit: usize,
 ) -> Result<()> {
     configure_extension_directory(conn, extension_dir)?;
-    let plan = build_ducklake_attach_plan(
-        postgres_dsn,
-        attach_uri,
-        duckdb_path,
-        local_storage_dir,
-        data_inlining_row_limit,
-    )?;
+    let plan =
+        build_ducklake_attach_plan(postgres_dsn, attach_uri, duckdb_path, local_storage_dir)?;
 
     if plan.needs_motherduck && conn.execute_batch("LOAD md;").is_err() {
         conn.execute_batch("INSTALL md; LOAD md;")?;
@@ -64,7 +58,6 @@ pub(super) fn ducklake_attach_plan(config: &Config) -> Result<DuckLakeAttachPlan
         config.ducklake_attach_uri.as_deref(),
         &config.duckdb_path,
         &config.local_storage_dir,
-        config.ducklake_data_inlining_row_limit,
     )
 }
 
@@ -73,7 +66,6 @@ pub(super) fn build_ducklake_attach_plan(
     attach_uri: Option<&str>,
     duckdb_path: &Path,
     local_storage_dir: &Path,
-    data_inlining_row_limit: usize,
 ) -> Result<DuckLakeAttachPlan> {
     if postgres_dsn.is_some() && attach_uri.is_some() {
         anyhow::bail!(
@@ -98,16 +90,10 @@ pub(super) fn build_ducklake_attach_plan(
                 "CANARDSTACK_DUCKLAKE_ATTACH_URI must be an md: or ducklake: URI because immutable ingest registers data files with DuckLake"
             );
         }
-        let attach_options = if is_ducklake {
-            format!(" (DATA_INLINING_ROW_LIMIT {data_inlining_row_limit})")
-        } else {
-            String::new()
-        };
         return Ok(DuckLakeAttachPlan {
             sql: format!(
-                "ATTACH '{}' AS canardlake{}; USE canardlake;",
+                "ATTACH '{}' AS canardlake; USE canardlake;",
                 uri.replace('\'', "''"),
-                attach_options
             ),
             mode: if is_motherduck {
                 "ducklake_motherduck_remote"
@@ -125,10 +111,9 @@ pub(super) fn build_ducklake_attach_plan(
     if let Some(dsn) = postgres_dsn {
         return Ok(DuckLakeAttachPlan {
             sql: format!(
-                "ATTACH 'ducklake:postgres:{}' AS canardlake (DATA_PATH '{}', DATA_INLINING_ROW_LIMIT {}); USE canardlake;",
+                "ATTACH 'ducklake:postgres:{}' AS canardlake (DATA_PATH '{}'); USE canardlake;",
                 dsn.replace('\'', "''"),
                 data_path,
-                data_inlining_row_limit
             ),
             mode: "ducklake_postgres_catalog",
             needs_ducklake: true,
@@ -144,10 +129,9 @@ pub(super) fn build_ducklake_attach_plan(
         .join("canardstack.ducklake");
     Ok(DuckLakeAttachPlan {
         sql: format!(
-            "ATTACH 'ducklake:{}' AS canardlake (DATA_PATH '{}', DATA_INLINING_ROW_LIMIT {}); USE canardlake;",
+            "ATTACH 'ducklake:{}' AS canardlake (DATA_PATH '{}'); USE canardlake;",
             sql_path(&metadata),
             data_path,
-            data_inlining_row_limit
         ),
         mode: "ducklake_duckdb_catalog",
         needs_ducklake: true,

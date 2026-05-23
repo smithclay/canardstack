@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::ingest::Signal;
+use crate::ingest::StorageSignal;
 use arrow58::array::{Array, TimestampMicrosecondArray};
 use arrow58::record_batch::RecordBatch;
 use chrono::{DateTime, Utc};
@@ -192,7 +192,7 @@ pub fn parse_limit(value: Option<&Value>, default: usize, max: usize) -> ApiResu
 
 pub fn validate_arrow_timestamp_skew(
     batch: &RecordBatch,
-    signal: Signal,
+    signal: StorageSignal,
     config: &Config,
 ) -> ApiResult<()> {
     let now_ms = Utc::now().timestamp_millis();
@@ -235,7 +235,7 @@ pub fn validate_arrow_timestamp_skew(
 
 fn arrow_timestamp_micros(
     batch: &RecordBatch,
-    signal: Signal,
+    signal: StorageSignal,
 ) -> ApiResult<&TimestampMicrosecondArray> {
     let idx = batch.schema().index_of("timestamp").map_err(|_| {
         ApiError::new(

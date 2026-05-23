@@ -156,7 +156,7 @@ Committed inserts record their affected `(signal, event_date)` buckets as dirty.
 The `metadata_refresh` scheduler job drains that set, rebuilding each bucket's
 summary rows from canonical columns and JSON attribute extraction; a failed
 refresh re-queues the buckets for the next tick. Keeping the day-partition scan
-off the commit path stops it from blocking the writer on every flush. An
+off the commit path stops it from blocking the writer on every seal. An
 in-process generation counter, bumped after each committed refresh, lets bounded
 discovery caches invalidate.
 

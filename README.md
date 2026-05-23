@@ -51,6 +51,12 @@ Docker Compose runs canardstack on `http://localhost:4318` and Grafana on
 `http://localhost:3000`. Local DuckLake metadata and data files live in the
 `canardstack-data` Docker volume.
 
+For host runs, copy `config/example.toml` to `config.toml` and edit the
+structured config there. Environment variables override the file; set
+`CANARDSTACK_CONFIG=/path/to/config.toml` to use a different location.
+Diagnostics are logfmt-style structured events on stderr; set
+`CANARDSTACK_LOG=debug` or use `RUST_LOG` to adjust verbosity.
+
 Seed representative telemetry through the running service:
 
 ```bash
@@ -160,7 +166,7 @@ flowchart LR
         Storage["Storage<br/>writer + reader"]
         Compat["Compat Query APIs"]
         Ingest --> Queues
-        Queues -->|flush| Storage
+        Queues -->|seal| Storage
         Compat -->|reader clone| Storage
     end
 
@@ -232,7 +238,7 @@ MotherDuck, or SQL clients.
 | Process model | One synchronous Rust binary, one DuckDB process, no async runtime. |
 | Ingest | OTLP/HTTP JSON and protobuf for logs, traces, gauge metrics, and sum metrics. |
 | Backpressure | Bounded queues return `429` under pressure. Storage dependency failures surface as `503`. |
-| Durability | A `2xx` ingest response means accepted into bounded process memory. It does not mean committed to DuckLake. |
+| Durability | A `2xx` ingest response means fsynced to the local raw spool and accepted into bounded processing. It does not mean committed to DuckLake or query-visible. |
 | Storage | DuckLake-backed DuckDB tables by default. Local DuckLake is the quickstart path; MotherDuck and Postgres-catalog DuckLake are supported paths. |
 | Query | Prometheus, Loki, and Tempo compatibility subsets with server-side time range, row limit, timeout, memory, and concurrency guards. |
 | SQL | Direct SQL is intentionally outside the HTTP product surface. Use DuckDB CLI, MotherDuck, or another SQL client. |
@@ -245,7 +251,15 @@ canardstack is experimental and not production-ready.
 
 Known v0 limits:
 
-- No durable ingest WAL. A crash can lose accepted but unflushed telemetry.
+- Current single-node throughput is bounded by raw-spool append/backlog
+  behavior. On May 20, 2026, the highest clean 10-minute mixed-signal run was
+  `2000 GB/day` with `--ingest-concurrency 64` (`23.1 MB/s` accepted decoded
+  throughput, no `429`/`503` or query failures). A `2500 GB/day` mixed run
+  reached Vector-like log event rates briefly, but failed the 10-minute guardrail
+  with `429` queue-pressure responses after roughly eight minutes.
+- No exactly-once ingest acknowledgement. A crash after `2xx` should replay the
+  fsynced raw-spool record if it was not checkpointed, but duplicate replay can
+  occur when storage commit succeeds before raw-spool checkpoint.
 - No OTLP/gRPC endpoint. Use an OpenTelemetry Collector if your clients need
   gRPC.
 - No histograms or exponential histograms.
@@ -265,5 +279,5 @@ Known v0 limits:
 - [Storage schema](docs/architecture/storage-schema.md)
 - [Query API](docs/architecture/query-api.md)
 - [Operator metrics](docs/architecture/operator-metrics.md)
-- [Benchmark evidence and proof gates](docs/planning/benchmark.md)
+- [Benchmark gates](docs/planning/benchmark.md)
 - [Failure runbooks](docs/runbooks/failure-runbooks.md)

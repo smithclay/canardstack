@@ -33,6 +33,8 @@ prek run --all-files
 # Local server workflow
 cp config/example.env .env && set -a && . ./.env && set +a
 cargo run -- serve              # serves on CANARDSTACK_BIND, default 127.0.0.1:4318
+cargo run -- serve --role ingest # ingest routes plus operator endpoints; no query routes
+cargo run -- serve --role query  # query routes plus operator endpoints; no ingest routes
 cargo run -- smoke              # in-process smoke: starts app, ingests fixtures, queries, prints health
 cargo run -- smoke-http <url>   # smoke against an already-running server
 cargo run -- healthcheck <url>  # used as the Docker healthcheck
@@ -48,6 +50,9 @@ cargo bench --bench throughput_iteration
 
 DuckLake is the only ingest storage mode and requires the DuckLake DuckDB extension; startup should fail loudly if it is not loadable. With no remote catalog configuration, canardstack uses a local DuckLake catalog and local data files.
 
+For the reusable 10 minute mixed-query performance smoke, use
+`docs/BENCHMARKING.md`.
+
 ## Architecture
 
 Data flow:
@@ -55,13 +60,15 @@ Data flow:
 ```text
 OTLP/HTTP (JSON or protobuf, optional gzip)
   -> validation (auth, content type, size, timestamp skew)
-  -> otlp2records -> Arrow RecordBatch grouped by Signal
-  -> bounded per-signal in-memory queue
-  -> immutable Parquet segment files registered with DuckLake
+  -> local fsync raw spool
+  -> otlp2records -> Arrow RecordBatch grouped by storage signal
+  -> freshness-first admission (freshness budget + per-storage-signal in-flight ceiling)
+  -> ingest worker pool inserts into the storage immutable buffer
+  -> scheduler single seal driver -> immutable Parquet segment files registered with DuckLake
   -> bounded compat query adapters for Prometheus / Loki / Tempo subsets
 ```
 
-Signals are `Logs`, `Spans`, `MetricGauge`, and `MetricSum`. Histograms and exponential histograms are intentionally rejected in v0.
+Storage signals are `Logs`, `Spans`, `MetricGauge`, and `MetricSum`. Histograms and exponential histograms are intentionally rejected in v0.
 
 ## Source Map
 
@@ -74,12 +81,13 @@ Top-level modules map to pipeline stages or boundaries. Subdirectories group hel
 - `src/http.rs` - hand-rolled std-library HTTP/1.1 server with bounded per-connection threads and non-blocking accept shutdown.
 - `src/validation.rs` - auth, content-type, size, compression, timestamp-skew checks, `ApiError`, and error envelopes.
 - `src/otlp.rs` - OTLP JSON/protobuf decode and `Transformed` payload construction.
-- `src/ingest/` - request flow, admission, queue accounting, flush orchestration, and `PartialFlushError`.
+- `src/ingest/` - request flow, freshness-first admission, per-signal in-flight accounting, the durable raw spool, and the ingest worker pool that inserts into the storage immutable buffer.
+- `src/admission_control.rs` - seal admission, freshness-budget ingest admission, and cheap/heavy query admission.
 - `src/storage/` - DuckDB lifecycle, DuckLake `ATTACH`, extension install, immutable segment writes, `StorageProbe`, retention, and maintenance SQL.
 - `src/query/` - bounded query helpers, shared query plans, and Prometheus/Loki/Tempo selector parsing.
 - `src/compat/` - Prometheus/Loki/Tempo route adapters and the v0 public query surface.
 - `src/metadata.rs` - bounded discovery-metadata adapters over `metadata_summary`, with a generation-keyed in-process cache.
-- `src/maintenance.rs` - `Scheduler` background thread for flush, metadata refresh, operator-metrics snapshot, compaction, retention, and maintenance pause.
+- `src/maintenance.rs` - `Scheduler` background thread for seal, metadata refresh, operator-metrics snapshot, compaction, retention, and maintenance pause.
 - `src/metrics.rs` - Prometheus-style operator metrics at `/metrics`.
 - `src/db/sql.rs` - shared SQL fragment helpers used by `storage`, `query`, and `compat`.
 - `src/runtime/memory.rs` - runtime memory-pressure probing.
@@ -89,8 +97,10 @@ Top-level modules map to pipeline stages or boundaries. Subdirectories group hel
 
 - Keep the code synchronous. Do not add `tokio`, `async fn`, gRPC, Kafka, a second binary, or another long-running service unless the task explicitly changes the architecture.
 - Use OS threads plus `Arc<Mutex<_>>`. Prefer `LockExt::lock_or_poisoned()` over `.lock().unwrap()` for shared state.
-- Treat ingest as best-effort: a 2xx response means "accepted into a bounded in-memory queue," not "durably committed." There is no WAL.
-- Preserve pressure behavior: queues return 429 under pressure, and storage/dependency failures surface as 503 where appropriate.
+- Treat ingest as at-least-once after local durable spool: a 2xx response means the raw request was fsynced to the local raw spool and accepted for bounded processing. It does not mean the rows are DuckLake-committed or query-visible yet.
+- Preserve pressure behavior: ingest admission returns 429 under pressure, and storage/dependency failures surface as 503 where appropriate.
+- Preserve freshness-first admission: request-path checks may reject with 429 before raw-spool append when projected seal visibility exceeds the configured freshness SLA.
+- Preserve seal/query admission priority: seal capacity is reserved before query capacity; cheap metadata/probe/discovery/instant-ish queries keep protected admission, and heavy range/search queries degrade or reject first under freshness debt.
 - Keep query routes bounded by time range, row limit, timeout, DuckDB memory limit, and concurrency caps through `QueryEngine`.
 - Do not expose arbitrary SQL through the compatibility APIs. Direct SQL is intentionally an external DuckDB CLI / MotherDuck path.
 - Preserve the Prometheus/Loki error envelope shape: `{"status":"error","errorType":"...","error":"..."}`.
@@ -132,4 +142,4 @@ docs: document commit message convention
 
 ## Further Reading
 
-The `docs/` tree is the canonical longer-form reference. Start with `docs/developer.md`; deeper material is under `docs/architecture/`, `docs/planning/`, and `docs/runbooks/`.
+The `docs/` tree is the canonical longer-form reference. Start with `docs/developer.md`; architecture details are under `docs/architecture/`, benchmark gates are in `docs/planning/benchmark.md`, and operator procedures are under `docs/runbooks/`.

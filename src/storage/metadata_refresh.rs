@@ -2,15 +2,15 @@ use crate::db::sql::{
     logs_deployment_environment_expr, logs_http_method_expr, logs_http_route_expr,
     metrics_deployment_environment_expr, quote as sql_quote, spans_http_route_expr,
 };
-use crate::ingest::Signal;
+use crate::ingest::StorageSignal;
 use anyhow::{Context, Result};
 use chrono::NaiveDate;
 use duckdb::Connection;
 use std::collections::{BTreeMap, BTreeSet};
 
 pub(super) fn merge_dirty_metadata(
-    dst: &mut BTreeMap<Signal, BTreeSet<String>>,
-    src: BTreeMap<Signal, BTreeSet<String>>,
+    dst: &mut BTreeMap<StorageSignal, BTreeSet<String>>,
+    src: BTreeMap<StorageSignal, BTreeSet<String>>,
 ) {
     for (signal, dates) in src {
         dst.entry(signal).or_default().extend(dates);
@@ -20,7 +20,7 @@ pub(super) fn merge_dirty_metadata(
 pub(super) fn refresh_metadata_summaries_on(
     conn: &Connection,
     prefix: &str,
-    affected: &BTreeMap<Signal, BTreeSet<String>>,
+    affected: &BTreeMap<StorageSignal, BTreeSet<String>>,
 ) -> Result<usize> {
     if affected.is_empty() {
         return Ok(0);
@@ -50,23 +50,30 @@ pub(super) fn refresh_metadata_summaries_on(
             // A failed ROLLBACK can leave the shared writer connection with a
             // dangling transaction; surface it so a wedged refresh path is
             // observable instead of silently cascading into later appends.
-            crate::log_event(
-                "error",
-                "metadata_refresh_rollback_failed",
-                &[("error", &rollback_err.to_string())],
+            tracing::error!(
+                event = "metadata_refresh_rollback_failed",
+                error = %rollback_err
             );
         }
     }
     result
 }
 
-pub(super) fn metadata_refresh_sql(prefix: &str, signal: Signal, date: &str) -> Result<String> {
+pub(super) fn metadata_refresh_sql(
+    prefix: &str,
+    signal: StorageSignal,
+    date: &str,
+) -> Result<String> {
     let day = MetadataRefreshDay::new(date)?;
     let selects = match signal {
-        Signal::Logs => logs_metadata_sql(prefix, &day),
-        Signal::Spans => spans_metadata_sql(prefix, &day),
-        Signal::MetricGauge => metric_metadata_sql(prefix, Signal::MetricGauge, &day, "gauge"),
-        Signal::MetricSum => metric_metadata_sql(prefix, Signal::MetricSum, &day, "counter"),
+        StorageSignal::Logs => logs_metadata_sql(prefix, &day),
+        StorageSignal::Spans => spans_metadata_sql(prefix, &day),
+        StorageSignal::MetricGauge => {
+            metric_metadata_sql(prefix, StorageSignal::MetricGauge, &day, "gauge")
+        }
+        StorageSignal::MetricSum => {
+            metric_metadata_sql(prefix, StorageSignal::MetricSum, &day, "counter")
+        }
     };
     if selects.is_empty() {
         anyhow::bail!("metadata refresh for {signal} produced no SELECT statements");
@@ -168,7 +175,7 @@ pub(super) fn spans_metadata_sql(prefix: &str, day: &MetadataRefreshDay<'_>) -> 
 
 pub(super) fn metric_metadata_sql(
     prefix: &str,
-    signal: Signal,
+    signal: StorageSignal,
     day: &MetadataRefreshDay<'_>,
     metric_type: &str,
 ) -> Vec<String> {

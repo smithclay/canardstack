@@ -1,112 +1,167 @@
-use crate::config::{Config, IngestControlMode};
+use crate::admission_control::{AdmissionController, FreshnessBudgetInputs};
+use crate::config::Config;
 use crate::metrics::Metrics;
 use crate::otlp::{self, Transformed};
-use crate::storage::Storage;
+use crate::storage::{ArrowBatchBuffer, ArrowBatchBufferTiming, Storage};
 use crate::validation::{self, ApiError, ApiResult};
 use crate::LockExt;
+use anyhow::{Context, Result};
 use serde::Serialize;
 use serde_json::{json, Value};
+use spool::{Options, RecordId, SealRef, Writer};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::atomic::AtomicUsize;
+use std::sync::mpsc::TrySendError;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 mod admission;
-mod flush;
-mod queue;
+mod batches;
+pub mod spool;
+mod worker;
 
-pub use flush::{partial_commit_info, PartialFlushError};
-pub use queue::IngestSnapshot;
+pub use batches::IngestSnapshot;
+use worker::IngestWorkerPool;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize)]
-pub enum Signal {
+pub enum StorageSignal {
     Logs,
     Spans,
     MetricGauge,
     MetricSum,
 }
 
-impl Signal {
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize)]
+pub enum OtlpRequestKind {
+    Logs,
+    Traces,
+    Metrics,
+}
+
+impl OtlpRequestKind {
     pub fn as_str(self) -> &'static str {
         match self {
-            Signal::Logs => "logs",
-            Signal::Spans => "spans",
-            Signal::MetricGauge => "metric_gauge",
-            Signal::MetricSum => "metric_sum",
+            Self::Logs => "logs",
+            Self::Traces => "traces",
+            Self::Metrics => "metrics",
         }
     }
 
-    fn is_metric(self) -> bool {
-        matches!(self, Signal::MetricGauge | Signal::MetricSum)
+    pub fn raw_spool_lane(self) -> RawSpoolLane {
+        match self {
+            Self::Logs => RawSpoolLane::Logs,
+            Self::Traces => RawSpoolLane::Traces,
+            Self::Metrics => RawSpoolLane::Metrics,
+        }
     }
 }
 
-impl fmt::Display for Signal {
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize)]
+pub enum RawSpoolLane {
+    Logs,
+    Traces,
+    Metrics,
+}
+
+impl RawSpoolLane {
+    pub const ALL: [RawSpoolLane; 3] = [Self::Logs, Self::Traces, Self::Metrics];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Logs => "logs",
+            Self::Traces => "traces",
+            Self::Metrics => "metrics",
+        }
+    }
+}
+
+impl fmt::Display for RawSpoolLane {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
 }
 
-#[derive(Clone)]
+impl StorageSignal {
+    pub const ALL: [StorageSignal; 4] = [
+        StorageSignal::Logs,
+        StorageSignal::Spans,
+        StorageSignal::MetricGauge,
+        StorageSignal::MetricSum,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StorageSignal::Logs => "logs",
+            StorageSignal::Spans => "spans",
+            StorageSignal::MetricGauge => "metric_gauge",
+            StorageSignal::MetricSum => "metric_sum",
+        }
+    }
+}
+
+impl fmt::Display for StorageSignal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 pub struct Ingestor {
-    queues: Arc<Mutex<queue::QueueMap>>,
-    flush_lock: Arc<Mutex<()>>,
-    flush_signal: Arc<FlushSignal>,
     runtime_memory_reserved_bytes: Arc<AtomicUsize>,
+    inflight: Arc<admission::InflightBytes>,
+    raw_spools: BTreeMap<RawSpoolLane, Writer>,
+    raw_spool_seal_refs: Arc<Mutex<BTreeMap<(RawSpoolLane, RecordId), SealRef>>>,
+    ingest_workers: Mutex<Option<IngestWorkerPool>>,
     config: Config,
 }
 
-#[derive(Default)]
-struct FlushSignal {
-    requested: Mutex<bool>,
-    ready: Condvar,
+pub(in crate::ingest) struct SpooledIngestWork {
+    pub(in crate::ingest) route: OtlpRequestKind,
+    headers: HashMap<String, String>,
+    compressed_body: Vec<u8>,
+    raw_spool_ref: spool::AppendRef,
+    inflight_reservation: admission::InflightReservation,
+    runtime_memory_reservation: admission::RuntimeMemoryReservation,
+    pub(in crate::ingest) metrics: Arc<Metrics>,
 }
 
 impl Ingestor {
-    pub fn new(config: Config) -> Self {
-        Self {
-            queues: Arc::new(Mutex::new(HashMap::new())),
-            flush_lock: Arc::new(Mutex::new(())),
-            flush_signal: Arc::new(FlushSignal::default()),
+    pub fn new(config: Config) -> Result<Self> {
+        let mut raw_spools = BTreeMap::new();
+        for lane in RawSpoolLane::ALL {
+            raw_spools.insert(lane, spawn_raw_spool_writer(&config, lane)?);
+        }
+        Ok(Self {
             runtime_memory_reserved_bytes: Arc::new(AtomicUsize::new(0)),
+            inflight: Arc::new(admission::InflightBytes::new(&config)),
+            raw_spools,
+            raw_spool_seal_refs: Arc::new(Mutex::new(BTreeMap::new())),
+            ingest_workers: Mutex::new(None),
             config,
-        }
-    }
-
-    pub fn request_flush(&self) {
-        let mut requested = self.flush_signal.requested.lock_or_poisoned();
-        *requested = true;
-        self.flush_signal.ready.notify_one();
-    }
-
-    pub fn wait_for_flush_or_timeout(&self, timeout: Duration, stop: &AtomicBool) -> bool {
-        let mut requested = self.flush_signal.requested.lock_or_poisoned();
-        if !*requested && !stop.load(Ordering::SeqCst) {
-            let (guard, _) = self
-                .flush_signal
-                .ready
-                .wait_timeout(requested, timeout)
-                .unwrap_or_else(|e| e.into_inner());
-            requested = guard;
-        }
-        let was_requested = *requested;
-        *requested = false;
-        was_requested
+        })
     }
 
     pub fn ingest(
         &self,
-        signal: Signal,
+        route: OtlpRequestKind,
         headers: &HashMap<String, String>,
-        compressed_body: &[u8],
+        compressed_body: Vec<u8>,
         storage: &Storage,
-        metrics: &Metrics,
+        admission: &AdmissionController,
+        metrics: Arc<Metrics>,
     ) -> ApiResult<Value> {
-        validation::validate_body_size(compressed_body.len(), &self.config)?;
-        validation::validate_content_type(headers)?;
-        if !storage.accepts_memory_ingest() || self.config.force_dependency_unhealthy {
-            metrics.ingest_request(signal, 503, "dependency_unhealthy");
+        let async_metrics = Arc::clone(&metrics);
+        let metrics = metrics.as_ref();
+        if let Err(err) = validation::validate_body_size(compressed_body.len(), &self.config) {
+            metrics.ingest_request(route.as_str(), err.status, err.reason);
+            return Err(err);
+        }
+        if let Err(err) = validation::validate_content_type(headers) {
+            metrics.ingest_request(route.as_str(), err.status, err.reason);
+            return Err(err);
+        }
+        if !storage.accepts_memory_ingest() {
+            metrics.ingest_request(route.as_str(), 503, "dependency_unhealthy");
             return Err(ApiError::new(
                 503,
                 "dependency_unhealthy",
@@ -114,187 +169,413 @@ impl Ingestor {
             )
             .with_retry_after(10));
         }
-        let mut runtime_memory_reservation =
-            match self.admit_runtime_memory(signal, headers, compressed_body.len(), metrics) {
+        let inflight_reservation = match self.reserve_inflight(
+            route,
+            headers,
+            compressed_body.len(),
+            storage,
+            admission,
+            metrics,
+        ) {
+            Ok(reservation) => reservation,
+            Err(err) => {
+                self.record_inflight_metrics(metrics);
+                metrics.ingest_request(route.as_str(), err.status, err.reason);
+                return Err(err);
+            }
+        };
+        let runtime_memory_reservation =
+            match self.admit_runtime_memory(route, headers, compressed_body.len(), metrics) {
                 Ok(reservation) => reservation,
                 Err(err) => {
-                    metrics.ingest_request(signal, err.status, err.reason);
+                    metrics.ingest_request(route.as_str(), err.status, err.reason);
                     return Err(err);
                 }
             };
-        if self.config.ingest_control_mode == IngestControlMode::ValidationOnly {
-            metrics.ingest_request(signal, 202, "bench_validation_only");
-            metrics.inc(
-                "canardstack_ingest_request_bytes_total",
-                &[
-                    ("signal", signal.as_str()),
-                    (
-                        "encoding",
-                        headers
-                            .get("content-encoding")
-                            .map(String::as_str)
-                            .unwrap_or("identity"),
-                    ),
-                ],
-                compressed_body.len() as u64,
-            );
-            metrics.inc(
-                "canardstack_ingest_control_requests_total",
-                &[
-                    ("signal", signal.as_str()),
-                    ("mode", self.config.ingest_control_mode.as_str()),
-                ],
-                1,
-            );
-            return Ok(json!({
-                "accepted": true,
-                "records": 0,
-                "acknowledgement": "benchmark_control_validation_only_not_transformed_or_enqueued",
-                "unsupported_histograms": 0
-            }));
+        if let Err(err) = self.ensure_ingest_workers_available(route, metrics) {
+            metrics.ingest_request(route.as_str(), err.status, err.reason);
+            return Err(err);
         }
+        let (raw_spool_ref, compressed_body) =
+            match self.append_raw_spool(route, headers, compressed_body, metrics) {
+                Ok(appended) => appended,
+                Err(err) => {
+                    metrics.ingest_request(route.as_str(), err.status, err.reason);
+                    return Err(err);
+                }
+            };
+        let spooled = SpooledIngestWork {
+            route,
+            headers: headers.clone(),
+            compressed_body,
+            raw_spool_ref,
+            inflight_reservation,
+            runtime_memory_reservation,
+            metrics: async_metrics,
+        };
+        self.dispatch_ingest_work(spooled, storage, metrics)
+    }
 
+    pub(in crate::ingest) fn process_spooled_ingest(
+        &self,
+        work: SpooledIngestWork,
+        storage: &Storage,
+    ) -> ApiResult<()> {
+        let SpooledIngestWork {
+            route,
+            headers,
+            compressed_body,
+            raw_spool_ref,
+            mut inflight_reservation,
+            mut runtime_memory_reservation,
+            metrics,
+        } = work;
+        let metrics_arc = metrics;
+        let metrics = metrics_arc.as_ref();
         let started = Instant::now();
         let body_result =
-            otlp::decompress_if_needed(headers, compressed_body, self.config.max_body_bytes);
-        metrics.observe_phase_seconds(
-            signal.as_str(),
+            otlp::decompress_if_needed(&headers, &compressed_body, self.config.max_body_bytes);
+        metrics.observe_request_phase_seconds(
+            route.as_str(),
             "decompress",
-            None,
             started.elapsed().as_secs_f64(),
         );
-        let body = body_result?;
-        validation::validate_body_size(body.len(), &self.config)?;
+        let body = match body_result {
+            Ok(body) => body,
+            Err(err) => {
+                let reason = if err.reason == "payload_too_large" {
+                    "body_size_invalid"
+                } else {
+                    "decode_failed"
+                };
+                self.checkpoint_raw_spool_terminal(raw_spool_ref, route, reason, metrics)?;
+                return Err(err);
+            }
+        };
+        let decoded_body_materialized_bytes = match &body {
+            std::borrow::Cow::Borrowed(_) => 0,
+            std::borrow::Cow::Owned(bytes) => bytes.len(),
+        };
+        if let Err(err) = validation::validate_body_size(body.len(), &self.config) {
+            self.checkpoint_raw_spool_terminal(raw_spool_ref, route, "body_size_invalid", metrics)?;
+            return Err(err);
+        }
         let started = Instant::now();
         #[cfg(feature = "otlp2records-observer")]
-        let transformed_result = otlp::transform_observed(signal, headers, &body, metrics);
+        let transformed_result = otlp::transform_observed(route, &headers, &body, metrics);
         #[cfg(not(feature = "otlp2records-observer"))]
-        let transformed_result = otlp::transform(signal, headers, &body);
-        metrics.observe_phase_seconds(
-            signal.as_str(),
+        let transformed_result = otlp::transform(route, &headers, &body);
+        metrics.observe_request_phase_seconds(
+            route.as_str(),
             "otlp_transform",
-            None,
             started.elapsed().as_secs_f64(),
         );
-        let transformed = transformed_result?;
+        let transformed = match transformed_result {
+            Ok(transformed) => transformed,
+            Err(err) => {
+                self.checkpoint_raw_spool_terminal(
+                    raw_spool_ref,
+                    route,
+                    "transform_failed",
+                    metrics,
+                )?;
+                return Err(err);
+            }
+        };
+        let unsupported_histograms = transformed.unsupported_histograms;
+        let started = Instant::now();
+        let skew_result = self.validate_skew(&transformed);
+        metrics.observe_request_phase_seconds(
+            route.as_str(),
+            "timestamp_validation",
+            started.elapsed().as_secs_f64(),
+        );
+        if let Err(err) = skew_result {
+            self.checkpoint_raw_spool_terminal(
+                raw_spool_ref,
+                route,
+                "timestamp_rejected",
+                metrics,
+            )?;
+            return Err(err);
+        }
+        let decoded_body_len = body.len();
         for (output_signal, rows) in transformed_rows_by_signal(&transformed) {
             metrics.inc(
                 "canardstack_ingest_transformed_rows_total",
                 &[
-                    ("signal", output_signal.as_str()),
-                    ("request_signal", signal.as_str()),
+                    ("storage_signal", output_signal.as_str()),
+                    ("request_kind", route.as_str()),
                 ],
                 rows as u64,
             );
         }
-        let started = Instant::now();
-        let skew_result = self.validate_skew(&transformed);
-        metrics.observe_phase_seconds(
-            signal.as_str(),
-            "timestamp_validation",
-            None,
-            started.elapsed().as_secs_f64(),
-        );
-        skew_result?;
 
         let request_bytes = compressed_body.len();
-        let unsupported_histograms = transformed.unsupported_histograms;
-        let batches = queue::pending_batches(transformed);
-        let enqueued_totals = pending_batch_totals(&batches);
+        let batches = batches::pending_batches(transformed);
+        let buffered_totals = pending_batch_totals(&batches);
+        // Correct the admission estimate to the exact buffered Arrow bytes. The
+        // request is already durably spooled, so this is infallible accounting,
+        // never a late rejection.
+        inflight_reservation.adjust(admission::inflight_bytes_by_signal(&batches));
         let pending_bytes = batches.iter().map(|b| b.approx_bytes).sum::<usize>();
         let peak_bytes = request_bytes
-            .saturating_add(body.len())
+            .saturating_add(decoded_body_materialized_bytes)
             .saturating_add(pending_bytes);
-        if let Err(err) = runtime_memory_reservation.reserve_at_least(peak_bytes, signal, metrics) {
-            metrics.ingest_request(signal, err.status, err.reason);
+        if let Err(err) = runtime_memory_reservation.reserve_at_least(peak_bytes, route, metrics) {
+            self.checkpoint_raw_spool_terminal(raw_spool_ref, route, "memory_rejected", metrics)?;
             return Err(err);
         }
-        if self.config.ingest_control_mode == IngestControlMode::TransformOnly {
-            let transformed_rows = enqueued_totals
-                .values()
-                .map(|(rows, _)| *rows)
-                .sum::<usize>();
-            metrics.ingest_request(signal, 202, "bench_transform_only");
-            self.record_accepted_body_metrics(signal, headers, request_bytes, body.len(), metrics);
-            metrics.inc(
-                "canardstack_ingest_records_total",
-                &[("signal", signal.as_str())],
-                transformed_rows as u64,
-            );
-            metrics.inc(
-                "canardstack_ingest_control_requests_total",
-                &[
-                    ("signal", signal.as_str()),
-                    ("mode", self.config.ingest_control_mode.as_str()),
-                ],
-                1,
-            );
-            for (output_signal, (rows, bytes)) in enqueued_totals {
-                metrics.inc(
-                    "canardstack_ingest_control_dropped_rows_total",
-                    &[
-                        ("signal", output_signal.as_str()),
-                        ("mode", self.config.ingest_control_mode.as_str()),
-                    ],
-                    rows as u64,
-                );
-                metrics.inc(
-                    "canardstack_ingest_control_dropped_bytes_total",
-                    &[
-                        ("signal", output_signal.as_str()),
-                        ("mode", self.config.ingest_control_mode.as_str()),
-                    ],
-                    bytes as u64,
-                );
-            }
-            return Ok(json!({
-                "accepted": true,
-                "records": transformed_rows,
-                "acknowledgement": "benchmark_control_transformed_not_enqueued_or_durably_committed",
-                "unsupported_histograms": unsupported_histograms
-            }));
+        if batches.is_empty() {
+            self.checkpoint_raw_spool_terminal(raw_spool_ref, route, "transform_empty", metrics)?;
+            return Ok(());
         }
-        let accepted = match self.enqueue(signal, batches, metrics) {
-            Ok(accepted) => accepted,
+
+        let buffers = batches
+            .iter()
+            .filter(|batch| batch.batch.num_rows() > 0)
+            .map(|batch| ArrowBatchBuffer {
+                table: batch.signal,
+                batch: &batch.batch,
+                source_format: batch.source_format,
+            })
+            .collect::<Vec<_>>();
+        let buffer_started = Instant::now();
+        let buffer_result = storage.buffer_arrow_batches(&buffers);
+        metrics.observe_request_phase_seconds(
+            route.as_str(),
+            "storage_buffer",
+            buffer_started.elapsed().as_secs_f64(),
+        );
+        let buffered = match buffer_result {
+            Ok(result) => result,
             Err(err) => {
-                self.record_queue_metrics(metrics);
-                metrics.ingest_request(signal, err.status, err.reason);
-                return Err(err);
+                // The rows never reached the immutable buffer and the raw-spool
+                // record was not tracked, so it stays pending and replays on a
+                // future restart (at-least-once). Surface a retryable
+                // dependency error; the admission credit drops with this scope.
+                metrics.inc(
+                    "canardstack_ingest_storage_insert_total",
+                    &[("request_kind", route.as_str()), ("status", "error")],
+                    1,
+                );
+                tracing::warn!(
+                    event = "ingest_storage_insert_failed",
+                    request_kind = route.as_str(),
+                    error = %err
+                );
+                return Err(
+                    ApiError::new(503, "storage_insert_failed", "storage insert failed")
+                        .with_retry_after(5),
+                );
             }
         };
+        observe_storage_timings(metrics, &buffered.timings);
+        metrics.inc(
+            "canardstack_ingest_storage_insert_total",
+            &[("request_kind", route.as_str()), ("status", "ok")],
+            1,
+        );
 
-        metrics.ingest_request(signal, 202, "accepted");
-        self.record_accepted_body_metrics(signal, headers, request_bytes, body.len(), metrics);
+        // Rows are now in the immutable buffer. Track the raw-spool record so the
+        // scheduler checkpoints it after the next durable seal, then release the
+        // admission credit (buffer occupancy is now reflected as buffered bytes
+        // for freshness, not as a held queue credit).
+        self.track_raw_spool_record(raw_spool_ref, route);
+        drop(inflight_reservation);
+
+        let accepted = buffered_totals
+            .values()
+            .map(|(rows, _)| *rows)
+            .sum::<usize>();
+        self.record_accepted_body_metrics(
+            route.as_str(),
+            &headers,
+            request_bytes,
+            decoded_body_len,
+            decoded_body_materialized_bytes,
+            metrics,
+        );
         metrics.inc(
             "canardstack_ingest_records_total",
-            &[("signal", signal.as_str())],
+            &[("request_kind", route.as_str())],
             accepted as u64,
         );
-        for (output_signal, (rows, bytes)) in enqueued_totals {
+        if unsupported_histograms > 0 {
             metrics.inc(
-                "canardstack_ingest_enqueued_rows_total",
-                &[("signal", output_signal.as_str())],
+                "canardstack_ingest_unsupported_histograms_total",
+                &[("request_kind", route.as_str())],
+                unsupported_histograms as u64,
+            );
+        }
+        for (output_signal, (rows, bytes)) in buffered_totals {
+            metrics.inc(
+                "canardstack_ingest_buffered_rows_total",
+                &[("storage_signal", output_signal.as_str())],
                 rows as u64,
             );
             metrics.inc(
-                "canardstack_ingest_enqueued_bytes_total",
-                &[("signal", output_signal.as_str())],
+                "canardstack_ingest_buffered_bytes_total",
+                &[("storage_signal", output_signal.as_str())],
                 bytes as u64,
             );
         }
-        self.record_queue_metrics(metrics);
 
+        Ok(())
+    }
+
+    fn dispatch_ingest_work(
+        &self,
+        work: SpooledIngestWork,
+        storage: &Storage,
+        metrics: &Metrics,
+    ) -> ApiResult<Value> {
+        let route = work.route;
+        // Round-robin to the first worker with buffer space. On a successful send
+        // the function returns directly from inside the loop; if every worker is
+        // full (or the pool is gone) the still-owned `work` falls through to the
+        // caller-runs path below.
+        let work = {
+            let mut pool = self.ingest_workers.lock_or_poisoned();
+            let mut work = work;
+            if let Some(dispatcher) = pool.as_mut() {
+                let worker_count = dispatcher.commands.len();
+                if worker_count > 0 {
+                    let start = dispatcher.next_worker % worker_count;
+                    for offset in 0..worker_count {
+                        let worker_idx = (start + offset) % worker_count;
+                        match dispatcher.commands[worker_idx].try_send(work) {
+                            Ok(()) => {
+                                dispatcher.next_worker = worker_idx.wrapping_add(1);
+                                metrics.ingest_request(route.as_str(), 202, "accepted");
+                                self.record_worker_queue_metrics(metrics);
+                                metrics.inc(
+                                    "canardstack_ingest_requests_queued_total",
+                                    &[("request_kind", route.as_str()), ("status", "queued")],
+                                    1,
+                                );
+                                return Ok(json!({
+                                    "accepted": true,
+                                    "acknowledgement": "locally_spooled"
+                                }));
+                            }
+                            Err(TrySendError::Full(returned)) => work = returned,
+                            Err(TrySendError::Disconnected(returned)) => work = returned,
+                        }
+                    }
+                }
+            }
+            work
+        };
+
+        // Caller-runs: no worker could take the handoff, so process the already
+        // durably-spooled work inline on this thread instead of dropping it for
+        // restart replay. This keeps the 202 honest (the rows reach the immutable
+        // buffer now, not only after the next process restart) and applies
+        // natural backpressure: request latency rises under worker saturation.
+        metrics.inc(
+            "canardstack_ingest_requests_queued_total",
+            &[
+                ("request_kind", route.as_str()),
+                ("status", "processed_inline"),
+            ],
+            1,
+        );
+        let result = self.process_spooled_ingest(work, storage);
+        self.record_inflight_metrics(metrics);
+        // The raw request is durably spooled, so the 202 acknowledgement holds
+        // regardless of the inline transform outcome — matching the async worker
+        // contract where 202 means spooled-and-accepted, not transformed.
+        // `process_spooled_ingest` has already disposed of the record (terminal
+        // checkpoint for bad payloads, left pending for retryable storage faults).
+        if let Err(err) = result {
+            tracing::warn!(
+                event = "ingest_inline_process_failed",
+                request_kind = route.as_str(),
+                status = err.status,
+                reason = err.reason,
+                message = %err.message,
+                "inline ingest processing failed after worker saturation; raw request stays durably spooled"
+            );
+        }
+        metrics.ingest_request(route.as_str(), 202, "accepted_inline");
         Ok(json!({
             "accepted": true,
-            "records": accepted,
-            "acknowledgement": "accepted_into_process_memory_not_durably_committed",
-            "unsupported_histograms": unsupported_histograms
+            "acknowledgement": "locally_spooled"
         }))
+    }
+
+    fn ensure_ingest_workers_available(
+        &self,
+        route: OtlpRequestKind,
+        metrics: &Metrics,
+    ) -> ApiResult<()> {
+        {
+            let pool = self.ingest_workers.lock_or_poisoned();
+            let Some(dispatcher) = pool.as_ref() else {
+                metrics.inc(
+                    "canardstack_ingest_requests_queued_total",
+                    &[
+                        ("request_kind", route.as_str()),
+                        ("status", "workers_unavailable"),
+                    ],
+                    1,
+                );
+                return Err(ApiError::new(
+                    503,
+                    "ingest_workers_unavailable",
+                    "ingest workers are not available",
+                )
+                .with_retry_after(5));
+            };
+            if dispatcher.commands.is_empty() {
+                metrics.inc(
+                    "canardstack_ingest_requests_queued_total",
+                    &[
+                        ("request_kind", route.as_str()),
+                        ("status", "workers_unavailable"),
+                    ],
+                    1,
+                );
+                return Err(ApiError::new(
+                    503,
+                    "ingest_workers_unavailable",
+                    "ingest workers are stopped",
+                )
+                .with_retry_after(5));
+            }
+        }
+        Ok(())
+    }
+
+    /// Single ingest admission gate: project visibility through the freshness
+    /// budget (the freshness-first authority), then take a per-storage-signal
+    /// in-flight reservation as a cheap isolation ceiling. Both run before the
+    /// durable raw-spool append, so a rejection never spools.
+    fn reserve_inflight(
+        &self,
+        route: OtlpRequestKind,
+        headers: &HashMap<String, String>,
+        compressed_body_bytes: usize,
+        storage: &Storage,
+        admission: &AdmissionController,
+        metrics: &Metrics,
+    ) -> ApiResult<admission::InflightReservation> {
+        let estimate = self.inflight.estimate_for_request(
+            route,
+            headers,
+            compressed_body_bytes,
+            self.config.max_body_bytes,
+        );
+        let mut inputs = self.freshness_budget_inputs(storage);
+        inputs.incoming_bytes = estimate.values().sum::<usize>();
+        admission.admit_ingest(inputs, metrics)?;
+        self.inflight.reserve(estimate)
     }
 
     fn admit_runtime_memory(
         &self,
-        signal: Signal,
+        route: OtlpRequestKind,
         headers: &HashMap<String, String>,
         compressed_body_bytes: usize,
         metrics: &Metrics,
@@ -312,100 +593,105 @@ impl Ingestor {
                 compressed_body_bytes,
                 self.config.max_body_bytes,
             ),
-            signal,
+            route,
             metrics,
         )?;
         Ok(reservation)
     }
 
     pub fn snapshots(&self) -> Vec<IngestSnapshot> {
-        let queues = self.queues.lock_or_poisoned();
-        queue::snapshots(&queues, &self.config)
+        let capacity = self.inflight.capacity_bytes();
+        StorageSignal::ALL
+            .into_iter()
+            .map(|signal| {
+                let inflight_bytes = self.inflight.signal_bytes(signal);
+                IngestSnapshot {
+                    storage_signal: signal.as_str(),
+                    inflight_bytes,
+                    inflight_capacity_bytes: capacity,
+                    pressure: if capacity == 0 {
+                        0.0
+                    } else {
+                        inflight_bytes as f64 / capacity as f64
+                    },
+                }
+            })
+            .collect()
     }
 
-    pub fn record_queue_metrics(&self, metrics: &Metrics) {
+    pub fn record_inflight_metrics(&self, metrics: &Metrics) {
         for snapshot in self.snapshots() {
             metrics.gauge(
-                "canardstack_ingest_queue_rows",
-                &[("signal", snapshot.signal)],
-                snapshot.queued_rows as f64,
+                "canardstack_ingest_inflight_bytes",
+                &[("storage_signal", snapshot.storage_signal)],
+                snapshot.inflight_bytes as f64,
             );
             metrics.gauge_max(
-                "canardstack_ingest_queue_rows_max",
-                &[("signal", snapshot.signal)],
-                snapshot.queued_rows as f64,
+                "canardstack_ingest_inflight_bytes_max",
+                &[("storage_signal", snapshot.storage_signal)],
+                snapshot.inflight_bytes as f64,
             );
             metrics.gauge(
-                "canardstack_ingest_queue_bytes",
-                &[("signal", snapshot.signal)],
-                snapshot.queued_bytes as f64,
-            );
-            metrics.gauge_max(
-                "canardstack_ingest_queue_bytes_max",
-                &[("signal", snapshot.signal)],
-                snapshot.queued_bytes as f64,
-            );
-            metrics.gauge(
-                "canardstack_ingest_queue_oldest_age_seconds",
-                &[("signal", snapshot.signal)],
-                snapshot.oldest_age_seconds,
-            );
-            metrics.gauge_max(
-                "canardstack_ingest_queue_oldest_age_seconds_max",
-                &[("signal", snapshot.signal)],
-                snapshot.oldest_age_seconds,
-            );
-            metrics.gauge(
-                "canardstack_ingest_queue_pressure",
-                &[("signal", snapshot.signal)],
+                "canardstack_ingest_inflight_pressure",
+                &[("storage_signal", snapshot.storage_signal)],
                 snapshot.pressure,
             );
             metrics.gauge_max(
-                "canardstack_ingest_queue_pressure_max",
-                &[("signal", snapshot.signal)],
+                "canardstack_ingest_inflight_pressure_max",
+                &[("storage_signal", snapshot.storage_signal)],
                 snapshot.pressure,
+            );
+            metrics.gauge(
+                "canardstack_ingest_inflight_capacity_bytes",
+                &[("storage_signal", snapshot.storage_signal)],
+                snapshot.inflight_capacity_bytes as f64,
             );
         }
     }
 
-    fn enqueue(
-        &self,
-        request_signal: Signal,
-        batches: Vec<queue::PendingBatch>,
-        metrics: &Metrics,
-    ) -> ApiResult<usize> {
-        if batches.is_empty() {
-            return Ok(0);
-        }
-        let started = Instant::now();
-        let queue_result = {
-            let mut queues = self.queues.lock_or_poisoned();
-            admission::admit_and_enqueue(&mut queues, batches, &self.config)
-        };
-        metrics.observe_phase_seconds(
-            request_signal.as_str(),
-            "queue_admission",
-            None,
-            started.elapsed().as_secs_f64(),
+    pub fn record_worker_queue_metrics(&self, metrics: &Metrics) {
+        metrics.gauge(
+            "canardstack_ingest_worker_queue_capacity",
+            &[("state", "capacity")],
+            self.config.ingest_buffer_capacity as f64,
         );
-        let queue_result = queue_result?;
-        if queue_result.should_request_flush {
-            self.request_flush();
-            metrics.inc(
-                "canardstack_ingest_flush_requests_total",
-                &[("triggered_by", request_signal.as_str())],
-                1,
-            );
+    }
+
+    pub fn freshness_budget_inputs(&self, storage: &Storage) -> FreshnessBudgetInputs {
+        let (buffered_bytes, buffered_active_count, oldest_buffer_age_seconds) = storage
+            .immutable_buffer_metrics()
+            .into_iter()
+            .fold((0usize, 0usize, 0.0f64), |(bytes, count, age), metric| {
+                (
+                    bytes.saturating_add(metric.bytes),
+                    count.saturating_add(usize::from(metric.bytes > 0)),
+                    age.max(metric.age_seconds),
+                )
+            });
+        FreshnessBudgetInputs {
+            inflight_bytes: self.inflight_bytes(),
+            incoming_bytes: 0,
+            // Admitted bytes move straight from the worker into the immutable
+            // buffer; there is no separate in-memory queue to age out, so queue
+            // dwell is zero and buffer age is carried by oldest_buffer_age_seconds.
+            oldest_queue_age_seconds: 0.0,
+            buffered_bytes,
+            buffered_active_count,
+            oldest_buffer_age_seconds,
         }
-        Ok(queue_result.accepted)
+    }
+
+    pub fn inflight_bytes(&self) -> usize {
+        self.inflight.total_bytes()
     }
 
     fn record_accepted_body_metrics(
         &self,
-        signal: Signal,
+        route: &str,
         headers: &HashMap<String, String>,
         request_bytes: usize,
         decoded_bytes: usize,
+        _decoded_body_materialized_bytes: usize,
         metrics: &Metrics,
     ) {
         let encoding = headers
@@ -414,52 +700,72 @@ impl Ingestor {
             .unwrap_or("identity");
         metrics.inc(
             "canardstack_ingest_request_bytes_total",
-            &[("signal", signal.as_str()), ("encoding", encoding)],
+            &[("request_kind", route), ("encoding", encoding)],
             request_bytes as u64,
         );
         metrics.inc(
             "canardstack_ingest_decoded_bytes_total",
-            &[("signal", signal.as_str()), ("encoding", encoding)],
+            &[("request_kind", route), ("encoding", encoding)],
             decoded_bytes as u64,
         );
     }
 
     fn validate_skew(&self, transformed: &Transformed) -> ApiResult<()> {
-        if let Some(logs) = &transformed.logs {
-            validation::validate_arrow_timestamp_skew(logs, Signal::Logs, &self.config)?;
-        }
-        if let Some(spans) = &transformed.spans {
-            validation::validate_arrow_timestamp_skew(spans, Signal::Spans, &self.config)?;
-        }
-        if let Some(gauge) = &transformed.gauge {
-            validation::validate_arrow_timestamp_skew(gauge, Signal::MetricGauge, &self.config)?;
-        }
-        if let Some(sum) = &transformed.sum {
-            validation::validate_arrow_timestamp_skew(sum, Signal::MetricSum, &self.config)?;
+        for (signal, batch) in transformed.signal_batches() {
+            if let Some(batch) = batch {
+                validation::validate_arrow_timestamp_skew(batch, signal, &self.config)?;
+            }
         }
         Ok(())
     }
 }
 
-fn transformed_rows_by_signal(transformed: &Transformed) -> Vec<(Signal, usize)> {
-    [
-        (Signal::Logs, transformed.logs.as_ref()),
-        (Signal::Spans, transformed.spans.as_ref()),
-        (Signal::MetricGauge, transformed.gauge.as_ref()),
-        (Signal::MetricSum, transformed.sum.as_ref()),
-    ]
-    .into_iter()
-    .filter_map(|(signal, batch)| {
-        let rows = batch.map(|batch| batch.num_rows()).unwrap_or(0);
-        (rows > 0).then_some((signal, rows))
-    })
-    .collect()
+fn observe_storage_timings(metrics: &Metrics, timings: &[ArrowBatchBufferTiming]) {
+    for timing in timings {
+        metrics.observe_storage_signal_phase_seconds(
+            timing.table.as_str(),
+            timing.phase.as_str(),
+            timing.seconds,
+        );
+    }
 }
 
-fn pending_batch_totals(batches: &[queue::PendingBatch]) -> BTreeMap<Signal, (usize, usize)> {
+fn transformed_rows_by_signal(transformed: &Transformed) -> Vec<(StorageSignal, usize)> {
+    transformed
+        .signal_batches()
+        .into_iter()
+        .filter_map(|(signal, batch)| {
+            let rows = batch.map(|batch| batch.num_rows()).unwrap_or(0);
+            (rows > 0).then_some((signal, rows))
+        })
+        .collect()
+}
+
+fn spawn_raw_spool_writer(config: &Config, lane: RawSpoolLane) -> Result<Writer> {
+    Writer::spawn(
+        Options {
+            dir: config.raw_spool_dir.join(lane.as_str()),
+            max_segment_bytes: config.raw_spool_max_segment_bytes as u64,
+            max_record_bytes: config.raw_spool_max_record_bytes as u64,
+            max_total_bytes: config.raw_spool_max_total_bytes as u64,
+            append_sync_interval: config.raw_spool_append_sync_interval,
+            append_sync_bytes: config.raw_spool_append_sync_bytes as u64,
+            checkpoint_fsync_records: config.raw_spool_checkpoint_fsync_records,
+            checkpoint_fsync_delay: config.raw_spool_checkpoint_fsync_delay,
+        },
+        config.raw_spool_writer_queue_capacity,
+        config.raw_spool_group_commit_records,
+        config.raw_spool_group_commit_delay,
+    )
+    .with_context(|| format!("spawn {lane} raw spool writer"))
+}
+
+fn pending_batch_totals(
+    batches: &[batches::PendingBatch],
+) -> BTreeMap<StorageSignal, (usize, usize)> {
     let mut totals = BTreeMap::new();
     for batch in batches {
-        let (rows, bytes) = totals.entry(batch.key.signal).or_insert((0, 0));
+        let (rows, bytes) = totals.entry(batch.signal).or_insert((0, 0));
         *rows += batch.batch.num_rows();
         *bytes += batch.approx_bytes;
     }

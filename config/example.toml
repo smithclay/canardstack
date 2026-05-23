@@ -1,0 +1,71 @@
+# Copy to ./config.toml or set CANARDSTACK_CONFIG=/path/to/config.toml.
+# Environment variables override matching settings.
+
+[server]
+bind = "127.0.0.1:4318"
+max_connections = 1024
+socket_read_timeout_secs = 30
+socket_write_timeout_secs = 30
+
+[auth]
+api_key = "dev-canardstack-key"
+admin_api_key = "dev-canardstack-admin-key"
+
+[paths]
+data_dir = ".canardstack"
+# duckdb_extension_dir = "/usr/local/lib/duckdb/extensions"
+
+[duckdb]
+memory_limit = "1GiB"
+
+[ducklake]
+# With no remote attach URI or PostgreSQL DSN, canardstack uses a local DuckLake
+# catalog and local data files under data_dir.
+# postgres_dsn = "dbname=ducklake_catalog host=localhost user=postgres password=postgres"
+# attach_uri = "md:test-ducklake"
+
+[ingest]
+max_body_bytes = 8388608
+memory_bytes = 2147483648
+# process_memory_limit_bytes = 3221225472
+seal_rate_seed_bytes = 4194304
+seal_rate_seed_window_secs = 10
+# Parallel transform across OS threads; the scheduler is the single seal driver.
+# workers = 4
+# buffer_capacity = 1024
+
+[validation]
+accept_late_secs = 86400
+accept_future_secs = 600
+
+[storage]
+segment_target_bytes = 67108864
+segment_max_age_secs = 10
+
+[raw_spool]
+capacity_bytes = 1073741824
+group_commit_ms = 1
+
+[query]
+concurrency = 4
+timeout_secs = 15
+memory_limit = "1GiB"
+
+[admission]
+seal_capacity = 1
+cheap_query_capacity = 1
+heavy_query_degraded_capacity = 1
+freshness_budget_sla_secs = 15
+
+[retention]
+days = 14
+
+[scheduler]
+enabled = true
+maintenance_interval_secs = 30
+# Seal cadence for the single seal driver. Keep well under the freshness SLA so
+# immutable-buffer age never approaches the freshness-budget reject threshold (default 1000ms).
+# seal_interval_ms = 1000
+
+[bench]
+http_keepalive = true

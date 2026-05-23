@@ -1,6 +1,6 @@
 use super::immutable::timestamp_day;
 use super::schema::table_columns;
-use crate::ingest::Signal;
+use crate::ingest::StorageSignal;
 use anyhow::{Context, Result};
 use arrow58::array as arrow58_array;
 use arrow58::array::Array as _;
@@ -12,7 +12,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 pub(super) fn storage_duckdb_batch(
-    table: Signal,
+    table: StorageSignal,
     batch: &RecordBatch,
     source_format: &str,
 ) -> Result<RecordBatch> {

@@ -3,7 +3,7 @@ use super::params::{
     validate_range,
 };
 use crate::query::log::parse_loki_query;
-use crate::query::plan::TimeBounds;
+use crate::query::plan::{LogPlan, TimeBounds};
 use crate::validation::ApiResult;
 use crate::AppState;
 use chrono::Utc;
@@ -59,24 +59,7 @@ pub(super) fn loki_query_inner(
     params: &HashMap<String, String>,
     range: bool,
 ) -> ApiResult<Value> {
-    let query = required_param(params, "query")?;
-    let end = optional_time(params, "end")?.unwrap_or_else(Utc::now);
-    let start = optional_time(params, "start")?.unwrap_or(end - chrono::Duration::hours(1));
-    validate_range(start, end, INTERACTIVE_RANGE_SECS)?;
-    let limit = parse_usize(params.get("limit"), 100, 1000)?;
-    let direction = params
-        .get("direction")
-        .map(String::as_str)
-        .unwrap_or("backward");
-    let time_bounds = TimeBounds {
-        from: start,
-        to: if range {
-            end
-        } else {
-            end + chrono::Duration::seconds(1)
-        },
-    };
-    let plan = parse_loki_query(query, time_bounds, limit, direction)?;
+    let plan = loki_plan(params, range)?;
     let result = state.queries.execute_logs(&state.storage, &plan)?;
     let mut streams: BTreeMap<String, (Map<String, Value>, Vec<Value>)> = BTreeMap::new();
     for row in result_rows(&result) {
@@ -95,9 +78,9 @@ pub(super) fn loki_query_inner(
             .get("timestamp")
             .and_then(Value::as_str)
             .and_then(parse_any_time_to_utc)
-            .unwrap_or(end)
+            .unwrap_or(plan.time_bounds.to)
             .timestamp_nanos_opt()
-            .unwrap_or_else(|| end.timestamp_micros() * 1000);
+            .unwrap_or_else(|| plan.time_bounds.to.timestamp_micros() * 1000);
         let line = row
             .get("body")
             .and_then(Value::as_str)
@@ -119,6 +102,27 @@ pub(super) fn loki_query_inner(
     Ok(loki_success(
         json!({"resultType": "streams", "result": result}),
     ))
+}
+
+fn loki_plan(params: &HashMap<String, String>, range: bool) -> ApiResult<LogPlan> {
+    let query = required_param(params, "query")?;
+    let end = optional_time(params, "end")?.unwrap_or_else(Utc::now);
+    let start = optional_time(params, "start")?.unwrap_or(end - chrono::Duration::hours(1));
+    validate_range(start, end, INTERACTIVE_RANGE_SECS)?;
+    let limit = parse_usize(params.get("limit"), 100, 1000)?;
+    let direction = params
+        .get("direction")
+        .map(String::as_str)
+        .unwrap_or("backward");
+    let time_bounds = TimeBounds {
+        from: start,
+        to: if range {
+            end
+        } else {
+            end + chrono::Duration::seconds(1)
+        },
+    };
+    parse_loki_query(query, time_bounds, limit, direction)
 }
 
 fn loki_success(data: Value) -> Value {

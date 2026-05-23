@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::ingest::Signal;
+use crate::ingest::StorageSignal;
 use anyhow::{Context, Result};
 use arrow58::record_batch::RecordBatch;
 use duckdb::Connection;
@@ -8,6 +8,8 @@ use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::PathBuf;
+#[cfg(debug_assertions)]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -28,7 +30,7 @@ use ducklake::{
     attach_ducklake_connection, configure_base_connection, configure_write_connection,
     ducklake_attach_plan,
 };
-pub use immutable::ImmutableFlushOutcome;
+pub use immutable::ImmutableSealOutcome;
 use immutable::ImmutableSegmentBuffer;
 use schema::create_tables_on;
 
@@ -73,16 +75,14 @@ impl StorageHealth {
 pub struct StorageCapabilities {
     pub insert: bool,
     pub query: bool,
-    pub inlined_flush: bool,
     pub snapshot_expiration: bool,
     pub cleanup_old_files: bool,
-    pub merge_adjacent_files: bool,
     pub whole_day_retention: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
 pub struct ImmutableBufferMetric {
-    pub table: Signal,
+    pub table: StorageSignal,
     pub rows: usize,
     pub bytes: usize,
     pub age_seconds: f64,
@@ -91,7 +91,7 @@ pub struct ImmutableBufferMetric {
 pub struct Storage {
     /// Write-side connection. Held for inserts, DDL, and DuckLake maintenance.
     /// Reader path never touches this mutex — that decoupling keeps /healthz,
-    /// /metrics, and queries responsive while a flush is in flight.
+    /// /metrics, and queries responsive while a seal is in flight.
     writer: Mutex<Connection>,
     /// Cloned from `writer` at startup after ATTACH + DDL; shares the
     /// underlying Database (attached schemas survive `try_clone`). Source of
@@ -101,23 +101,25 @@ pub struct Storage {
     mode: String,
     catalog_name: String,
     ducklake_available: bool,
+    #[cfg(debug_assertions)]
+    force_dependency_unhealthy: AtomicBool,
     postgres_catalog_configured: bool,
     local_storage_dir: PathBuf,
     ducklake_required: bool,
     ducklake_managed_maintenance: bool,
     immutable_segment_target_bytes: usize,
     immutable_segment_max_age: Duration,
-    immutable_buffers: Mutex<BTreeMap<Signal, ImmutableSegmentBuffer>>,
+    immutable_buffers: Mutex<BTreeMap<StorageSignal, ImmutableSegmentBuffer>>,
     write_memory_limit: String,
     last_error: Mutex<Option<String>>,
     /// Cache-invalidation token for discovery metadata. Bumped only after a
     /// committed `metadata_summary` change (refresh or retention); discovery
     /// caches in `Metadata` key entries on this value and drop them on a bump.
     metadata_generation: AtomicU64,
-    /// Signal/event-date buckets whose `metadata_summary` rows are stale after
+    /// StorageSignal/event-date buckets whose `metadata_summary` rows are stale after
     /// a committed insert. Drained by the `metadata_refresh` scheduler job so
     /// the day-partition re-aggregation stays off the ingest commit path.
-    dirty_metadata: Mutex<BTreeMap<Signal, BTreeSet<String>>>,
+    dirty_metadata: Mutex<BTreeMap<StorageSignal, BTreeSet<String>>>,
 }
 
 pub struct RetentionPolicy {
@@ -141,64 +143,41 @@ impl std::fmt::Display for QueryTimeoutError {
 
 impl std::error::Error for QueryTimeoutError {}
 
-/// Storage insert failed after one or more smaller transactions may already
-/// have committed. Callers use `committed_rows` to avoid retrying rows that
-/// DuckDB has already accepted.
-#[derive(Debug)]
-pub struct InsertRecordsError {
-    pub table: Signal,
-    pub committed_rows: usize,
-    pub attempted_rows: usize,
-    pub source: anyhow::Error,
-}
-
-impl std::fmt::Display for InsertRecordsError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "insert failed for {} after committing {}/{} row(s): {}",
-            self.table, self.committed_rows, self.attempted_rows, self.source
-        )
-    }
-}
-
-impl std::error::Error for InsertRecordsError {}
-
-pub struct ArrowBatchInsert<'a> {
-    pub table: Signal,
+pub struct ArrowBatchBuffer<'a> {
+    pub table: StorageSignal,
     pub batch: &'a RecordBatch,
     pub source_format: &'a str,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TimingPhase {
+    Coalesce,
     Prepare,
+    ImmutableCoalesce,
     Buffer,
     PartitionSplit,
     ParquetEncode,
-    ParquetWrite,
     FileWrite,
     FileFsync,
     FileRename,
     DucklakeRegister,
     DucklakeCommit,
-    Insert,
 }
 
 impl TimingPhase {
     pub fn as_str(self) -> &'static str {
         match self {
+            TimingPhase::Coalesce => "storage_coalesce",
             TimingPhase::Prepare => "storage_prepare",
+            TimingPhase::ImmutableCoalesce => "storage_immutable_coalesce",
             TimingPhase::Buffer => "storage_buffer",
             TimingPhase::PartitionSplit => "storage_partition_split",
             TimingPhase::ParquetEncode => "storage_parquet_encode",
-            TimingPhase::ParquetWrite => "storage_parquet_write",
             TimingPhase::FileWrite => "storage_file_write",
             TimingPhase::FileFsync => "storage_file_fsync",
             TimingPhase::FileRename => "storage_file_rename",
             TimingPhase::DucklakeRegister => "storage_ducklake_register",
             TimingPhase::DucklakeCommit => "storage_ducklake_commit",
-            TimingPhase::Insert => "storage_insert",
         }
     }
 }
@@ -210,21 +189,21 @@ impl std::fmt::Display for TimingPhase {
 }
 
 #[derive(Clone, Debug)]
-pub struct ArrowBatchInsertTiming {
-    pub table: Signal,
+pub struct ArrowBatchBufferTiming {
+    pub table: StorageSignal,
     pub phase: TimingPhase,
     pub rows: usize,
     pub seconds: f64,
 }
 
 #[derive(Clone, Debug)]
-pub struct ArrowBatchInsertResult {
+pub struct ArrowBatchBufferResult {
     pub rows: usize,
-    pub timings: Vec<ArrowBatchInsertTiming>,
+    pub timings: Vec<ArrowBatchBufferTiming>,
 }
 
 struct PreparedArrowBatch {
-    pub(super) table: Signal,
+    pub(super) table: StorageSignal,
     pub(super) batch: RecordBatch,
     pub(super) rows: usize,
     pub(super) timestamp_days: Vec<String>,
@@ -249,7 +228,6 @@ impl Storage {
             &config.duckdb_path,
             &config.local_storage_dir,
             config.duckdb_extension_dir.as_deref(),
-            config.ducklake_data_inlining_row_limit,
         )
         .context(
             "DuckLake attach failed. Fix the catalog config (URI, token, network, or extension path) and restart.",
@@ -275,6 +253,8 @@ impl Storage {
             mode,
             catalog_name: "canardlake".to_string(),
             ducklake_available: true,
+            #[cfg(debug_assertions)]
+            force_dependency_unhealthy: AtomicBool::new(false),
             postgres_catalog_configured: config.postgres_dsn.is_some(),
             local_storage_dir: config.local_storage_dir.clone(),
             ducklake_required: true,
@@ -311,13 +291,12 @@ mod tests {
             Some("ducklake:md:test-ducklake"),
             &dir.path().join("canardstack.duckdb"),
             &dir.path().join("storage"),
-            1_000,
         )
         .unwrap();
 
         assert_eq!(
             plan.sql,
-            "ATTACH 'ducklake:md:test-ducklake' AS canardlake (DATA_INLINING_ROW_LIMIT 1000); USE canardlake;"
+            "ATTACH 'ducklake:md:test-ducklake' AS canardlake; USE canardlake;"
         );
         assert_eq!(plan.mode, "ducklake_custom_uri");
         assert!(plan.needs_ducklake);
@@ -333,7 +312,6 @@ mod tests {
             Some("md:test-ducklake"),
             &dir.path().join("canardstack.duckdb"),
             &dir.path().join("storage"),
-            1_000,
         )
         .unwrap();
 
@@ -356,7 +334,6 @@ mod tests {
             Some("ducklake:md:test-ducklake"),
             &dir.path().join("canardstack.duckdb"),
             &dir.path().join("storage"),
-            1_000,
         )
         .unwrap_err();
 
@@ -366,18 +343,18 @@ mod tests {
     }
 
     #[test]
-    fn ducklake_attach_uses_configured_data_inlining_limit() {
+    fn local_ducklake_attach_uses_data_path_without_inlining() {
         let dir = tempdir().unwrap();
         let plan = build_ducklake_attach_plan(
             None,
             None,
             &dir.path().join("canardstack.duckdb"),
             &dir.path().join("storage"),
-            0,
         )
         .unwrap();
 
-        assert!(plan.sql.contains("DATA_INLINING_ROW_LIMIT 0"));
+        assert!(plan.sql.contains("DATA_PATH"));
+        assert!(!plan.sql.contains("DATA_INLINING_ROW_LIMIT"));
     }
 
     #[test]
@@ -388,7 +365,6 @@ mod tests {
             Some("ATTACH 'md:test-ducklake';"),
             &dir.path().join("canardstack.duckdb"),
             &dir.path().join("storage"),
-            1_000,
         )
         .unwrap_err();
 
@@ -405,7 +381,6 @@ mod tests {
             Some("sqlite:/tmp/not-ducklake.db"),
             &dir.path().join("canardstack.duckdb"),
             &dir.path().join("storage"),
-            1_000,
         )
         .unwrap_err();
 
@@ -415,10 +390,10 @@ mod tests {
     #[test]
     fn metadata_refresh_uses_one_insert_per_signal_bucket() {
         for (signal, select_count) in [
-            (Signal::Logs, 8),
-            (Signal::Spans, 6),
-            (Signal::MetricGauge, 5),
-            (Signal::MetricSum, 5),
+            (StorageSignal::Logs, 8),
+            (StorageSignal::Spans, 6),
+            (StorageSignal::MetricGauge, 5),
+            (StorageSignal::MetricSum, 5),
         ] {
             let sql = metadata_refresh_sql("canardlake.", signal, "2026-05-16").unwrap();
             assert_eq!(

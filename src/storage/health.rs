@@ -1,4 +1,4 @@
-use super::ducklake::{ducklake_metadata_prefix, quote_ident};
+use super::ducklake::ducklake_metadata_prefix;
 use super::{Storage, StorageCapabilities, StorageHealth, StorageProbe};
 use crate::LockExt;
 use anyhow::Result;
@@ -6,6 +6,8 @@ use chrono::Utc;
 use duckdb::Connection;
 use serde_json::{json, Value};
 use std::fs;
+#[cfg(debug_assertions)]
+use std::sync::atomic::Ordering;
 
 impl Storage {
     pub fn healthy(&self) -> bool {
@@ -22,7 +24,22 @@ impl Storage {
     }
 
     pub fn accepts_memory_ingest(&self) -> bool {
-        self.ducklake_available
+        self.ducklake_available && {
+            #[cfg(debug_assertions)]
+            {
+                !self.force_dependency_unhealthy.load(Ordering::Acquire)
+            }
+            #[cfg(not(debug_assertions))]
+            {
+                true
+            }
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn set_dependency_unhealthy_for_tests(&self, unhealthy: bool) {
+        self.force_dependency_unhealthy
+            .store(unhealthy, Ordering::SeqCst);
     }
 
     pub fn health(&self) -> StorageHealth {
@@ -37,10 +54,8 @@ impl Storage {
             capabilities: StorageCapabilities {
                 insert: true,
                 query: true,
-                inlined_flush: self.ducklake_managed_maintenance,
                 snapshot_expiration: self.ducklake_managed_maintenance,
                 cleanup_old_files: self.ducklake_managed_maintenance,
-                merge_adjacent_files: false,
                 whole_day_retention: true,
             },
             freshness_watermarks: self
@@ -103,32 +118,9 @@ impl Storage {
                 json!({
                     "table_id": table_id,
                     "parquet_files": parquet_files,
-                    "parquet_rows": parquet_rows,
-                    "inlined_rows": 0
+                    "parquet_rows": parquet_rows
                 }),
             );
-        }
-
-        let sql = format!(
-            "SELECT table_id, table_name FROM {metadata_prefix}ducklake_inlined_data_tables ORDER BY table_id"
-        );
-        let mut stmt = conn.prepare(&sql)?;
-        let inlined = stmt.query_map([], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-        })?;
-        for row in inlined {
-            let (table_id, inlined_table) = row?;
-            let count_sql = format!(
-                "SELECT count(*) FROM {metadata_prefix}{} WHERE end_snapshot IS NULL",
-                quote_ident(&inlined_table)
-            );
-            let inlined_rows: i64 = conn.query_row(&count_sql, [], |row| row.get(0))?;
-            for value in tables.values_mut() {
-                if value.get("table_id").and_then(Value::as_i64) == Some(table_id) {
-                    value["inlined_rows"] = json!(inlined_rows);
-                    break;
-                }
-            }
         }
         Ok(Value::Object(tables))
     }
@@ -181,7 +173,7 @@ impl Storage {
     }
 
     fn check_health_target(&self) -> Result<()> {
-        // Reader, not writer — a stuck flush must not hang /healthz.
+        // Reader, not writer — a stuck seal must not hang /healthz.
         let conn = self.reader.lock_or_poisoned();
         conn.query_row("SELECT 1", [], |_| Ok(()))?;
         let sql = format!("SELECT * FROM {}logs LIMIT 0", self.target_prefix);

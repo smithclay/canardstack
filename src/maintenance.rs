@@ -1,8 +1,8 @@
 use crate::app::AppState;
 use crate::config::Config;
-use crate::ingest::Ingestor;
+use crate::ingest::{IngestSnapshot, Ingestor};
 use crate::metrics::Metrics;
-use crate::storage::{ArrowBatchInsertTiming, ImmutableFlushOutcome, RetentionPolicy, Storage};
+use crate::storage::{RetentionPolicy, Storage};
 use crate::LockExt;
 use anyhow::Result;
 use serde_json::{json, Value};
@@ -12,19 +12,14 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+const SCHEDULER_METADATA_REFRESH_BUCKET_LIMIT: usize = 1;
+const METADATA_REFRESH_QUEUE_PRESSURE_YIELD: f64 = 0.70;
+
 #[derive(Clone, Debug)]
 struct FailureRecord {
     at: String,
     reason: String,
     consecutive: u32,
-}
-
-#[derive(Clone, Copy, Default)]
-pub struct FlushOptions<'a> {
-    pub table: Option<&'a str>,
-    /// Seal every in-memory immutable-segment buffer immediately, ignoring size
-    /// and age thresholds. The scheduler leaves this unset; admin flush sets it.
-    pub force_immutable_segments: bool,
 }
 
 pub struct Maintenance {
@@ -65,9 +60,10 @@ impl Maintenance {
 
     pub fn is_ready(&self) -> bool {
         let failures = self.last_failures.lock_or_poisoned();
-        failures
-            .values()
-            .all(|r| r.consecutive < Self::CONSECUTIVE_FAILURE_PAGE_THRESHOLD)
+        failures.iter().all(|(job, r)| {
+            !failure_affects_readiness(job)
+                || r.consecutive < Self::CONSECUTIVE_FAILURE_PAGE_THRESHOLD
+        })
     }
 
     pub fn health(&self) -> Value {
@@ -95,87 +91,27 @@ impl Maintenance {
                 "spans": self.retention.spans_days,
                 "metrics": self.retention.metrics_days
             },
-            "priority_order": ["queue_watchdog", "flush_inlined_data", "merge_adjacent_files", "retention"]
+            "scheduler_jobs": ["metadata_refresh", "metrics_snapshot", "retention"]
         })
     }
 
-    pub fn run_flush(
+    pub fn run_seal(
         &self,
         ingestor: &Ingestor,
         storage: &Storage,
         metrics: &Metrics,
-        options: FlushOptions<'_>,
     ) -> Result<Value> {
-        if self.is_paused() {
-            return Ok(json!({"status": "paused"}));
-        }
         let started = Instant::now();
-        let process_rows = ingestor.flush_all_with_metrics(storage, Some(metrics))?;
-        let immutable = storage.flush_immutable_segments(options.force_immutable_segments)?;
-        observe_phase_timings(metrics, &immutable.timings);
-        observe_immutable_flush(metrics, &immutable);
-        let ducklake_started = Instant::now();
-        let ducklake = storage.flush_inlined_data(options.table)?;
-        metrics.observe_seconds(
-            "canardstack_ducklake_flush_inlined_duration_seconds",
-            &[("table", options.table.unwrap_or("all"))],
-            ducklake_started.elapsed().as_secs_f64(),
-        );
-        self.record_run("flush");
+        let immutable = ingestor.seal_committed_to_storage(storage, metrics)?;
+        self.record_run("seal");
         Ok(json!({
             "status": "ok",
-            "process_rows_flushed": process_rows,
             "immutable_segments": immutable.to_json(),
-            "ducklake": ducklake,
-            "duration_ms": started.elapsed().as_millis()
-        }))
-    }
-
-    pub fn run_compaction(
-        &self,
-        storage: &Storage,
-        table: Option<&str>,
-        metrics: &Metrics,
-    ) -> Result<Value> {
-        if self.is_paused() {
-            return Ok(json!({"status": "paused"}));
-        }
-        let started = Instant::now();
-        let decision = storage.compaction_decision(table)?;
-        if !decision
-            .get("should_compact")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-        {
-            self.record_run("compaction");
-            return Ok(json!({
-                "status": "skipped",
-                "reason": decision.get("status").and_then(Value::as_str).unwrap_or("not_needed"),
-                "decision": decision,
-                "duration_ms": started.elapsed().as_millis()
-            }));
-        }
-
-        let compaction_started = Instant::now();
-        let compaction = storage.merge_adjacent_files(table)?;
-        metrics.observe_seconds(
-            "canardstack_ducklake_compaction_duration_seconds",
-            &[("table", table.unwrap_or("all"))],
-            compaction_started.elapsed().as_secs_f64(),
-        );
-        self.record_run("compaction");
-        Ok(json!({
-            "status": "ok",
-            "decision": decision,
-            "compaction": compaction,
             "duration_ms": started.elapsed().as_millis()
         }))
     }
 
     pub fn retention(&self, storage: &Storage, dry_run: bool) -> Result<Value> {
-        if self.is_paused() {
-            return Ok(json!({"status": "paused"}));
-        }
         let started = Instant::now();
         let retention = storage.enforce_retention(&self.retention, dry_run)?;
         let snapshot_expiration = if dry_run {
@@ -195,35 +131,6 @@ impl Maintenance {
             "retention": retention,
             "snapshot_expiration": snapshot_expiration,
             "cleanup": cleanup,
-            "duration_ms": started.elapsed().as_millis()
-        }))
-    }
-
-    pub fn run_watchdog(
-        &self,
-        ingestor: &Ingestor,
-        storage: &Storage,
-        metrics: &Metrics,
-    ) -> Result<Value> {
-        if self.is_paused() {
-            return Ok(json!({"status": "paused"}));
-        }
-        let started = Instant::now();
-        let flushed = ingestor.flush_due(storage, Some(metrics))?;
-        let immutable = storage.flush_immutable_segments(false)?;
-        observe_phase_timings(metrics, &immutable.timings);
-        observe_immutable_flush(metrics, &immutable);
-        if !flushed.is_empty() {
-            self.record_run("watchdog");
-        }
-        let by_signal: BTreeMap<String, usize> = flushed
-            .into_iter()
-            .map(|(s, n)| (s.as_str().to_string(), n))
-            .collect();
-        Ok(json!({
-            "status": "ok",
-            "flushed": by_signal,
-            "immutable_segments": immutable.to_json(),
             "duration_ms": started.elapsed().as_millis()
         }))
     }
@@ -259,37 +166,6 @@ impl Maintenance {
     }
 }
 
-fn observe_phase_timings(metrics: &Metrics, timings: &[ArrowBatchInsertTiming]) {
-    for timing in timings {
-        metrics.observe_phase_seconds(
-            timing.table.as_str(),
-            timing.phase.as_str(),
-            None,
-            timing.seconds,
-        );
-    }
-}
-
-fn observe_immutable_flush(metrics: &Metrics, outcome: &ImmutableFlushOutcome) {
-    if outcome.sealed_rows == 0 && outcome.sealed_files == 0 {
-        return;
-    }
-    for timing in &outcome.timings {
-        if timing.phase == crate::storage::TimingPhase::ParquetEncode {
-            metrics.inc(
-                "canardstack_immutable_segments_sealed_files_total",
-                &[("signal", timing.table.as_str())],
-                1,
-            );
-            metrics.inc(
-                "canardstack_immutable_segments_sealed_rows_total",
-                &[("signal", timing.table.as_str())],
-                timing.rows as u64,
-            );
-        }
-    }
-}
-
 pub struct Scheduler {
     stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
@@ -320,58 +196,74 @@ impl Drop for Scheduler {
 }
 
 fn scheduler_loop(state: Arc<AppState>, stop: Arc<AtomicBool>) {
-    let watchdog_every = state.config.scheduler_watchdog_interval;
-    let flush_every = state.config.scheduler_flush_interval;
+    let seal_cadence = state.config.scheduler_seal_interval;
+    let segment_target_bytes = state.config.immutable_segment_target_bytes;
+    let segment_max_age_seconds = state.config.immutable_segment_max_age.as_secs_f64();
     let metadata_every = state.config.scheduler_metadata_interval;
     let metrics_every = state.config.scheduler_metrics_interval;
-    let compaction_every = state.config.scheduler_compaction_interval;
     let retention_every = state.config.scheduler_retention_interval;
-    let tick = watchdog_every
-        .min(Duration::from_millis(500))
+    // Poll fast enough to seal on the freshness cadence and to catch a
+    // size-due buffer promptly; the maintenance jobs are gated by their own
+    // (coarse) timers regardless of how often we wake.
+    let tick = seal_cadence
+        .min(metadata_every)
+        .min(Duration::from_millis(250))
         .max(Duration::from_millis(10));
-    let mut next_watchdog = Instant::now();
-    let mut next_flush = Instant::now();
+    let mut next_seal = Instant::now() + seal_cadence;
+    let mut seal_backoff_until = Instant::now();
     let mut next_metadata = Instant::now() + metadata_every;
     let mut next_metrics = Instant::now() + metrics_every;
-    let mut next_compaction = Instant::now() + compaction_every;
     let mut next_retention = Instant::now() + retention_every;
 
     loop {
         if stop.load(Ordering::SeqCst) {
             return;
         }
-        let flush_requested = state.ingestor.wait_for_flush_or_timeout(tick, &stop);
+        thread::sleep(tick);
         if stop.load(Ordering::SeqCst) {
             return;
         }
         let now = Instant::now();
 
-        if flush_requested || now >= next_watchdog {
-            let ok = run_job(&state, "watchdog", |s| {
-                s.maintenance
-                    .run_watchdog(&s.ingestor, &s.storage, &s.metrics)
-            });
-            next_watchdog = now + next_interval(&state, "watchdog", watchdog_every, ok);
+        if state.maintenance.is_paused() {
+            continue;
         }
 
-        if now >= next_flush {
-            let ok = run_job(&state, "flush", |s| {
-                s.maintenance.run_flush(
-                    &s.ingestor,
-                    &s.storage,
-                    &s.metrics,
-                    FlushOptions::default(),
-                )
+        // Single seal driver. Seal when a buffered signal reaches its size/age
+        // threshold, or on the freshness cadence, keeping immutable-buffer age
+        // well under the freshness-budget SLA so ingest is never shed for freshness debt. A
+        // failed seal backs off so a broken catalog cannot spin the writer.
+        if now >= seal_backoff_until {
+            let buffers = state.storage.immutable_buffer_metrics();
+            let buffered = buffers.iter().any(|metric| metric.bytes > 0);
+            let threshold_due = buffers.iter().any(|metric| {
+                metric.bytes >= segment_target_bytes
+                    || metric.age_seconds >= segment_max_age_seconds
             });
-            next_flush = now + next_interval(&state, "flush", flush_every, ok);
+            if buffered && (threshold_due || now >= next_seal) {
+                let ok = run_seal_tick(&state);
+                next_seal = now + seal_cadence;
+                if !ok {
+                    seal_backoff_until = now + seal_cadence;
+                }
+            } else if now >= next_seal {
+                next_seal = now + seal_cadence;
+            }
         }
 
         if now >= next_metadata {
             let ok = run_job(&state, "metadata_refresh", |s| {
-                if s.maintenance.is_paused() {
-                    return Ok(json!({"status": "paused"}));
+                let snapshots = s.ingestor.snapshots();
+                if metadata_refresh_should_yield_to_ingest(&snapshots) {
+                    return Ok(json!({
+                        "status": "skipped",
+                        "reason": "ingest_pressure",
+                        "max_queue_pressure": max_queue_pressure(&snapshots)
+                    }));
                 }
-                let buckets = s.storage.refresh_metadata()?;
+                let buckets = s
+                    .storage
+                    .refresh_metadata_limited(SCHEDULER_METADATA_REFRESH_BUCKET_LIMIT)?;
                 Ok(json!({"status": "ok", "buckets": buckets}))
             });
             next_metadata = now + next_interval(&state, "metadata_refresh", metadata_every, ok);
@@ -380,17 +272,11 @@ fn scheduler_loop(state: Arc<AppState>, stop: Arc<AtomicBool>) {
         if now >= next_metrics {
             let ok = run_job(&state, "metrics_snapshot", |s| {
                 crate::http::record_operator_gauges(s);
+                crate::http::record_storage_operator_gauges(s);
                 let rows = s.metrics.write_snapshot_to_storage(&s.storage)?;
                 Ok(json!({"status": "ok", "rows": rows}))
             });
             next_metrics = now + next_interval(&state, "metrics_snapshot", metrics_every, ok);
-        }
-
-        if now >= next_compaction {
-            let ok = run_job(&state, "compaction", |s| {
-                s.maintenance.run_compaction(&s.storage, None, &s.metrics)
-            });
-            next_compaction = now + next_interval(&state, "compaction", compaction_every, ok);
         }
 
         if now >= next_retention {
@@ -400,6 +286,25 @@ fn scheduler_loop(state: Arc<AppState>, stop: Arc<AtomicBool>) {
             next_retention = now + next_interval(&state, "retention", retention_every, ok);
         }
     }
+}
+
+fn run_seal_tick(state: &AppState) -> bool {
+    run_job(state, "seal", |s| {
+        let pending_bytes: usize = s
+            .storage
+            .immutable_buffer_metrics()
+            .iter()
+            .map(|metric| metric.bytes)
+            .sum();
+        let mut guard = s
+            .admission
+            .reserve_seal(&s.metrics)
+            .map_err(|err| anyhow::anyhow!(err.message.clone()))?;
+        guard.record_bytes(pending_bytes);
+        let result = s.maintenance.run_seal(&s.ingestor, &s.storage, &s.metrics);
+        guard.finish(&s.metrics);
+        result
+    })
 }
 
 fn run_job<F>(state: &AppState, job: &'static str, f: F) -> bool
@@ -415,28 +320,14 @@ where
             true
         }
         Err(err) => {
-            if let Some((partial_signal, committed)) = crate::ingest::partial_commit_info(&err) {
-                if committed > 0 {
-                    state.metrics.inc(
-                        "canardstack_ingest_partial_commit_rows_total",
-                        &[("signal", partial_signal.as_str()), ("triggered_by", job)],
-                        committed as u64,
-                    );
-                }
-            }
             let reason = classify_job_error(&err, job);
             let consecutive = state.maintenance.record_failure(job, reason);
-            let consecutive_str = consecutive.to_string();
-            let err_str = err.to_string();
-            crate::log_event(
-                "error",
-                "scheduler_job_failed",
-                &[
-                    ("job", job),
-                    ("reason", reason),
-                    ("consecutive", &consecutive_str),
-                    ("error", &err_str),
-                ],
+            tracing::error!(
+                event = "scheduler_job_failed",
+                job,
+                reason,
+                consecutive,
+                error = %err
             );
             state
                 .metrics
@@ -457,6 +348,10 @@ where
     ok
 }
 
+fn failure_affects_readiness(job: &str) -> bool {
+    !matches!(job, "metrics_snapshot")
+}
+
 fn next_interval(state: &AppState, job: &str, base: Duration, ok: bool) -> Duration {
     if ok {
         return base;
@@ -469,6 +364,17 @@ fn next_interval(state: &AppState, job: &str, base: Duration, ok: bool) -> Durat
     backoff.min(Duration::from_secs(300)).max(base)
 }
 
+fn metadata_refresh_should_yield_to_ingest(snapshots: &[IngestSnapshot]) -> bool {
+    max_queue_pressure(snapshots) >= METADATA_REFRESH_QUEUE_PRESSURE_YIELD
+}
+
+fn max_queue_pressure(snapshots: &[IngestSnapshot]) -> f64 {
+    snapshots
+        .iter()
+        .map(|snapshot| snapshot.pressure)
+        .fold(0.0, f64::max)
+}
+
 /// Bounded `reason` label. Most reasons derive from `job` (a static str we
 /// control); only `disk_full` substring-matches OS/DuckDB messages.
 fn classify_job_error(err: &anyhow::Error, job: &str) -> &'static str {
@@ -477,11 +383,40 @@ fn classify_job_error(err: &anyhow::Error, job: &str) -> &'static str {
         return "disk_full";
     }
     match job {
-        "flush" | "watchdog" => "flush_failed",
+        "seal" => "seal_failed",
         "metadata_refresh" => "metadata_refresh_failed",
         "metrics_snapshot" => "metrics_snapshot_failed",
-        "compaction" => "compaction_failed",
         "retention" | "retention_dry_run" => "retention_failed",
         _ => "scheduler_job_failed",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn snapshot(signal: &'static str, pressure: f64) -> IngestSnapshot {
+        IngestSnapshot {
+            storage_signal: signal,
+            inflight_bytes: 0,
+            inflight_capacity_bytes: 0,
+            pressure,
+        }
+    }
+
+    #[test]
+    fn metadata_refresh_yields_to_high_queue_pressure() {
+        assert!(metadata_refresh_should_yield_to_ingest(&[
+            snapshot("logs", 0.10),
+            snapshot("spans", METADATA_REFRESH_QUEUE_PRESSURE_YIELD),
+        ]));
+    }
+
+    #[test]
+    fn metadata_refresh_runs_when_queues_are_below_pressure_threshold() {
+        assert!(!metadata_refresh_should_yield_to_ingest(&[
+            snapshot("logs", 0.69),
+            snapshot("spans", 0.10),
+        ]));
     }
 }

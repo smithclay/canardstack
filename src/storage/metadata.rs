@@ -1,6 +1,6 @@
 use super::ducklake::configure_write_connection;
 use super::metadata_refresh::{merge_dirty_metadata, refresh_metadata_summaries_on};
-use super::{Signal, Storage};
+use super::{Storage, StorageSignal};
 use crate::LockExt;
 use anyhow::Result;
 use std::collections::{BTreeMap, BTreeSet};
@@ -11,17 +11,23 @@ impl Storage {
         self.metadata_generation.load(Ordering::SeqCst)
     }
 
-    pub(super) fn mark_metadata_dirty(&self, affected: BTreeMap<Signal, BTreeSet<String>>) {
+    pub(super) fn mark_metadata_dirty(&self, affected: BTreeMap<StorageSignal, BTreeSet<String>>) {
         merge_dirty_metadata(&mut self.dirty_metadata.lock_or_poisoned(), affected);
     }
 
-    /// Re-aggregate `metadata_summary` for every signal/date bucket dirtied by
-    /// a committed insert. Runs on the `metadata_refresh` scheduler job so the
-    /// full day-partition scan stays off the ingest commit path. On failure the
-    /// drained buckets are re-queued so the next tick retries them — committed
-    /// telemetry must not stay invisible to the discovery APIs.
-    pub fn refresh_metadata(&self) -> Result<usize> {
-        let affected = std::mem::take(&mut *self.dirty_metadata.lock_or_poisoned());
+    /// Re-aggregate at most `max_buckets` dirtied signal/date buckets.
+    ///
+    /// Each `metadata_summary` re-aggregation is driven by this bounded form so
+    /// metadata discovery work cannot monopolize the writer connection while
+    /// ingest is under load. The `metadata_refresh` scheduler job passes a small
+    /// limit; pass `usize::MAX` to drain every pending bucket in one pass. On
+    /// failure the drained buckets are re-queued so the next call retries them —
+    /// committed telemetry must not stay invisible to the discovery APIs.
+    pub fn refresh_metadata_limited(&self, max_buckets: usize) -> Result<usize> {
+        let affected = {
+            let mut dirty = self.dirty_metadata.lock_or_poisoned();
+            take_dirty_metadata_batch(&mut dirty, max_buckets)
+        };
         if affected.is_empty() {
             return Ok(0);
         }
@@ -37,5 +43,85 @@ impl Storage {
                 Err(err)
             }
         }
+    }
+}
+
+fn take_dirty_metadata_batch(
+    dirty: &mut BTreeMap<StorageSignal, BTreeSet<String>>,
+    max_buckets: usize,
+) -> BTreeMap<StorageSignal, BTreeSet<String>> {
+    let mut selected = BTreeMap::<StorageSignal, BTreeSet<String>>::new();
+    let mut remaining = max_buckets;
+    if remaining == 0 {
+        return selected;
+    }
+
+    let signals = dirty.keys().copied().collect::<Vec<_>>();
+    for signal in signals {
+        while remaining > 0 {
+            let Some(dates) = dirty.get_mut(&signal) else {
+                break;
+            };
+            let Some(date) = dates.iter().next().cloned() else {
+                dirty.remove(&signal);
+                break;
+            };
+            dates.remove(&date);
+            selected.entry(signal).or_default().insert(date);
+            remaining -= 1;
+            if dates.is_empty() {
+                dirty.remove(&signal);
+                break;
+            }
+        }
+        if remaining == 0 {
+            break;
+        }
+    }
+    selected
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dirty(signals: &[(StorageSignal, &[&str])]) -> BTreeMap<StorageSignal, BTreeSet<String>> {
+        signals
+            .iter()
+            .map(|(signal, dates)| (*signal, dates.iter().map(|date| date.to_string()).collect()))
+            .collect()
+    }
+
+    #[test]
+    fn metadata_batch_limit_preserves_unselected_dirty_buckets() {
+        let mut pending = dirty(&[
+            (StorageSignal::Logs, &["2026-05-18", "2026-05-19"]),
+            (StorageSignal::Spans, &["2026-05-19"]),
+            (StorageSignal::MetricGauge, &["2026-05-19"]),
+        ]);
+
+        let selected = take_dirty_metadata_batch(&mut pending, 2);
+
+        assert_eq!(
+            selected,
+            dirty(&[(StorageSignal::Logs, &["2026-05-18", "2026-05-19"])])
+        );
+        assert_eq!(
+            pending,
+            dirty(&[
+                (StorageSignal::Spans, &["2026-05-19"]),
+                (StorageSignal::MetricGauge, &["2026-05-19"]),
+            ])
+        );
+    }
+
+    #[test]
+    fn metadata_batch_limit_zero_does_not_drain_dirty_buckets() {
+        let mut pending = dirty(&[(StorageSignal::Logs, &["2026-05-19"])]);
+
+        let selected = take_dirty_metadata_batch(&mut pending, 0);
+
+        assert!(selected.is_empty());
+        assert_eq!(pending, dirty(&[(StorageSignal::Logs, &["2026-05-19"])]));
     }
 }

@@ -3,6 +3,8 @@ use crate::{AppState, Config};
 use chrono::{Duration, Utc};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::thread;
+use std::time::{Duration as StdDuration, Instant};
 
 pub fn run() -> anyhow::Result<()> {
     let state = AppState::new(Config::from_env()?)?;
@@ -48,8 +50,13 @@ pub fn run() -> anyhow::Result<()> {
         metrics.to_string().as_bytes(),
         &state,
     );
-    state.ingestor.flush_all(&state.storage)?;
-    state.storage.flush_immutable_segments(true)?;
+    let deadline = Instant::now() + StdDuration::from_secs(5);
+    while Instant::now() < deadline && state.ingestor.inflight_bytes() > 0 {
+        thread::sleep(StdDuration::from_millis(20));
+    }
+    state
+        .ingestor
+        .seal_committed_to_storage(&state.storage, &state.metrics)?;
 
     let mut admin_headers = HashMap::new();
     admin_headers.insert(

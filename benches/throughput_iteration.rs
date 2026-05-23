@@ -17,9 +17,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const BENCH_NAME: &str = "throughput_iteration";
-const BENCH_VERSION: &str = "0.3.4";
+const BENCH_VERSION: &str = "0.3.13";
 const SCENARIO_NAME: &str = "throughput-iteration";
-const USAGE: &str = "cargo bench --bench throughput_iteration -- [--base-url URL] [--warmup 2m] [--duration 20m] [--target-gb-day 100] [--profile ingest-only|mixed-query] [--signals all|logs|spans|metrics] [--ingest-concurrency 1] [--connection-mode close|persistent] [--query-pressure off|low|medium|high] [--query-interval 5s] [--query-concurrency 1] [--services 1] [--items-per-batch 256] [--log-records 8] [--log-body-bytes 120000] [--trace-spans 16] [--trace-attribute-bytes 48000] [--metric-series 40] [--metric-description-bytes 192] [--timestamp-mode fixed|advancing] [--progress-interval 30s] [--max-runtime 27m] [--no-queries] [--report-dir DIR] [--server-pid PID] [--resource-sample-interval 5s]";
+const USAGE: &str = "cargo bench --bench throughput_iteration -- [--base-url URL] [--warmup 2m] [--duration 20m] [--target-gb-day 100] [--profile ingest-only|mixed-query] [--signals all|logs|spans|metrics] [--ingest-concurrency 1] [--connection-mode close|persistent] [--query-pressure off|low|medium|high] [--query-interval 5s] [--query-concurrency 1] [--services 1] [--items-per-batch 256] [--log-records 8] [--log-body-bytes 120000] [--trace-spans 16] [--trace-attribute-bytes 48000] [--metric-series 40] [--metric-description-bytes 192] [--timestamp-mode fixed|advancing] [--freshness-sla 15s] [--progress-interval 30s] [--max-runtime 27m] [--no-queries] [--report-dir DIR] [--server-pid PID] [--resource-sample-interval 5s]";
 const DETERMINISTIC_SEED: u64 = 0xCA4A_D57A_C5AC;
 const DEFAULT_TARGET_GB_PER_DAY: f64 = 100.0;
 const DEFAULT_BASE_URL: &str = "http://127.0.0.1:4318";
@@ -31,6 +31,7 @@ const DEFAULT_PROGRESS_INTERVAL: Duration = Duration::from_secs(30);
 const DEFAULT_MAX_RUNTIME_GRACE: Duration = Duration::from_secs(5 * 60);
 const NEAR_TIMEOUT_MS: f64 = 25_000.0;
 const CLIENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const PERSISTENT_IDLE_RECONNECT: Duration = Duration::from_secs(25);
 const DEFAULT_SERVICE_COUNT: usize = 1;
 const DEFAULT_LOG_RECORD_COUNT: usize = 8;
 const DEFAULT_LOG_BODY_BYTES: usize = 120_000;
@@ -89,7 +90,7 @@ fn run() -> Result<(Report, PathBuf)> {
         fmt_duration(args.max_runtime())
     );
 
-    let mut query_plan = QueryPlan::new(run_started);
+    let mut query_plan = QueryPlan::new(run_started, args.signals);
     let _warmup = run_phase(
         &client,
         &api_key,
@@ -104,6 +105,7 @@ fn run() -> Result<(Report, PathBuf)> {
             query_concurrency: args.query_concurrency,
             no_queries: args.no_queries(),
             measured: false,
+            signals: args.signals,
             progress_interval: args.progress_interval,
             guard_deadline,
         },
@@ -142,6 +144,7 @@ fn run() -> Result<(Report, PathBuf)> {
             query_concurrency: args.query_concurrency,
             no_queries: args.no_queries(),
             measured: true,
+            signals: args.signals,
             progress_interval: args.progress_interval,
             guard_deadline,
         },
@@ -158,7 +161,7 @@ fn run() -> Result<(Report, PathBuf)> {
     ));
 
     let _ = client.post_body(
-        "/api/admin/maintenance/flush",
+        "/api/admin/maintenance/seal",
         Some(&admin_key),
         "application/json",
         b"{}",
@@ -236,7 +239,14 @@ fn run_phase(
             break;
         }
         if now >= next_progress {
-            print_progress(config.phase, started, config.duration, &stats, client);
+            print_progress(
+                config.phase,
+                started,
+                config.duration,
+                &stats,
+                client,
+                config.signals,
+            );
             while next_progress <= now {
                 next_progress += config.progress_interval;
             }
@@ -277,7 +287,14 @@ fn run_phase(
     }
 
     stats.elapsed = started.elapsed();
-    print_progress(config.phase, started, config.duration, &stats, client);
+    print_progress(
+        config.phase,
+        started,
+        config.duration,
+        &stats,
+        client,
+        config.signals,
+    );
     stats
 }
 
@@ -330,6 +347,7 @@ fn run_phase_concurrent_ingest(
                 config.duration,
                 &stats_snapshot,
                 client,
+                config.signals,
             );
             while next_progress <= now {
                 next_progress += config.progress_interval;
@@ -370,7 +388,14 @@ fn run_phase_concurrent_ingest(
         .into_inner()
         .expect("lock benchmark stats");
     stats.elapsed = started.elapsed();
-    print_progress(config.phase, started, config.duration, &stats, client);
+    print_progress(
+        config.phase,
+        started,
+        config.duration,
+        &stats,
+        client,
+        config.signals,
+    );
     stats
 }
 
@@ -436,6 +461,7 @@ fn print_progress(
     duration: Duration,
     stats: &RunStats,
     client: &Client,
+    signals: SignalSelection,
 ) {
     let elapsed = started.elapsed();
     let throughput = if elapsed.as_secs_f64() > 0.0 {
@@ -451,7 +477,7 @@ fn print_progress(
         .unwrap_or_default();
     let freshness = metrics
         .as_ref()
-        .and_then(|metrics| max_map_value(&metrics.freshness_lag_seconds))
+        .and_then(|metrics| max_freshness_lag_for_signals(&metrics.freshness_lag_seconds, signals))
         .map(|lag| format!(" freshness_lag={lag:.1}s"))
         .unwrap_or_default();
     eprintln!(
@@ -638,6 +664,7 @@ struct PhaseConfig {
     query_concurrency: usize,
     no_queries: bool,
     measured: bool,
+    signals: SignalSelection,
     progress_interval: Duration,
     guard_deadline: Instant,
 }
@@ -780,8 +807,10 @@ fn build_report(input: BuildReportInput) -> Report {
         metrics.queue.max_oldest_age_seconds
     });
     let freshness_lag_trend = trend_from_samples(&trend_samples, |metrics| {
-        max_map_value(&metrics.freshness_lag_seconds)
+        max_freshness_lag_for_signals(&metrics.freshness_lag_seconds, args.signals)
     });
+    let max_measured_freshness_lag_seconds =
+        max_freshness_lag_from_samples(&trend_samples, args.signals);
     let queue_rows_trend = trend_from_samples(&trend_samples, |metrics| metrics.queue.max_rows);
     let queue_bytes_trend = trend_from_samples(&trend_samples, |metrics| metrics.queue.max_bytes);
 
@@ -792,6 +821,21 @@ fn build_report(input: BuildReportInput) -> Report {
     if freshness_lag_trend.clearly_increasing {
         failure_reasons.push("freshness lag increased across the measured window".to_string());
         smell_observations.push("ingest-to-query freshness lag grew without recovery".to_string());
+    }
+    if let Some(sla) = args.freshness_sla {
+        match max_measured_freshness_lag_seconds {
+            Some(max_lag) if max_lag > sla.as_secs_f64() => {
+                failure_reasons.push(format!(
+                    "query-visible freshness lag {:.3}s exceeded SLA {:.3}s",
+                    max_lag,
+                    sla.as_secs_f64()
+                ));
+            }
+            Some(_) => {}
+            None => smell_observations.push(
+                "freshness SLA configured but freshness samples were unavailable".to_string(),
+            ),
+        }
     }
 
     let metric_snapshots = metric_samples
@@ -804,14 +848,9 @@ fn build_report(input: BuildReportInput) -> Report {
             "measured-window stage throughput deltas unavailable from /metrics samples".to_string(),
         );
     } else {
-        let enqueued_rows = stage_throughput
-            .totals
-            .get("enqueued_rows")
-            .copied()
-            .unwrap_or(0.0);
         let buffered_rows = stage_throughput
             .totals
-            .get("flush_buffered_rows")
+            .get("buffered_rows")
             .copied()
             .unwrap_or(0.0);
         let visible_rows = stage_throughput
@@ -819,16 +858,10 @@ fn build_report(input: BuildReportInput) -> Report {
             .get("storage_visible_rows")
             .copied()
             .unwrap_or(0.0);
-        if enqueued_rows > 0.0 && buffered_rows < enqueued_rows * 0.80 {
+        if buffered_rows > 0.0 && visible_rows < buffered_rows * 0.80 {
             smell_observations.push(format!(
-                "flush buffered only {:.0}/{:.0} measured-window enqueued rows",
-                buffered_rows, enqueued_rows
-            ));
-        }
-        if enqueued_rows > 0.0 && visible_rows < enqueued_rows * 0.80 {
-            smell_observations.push(format!(
-                "storage-visible rows advanced only {:.0}/{:.0} measured-window enqueued rows",
-                visible_rows, enqueued_rows
+                "storage-visible rows advanced only {:.0}/{:.0} measured-window buffered rows",
+                visible_rows, buffered_rows
             ));
         }
     }
@@ -840,8 +873,8 @@ fn build_report(input: BuildReportInput) -> Report {
         storage,
         mut server_phase_timing,
         transform_counters,
-        flush_counters,
-        flush_gauges,
+        ingest_buffer_counters,
+        ingest_buffer_gauges,
         ducklake_maintenance_timing,
     ) = match scraped {
         Some(scraped) => (
@@ -850,8 +883,8 @@ fn build_report(input: BuildReportInput) -> Report {
             Some(scraped.storage),
             scraped.server_phase_timing,
             scraped.transform_counters,
-            scraped.flush_counters,
-            scraped.flush_gauges,
+            scraped.ingest_buffer_counters,
+            scraped.ingest_buffer_gauges,
             scraped.ducklake_maintenance_timing,
         ),
         None => (
@@ -888,7 +921,7 @@ fn build_report(input: BuildReportInput) -> Report {
         smell_observations.push("freshness lag trend unavailable from server metrics".to_string());
     }
 
-    let pass_fail_criteria = vec![
+    let mut pass_fail_criteria = vec![
         PassFailCriterionReport::new(
             "throughput_at_least_90_percent_target",
             actual_decoded_bytes_per_sec >= target_decoded_bytes_per_sec * 0.90,
@@ -955,8 +988,21 @@ fn build_report(input: BuildReportInput) -> Report {
             ),
         ),
     ];
+    if let Some(sla) = args.freshness_sla {
+        pass_fail_criteria.push(PassFailCriterionReport::new(
+            "query_visible_freshness_within_sla",
+            max_measured_freshness_lag_seconds.is_some_and(|max_lag| max_lag <= sla.as_secs_f64()),
+            format!(
+                "max_measured_lag_seconds={} sla_seconds={:.3}",
+                fmt_optional(max_measured_freshness_lag_seconds),
+                sla.as_secs_f64()
+            ),
+        ));
+    }
 
     let pass = failure_reasons.is_empty();
+    let loki_progressive_query =
+        LokiProgressiveQueryReport::from_samples(&metric_samples, &server_phase_timing);
 
     Report {
         git_sha: git_sha(),
@@ -1010,16 +1056,19 @@ fn build_report(input: BuildReportInput) -> Report {
         ingest_latency_ms,
         query_latency_ms,
         freshness_lag_seconds,
+        freshness_sla_seconds: args.freshness_sla.map(|sla| sla.as_secs_f64()),
+        max_measured_freshness_lag_seconds,
         queue,
         storage,
         server_phase_timing,
         transform_counters,
-        flush_counters,
-        flush_gauges,
+        ingest_buffer_counters,
+        ingest_buffer_gauges,
         ducklake_maintenance_timing,
         resource_samples,
         metric_snapshots,
         stage_throughput,
+        loki_progressive_query,
         queue_oldest_age_trend,
         queue_rows_trend,
         queue_bytes_trend,
@@ -1162,7 +1211,7 @@ fn print_summary(report: &Report, path: &Path) {
     }
     if report.stage_throughput.available {
         println!(
-            "stage_rates_per_sec accepted_decoded_bytes={:.0} transformed_rows={:.0} enqueued_rows={:.0} flush_buffered_rows={:.0} storage_visible_rows={:.0}",
+            "stage_rates_per_sec accepted_decoded_bytes={:.0} transformed_rows={:.0} buffered_rows={:.0} storage_visible_rows={:.0}",
             report
                 .stage_throughput
                 .totals_per_second
@@ -1178,13 +1227,7 @@ fn print_summary(report: &Report, path: &Path) {
             report
                 .stage_throughput
                 .totals_per_second
-                .get("enqueued_rows")
-                .copied()
-                .unwrap_or(0.0),
-            report
-                .stage_throughput
-                .totals_per_second
-                .get("flush_buffered_rows")
+                .get("buffered_rows")
                 .copied()
                 .unwrap_or(0.0),
             report
@@ -1194,31 +1237,46 @@ fn print_summary(report: &Report, path: &Path) {
                 .copied()
                 .unwrap_or(0.0)
         );
-        if report
-            .stage_throughput
-            .totals_per_second
-            .contains_key("null_sink_rows")
-            || report
-                .stage_throughput
-                .totals_per_second
-                .contains_key("control_dropped_rows")
-        {
-            println!(
-                "control_rates_per_sec dropped_rows={:.0} null_sink_rows={:.0}",
+    }
+    if report.loki_progressive_query.available {
+        println!(
+            "loki_progressive_query ok_delta={} batches_scanned={} files_scanned={} candidate_files={} rows_scanned={} result_rows={} scanned_file_fraction={} plan_avg_ms={} candidate_execute_avg_ms={} total_avg_ms={}",
+            report
+                .loki_progressive_query
+                .requests_ok_delta
+                .unwrap_or(0.0),
+            fmt_optional(report.loki_progressive_query.final_batches_scanned),
+            fmt_optional(report.loki_progressive_query.final_files_scanned),
+            fmt_optional(report.loki_progressive_query.final_candidate_files),
+            fmt_optional(report.loki_progressive_query.final_rows_scanned),
+            fmt_optional(report.loki_progressive_query.final_result_rows),
+            fmt_optional(
                 report
-                    .stage_throughput
-                    .totals_per_second
-                    .get("control_dropped_rows")
-                    .copied()
-                    .unwrap_or(0.0),
+                    .loki_progressive_query
+                    .scanned_file_fraction_of_candidates
+            ),
+            fmt_optional(
                 report
-                    .stage_throughput
-                    .totals_per_second
-                    .get("null_sink_rows")
-                    .copied()
-                    .unwrap_or(0.0)
-            );
-        }
+                    .loki_progressive_query
+                    .planner_timing
+                    .avg_seconds
+                    .map(|seconds| seconds * 1000.0)
+            ),
+            fmt_optional(
+                report
+                    .loki_progressive_query
+                    .candidate_execute_timing
+                    .avg_seconds
+                    .map(|seconds| seconds * 1000.0)
+            ),
+            fmt_optional(
+                report
+                    .loki_progressive_query
+                    .total_timing
+                    .avg_seconds
+                    .map(|seconds| seconds * 1000.0)
+            )
+        );
     }
     println!("report={}", path.display());
     if !report.failure_reasons.is_empty() {
@@ -1248,6 +1306,7 @@ struct Args {
     workload: WorkloadProfile,
     timestamp_mode: TimestampMode,
     progress_interval: Duration,
+    freshness_sla: Option<Duration>,
     max_runtime: Option<Duration>,
     no_queries_legacy: bool,
     report_dir: Option<PathBuf>,
@@ -1272,6 +1331,7 @@ impl Args {
             workload: WorkloadProfile::default(),
             timestamp_mode: TimestampMode::Fixed,
             progress_interval: DEFAULT_PROGRESS_INTERVAL,
+            freshness_sla: None,
             max_runtime: None,
             no_queries_legacy: false,
             report_dir: None,
@@ -1363,6 +1423,10 @@ impl Args {
                     parsed.progress_interval =
                         parse_duration(&next_arg(&mut args, "--progress-interval")?)?;
                 }
+                "--freshness-sla" => {
+                    parsed.freshness_sla =
+                        Some(parse_duration(&next_arg(&mut args, "--freshness-sla")?)?);
+                }
                 "--max-runtime" => {
                     parsed.max_runtime =
                         Some(parse_duration(&next_arg(&mut args, "--max-runtime")?)?);
@@ -1416,6 +1480,9 @@ impl Args {
         }
         if parsed.resource_sample_interval.is_zero() {
             bail!("--resource-sample-interval must be positive");
+        }
+        if parsed.freshness_sla.is_some_and(|sla| sla.is_zero()) {
+            bail!("--freshness-sla must be positive");
         }
         if parsed
             .max_runtime
@@ -1490,6 +1557,15 @@ impl SignalSelection {
             Self::Logs => signal == "logs",
             Self::Spans => signal == "spans",
             Self::Metrics => signal == "metrics",
+        }
+    }
+
+    fn includes_table(self, table: &str) -> bool {
+        match self {
+            Self::All => true,
+            Self::Logs => table == "logs",
+            Self::Spans => table == "spans",
+            Self::Metrics => table == "metric_gauge" || table == "metric_sum",
         }
     }
 
@@ -2046,13 +2122,15 @@ fn current_nanos() -> i64 {
 
 struct QueryPlan {
     run_started: chrono::DateTime<Utc>,
+    signals: SignalSelection,
     next_idx: usize,
 }
 
 impl QueryPlan {
-    fn new(run_started: chrono::DateTime<Utc>) -> Self {
+    fn new(run_started: chrono::DateTime<Utc>, signals: SignalSelection) -> Self {
         Self {
             run_started,
+            signals,
             next_idx: 0,
         }
     }
@@ -2060,28 +2138,46 @@ impl QueryPlan {
     fn next(&mut self) -> String {
         let from = self.run_started - ChronoDuration::minutes(10);
         let to = Utc::now() + ChronoDuration::minutes(1);
-        let path = match self.next_idx % 3 {
-            0 => format!(
-                "/loki/api/v1/query_range?query={}&start={}&end={}&limit=100",
-                enc("{service_name=\"bench-checkout\"} |= \"canardstack-v0-iteration\""),
-                enc(&from.to_rfc3339()),
-                enc(&to.to_rfc3339())
-            ),
-            1 => format!(
-                "/api/v1/query_range?query={}&start={}&end={}&step=60",
-                enc("avg(canardstack.bench.gauge{service_name=\"bench-checkout\"})"),
-                enc(&from.to_rfc3339()),
-                enc(&to.to_rfc3339())
-            ),
-            _ => format!(
-                "/api/search?start={}&end={}&service.name=bench-checkout&limit=10",
-                enc(&from.to_rfc3339()),
-                enc(&to.to_rfc3339())
-            ),
+        let paths = match self.signals {
+            SignalSelection::All => vec![
+                loki_query_range_path(from, to),
+                prometheus_query_range_path(from, to),
+                tempo_search_path(from, to),
+            ],
+            SignalSelection::Logs => vec![loki_query_range_path(from, to)],
+            SignalSelection::Spans => vec![tempo_search_path(from, to)],
+            SignalSelection::Metrics => vec![prometheus_query_range_path(from, to)],
         };
+        let path = paths[self.next_idx % paths.len()].clone();
         self.next_idx += 1;
         path
     }
+}
+
+fn loki_query_range_path(from: chrono::DateTime<Utc>, to: chrono::DateTime<Utc>) -> String {
+    format!(
+        "/loki/api/v1/query_range?query={}&start={}&end={}&limit=100",
+        enc("{service_name=\"bench-checkout\"} |= \"canardstack-v0-iteration\""),
+        enc(&from.to_rfc3339()),
+        enc(&to.to_rfc3339())
+    )
+}
+
+fn prometheus_query_range_path(from: chrono::DateTime<Utc>, to: chrono::DateTime<Utc>) -> String {
+    format!(
+        "/api/v1/query_range?query={}&start={}&end={}&step=60",
+        enc("avg(canardstack.bench.gauge{service_name=\"bench-checkout\"})"),
+        enc(&from.to_rfc3339()),
+        enc(&to.to_rfc3339())
+    )
+}
+
+fn tempo_search_path(from: chrono::DateTime<Utc>, to: chrono::DateTime<Utc>) -> String {
+    format!(
+        "/api/search?start={}&end={}&service.name=bench-checkout&limit=10",
+        enc(&from.to_rfc3339()),
+        enc(&to.to_rfc3339())
+    )
 }
 
 #[derive(Clone, Default)]
@@ -2171,7 +2267,12 @@ struct Client {
     host: String,
     port: u16,
     connection_mode: ConnectionMode,
-    stream: Arc<Mutex<Option<TcpStream>>>,
+    stream: Arc<Mutex<Option<PersistentStream>>>,
+}
+
+struct PersistentStream {
+    stream: TcpStream,
+    last_used: Instant,
 }
 
 impl Clone for Client {
@@ -2272,14 +2373,24 @@ impl Client {
         body: Option<(&str, &[u8])>,
     ) -> Result<Response> {
         let mut slot = self.stream.lock().expect("lock benchmark client stream");
-        if slot.is_none() {
-            *slot = Some(self.connect()?);
+        let now = Instant::now();
+        if slot
+            .as_ref()
+            .is_some_and(|slot| now.duration_since(slot.last_used) >= PERSISTENT_IDLE_RECONNECT)
+        {
+            *slot = None;
         }
-        let stream = slot.as_mut().expect("persistent stream exists");
+        if slot.is_none() {
+            *slot = Some(PersistentStream {
+                stream: self.connect()?,
+                last_used: now,
+            });
+        }
+        let slot_stream = slot.as_mut().expect("persistent stream exists");
         let deadline = Instant::now() + CLIENT_REQUEST_TIMEOUT;
         let result = self
             .write_request(
-                stream,
+                &mut slot_stream.stream,
                 RequestSpec {
                     method,
                     path,
@@ -2289,11 +2400,13 @@ impl Client {
                 },
                 deadline,
             )
-            .and_then(|()| read_response(stream, deadline));
+            .and_then(|()| read_response(&mut slot_stream.stream, deadline));
         match result {
             Ok(response) => {
                 if response.connection_close {
                     *slot = None;
+                } else if let Some(slot) = slot.as_mut() {
+                    slot.last_used = Instant::now();
                 }
                 Ok(response)
             }
@@ -2466,8 +2579,8 @@ struct ScrapedMetrics {
     storage: StorageReport,
     server_phase_timing: BTreeMap<String, PhaseTimingReport>,
     transform_counters: BTreeMap<String, u64>,
-    flush_counters: BTreeMap<String, u64>,
-    flush_gauges: BTreeMap<String, f64>,
+    ingest_buffer_counters: BTreeMap<String, u64>,
+    ingest_buffer_gauges: BTreeMap<String, f64>,
     ducklake_maintenance_timing: BTreeMap<String, PhaseTimingReport>,
 }
 
@@ -2493,20 +2606,8 @@ fn scrape_metrics(text: &str) -> ScrapedMetrics {
                         .insert(table.clone(), metric.value);
                 }
             }
-            "canardstack_ingest_queue_rows" | "canardstack_ingest_queue_rows_max" => {
-                out.queue.max_rows = Some(out.queue.max_rows.unwrap_or(0.0).max(metric.value));
-            }
-            "canardstack_ingest_queue_bytes" | "canardstack_ingest_queue_bytes_max" => {
+            "canardstack_ingest_inflight_bytes" | "canardstack_ingest_inflight_bytes_max" => {
                 out.queue.max_bytes = Some(out.queue.max_bytes.unwrap_or(0.0).max(metric.value));
-            }
-            "canardstack_ingest_queue_oldest_age_seconds"
-            | "canardstack_ingest_queue_oldest_age_seconds_max" => {
-                out.queue.max_oldest_age_seconds = Some(
-                    out.queue
-                        .max_oldest_age_seconds
-                        .unwrap_or(0.0)
-                        .max(metric.value),
-                );
             }
             "canardstack_storage_physical_bytes" => {
                 out.storage.physical_bytes = Some(metric.value as u64);
@@ -2549,20 +2650,21 @@ fn scrape_metrics(text: &str) -> ScrapedMetrics {
                 out.transform_counters
                     .insert(labels_key(&metric.labels), metric.value as u64);
             }
-            name if name.starts_with("canardstack_ingest_flush_") && name.ends_with("_total") => {
-                out.flush_counters.insert(
+            name if name.starts_with("canardstack_ingest_buffered_")
+                && name.ends_with("_total") =>
+            {
+                out.ingest_buffer_counters.insert(
                     format!("{} {}", metric.name, labels_key(&metric.labels)),
                     metric.value as u64,
                 );
             }
-            name if name.starts_with("canardstack_ingest_flush_") => {
-                out.flush_gauges.insert(
+            name if name.starts_with("canardstack_ingest_buffered_") => {
+                out.ingest_buffer_gauges.insert(
                     format!("{} {}", metric.name, labels_key(&metric.labels)),
                     metric.value,
                 );
             }
-            "canardstack_ducklake_flush_inlined_duration_seconds_count"
-            | "canardstack_ducklake_compaction_duration_seconds_count" => {
+            "canardstack_ducklake_compaction_duration_seconds_count" => {
                 ducklake_counts.insert(
                     format!(
                         "{} {}",
@@ -2572,8 +2674,7 @@ fn scrape_metrics(text: &str) -> ScrapedMetrics {
                     metric.value,
                 );
             }
-            "canardstack_ducklake_flush_inlined_duration_seconds_sum"
-            | "canardstack_ducklake_compaction_duration_seconds_sum" => {
+            "canardstack_ducklake_compaction_duration_seconds_sum" => {
                 ducklake_sums.insert(
                     format!(
                         "{} {}",
@@ -2664,6 +2765,29 @@ fn parse_labels(raw: &str) -> BTreeMap<String, String> {
         .collect()
 }
 
+fn max_freshness_lag_from_samples(
+    samples: &[MetricSample],
+    signals: SignalSelection,
+) -> Option<f64> {
+    samples
+        .iter()
+        .filter_map(|sample| sample.metrics.as_ref())
+        .filter_map(|metrics| {
+            max_freshness_lag_for_signals(&metrics.freshness_lag_seconds, signals)
+        })
+        .max_by(f64::total_cmp)
+}
+
+fn max_freshness_lag_for_signals(
+    freshness_lag_seconds: &BTreeMap<String, f64>,
+    signals: SignalSelection,
+) -> Option<f64> {
+    freshness_lag_seconds
+        .iter()
+        .filter_map(|(table, lag)| signals.includes_table(table).then_some(*lag))
+        .max_by(f64::total_cmp)
+}
+
 fn labels_key(labels: &BTreeMap<String, String>) -> String {
     labels
         .iter()
@@ -2737,10 +2861,6 @@ fn trend_from_samples(
     }
 }
 
-fn max_map_value(values: &BTreeMap<String, f64>) -> Option<f64> {
-    values.values().copied().reduce(f64::max)
-}
-
 fn top_phase_timings(
     phases: &BTreeMap<String, PhaseTimingReport>,
 ) -> Vec<(&String, &PhaseTimingReport)> {
@@ -2786,16 +2906,19 @@ struct Report {
     ingest_latency_ms: LatencySummary,
     query_latency_ms: LatencySummary,
     freshness_lag_seconds: BTreeMap<String, f64>,
+    freshness_sla_seconds: Option<f64>,
+    max_measured_freshness_lag_seconds: Option<f64>,
     queue: Option<QueueReport>,
     storage: Option<StorageReport>,
     server_phase_timing: BTreeMap<String, PhaseTimingReport>,
     transform_counters: BTreeMap<String, u64>,
-    flush_counters: BTreeMap<String, u64>,
-    flush_gauges: BTreeMap<String, f64>,
+    ingest_buffer_counters: BTreeMap<String, u64>,
+    ingest_buffer_gauges: BTreeMap<String, f64>,
     ducklake_maintenance_timing: BTreeMap<String, PhaseTimingReport>,
     resource_samples: Vec<ResourceSample>,
     metric_snapshots: Vec<MetricSnapshotReport>,
     stage_throughput: StageThroughputReport,
+    loki_progressive_query: LokiProgressiveQueryReport,
     queue_oldest_age_trend: TrendReport,
     queue_rows_trend: TrendReport,
     queue_bytes_trend: TrendReport,
@@ -2886,6 +3009,18 @@ struct PhaseTimingReport {
     wall_time_share: Option<f64>,
 }
 
+impl PhaseTimingReport {
+    fn zero() -> Self {
+        Self {
+            count: 0,
+            sum_seconds: 0.0,
+            avg_seconds: None,
+            seconds_per_mib: None,
+            wall_time_share: None,
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct MetricSnapshotReport {
     label: String,
@@ -2907,6 +3042,177 @@ impl MetricSnapshotReport {
                 .as_ref()
                 .map(|metrics| metrics.freshness_lag_seconds.clone())
                 .unwrap_or_default(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct LokiProgressiveQueryReport {
+    available: bool,
+    requests_ok_delta: Option<f64>,
+    final_candidate_files: Option<f64>,
+    final_candidate_rows: Option<f64>,
+    final_candidate_bytes: Option<f64>,
+    final_batch_size: Option<f64>,
+    final_files_scanned: Option<f64>,
+    final_batches_scanned: Option<f64>,
+    final_rows_scanned: Option<f64>,
+    final_bytes_scanned: Option<f64>,
+    final_result_rows: Option<f64>,
+    final_total_log_files: Option<f64>,
+    final_total_log_rows: Option<f64>,
+    scanned_file_fraction_of_candidates: Option<f64>,
+    scanned_row_fraction_of_candidates: Option<f64>,
+    scanned_byte_fraction_of_candidates: Option<f64>,
+    scanned_file_fraction_of_total: Option<f64>,
+    scanned_row_fraction_of_total: Option<f64>,
+    planner_timing: PhaseTimingReport,
+    candidate_execute_timing: PhaseTimingReport,
+    total_timing: PhaseTimingReport,
+}
+
+impl LokiProgressiveQueryReport {
+    fn from_samples(
+        samples: &[MetricSample],
+        server_phase_timing: &BTreeMap<String, PhaseTimingReport>,
+    ) -> Self {
+        let total_timing = server_phase_timing
+            .get(
+                "phase=loki_progressive_query_execute,route_template=/loki/api/v1/query_range,storage_signal=logs",
+            )
+            .cloned()
+            .unwrap_or_else(PhaseTimingReport::zero);
+        let planner_timing = server_phase_timing
+            .get(
+                "phase=loki_progressive_query_candidate_plan,route_template=/loki/api/v1/query_range,storage_signal=logs",
+            )
+            .cloned()
+            .unwrap_or_else(PhaseTimingReport::zero);
+        let candidate_execute_timing = server_phase_timing
+            .get(
+                "phase=loki_progressive_query_candidate_execute,route_template=/loki/api/v1/query_range,storage_signal=logs",
+            )
+            .cloned()
+            .unwrap_or_else(PhaseTimingReport::zero);
+        let Some(end) = samples.iter().find(|sample| sample.label == "end") else {
+            return Self::unavailable(planner_timing, candidate_execute_timing, total_timing);
+        };
+        let Some(end_metrics) = end.metrics.as_ref() else {
+            return Self::unavailable(planner_timing, candidate_execute_timing, total_timing);
+        };
+        let start_metrics = samples
+            .iter()
+            .find(|sample| sample.label == "start")
+            .and_then(|sample| sample.metrics.as_ref());
+
+        let final_candidate_files = metric_value(
+            end_metrics,
+            "canardstack_loki_progressive_query_candidate_files",
+        );
+        let final_candidate_rows = metric_value(
+            end_metrics,
+            "canardstack_loki_progressive_query_candidate_rows",
+        );
+        let final_candidate_bytes = metric_value(
+            end_metrics,
+            "canardstack_loki_progressive_query_candidate_bytes",
+        );
+        let final_batch_size =
+            metric_value(end_metrics, "canardstack_loki_progressive_query_batch_size");
+        let final_files_scanned = metric_value(
+            end_metrics,
+            "canardstack_loki_progressive_query_files_scanned",
+        );
+        let final_batches_scanned = metric_value(
+            end_metrics,
+            "canardstack_loki_progressive_query_batches_scanned",
+        );
+        let final_rows_scanned = metric_value(
+            end_metrics,
+            "canardstack_loki_progressive_query_rows_scanned",
+        );
+        let final_bytes_scanned = metric_value(
+            end_metrics,
+            "canardstack_loki_progressive_query_bytes_scanned",
+        );
+        let final_result_rows = metric_value(
+            end_metrics,
+            "canardstack_loki_progressive_query_result_rows",
+        );
+        let final_total_log_files = labeled_metric_value(
+            end_metrics,
+            "canardstack_ducklake_parquet_files",
+            "table",
+            "logs",
+        );
+        let final_total_log_rows = labeled_metric_value(
+            end_metrics,
+            "canardstack_ducklake_parquet_rows",
+            "table",
+            "logs",
+        );
+        let requests_ok_delta = counter_delta(
+            start_metrics,
+            end_metrics,
+            "canardstack_loki_progressive_query_requests_total",
+            &[("status", "ok")],
+        );
+        let available = final_files_scanned.is_some()
+            || requests_ok_delta.unwrap_or(0.0) > 0.0
+            || total_timing.count > 0;
+
+        Self {
+            available,
+            requests_ok_delta,
+            final_candidate_files,
+            final_candidate_rows,
+            final_candidate_bytes,
+            final_batch_size,
+            final_files_scanned,
+            final_batches_scanned,
+            final_rows_scanned,
+            final_bytes_scanned,
+            final_result_rows,
+            final_total_log_files,
+            final_total_log_rows,
+            scanned_file_fraction_of_candidates: ratio(final_files_scanned, final_candidate_files),
+            scanned_row_fraction_of_candidates: ratio(final_rows_scanned, final_candidate_rows),
+            scanned_byte_fraction_of_candidates: ratio(final_bytes_scanned, final_candidate_bytes),
+            scanned_file_fraction_of_total: ratio(final_files_scanned, final_total_log_files),
+            scanned_row_fraction_of_total: ratio(final_rows_scanned, final_total_log_rows),
+            planner_timing,
+            candidate_execute_timing,
+            total_timing,
+        }
+    }
+
+    fn unavailable(
+        planner_timing: PhaseTimingReport,
+        candidate_execute_timing: PhaseTimingReport,
+        total_timing: PhaseTimingReport,
+    ) -> Self {
+        Self {
+            available: total_timing.count > 0,
+            requests_ok_delta: None,
+            final_candidate_files: None,
+            final_candidate_rows: None,
+            final_candidate_bytes: None,
+            final_batch_size: None,
+            final_files_scanned: None,
+            final_batches_scanned: None,
+            final_rows_scanned: None,
+            final_bytes_scanned: None,
+            final_result_rows: None,
+            final_total_log_files: None,
+            final_total_log_rows: None,
+            scanned_file_fraction_of_candidates: None,
+            scanned_row_fraction_of_candidates: None,
+            scanned_byte_fraction_of_candidates: None,
+            scanned_file_fraction_of_total: None,
+            scanned_row_fraction_of_total: None,
+            planner_timing,
+            candidate_execute_timing,
+            total_timing,
         }
     }
 }
@@ -2941,105 +3247,63 @@ impl StageThroughputReport {
             (end.seconds_from_measured_start - start.seconds_from_measured_start).max(0.001);
         let stages = [
             StageMetric {
+                stage: "raw_spooled_records",
+                metric: "canardstack_raw_spool_records_total",
+                label: "spool_lane",
+                kind: StageMetricKind::Counter,
+            },
+            StageMetric {
+                stage: "raw_spool_replayed_records",
+                metric: "canardstack_raw_spool_replayed_records_total",
+                label: "request_kind",
+                kind: StageMetricKind::Counter,
+            },
+            StageMetric {
                 stage: "accepted_request_bytes",
                 metric: "canardstack_ingest_request_bytes_total",
-                label: "signal",
+                label: "request_kind",
                 kind: StageMetricKind::Counter,
             },
             StageMetric {
                 stage: "accepted_decoded_bytes",
                 metric: "canardstack_ingest_decoded_bytes_total",
-                label: "signal",
+                label: "request_kind",
                 kind: StageMetricKind::Counter,
             },
             StageMetric {
                 stage: "transformed_rows",
                 metric: "canardstack_ingest_transformed_rows_total",
-                label: "signal",
+                label: "storage_signal",
                 kind: StageMetricKind::Counter,
             },
             StageMetric {
-                stage: "enqueued_rows",
-                metric: "canardstack_ingest_enqueued_rows_total",
-                label: "signal",
+                stage: "buffered_rows",
+                metric: "canardstack_ingest_buffered_rows_total",
+                label: "storage_signal",
                 kind: StageMetricKind::Counter,
             },
             StageMetric {
-                stage: "enqueued_bytes",
-                metric: "canardstack_ingest_enqueued_bytes_total",
-                label: "signal",
-                kind: StageMetricKind::Counter,
-            },
-            StageMetric {
-                stage: "control_dropped_rows",
-                metric: "canardstack_ingest_control_dropped_rows_total",
-                label: "signal",
-                kind: StageMetricKind::Counter,
-            },
-            StageMetric {
-                stage: "control_dropped_bytes",
-                metric: "canardstack_ingest_control_dropped_bytes_total",
-                label: "signal",
-                kind: StageMetricKind::Counter,
-            },
-            StageMetric {
-                stage: "flush_drained_rows",
-                metric: "canardstack_ingest_flush_drained_rows_total",
-                label: "signal",
-                kind: StageMetricKind::Counter,
-            },
-            StageMetric {
-                stage: "flush_drained_bytes",
-                metric: "canardstack_ingest_flush_drained_bytes_total",
-                label: "signal",
-                kind: StageMetricKind::Counter,
-            },
-            StageMetric {
-                stage: "flush_coalesced_rows",
-                metric: "canardstack_ingest_flush_coalesced_rows_total",
-                label: "signal",
-                kind: StageMetricKind::Counter,
-            },
-            StageMetric {
-                stage: "flush_coalesced_bytes",
-                metric: "canardstack_ingest_flush_coalesced_bytes_total",
-                label: "signal",
-                kind: StageMetricKind::Counter,
-            },
-            StageMetric {
-                stage: "flush_buffered_rows",
-                metric: "canardstack_ingest_flush_buffered_rows_total",
-                label: "signal",
-                kind: StageMetricKind::Counter,
-            },
-            StageMetric {
-                stage: "flush_buffered_bytes",
-                metric: "canardstack_ingest_flush_buffered_bytes_total",
-                label: "signal",
-                kind: StageMetricKind::Counter,
-            },
-            StageMetric {
-                stage: "null_sink_rows",
-                metric: "canardstack_ingest_null_sink_rows_total",
-                label: "signal",
-                kind: StageMetricKind::Counter,
-            },
-            StageMetric {
-                stage: "null_sink_bytes",
-                metric: "canardstack_ingest_null_sink_bytes_total",
-                label: "signal",
+                stage: "buffered_bytes",
+                metric: "canardstack_ingest_buffered_bytes_total",
+                label: "storage_signal",
                 kind: StageMetricKind::Counter,
             },
             StageMetric {
                 stage: "immutable_sealed_rows",
                 metric: "canardstack_immutable_segments_sealed_rows_total",
-                label: "signal",
+                label: "storage_signal",
                 kind: StageMetricKind::Counter,
             },
             StageMetric {
                 stage: "immutable_sealed_files",
                 metric: "canardstack_immutable_segments_sealed_files_total",
-                label: "signal",
+                label: "storage_signal",
+                kind: StageMetricKind::Counter,
+            },
+            StageMetric {
+                stage: "raw_spool_checkpointed_records",
+                metric: "canardstack_raw_spool_checkpointed_records_total",
+                label: "request_kind",
                 kind: StageMetricKind::Counter,
             },
             StageMetric {
@@ -3150,7 +3414,7 @@ fn stage_delta_by_label(
             StageMetricKind::GaugeDelta => (end_value - start_value).max(0.0),
         };
         if delta > 0.0 {
-            values.insert(label_value.clone(), delta);
+            *values.entry(label_value.clone()).or_default() += delta;
         }
     }
     values
@@ -3168,6 +3432,49 @@ fn parse_metric_series_key(key: &str) -> (String, BTreeMap<String, String>) {
         })
         .collect();
     (name.to_string(), parsed)
+}
+
+fn metric_value(metrics: &ScrapedMetrics, name: &str) -> Option<f64> {
+    metrics.raw_values.get(name).copied()
+}
+
+fn labeled_metric_value(
+    metrics: &ScrapedMetrics,
+    name: &str,
+    label: &str,
+    label_value: &str,
+) -> Option<f64> {
+    series_value(metrics, name, &[(label, label_value)])
+}
+
+fn counter_delta(
+    start: Option<&ScrapedMetrics>,
+    end: &ScrapedMetrics,
+    name: &str,
+    labels: &[(&str, &str)],
+) -> Option<f64> {
+    let end_value = series_value(end, name, labels)?;
+    let start_value = start
+        .and_then(|metrics| series_value(metrics, name, labels))
+        .unwrap_or(0.0);
+    Some((end_value - start_value).max(0.0))
+}
+
+fn series_value(metrics: &ScrapedMetrics, name: &str, labels: &[(&str, &str)]) -> Option<f64> {
+    let labels = labels
+        .iter()
+        .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+        .collect::<BTreeMap<_, _>>();
+    metrics
+        .raw_values
+        .get(&metric_series_key(name, &labels))
+        .copied()
+}
+
+fn ratio(numerator: Option<f64>, denominator: Option<f64>) -> Option<f64> {
+    let numerator = numerator?;
+    let denominator = denominator?;
+    (denominator > 0.0).then_some(numerator / denominator)
 }
 
 #[derive(Serialize)]

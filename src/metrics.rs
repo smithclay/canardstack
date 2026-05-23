@@ -1,4 +1,4 @@
-use crate::ingest::Signal;
+use crate::ingest::StorageSignal;
 use crate::storage::Storage;
 use crate::LockExt;
 use anyhow::{Context, Result};
@@ -10,20 +10,64 @@ use arrow58::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow58::record_batch::RecordBatch;
 use chrono::Utc;
 use serde_json::{json, Map, Value};
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Instant;
 
-#[derive(Default)]
+/// Number of independent lock shards. A power of two so shard selection is a
+/// cheap mask. Sized to cover the connection-thread + ingest-worker fan-out so
+/// the hot ingest path stops serializing on a single metrics mutex.
+const METRICS_SHARDS: usize = 16;
+
 pub struct Metrics {
-    inner: Mutex<MetricsInner>,
+    shards: [Mutex<MetricsInner>; METRICS_SHARDS],
+}
+
+impl Default for Metrics {
+    fn default() -> Self {
+        Self {
+            shards: std::array::from_fn(|_| Mutex::new(MetricsInner::default())),
+        }
+    }
 }
 
 #[derive(Default)]
 struct MetricsInner {
-    counters: BTreeMap<String, u64>,
-    gauges: BTreeMap<String, f64>,
+    counters: BTreeMap<MetricId, u64>,
+    gauges: BTreeMap<MetricId, f64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct MetricId {
+    name: String,
+    labels: Vec<(String, String)>,
+}
+
+impl MetricId {
+    fn new(name: &str, labels: &[(&str, &str)]) -> Self {
+        Self {
+            name: name.to_string(),
+            labels: labels
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                .collect(),
+        }
+    }
+
+    fn render_prometheus(&self) -> String {
+        if self.labels.is_empty() {
+            return self.name.clone();
+        }
+        let rendered = self
+            .labels
+            .iter()
+            .map(|(key, value)| format!("{key}=\"{}\"", escape_label_value(value)))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!("{}{{{rendered}}}", self.name)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -68,23 +112,46 @@ pub enum MetricKind {
 }
 
 impl Metrics {
+    /// Select the lock shard for a metric id. A given id always maps
+    /// to the same shard, so read-modify-write counters/gauges remain correct
+    /// without a single global lock. FNV-1a keeps this branch-free and cheap.
+    fn shard_for(&self, metric_id: &MetricId) -> &Mutex<MetricsInner> {
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        hash_metric_part(&mut hash, metric_id.name.as_bytes());
+        for (key, value) in &metric_id.labels {
+            hash_metric_part(&mut hash, key.as_bytes());
+            hash_metric_part(&mut hash, value.as_bytes());
+        }
+        &self.shards[(hash as usize) & (METRICS_SHARDS - 1)]
+    }
+
     pub fn inc(&self, name: &str, labels: &[(&str, &str)], by: u64) {
-        let mut inner = self.inner.lock_or_poisoned();
-        *inner.counters.entry(key(name, labels)).or_default() += by;
+        let metric_id = MetricId::new(name, labels);
+        let mut inner = self.shard_for(&metric_id).lock_or_poisoned();
+        *inner.counters.entry(metric_id).or_default() += by;
+    }
+
+    pub fn set_counter(&self, name: &str, labels: &[(&str, &str)], value: u64) {
+        let metric_id = MetricId::new(name, labels);
+        self.shard_for(&metric_id)
+            .lock_or_poisoned()
+            .counters
+            .insert(metric_id, value);
     }
 
     pub fn gauge(&self, name: &str, labels: &[(&str, &str)], value: f64) {
-        self.inner
+        let metric_id = MetricId::new(name, labels);
+        self.shard_for(&metric_id)
             .lock_or_poisoned()
             .gauges
-            .insert(key(name, labels), value);
+            .insert(metric_id, value);
     }
 
     pub fn gauge_max(&self, name: &str, labels: &[(&str, &str)], value: f64) {
-        let mut inner = self.inner.lock_or_poisoned();
-        let metric_key = key(name, labels);
-        let current = inner.gauges.get(&metric_key).copied().unwrap_or(value);
-        inner.gauges.insert(metric_key, current.max(value));
+        let metric_id = MetricId::new(name, labels);
+        let mut inner = self.shard_for(&metric_id).lock_or_poisoned();
+        let current = inner.gauges.get(&metric_id).copied().unwrap_or(value);
+        inner.gauges.insert(metric_id, current.max(value));
     }
 
     pub fn observe_seconds(&self, name: &str, labels: &[(&str, &str)], seconds: f64) {
@@ -95,87 +162,120 @@ impl Metrics {
         if count == 0 {
             return;
         }
-        let mut inner = self.inner.lock_or_poisoned();
-        *inner
-            .counters
-            .entry(key(&format!("{name}_count"), labels))
-            .or_default() += count;
-        let sum_key = key(&format!("{name}_sum"), labels);
-        let current = inner.gauges.get(&sum_key).copied().unwrap_or(0.0);
-        inner.gauges.insert(sum_key, current + seconds);
-    }
-
-    pub fn observe_phase_seconds(
-        &self,
-        signal: &str,
-        phase: &str,
-        query_class: Option<&str>,
-        seconds: f64,
-    ) {
-        if let Some(query_class) = query_class {
-            self.observe_seconds(
-                "canardstack_phase_duration_seconds",
-                &[
-                    ("signal", signal),
-                    ("phase", phase),
-                    ("query_class", query_class),
-                ],
-                seconds,
-            );
-        } else {
-            self.observe_seconds(
-                "canardstack_phase_duration_seconds",
-                &[("signal", signal), ("phase", phase)],
-                seconds,
-            );
+        let count_id = MetricId::new(&format!("{name}_count"), labels);
+        let sum_id = MetricId::new(&format!("{name}_sum"), labels);
+        {
+            let mut inner = self.shard_for(&count_id).lock_or_poisoned();
+            *inner.counters.entry(count_id).or_default() += count;
         }
+        let mut inner = self.shard_for(&sum_id).lock_or_poisoned();
+        let current = inner.gauges.get(&sum_id).copied().unwrap_or(0.0);
+        inner.gauges.insert(sum_id, current + seconds);
     }
 
-    pub fn observe_phase_seconds_n(
+    pub fn set_observation(&self, name: &str, labels: &[(&str, &str)], count: u64, seconds: f64) {
+        let count_id = MetricId::new(&format!("{name}_count"), labels);
+        let sum_id = MetricId::new(&format!("{name}_sum"), labels);
+        self.shard_for(&count_id)
+            .lock_or_poisoned()
+            .counters
+            .insert(count_id, count);
+        self.shard_for(&sum_id)
+            .lock_or_poisoned()
+            .gauges
+            .insert(sum_id, seconds);
+    }
+
+    pub fn observe_request_phase_seconds(&self, request_kind: &str, phase: &str, seconds: f64) {
+        self.observe_labeled_phase_seconds(&[("request_kind", request_kind)], phase, seconds);
+    }
+
+    pub fn observe_request_phase_seconds_n(
         &self,
-        signal: &str,
+        request_kind: &str,
         phase: &str,
-        query_class: Option<&str>,
         count: u64,
         seconds: f64,
     ) {
-        if let Some(query_class) = query_class {
-            self.observe_seconds_n(
-                "canardstack_phase_duration_seconds",
-                &[
-                    ("signal", signal),
-                    ("phase", phase),
-                    ("query_class", query_class),
-                ],
-                count,
-                seconds,
-            );
-        } else {
-            self.observe_seconds_n(
-                "canardstack_phase_duration_seconds",
-                &[("signal", signal), ("phase", phase)],
-                count,
-                seconds,
-            );
-        }
+        self.observe_labeled_phase_seconds_n(
+            &[("request_kind", request_kind)],
+            phase,
+            count,
+            seconds,
+        );
     }
 
-    pub fn ingest_request(&self, signal: Signal, status: u16, reason: &str) {
+    pub fn observe_storage_signal_phase_seconds(
+        &self,
+        storage_signal: &str,
+        phase: &str,
+        seconds: f64,
+    ) {
+        self.observe_labeled_phase_seconds(&[("storage_signal", storage_signal)], phase, seconds);
+    }
+
+    pub fn observe_spool_lane_phase_seconds(&self, spool_lane: &str, phase: &str, seconds: f64) {
+        self.observe_labeled_phase_seconds(&[("spool_lane", spool_lane)], phase, seconds);
+    }
+
+    pub fn observe_spool_lane_phase_seconds_n(
+        &self,
+        spool_lane: &str,
+        phase: &str,
+        count: u64,
+        seconds: f64,
+    ) {
+        self.observe_labeled_phase_seconds_n(&[("spool_lane", spool_lane)], phase, count, seconds);
+    }
+
+    pub fn observe_query_route_phase_seconds(
+        &self,
+        route_template: &str,
+        phase: &str,
+        seconds: f64,
+    ) {
+        self.observe_labeled_phase_seconds(&[("route_template", route_template)], phase, seconds);
+    }
+
+    fn observe_labeled_phase_seconds(&self, labels: &[(&str, &str)], phase: &str, seconds: f64) {
+        self.observe_labeled_phase_seconds_n(labels, phase, 1, seconds);
+    }
+
+    fn observe_labeled_phase_seconds_n(
+        &self,
+        labels: &[(&str, &str)],
+        phase: &str,
+        count: u64,
+        seconds: f64,
+    ) {
+        let mut phase_labels = Vec::with_capacity(labels.len() + 1);
+        phase_labels.extend_from_slice(labels);
+        phase_labels.push(("phase", phase));
+        self.observe_seconds_n(
+            "canardstack_phase_duration_seconds",
+            &phase_labels,
+            count,
+            seconds,
+        );
+    }
+
+    pub fn ingest_request(&self, request_kind: &str, status: u16, reason: &str) {
+        let status = status_label(status);
         self.inc(
             "canardstack_ingest_requests_total",
             &[
-                ("signal", signal.as_str()),
-                ("status", &status.to_string()),
+                ("request_kind", request_kind),
+                ("status", status.as_ref()),
                 ("reason", reason),
             ],
             1,
         );
-        if status == 429 || status == 503 {
+        if status == "429" || status == "503" {
             self.inc(
                 "canardstack_ingest_rejections_total",
                 &[
-                    ("signal", signal.as_str()),
-                    ("status", &status.to_string()),
+                    ("request_kind", request_kind),
+                    ("status", status.as_ref()),
                     ("reason", reason),
                 ],
                 1,
@@ -183,32 +283,33 @@ impl Metrics {
         }
     }
 
-    pub fn query_request(&self, query_class: &str, status: u16, reason: &str, seconds: f64) {
+    pub fn query_request(&self, route_template: &str, status: u16, reason: &str, seconds: f64) {
+        let status = status_label(status);
         self.inc(
             "canardstack_query_requests_total",
             &[
-                ("query_class", query_class),
-                ("status", &status.to_string()),
+                ("route_template", route_template),
+                ("status", status.as_ref()),
                 ("reason", reason),
             ],
             1,
         );
         self.observe_seconds(
             "canardstack_query_duration_seconds",
-            &[("query_class", query_class)],
+            &[("route_template", route_template)],
             seconds,
         );
-        if status == 429 {
+        if status == "429" {
             self.inc(
                 "canardstack_query_rejections_total",
-                &[("query_class", query_class), ("reason", reason)],
+                &[("route_template", route_template), ("reason", reason)],
                 1,
             );
         }
         if reason == "query_timeout" {
             self.inc(
                 "canardstack_query_timeouts_total",
-                &[("query_class", query_class)],
+                &[("route_template", route_template)],
                 1,
             );
         }
@@ -228,16 +329,16 @@ impl Metrics {
     }
 
     pub fn render_prometheus(&self) -> String {
-        let inner = self.inner.lock_or_poisoned();
+        let (counters, gauges) = self.merged_shards();
         let mut out = String::new();
-        for (k, v) in &inner.counters {
-            out.push_str(k);
+        for (id, v) in &counters {
+            out.push_str(&id.render_prometheus());
             out.push(' ');
             out.push_str(&v.to_string());
             out.push('\n');
         }
-        for (k, v) in &inner.gauges {
-            out.push_str(k);
+        for (id, v) in &gauges {
+            out.push_str(&id.render_prometheus());
             out.push(' ');
             out.push_str(&format!("{v:.6}"));
             out.push('\n');
@@ -246,19 +347,30 @@ impl Metrics {
     }
 
     pub fn snapshot(&self) -> Vec<MetricSample> {
-        let inner = self.inner.lock_or_poisoned();
-        inner
-            .counters
+        let (counters, gauges) = self.merged_shards();
+        counters
             .iter()
-            .map(|(k, v)| {
-                let (name, labels) = split_metric_key(k);
-                MetricSample::counter(name, labels, *v as f64)
-            })
-            .chain(inner.gauges.iter().map(|(k, v)| {
-                let (name, labels) = split_metric_key(k);
-                MetricSample::gauge(name, labels, *v)
-            }))
+            .map(|(id, v)| MetricSample::counter(id.name.clone(), metric_labels_map(id), *v as f64))
+            .chain(
+                gauges
+                    .iter()
+                    .map(|(id, v)| MetricSample::gauge(id.name.clone(), metric_labels_map(id), *v)),
+            )
             .collect()
+    }
+
+    /// Merge all shards into sorted maps for a stable, deduplicated read. Each
+    /// key lives in exactly one shard, so the merge never collides. Locks one
+    /// shard at a time, so it cannot deadlock against the per-key writers.
+    fn merged_shards(&self) -> (BTreeMap<MetricId, u64>, BTreeMap<MetricId, f64>) {
+        let mut counters: BTreeMap<MetricId, u64> = BTreeMap::new();
+        let mut gauges: BTreeMap<MetricId, f64> = BTreeMap::new();
+        for shard in &self.shards {
+            let inner = shard.lock_or_poisoned();
+            counters.extend(inner.counters.iter().map(|(k, v)| (k.clone(), *v)));
+            gauges.extend(inner.gauges.iter().map(|(k, v)| (k.clone(), *v)));
+        }
+        (counters, gauges)
     }
 
     pub fn write_snapshot_to_storage(&self, storage: &Storage) -> Result<usize> {
@@ -278,17 +390,17 @@ impl Metrics {
             .collect::<Vec<_>>();
         let mut rows = 0;
         if !counters.is_empty() {
-            let batch = metric_samples_batch(&counters, Signal::MetricSum)?;
-            rows += storage.insert_arrow_records(
-                Signal::MetricSum,
+            let batch = metric_samples_batch(&counters, StorageSignal::MetricSum)?;
+            rows += storage.buffer_arrow_records(
+                StorageSignal::MetricSum,
                 &batch,
                 "canardstack_operator_metrics",
             )?;
         }
         if !gauges.is_empty() {
-            let batch = metric_samples_batch(&gauges, Signal::MetricGauge)?;
-            rows += storage.insert_arrow_records(
-                Signal::MetricGauge,
+            let batch = metric_samples_batch(&gauges, StorageSignal::MetricGauge)?;
+            rows += storage.buffer_arrow_records(
+                StorageSignal::MetricGauge,
                 &batch,
                 "canardstack_operator_metrics",
             )?;
@@ -313,81 +425,40 @@ impl Timer {
     }
 }
 
-fn key(name: &str, labels: &[(&str, &str)]) -> String {
-    if labels.is_empty() {
-        return name.to_string();
+/// Render an HTTP status as a label without allocating for the handful of
+/// statuses the hot ingest/query paths actually emit.
+fn status_label(status: u16) -> Cow<'static, str> {
+    match status {
+        200 => Cow::Borrowed("200"),
+        202 => Cow::Borrowed("202"),
+        400 => Cow::Borrowed("400"),
+        413 => Cow::Borrowed("413"),
+        415 => Cow::Borrowed("415"),
+        429 => Cow::Borrowed("429"),
+        500 => Cow::Borrowed("500"),
+        503 => Cow::Borrowed("503"),
+        other => Cow::Owned(other.to_string()),
     }
-    let rendered = labels
-        .iter()
-        .map(|(k, v)| format!("{k}=\"{}\"", escape_label_value(v)))
-        .collect::<Vec<_>>()
-        .join(",");
-    format!("{name}{{{rendered}}}")
 }
 
-/// Escape a label value for the `name{k="v"}` key format. Both `\` and `"` are
-/// escaped so `split_metric_key` can round-trip values containing either.
+fn hash_metric_part(hash: &mut u64, bytes: &[u8]) {
+    for byte in bytes {
+        *hash ^= u64::from(*byte);
+        *hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    *hash ^= 0xff;
+    *hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+}
+
+fn metric_labels_map(metric_id: &MetricId) -> BTreeMap<String, String> {
+    metric_id.labels.iter().cloned().collect()
+}
+
 fn escape_label_value(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-fn split_metric_key(key: &str) -> (String, BTreeMap<String, String>) {
-    let Some((name, rest)) = key.split_once('{') else {
-        return (key.to_string(), BTreeMap::new());
-    };
-    let Some(labels) = rest.strip_suffix('}') else {
-        return (key.to_string(), BTreeMap::new());
-    };
-    (name.to_string(), parse_labels(labels))
-}
-
-/// Parse the `k1="v1",k2="v2"` body produced by `key`. Quote-aware so a `,` or
-/// escaped `"` inside a value does not split or terminate it early.
-fn parse_labels(input: &str) -> BTreeMap<String, String> {
-    let mut out = BTreeMap::new();
-    let mut chars = input.chars().peekable();
-    loop {
-        let mut name = String::new();
-        while let Some(&ch) = chars.peek() {
-            if ch == '=' {
-                break;
-            }
-            name.push(ch);
-            chars.next();
-        }
-        if chars.next() != Some('=') || chars.next() != Some('"') {
-            break;
-        }
-        let mut value = String::new();
-        let mut closed = false;
-        while let Some(ch) = chars.next() {
-            match ch {
-                '\\' => {
-                    if let Some(escaped) = chars.next() {
-                        value.push(escaped);
-                    }
-                }
-                '"' => {
-                    closed = true;
-                    break;
-                }
-                _ => value.push(ch),
-            }
-        }
-        if !closed {
-            break;
-        }
-        if !name.is_empty() {
-            out.insert(name, value);
-        }
-        if chars.next() != Some(',') {
-            break;
-        }
-    }
-    out
-}
-
-fn metric_samples_batch(samples: &[MetricSample], signal: Signal) -> Result<RecordBatch> {
+fn metric_samples_batch(samples: &[MetricSample], signal: StorageSignal) -> Result<RecordBatch> {
     let rows = samples.len();
     let timestamp = Utc::now().timestamp_micros();
     let resource_attributes = json!({"service.name": "canardstack"}).to_string();
@@ -452,7 +523,7 @@ fn metric_samples_batch(samples: &[MetricSample], signal: Signal) -> Result<Reco
         Arc::new(Int32Array::from(vec![None; rows])),
         Arc::new(StringArray::from(vec![None::<String>; rows])),
     ];
-    if signal == Signal::MetricSum {
+    if signal == StorageSignal::MetricSum {
         fields.push(Field::new("aggregation_temporality", DataType::Int32, true));
         fields.push(Field::new("is_monotonic", DataType::Boolean, true));
         arrays.push(Arc::new(Int32Array::from(vec![Some(2); rows])));

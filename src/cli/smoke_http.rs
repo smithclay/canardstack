@@ -1,9 +1,9 @@
 use crate::cli::smoke::{log_fixture, metric_fixture, trace_fixture};
 use crate::cli::tcp_client::{ensure_status, parse_json, Client};
+use crate::Config;
 use anyhow::{bail, Result};
 use chrono::{Duration as ChronoDuration, Utc};
 use serde_json::{json, Value};
-use std::env;
 
 const TRACE_ID: &str = "11111111111111111111111111111111";
 
@@ -21,10 +21,9 @@ pub fn run(args: impl Iterator<Item = String>) -> Result<()> {
         }
     }
 
-    let api_key =
-        env::var("CANARDSTACK_API_KEY").unwrap_or_else(|_| "dev-canardstack-key".to_string());
-    let admin_key = env::var("CANARDSTACK_ADMIN_API_KEY")
-        .unwrap_or_else(|_| "dev-canardstack-admin-key".to_string());
+    let config = Config::from_env()?;
+    let api_key = config.api_key;
+    let admin_key = config.admin_api_key;
     let client = Client::new(&base_url)?;
 
     ensure_service_healthy(&client)?;
@@ -41,9 +40,8 @@ pub fn run(args: impl Iterator<Item = String>) -> Result<()> {
         ingest_fixture(&client, &api_key, "/v1/logs", log_fixture(nanos))?;
         ingest_fixture(&client, &api_key, "/v1/traces", trace_fixture(nanos))?;
         ingest_fixture(&client, &api_key, "/v1/metrics", metric_fixture(nanos))?;
-        let flush =
-            client.post_json("/api/admin/maintenance/flush", Some(&admin_key), json!({}))?;
-        ensure_status(&flush, 200, "admin flush")?;
+        let seal = client.post_json("/api/admin/maintenance/seal", Some(&admin_key), json!({}))?;
+        ensure_status(&seal, 200, "admin seal")?;
     }
 
     if mode == Mode::ExpectEmpty {

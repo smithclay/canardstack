@@ -1,6 +1,6 @@
-use super::{ArrowBatchInsertTiming, PreparedArrowBatch, TimingPhase};
+use super::{ArrowBatchBufferTiming, PreparedArrowBatch, TimingPhase};
 use crate::db::sql::quote as sql_quote;
-use crate::ingest::Signal;
+use crate::ingest::StorageSignal;
 use crate::storage::arrow::timestamp_column;
 use anyhow::{Context, Result};
 use arrow58::array as arrow58_array;
@@ -32,19 +32,19 @@ pub(super) struct ImmutableSegmentBuffer {
 pub(super) struct ImmutableSealResult {
     pub(super) rows: usize,
     pub(super) files: usize,
-    pub(super) timings: Vec<ArrowBatchInsertTiming>,
-    pub(super) affected: BTreeMap<Signal, BTreeSet<String>>,
+    pub(super) timings: Vec<ArrowBatchBufferTiming>,
+    pub(super) affected: BTreeMap<StorageSignal, BTreeSet<String>>,
 }
 
-pub struct ImmutableFlushOutcome {
+pub struct ImmutableSealOutcome {
     pub force: bool,
     pub sealed_files: usize,
     pub sealed_rows: usize,
-    pub timings: Vec<ArrowBatchInsertTiming>,
+    pub timings: Vec<ArrowBatchBufferTiming>,
     pub active_buffers: Value,
 }
 
-impl ImmutableFlushOutcome {
+impl ImmutableSealOutcome {
     pub fn to_json(&self) -> Value {
         json!({
             "supported": true,
@@ -59,7 +59,7 @@ impl ImmutableFlushOutcome {
 
 pub(super) struct ImmutableSegmentWrite {
     pub(super) segment: SealedSegment,
-    pub(super) timings: Vec<ArrowBatchInsertTiming>,
+    pub(super) timings: Vec<ArrowBatchBufferTiming>,
 }
 
 impl ImmutableSegmentBuffer {
@@ -95,7 +95,7 @@ impl ImmutableSegmentBuffer {
             && (self.bytes >= target_bytes || now.duration_since(self.opened_at) >= max_age)
     }
 
-    pub(super) fn record_batch(&self, table: Signal) -> Result<RecordBatch> {
+    pub(super) fn record_batch(&self, table: StorageSignal) -> Result<RecordBatch> {
         match self.batches.as_slice() {
             [] => anyhow::bail!("immutable {table} buffer is empty"),
             [batch] => Ok(batch.clone()),
@@ -109,28 +109,28 @@ impl ImmutableSegmentBuffer {
     }
 }
 pub(super) fn distribute_commit_seconds(
-    timings: &mut [ArrowBatchInsertTiming],
+    timings: &mut [ArrowBatchBufferTiming],
     commit_seconds: f64,
 ) {
     if timings.is_empty() || commit_seconds <= 0.0 {
         return;
     }
-    let insert_timings = timings
+    let register_timings = timings
         .iter_mut()
-        .filter(|timing| timing.phase == TimingPhase::Insert)
+        .filter(|timing| timing.phase == TimingPhase::DucklakeRegister)
         .collect::<Vec<_>>();
-    if insert_timings.is_empty() {
+    if register_timings.is_empty() {
         return;
     }
-    let total_rows: usize = insert_timings.iter().map(|timing| timing.rows).sum();
+    let total_rows: usize = register_timings.iter().map(|timing| timing.rows).sum();
     if total_rows == 0 {
-        let each = commit_seconds / insert_timings.len() as f64;
-        for timing in insert_timings {
+        let each = commit_seconds / register_timings.len() as f64;
+        for timing in register_timings {
             timing.seconds += each;
         }
         return;
     }
-    for timing in insert_timings {
+    for timing in register_timings {
         timing.seconds += commit_seconds * timing.rows as f64 / total_rows as f64;
     }
 }
@@ -139,7 +139,7 @@ pub(super) fn distributed_segment_timing(
     phase: TimingPhase,
     sealed: &[SealedSegment],
     seconds: f64,
-) -> Vec<ArrowBatchInsertTiming> {
+) -> Vec<ArrowBatchBufferTiming> {
     if sealed.is_empty() {
         return Vec::new();
     }
@@ -152,7 +152,7 @@ pub(super) fn distributed_segment_timing(
             } else {
                 seconds * segment.rows as f64 / total_rows as f64
             };
-            ArrowBatchInsertTiming {
+            ArrowBatchBufferTiming {
                 table: segment.table,
                 phase,
                 rows: segment.rows,
@@ -163,14 +163,14 @@ pub(super) fn distributed_segment_timing(
 }
 
 pub(super) struct SealedSegment {
-    pub(super) table: Signal,
+    pub(super) table: StorageSignal,
     pub(super) path: PathBuf,
     pub(super) rows: usize,
 }
 
 pub(super) fn write_immutable_segment(
     storage_dir: &Path,
-    table: Signal,
+    table: StorageSignal,
     partition: ImmutableSegmentPartition,
     batch: &RecordBatch,
 ) -> Result<ImmutableSegmentWrite> {
@@ -187,7 +187,7 @@ pub(super) fn write_immutable_segment(
 
     let started = Instant::now();
     let parquet_bytes = to_parquet(batch).context("encode immutable segment parquet")?;
-    timings.push(ArrowBatchInsertTiming {
+    timings.push(ArrowBatchBufferTiming {
         table,
         phase: TimingPhase::ParquetEncode,
         rows,
@@ -204,7 +204,7 @@ pub(super) fn write_immutable_segment(
     let file = file
         .into_inner()
         .context("flush immutable segment writer before seal")?;
-    timings.push(ArrowBatchInsertTiming {
+    timings.push(ArrowBatchBufferTiming {
         table,
         phase: TimingPhase::FileWrite,
         rows,
@@ -214,7 +214,7 @@ pub(super) fn write_immutable_segment(
     let started = Instant::now();
     file.sync_all()
         .with_context(|| format!("fsync immutable segment {}", tmp_path.display()))?;
-    timings.push(ArrowBatchInsertTiming {
+    timings.push(ArrowBatchBufferTiming {
         table,
         phase: TimingPhase::FileFsync,
         rows,
@@ -230,7 +230,7 @@ pub(super) fn write_immutable_segment(
             final_path.display()
         )
     })?;
-    timings.push(ArrowBatchInsertTiming {
+    timings.push(ArrowBatchBufferTiming {
         table,
         phase: TimingPhase::FileRename,
         rows,
@@ -249,7 +249,7 @@ pub(super) fn write_immutable_segment(
 
 pub(super) fn immutable_segment_path(
     storage_dir: &Path,
-    table: Signal,
+    table: StorageSignal,
     partition: ImmutableSegmentPartition,
 ) -> Result<PathBuf> {
     let sequence = IMMUTABLE_SEGMENT_COUNTER.fetch_add(1, Ordering::SeqCst);
@@ -359,7 +359,7 @@ pub(super) fn timestamp_utc(
 pub(super) fn register_ducklake_data_file(
     conn: &Connection,
     catalog_name: &str,
-    table: Signal,
+    table: StorageSignal,
     path: &Path,
 ) -> Result<()> {
     let sql = format!(
@@ -374,7 +374,7 @@ pub(super) fn register_ducklake_data_file(
 }
 
 pub(super) fn immutable_buffer_snapshot(
-    buffers: &BTreeMap<Signal, ImmutableSegmentBuffer>,
+    buffers: &BTreeMap<StorageSignal, ImmutableSegmentBuffer>,
 ) -> Value {
     let mut map = serde_json::Map::new();
     for (table, buffer) in buffers {
@@ -390,7 +390,7 @@ pub(super) fn immutable_buffer_snapshot(
     Value::Object(map)
 }
 
-pub(super) fn immutable_timing_snapshot(timings: &[ArrowBatchInsertTiming]) -> Value {
+pub(super) fn immutable_timing_snapshot(timings: &[ArrowBatchBufferTiming]) -> Value {
     Value::Array(
         timings
             .iter()
@@ -438,9 +438,10 @@ mod tests {
             hour: 0,
         };
 
-        let written = write_immutable_segment(dir.path(), Signal::Logs, partition, &batch).unwrap();
+        let written =
+            write_immutable_segment(dir.path(), StorageSignal::Logs, partition, &batch).unwrap();
 
-        assert_eq!(written.segment.table, Signal::Logs);
+        assert_eq!(written.segment.table, StorageSignal::Logs);
         assert_eq!(written.segment.rows, 2);
         assert!(written.segment.path.exists());
 
@@ -461,6 +462,6 @@ mod tests {
         assert!(written
             .timings
             .iter()
-            .all(|timing| timing.table == Signal::Logs && timing.rows == 2));
+            .all(|timing| timing.table == StorageSignal::Logs && timing.rows == 2));
     }
 }

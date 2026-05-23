@@ -8,7 +8,9 @@ For a practitioner-focused overview, start with the [README](../README.md).
 ## Architecture
 
 ```text
-OTLP/HTTP JSON or protobuf -> otlp2records -> bounded process queues -> ducklake/duckdb
+OTLP/HTTP -> cheap validation -> freshness-first admission -> fsynced local raw spool
+  -> ingest worker transform -> immutable buffer -> scheduler seal driver -> immutable Parquet segments
+  -> DuckLake registration -> logical queries
 ```
 
 canardstack is currently shaped as:
@@ -16,7 +18,12 @@ canardstack is currently shaped as:
 - One Rust binary, `canardstack`.
 - Synchronous standard-library HTTP server on `CANARDSTACK_BIND`.
 - `otlp2records` for OTLP logs, traces, gauge metrics, and sum metrics.
-- Bounded per-signal in-memory queues with row, byte, age, and pressure checks.
+- Local raw spool for the `202` acceptance boundary, with append fsync completed
+  before acknowledgement.
+- Bounded per-storage-signal in-memory accounting with row, byte, age, and
+  pressure checks.
+- Admission primitives for freshness-budget ingest admission, protected seal,
+  cheap query, and heavy query traffic.
 - DuckDB through `duckdb-rs`.
 - DuckLake through DuckDB's official `ducklake` extension SQL surface. The
   default local mode is a local DuckLake catalog and local immutable data files.
@@ -29,34 +36,54 @@ canardstack is currently shaped as:
 - Whole-day retention execution for telemetry tables, followed by DuckLake
   snapshot expiration and cleanup hooks when DuckLake is attached.
 - Storage health with freshness watermarks, logical row counts, and local
-  physical bytes.
+  physical bytes on admin health and scheduler-maintained metric snapshots.
 - Prometheus-style operator metrics at `/metrics`, also snapshotted into the
-  metric store for Grafana dashboards.
+  metric store for Grafana dashboards. `/metrics` itself records only cheap
+  in-process gauges.
+
+## Configuration
+
+canardstack reads built-in defaults, then `config.toml`, then environment
+overrides. Set `CANARDSTACK_CONFIG=/path/to/config.toml` to load a different
+file. If `CANARDSTACK_CONFIG` is unset, `./config.toml` is loaded when it
+exists; otherwise the defaults are used.
+
+Start from `config/example.toml` for a full structured config grouped by
+operator concern: server, auth, paths, DuckDB, DuckLake, ingest, query, admission,
+retention, scheduler, and raw spool. Every public TOML setting has a matching
+`CANARDSTACK_*` environment variable, and env vars always win. Empty env vars
+clear optional string/path settings such as
+`CANARDSTACK_DUCKLAKE_ATTACH_URI`, `CANARDSTACK_POSTGRES_DSN`,
+`CANARDSTACK_DUCKDB_EXTENSION_DIR`, and
+`CANARDSTACK_PROCESS_MEMORY_LIMIT_BYTES`.
+
+Runtime diagnostics are emitted to stderr as logfmt-style structured events.
+Set `CANARDSTACK_LOG` or `RUST_LOG` to `error`, `warn`, `info`, `debug`,
+`trace`, or `off`; the default level is `info`.
 
 ## Local DuckLake Mode
 
 Compose stores local metadata and files in the `canardstack-data` named volume
 mounted at `/var/lib/canardstack`.
 
-The default Compose environment is explicit:
+The default Compose environment is explicit and overrides any image-local
+config file:
 
 ```text
 CANARDSTACK_BIND=0.0.0.0:4318
 CANARDSTACK_DATA_DIR=/var/lib/canardstack
-CANARDSTACK_DUCKDB_PATH=/var/lib/canardstack/canardstack.duckdb
-CANARDSTACK_STORAGE_DIR=/var/lib/canardstack/storage
 CANARDSTACK_DUCKDB_EXTENSION_DIR=/usr/local/lib/duckdb/extensions
 ```
 
 With no `CANARDSTACK_POSTGRES_DSN`, DuckLake uses a local DuckDB-backed catalog
-file beside `CANARDSTACK_DUCKDB_PATH` and local file storage under
-`CANARDSTACK_STORAGE_DIR`. Postgres catalogs and object storage are later
+under `CANARDSTACK_DATA_DIR` and local file storage under
+`CANARDSTACK_DATA_DIR/storage`. Postgres catalogs and object storage are later
 deployment modes, not required for the Docker quickstart.
 
 Default v0 writes buffer prepared Arrow batches, seal immutable Parquet segment
 files with `otlp2records`, and register sealed files with
-`ducklake_add_data_files`. `CANARDSTACK_IMMUTABLE_SEGMENT_TARGET_BYTES`
-defaults to 64 MiB and `CANARDSTACK_IMMUTABLE_SEGMENT_MAX_AGE_SECS` defaults to
+`ducklake_add_data_files`. `CANARDSTACK_SEGMENT_TARGET_BYTES` defaults to 64
+MiB and `CANARDSTACK_SEGMENT_MAX_AGE_SECS` defaults to
 10 seconds. Managed DuckLake adjacent-file compaction is disabled for immutable
 segments.
 
@@ -95,8 +122,8 @@ USE canardlake;
 ```
 
 and then creates or reuses the standard telemetry tables in that remote
-database. The local `CANARDSTACK_DUCKDB_PATH` still exists as the client-side
-DuckDB file used to load extensions and establish query connections.
+database. The local DuckDB file under `CANARDSTACK_DATA_DIR` still exists as
+the client-side file used to load extensions and establish query connections.
 
 Run the live remote DuckLake smoke test with credentials loaded:
 
@@ -108,7 +135,7 @@ cargo test remote_ducklake_attach_uri_smoke -- --ignored --nocapture
 ```
 
 The normal test suite does not contact remote services. It verifies the attach
-plan offline; the ignored smoke verifies startup, ingest, flush, and
+plan offline; the ignored smoke verifies startup, ingest, seal, and
 compatibility query visibility against the configured remote DuckLake.
 
 ## Host Workflow
@@ -139,7 +166,7 @@ export CANARDSTACK_POSTGRES_DSN='dbname=ducklake_catalog host=localhost user=pos
 ```
 
 If `CANARDSTACK_POSTGRES_DSN` is unset, DuckLake uses a local DuckDB metadata
-catalog file beside `CANARDSTACK_DUCKDB_PATH`.
+catalog file under `CANARDSTACK_DATA_DIR`.
 
 Startup fails fast if DuckLake cannot attach; there is no non-DuckLake ingest
 fallback.
@@ -151,6 +178,20 @@ cargo check
 cargo test
 cargo run -- serve
 ```
+
+`serve` defaults to the all-in-one role. Route-only modes are available for
+split-process preparation:
+
+```bash
+cargo run -- serve --role all
+cargo run -- serve --role ingest
+cargo run -- serve --role query
+```
+
+`--role ingest` serves ingest and operator/control endpoints but not
+compatibility query routes. `--role query` serves query and operator/control
+endpoints but not ingest or maintenance mutation routes. The scheduler runs only
+in `all` and `ingest` roles.
 
 Then open:
 
@@ -165,7 +206,7 @@ cargo run -- smoke
 ```
 
 The smoke command starts the app in-process, ingests representative OTLP JSON
-logs, traces, gauge metrics, and sum metrics, flushes process queues, calls
+logs, traces, gauge metrics, and sum metrics, seals buffered rows, calls
 representative compatibility query endpoints, and prints health.
 
 ## Query Surface
@@ -206,12 +247,16 @@ normal HTTP API does not expose arbitrary SQL.
 
 Supported ingest response behavior:
 
-- `400` for invalid payload, content type, compression, payload size, or
-  timestamp skew.
+- `400` for cheap request validation failures such as content type or
+  compressed payload size. Decompression, OTLP transform, and timestamp-skew
+  checks run in ingest workers after `202`; terminal failures checkpoint the
+  raw-spool record instead of replaying it forever.
 - `401` for missing API key.
 - `403` for bad API key.
-- `429` for retryable queue or process ingest pressure.
-- `503` when storage dependencies are unhealthy.
+- `429` for retryable raw-spool, queue, or process ingest pressure.
+- `429 freshness_budget_exceeded` before raw-spool append when projected seal
+  visibility exceeds the configured freshness SLA.
+- `503` when the raw spool is unavailable or storage dependencies are unhealthy.
 
 ## Pre-commit Hooks
 
@@ -243,10 +288,11 @@ cargo test
 ```
 
 Coverage currently includes auth, invalid payloads, timestamp skew,
-dependency-unhealthy mode, unauthenticated `/healthz`, queue pressure, query
-limit validation, compatibility auth/error envelopes, ingest-to-query visibility
-through Prometheus/Loki/Tempo subsets, crash semantics, the scheduled queue
-watchdog, removed dashboard/alert routes, and the retention executor.
+dependency-unhealthy mode, unauthenticated `/healthz`, raw-spool replay and
+full-spool rejection, in-flight admission pressure, query limit validation,
+compatibility auth/error envelopes, ingest-to-query visibility through
+Prometheus/Loki/Tempo subsets, the scheduled seal driver, removed
+dashboard/alert routes, and the retention executor.
 
 Docker-local checks are intentionally outside normal `cargo test`:
 
@@ -274,20 +320,42 @@ scripts/smoke-docker-local.sh
 The `serve` command spawns one background thread that closes the maintenance
 loop without operator action:
 
-- A queue watchdog/flush worker drains due queue partitions when row, byte, or
-  age thresholds fire. Ingest request threads enqueue and signal this worker;
-  they do not perform DuckDB/DuckLake writes inline.
-- A periodic flush drains process queues to DuckLake and triggers DuckLake's
-  inlined-data flush.
+- A single seal driver seals the storage immutable buffer to durable Parquet
+  when per-signal size or age thresholds fire, or on the freshness cadence, then
+  checkpoints the raw spool. Ingest workers insert Arrow batches into the
+  immutable buffer; request threads do not perform DuckDB/DuckLake writes inline.
+- A periodic seal writes immutable buffers to Parquet and registers the files
+  with DuckLake.
 - DuckLake adjacent-file compaction is disabled for immutable telemetry
-  segments; segment sizing is controlled by immutable target bytes and max age.
+  segments and is not exposed as a v0 maintenance control; segment sizing is
+  controlled by immutable target bytes and max age.
 - A retention pass enforces the configured retention days, expires DuckLake
   snapshots, and cleans old files.
 
-All four respect `POST /api/admin/maintenance/pause`. Cadences are configurable
-via `CANARDSTACK_SCHEDULER_*` env vars. Set
-`CANARDSTACK_SCHEDULER_ENABLED=false` to fall back to operator-triggered
-maintenance only. The scheduler shuts down cleanly when `serve` exits.
+`POST /api/admin/maintenance/pause` pauses scheduled jobs only; manual seal and
+retention endpoints remain available for repair workflows. The base cadence is
+configurable as `scheduler.maintenance_interval_secs` in `config.toml` or via
+`CANARDSTACK_MAINTENANCE_INTERVAL_SECS`.
+Set `scheduler.enabled = false` or `CANARDSTACK_SCHEDULER_ENABLED=false` to
+fall back to operator-triggered maintenance only. The scheduler shuts down
+cleanly when `serve` exits.
+
+## Admission Controller
+
+`src/admission_control.rs` owns seal admission, query admission, and freshness
+budget projection. It is intentionally not a generic scheduler. The request path
+asks it one direct question before raw-spool append: will the process queue debt
+plus immutable-buffer visibility debt stay within
+`CANARDSTACK_FRESHNESS_BUDGET_SLA_SECS` or `_MS`?
+
+Seal jobs reserve seal admission before doing DuckDB/DuckLake work and record
+successful queue-byte drain into the EWMA. Compatibility routes reserve either
+cheap query admission (labels, metadata, probe, instant-ish queries) or heavy
+query admission (range/search/trace lookups). Heavy query capacity is reduced
+first under freshness debt and then rejected with the normal protocol error
+envelope when freshness is at risk. The controller records cached query-visible
+freshness lag from operator gauge refreshes as telemetry; ingest request threads
+never query DuckDB for admission.
 
 ## V0 Gaps
 
@@ -308,8 +376,10 @@ maintenance only. The scheduler shuts down cleanly when `serve` exits.
   proof gate.
 - The maintenance singleton lease is in-process; a Postgres-backed lease is
   needed before splitting maintenance into its own role.
-- Benchmarks for 25-100 GB/day and above are not implemented; no throughput
-  claim is made.
+- Query-only mode still uses the same binary and storage configuration; separate
+  writer/reader DuckDB processes remain a future proof gate.
+- The sustained MVP benchmark envelope is current for logs and traces. Metrics
+  performance remains TBD.
 
 ## Related Docs
 
@@ -317,5 +387,5 @@ maintenance only. The scheduler shuts down cleanly when `serve` exits.
 - [Storage schema](architecture/storage-schema.md)
 - [Query API](architecture/query-api.md)
 - [Operator metrics](architecture/operator-metrics.md)
-- [Benchmark evidence and proof gates](planning/benchmark.md)
+- [Benchmark gates](planning/benchmark.md)
 - [Failure runbooks](runbooks/failure-runbooks.md)

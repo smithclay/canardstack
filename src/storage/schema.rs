@@ -1,14 +1,14 @@
-use crate::ingest::Signal;
+use crate::ingest::StorageSignal;
 use anyhow::{Context, Result};
 use duckdb::Connection;
 
 pub(super) fn create_tables_on(conn: &Connection, prefix: &str) -> Result<()> {
     let mut ddl = String::new();
     for table in [
-        Signal::Logs,
-        Signal::Spans,
-        Signal::MetricGauge,
-        Signal::MetricSum,
+        StorageSignal::Logs,
+        StorageSignal::Spans,
+        StorageSignal::MetricGauge,
+        StorageSignal::MetricSum,
     ] {
         ddl.push_str(&create_table_sql(
             prefix,
@@ -30,10 +30,10 @@ pub(super) fn create_tables_on(conn: &Connection, prefix: &str) -> Result<()> {
 
 pub(super) fn configure_telemetry_partitioning_on(conn: &Connection, prefix: &str) -> Result<()> {
     for table in [
-        Signal::Logs,
-        Signal::Spans,
-        Signal::MetricGauge,
-        Signal::MetricSum,
+        StorageSignal::Logs,
+        StorageSignal::Spans,
+        StorageSignal::MetricGauge,
+        StorageSignal::MetricSum,
     ] {
         conn.execute_batch(&format!(
             "ALTER TABLE {prefix}{} SET PARTITIONED BY (year(timestamp), month(timestamp), day(timestamp));",
@@ -153,12 +153,12 @@ pub(super) const METADATA_SUMMARY_COLUMNS: &[(&str, &str)] = &[
     ("last_seen", "TIMESTAMP"),
 ];
 
-pub(super) fn table_columns(table: Signal) -> &'static [(&'static str, &'static str)] {
+pub(super) fn table_columns(table: StorageSignal) -> &'static [(&'static str, &'static str)] {
     match table {
-        Signal::Logs => LOGS_COLUMNS,
-        Signal::Spans => SPANS_COLUMNS,
-        Signal::MetricGauge => METRIC_GAUGE_COLUMNS,
-        Signal::MetricSum => METRIC_SUM_COLUMNS,
+        StorageSignal::Logs => LOGS_COLUMNS,
+        StorageSignal::Spans => SPANS_COLUMNS,
+        StorageSignal::MetricGauge => METRIC_GAUGE_COLUMNS,
+        StorageSignal::MetricSum => METRIC_SUM_COLUMNS,
     }
 }
 

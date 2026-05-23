@@ -409,6 +409,8 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "toml_edit",
+ "tracing",
 ]
 
 [[package]]

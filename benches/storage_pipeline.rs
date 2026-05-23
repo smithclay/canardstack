@@ -5,8 +5,8 @@ use arrow58::array::{
 use arrow58::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow58::record_batch::RecordBatch;
 use canardstack::config::Config;
-use canardstack::ingest::Signal;
-use canardstack::storage::{ArrowBatchInsert, ArrowBatchInsertTiming, Storage};
+use canardstack::ingest::StorageSignal;
+use canardstack::storage::{ArrowBatchBuffer, ArrowBatchBufferTiming, Storage};
 use chrono::Utc;
 use std::collections::BTreeMap;
 use std::env;
@@ -63,17 +63,17 @@ fn run() -> Result<()> {
 
         let started = Instant::now();
         for (signal, batch) in generated {
-            let result = storage.insert_arrow_batches(&[ArrowBatchInsert {
+            let result = storage.buffer_arrow_batches(&[ArrowBatchBuffer {
                 table: signal,
                 batch: &batch,
                 source_format: "storage_pipeline_bench",
             }])?;
             phase_stats.record_timings(result.timings);
         }
-        let flush = storage.flush_immutable_segments(true)?;
-        sealed_rows += flush.sealed_rows;
-        sealed_files += flush.sealed_files;
-        phase_stats.record_timings(flush.timings);
+        let seal = storage.seal_immutable_segments(true)?;
+        sealed_rows += seal.sealed_rows;
+        sealed_files += seal.sealed_files;
+        phase_stats.record_timings(seal.timings);
         storage_elapsed += started.elapsed();
     }
 
@@ -148,7 +148,7 @@ struct PhaseStat {
 }
 
 impl PhaseStats {
-    fn record_timings(&mut self, timings: Vec<ArrowBatchInsertTiming>) {
+    fn record_timings(&mut self, timings: Vec<ArrowBatchBufferTiming>) {
         for timing in timings {
             let key = (timing.table.as_str().to_string(), timing.phase.to_string());
             let stat = self.by_phase.entry(key).or_default();
@@ -252,17 +252,17 @@ impl Args {
         Ok(parsed)
     }
 
-    fn signals(&self) -> Vec<Signal> {
+    fn signals(&self) -> Vec<StorageSignal> {
         match self.signal {
-            SignalSelection::Logs => vec![Signal::Logs],
-            SignalSelection::Spans => vec![Signal::Spans],
-            SignalSelection::MetricGauge => vec![Signal::MetricGauge],
-            SignalSelection::MetricSum => vec![Signal::MetricSum],
+            SignalSelection::Logs => vec![StorageSignal::Logs],
+            SignalSelection::Spans => vec![StorageSignal::Spans],
+            SignalSelection::MetricGauge => vec![StorageSignal::MetricGauge],
+            SignalSelection::MetricSum => vec![StorageSignal::MetricSum],
             SignalSelection::All => vec![
-                Signal::Logs,
-                Signal::Spans,
-                Signal::MetricGauge,
-                Signal::MetricSum,
+                StorageSignal::Logs,
+                StorageSignal::Spans,
+                StorageSignal::MetricGauge,
+                StorageSignal::MetricSum,
             ],
         }
     }
@@ -322,12 +322,21 @@ where
         .map_err(|err| anyhow::anyhow!("invalid {name} value {raw}: {err}"))
 }
 
-fn make_batch(signal: Signal, rows: usize, iteration: usize, args: &Args) -> Result<RecordBatch> {
+fn make_batch(
+    signal: StorageSignal,
+    rows: usize,
+    iteration: usize,
+    args: &Args,
+) -> Result<RecordBatch> {
     match signal {
-        Signal::Logs => logs_batch(rows, iteration, args.log_body_bytes),
-        Signal::Spans => spans_batch(rows, iteration, args.trace_attribute_bytes),
-        Signal::MetricGauge => metric_batch(signal, rows, iteration, args.metric_description_bytes),
-        Signal::MetricSum => metric_batch(signal, rows, iteration, args.metric_description_bytes),
+        StorageSignal::Logs => logs_batch(rows, iteration, args.log_body_bytes),
+        StorageSignal::Spans => spans_batch(rows, iteration, args.trace_attribute_bytes),
+        StorageSignal::MetricGauge => {
+            metric_batch(signal, rows, iteration, args.metric_description_bytes)
+        }
+        StorageSignal::MetricSum => {
+            metric_batch(signal, rows, iteration, args.metric_description_bytes)
+        }
     }
 }
 
@@ -445,7 +454,7 @@ fn spans_batch(rows: usize, iteration: usize, attr_bytes: usize) -> Result<Recor
 }
 
 fn metric_batch(
-    signal: Signal,
+    signal: StorageSignal,
     rows: usize,
     iteration: usize,
     description_bytes: usize,
@@ -468,15 +477,15 @@ fn metric_batch(
         int_field("flags"),
         str_field("exemplars_json"),
     ];
-    if signal == Signal::MetricSum {
+    if signal == StorageSignal::MetricSum {
         fields.push(int_field("aggregation_temporality"));
         fields.push(Field::new("is_monotonic", DataType::Boolean, true));
     }
     let schema = Arc::new(Schema::new(fields));
 
     let metric_name = match signal {
-        Signal::MetricGauge => "storage.pipeline.gauge",
-        Signal::MetricSum => "storage.pipeline.sum",
+        StorageSignal::MetricGauge => "storage.pipeline.gauge",
+        StorageSignal::MetricSum => "storage.pipeline.sum",
         _ => unreachable!("metric_batch only supports metric signals"),
     };
     let mut arrays: Vec<Arc<dyn arrow58::array::Array>> = vec![
@@ -508,7 +517,7 @@ fn metric_batch(
         Arc::new(Int32Array::from(vec![0; rows])),
         Arc::new(repeated(rows, "[]")),
     ];
-    if signal == Signal::MetricSum {
+    if signal == StorageSignal::MetricSum {
         arrays.push(Arc::new(Int32Array::from(vec![2; rows])));
         arrays.push(Arc::new(BooleanArray::from(vec![true; rows])));
     }
