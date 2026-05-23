@@ -947,7 +947,7 @@ fn queue_pressure_returns_429() {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
     config.per_signal_inflight_bytes = 16;
-    config.process_ingest_bytes = 64;
+    config.ingest_memory_budget_bytes = 64;
     config.seal_rate_seed_bytes = 10_000;
     let state = AppState::new(config).unwrap();
     let body = log_fixture(Utc::now().timestamp_nanos_opt().unwrap()).to_string();

@@ -6,6 +6,8 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use toml_edit::{DocumentMut, Item};
 
+use crate::ingest::StorageSignal;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ServeRole {
     All,
@@ -68,7 +70,10 @@ pub struct Config {
     pub ducklake_attach_uri: Option<String>,
     pub max_body_bytes: usize,
     pub per_signal_inflight_bytes: usize,
-    pub process_ingest_bytes: usize,
+    /// Total soft ingest memory budget. Enforced as N per-signal in-flight
+    /// ceilings of budget/N (N = StorageSignal::ALL.len()) plus the freshness
+    /// projection — there is no single aggregate gate.
+    pub ingest_memory_budget_bytes: usize,
     pub runtime_memory_limit_bytes: Option<usize>,
     pub seal_rate_seed_bytes: usize,
     pub seal_rate_seed_window: Duration,
@@ -185,8 +190,9 @@ impl Config {
                 None => file.optional_string(&["ducklake", "attach_uri"])?,
             },
             max_body_bytes,
-            per_signal_inflight_bytes: (ingest_memory_bytes / 4).max(max_body_bytes),
-            process_ingest_bytes: ingest_memory_bytes,
+            per_signal_inflight_bytes: (ingest_memory_bytes / StorageSignal::ALL.len())
+                .max(max_body_bytes),
+            ingest_memory_budget_bytes: ingest_memory_bytes,
             runtime_memory_limit_bytes: match env_optional_usize(
                 "CANARDSTACK_PROCESS_MEMORY_LIMIT_BYTES",
             )? {
@@ -326,7 +332,7 @@ impl Config {
             ducklake_attach_uri: None,
             max_body_bytes: 8 * 1024 * 1024,
             per_signal_inflight_bytes: 1024 * 1024,
-            process_ingest_bytes: 4 * 1024 * 1024,
+            ingest_memory_budget_bytes: 4 * 1024 * 1024,
             runtime_memory_limit_bytes: None,
             seal_rate_seed_bytes: 256 * 1024,
             seal_rate_seed_window: Duration::from_millis(50),
@@ -385,17 +391,17 @@ impl Config {
                 "CANARDSTACK_API_KEY and CANARDSTACK_ADMIN_API_KEY must differ; reusing a single key collapses the admin authorization gate"
             );
         }
-        if self.per_signal_inflight_bytes > self.process_ingest_bytes {
+        if self.per_signal_inflight_bytes > self.ingest_memory_budget_bytes {
             anyhow::bail!(
                 "derived per-signal ingest in-flight bytes ({}) must be <= CANARDSTACK_INGEST_MEMORY_BYTES ({})",
                 self.per_signal_inflight_bytes,
-                self.process_ingest_bytes
+                self.ingest_memory_budget_bytes
             );
         }
         if self.max_body_bytes == 0 {
             anyhow::bail!("CANARDSTACK_MAX_BODY_BYTES must be > 0");
         }
-        if self.process_ingest_bytes == 0 || self.per_signal_inflight_bytes == 0 {
+        if self.ingest_memory_budget_bytes == 0 || self.per_signal_inflight_bytes == 0 {
             anyhow::bail!("ingest memory caps must be > 0");
         }
         if matches!(self.runtime_memory_limit_bytes, Some(0)) {
@@ -862,7 +868,7 @@ http_keepalive = true
         );
         assert_eq!(config.ducklake_attach_uri, None);
         assert_eq!(config.max_body_bytes, 12345);
-        assert_eq!(config.process_ingest_bytes, 3_000_000);
+        assert_eq!(config.ingest_memory_budget_bytes, 3_000_000);
         assert_eq!(config.per_signal_inflight_bytes, 750_000);
         assert_eq!(config.runtime_memory_limit_bytes, Some(4_000_000));
         assert_eq!(config.seal_rate_seed_bytes, 654_321);
@@ -967,5 +973,37 @@ max_body_bytes = "large"
         }
 
         Config::from_env().unwrap().validate().unwrap();
+    }
+
+    #[test]
+    fn per_signal_inflight_bytes_derives_from_signal_count() {
+        let _guard = env_lock().lock_or_poisoned();
+        let _snapshot = EnvSnapshot::capture_and_clear();
+
+        // Comfortably larger than 4 * max_body_bytes so budget / ALL.len()
+        // clears the `.max(max_body_bytes)` clamp and the equality is exact.
+        unsafe {
+            env::set_var("CANARDSTACK_INGEST_MEMORY_BYTES", "268435456"); // 256 MiB
+        }
+
+        let config = Config::from_env().unwrap();
+        let signals = StorageSignal::ALL.len();
+
+        // Clamp must be inactive at this budget for the equality to hold.
+        assert!(config.ingest_memory_budget_bytes / signals > config.max_body_bytes);
+
+        // The derivation divides by ALL.len(), not a literal.
+        assert_eq!(
+            config.per_signal_inflight_bytes,
+            config.ingest_memory_budget_bytes / signals
+        );
+
+        // Aggregate invariant: N ceilings fit under the budget, with an
+        // integer-division remainder smaller than the signal count.
+        assert!(config.per_signal_inflight_bytes * signals <= config.ingest_memory_budget_bytes);
+        assert!(
+            config.ingest_memory_budget_bytes - config.per_signal_inflight_bytes * signals
+                < signals
+        );
     }
 }
