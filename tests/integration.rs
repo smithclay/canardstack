@@ -1160,6 +1160,27 @@ fn ingest_stage_metrics_separate_transform_enqueue_and_storage_visibility() {
         metrics.contains("canardstack_arrow_flush_rows_total{storage_signal=\"logs\"} 1"),
         "{metrics}"
     );
+
+    // The lifecycle stage counters track this same path end to end (the contract
+    // behind the test name): the per-request funnel advances through the worker to
+    // arrow_buffered, and the seal funnel reaches raw_spool_checkpointed.
+    let metrics = metrics_text(&state);
+    for stage in ["worker_dispatched", "transformed", "arrow_buffered"] {
+        assert!(
+            metrics.contains(&format!(
+                "canardstack_ingest_stage_total{{request_kind=\"logs\",stage=\"{stage}\"}} 1"
+            )),
+            "missing ingest stage {stage}: {metrics}"
+        );
+    }
+    for stage in ["ducklake_committed", "raw_spool_checkpointed"] {
+        assert!(
+            metrics.contains(&format!(
+                "canardstack_ingest_seal_stage_total{{stage=\"{stage}\"}} 1"
+            )),
+            "missing seal stage {stage}: {metrics}"
+        );
+    }
 }
 
 #[test]
