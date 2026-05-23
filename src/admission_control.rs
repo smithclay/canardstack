@@ -112,8 +112,8 @@ pub struct AdmissionController {
     heavy_query_capacity: usize,
     heavy_query_degraded_capacity: usize,
     freshness_budget_sla_seconds: f64,
-    visibility_buffer_target_bytes: usize,
-    visibility_buffer_max_age_seconds: f64,
+    arrow_write_buffer_target_bytes: usize,
+    arrow_write_buffer_max_age_seconds: f64,
 }
 
 #[derive(Debug)]
@@ -176,8 +176,8 @@ impl AdmissionController {
             heavy_query_capacity,
             heavy_query_degraded_capacity,
             freshness_budget_sla_seconds: config.freshness_budget_sla.as_secs_f64(),
-            visibility_buffer_target_bytes: config.arrow_write_buffer_target_bytes.max(1),
-            visibility_buffer_max_age_seconds: config.arrow_write_buffer_max_age.as_secs_f64(),
+            arrow_write_buffer_target_bytes: config.arrow_write_buffer_target_bytes.max(1),
+            arrow_write_buffer_max_age_seconds: config.arrow_write_buffer_max_age.as_secs_f64(),
         }
     }
 
@@ -413,14 +413,14 @@ impl AdmissionController {
         state.projected_seal_seconds =
             projected_bytes as f64 / state.ewma_seal_bytes_per_second.max(1.0);
         let allowed_buffer_bytes = self
-            .visibility_buffer_target_bytes
+            .arrow_write_buffer_target_bytes
             .saturating_mul(inputs.buffered_active_count);
         let excess_buffer_bytes = inputs.buffered_bytes.saturating_sub(allowed_buffer_bytes);
         // Buffer-size debt drains at the same observed seal rate as seal debt.
         let buffer_size_debt_seconds =
             excess_buffer_bytes as f64 / state.ewma_seal_bytes_per_second.max(1.0);
         let buffer_age_debt_seconds =
-            (inputs.oldest_buffer_age_seconds - self.visibility_buffer_max_age_seconds).max(0.0);
+            (inputs.oldest_buffer_age_seconds - self.arrow_write_buffer_max_age_seconds).max(0.0);
         state.projected_buffer_seconds = buffer_size_debt_seconds + buffer_age_debt_seconds;
         state.projected_visibility_seconds = state
             .projected_seal_seconds

@@ -169,7 +169,7 @@ struct SegmentState {
 
 pub struct Spool {
     dir: PathBuf,
-    lane_label: String,
+    request_kind_label: String,
     max_segment_bytes: u64,
     max_record_bytes: u64,
     max_total_bytes: u64,
@@ -290,10 +290,10 @@ impl Spool {
             .open(&checkpoint_path)
             .with_context(|| format!("open raw spool checkpoint {}", checkpoint_path.display()))?;
 
-        // The spool directory's final component is the raw-spool lane (see
-        // `spawn_raw_spool_writer`), so derive a stable label for diagnostics
-        // without threading an `OtlpRequestKind` through `Options`.
-        let lane_label = options
+        // The spool directory's final component is the raw-spool request kind
+        // (see `spawn_raw_spool_writer`), so derive a stable label for
+        // diagnostics without threading an `OtlpRequestKind` through `Options`.
+        let request_kind_label = options
             .dir
             .file_name()
             .and_then(|name| name.to_str())
@@ -301,7 +301,7 @@ impl Spool {
             .to_string();
         Ok(Self {
             dir: options.dir,
-            lane_label,
+            request_kind_label,
             max_segment_bytes,
             max_record_bytes,
             max_total_bytes,
@@ -654,7 +654,7 @@ impl Spool {
                 if self.fatal_error.is_none() {
                     tracing::error!(
                         event = "raw_spool_writer_fatal",
-                        raw_spool_lane = self.lane_label.as_str(),
+                        request_kind = self.request_kind_label.as_str(),
                         error = %message,
                         "raw spool writer entered fatal state; appends for this signal will 503 until restart"
                     );
@@ -795,9 +795,9 @@ impl Spool {
         if self.fatal_error.is_none() {
             tracing::error!(
                 event = "raw_spool_writer_fatal",
-                raw_spool_lane = self.lane_label.as_str(),
+                request_kind = self.request_kind_label.as_str(),
                 error = %message,
-                "raw spool writer entered fatal state; appends for this lane will 503 until restart"
+                "raw spool writer entered fatal state; appends for this request kind will 503 until restart"
             );
         }
         self.fatal_error = Some(message);

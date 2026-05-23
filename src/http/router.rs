@@ -95,7 +95,7 @@ fn route_inner(
                 .raw_spool_health_by_lane()
                 .into_iter()
                 .filter(|(_, (healthy, _))| !healthy)
-                .map(|(lane, (_, error))| json!({"spool_lane": lane, "error": error}))
+                .map(|(request_kind, (_, error))| json!({"request_kind": request_kind, "error": error}))
                 .collect();
             let raw_spool_healthy = unhealthy_spools.is_empty();
             let ok = probe.is_ready() && raw_spool_healthy;
@@ -183,7 +183,7 @@ fn route_inner(
                     .unwrap_or_else(|err| json!({"error": err.to_string()}));
                 let body = json!({
                     "raw_spool_healthy": raw_spool_healthy,
-                    "queues": state.ingestor.snapshots(),
+                    "inflight": state.ingestor.snapshots(),
                     "admission": state.admission.snapshot_for(state.ingestor.freshness_budget_inputs(&state.storage)),
                     "raw_spool": raw_spool,
                     "raw_spool_by_lane": raw_spool_by_lane,

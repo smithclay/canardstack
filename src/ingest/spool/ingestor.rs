@@ -36,11 +36,11 @@ impl Ingestor {
         metrics: Arc<Metrics>,
     ) -> Result<usize> {
         let mut replayed = 0usize;
-        for lane in OtlpRequestKind::ALL {
+        for request_kind in OtlpRequestKind::ALL {
             let pending = self
-                .raw_spool_for(lane)?
+                .raw_spool_for(request_kind)?
                 .recover_pending()
-                .with_context(|| format!("recover {lane} raw spool pending records"))?;
+                .with_context(|| format!("recover {request_kind} raw spool pending records"))?;
             for recovered in pending {
                 let mut headers = HashMap::new();
                 headers.insert(
@@ -61,7 +61,7 @@ impl Ingestor {
                 match self.ingest_replayed_raw_record(
                     RecoveredWork {
                         raw_spool_ref: AppendRef {
-                            spool: lane,
+                            spool: request_kind,
                             id: recovered.id,
                         },
                         route: recovered.record.request_kind,
@@ -98,7 +98,6 @@ impl Ingestor {
                         tracing::warn!(
                             event = "raw_spool_replay_record_failed",
                             request_kind = recovered.record.request_kind.as_str(),
-                            raw_spool_lane = lane.as_str(),
                             record_segment = recovered.id.segment,
                             record_sequence = recovered.id.sequence,
                             error = %err,
@@ -322,27 +321,27 @@ impl Ingestor {
 
     fn record_raw_spool_append_batch_metrics(
         metrics: &Metrics,
-        lane: OtlpRequestKind,
+        request_kind: OtlpRequestKind,
         stats: AppendBatchStats,
     ) {
         metrics.inc(
             "canardstack_raw_spool_append_batches_total",
-            &[("request_kind", lane.as_str())],
+            &[("request_kind", request_kind.as_str())],
             1,
         );
         metrics.inc(
             "canardstack_raw_spool_append_batch_records_total",
-            &[("request_kind", lane.as_str())],
+            &[("request_kind", request_kind.as_str())],
             stats.records as u64,
         );
         metrics.inc(
             "canardstack_raw_spool_append_batch_encoded_bytes_total",
-            &[("request_kind", lane.as_str())],
+            &[("request_kind", request_kind.as_str())],
             stats.encoded_bytes,
         );
         metrics.inc(
             "canardstack_raw_spool_append_file_fsyncs_total",
-            &[("request_kind", lane.as_str())],
+            &[("request_kind", request_kind.as_str())],
             stats.fsync_count,
         );
         // Fine-grained spool append phase micro-timings are gated behind the
@@ -351,28 +350,28 @@ impl Ingestor {
         #[cfg(feature = "detailed-metrics")]
         {
             metrics.observe_request_phase_seconds_n(
-                lane.as_str(),
+                request_kind.as_str(),
                 "raw_spool_append_queue_wait",
                 stats.records as u64,
                 stats.queue_seconds,
             );
             metrics.observe_request_phase_seconds(
-                lane.as_str(),
+                request_kind.as_str(),
                 "raw_spool_append_batch_wait",
                 stats.wait_seconds,
             );
             metrics.observe_request_phase_seconds(
-                lane.as_str(),
+                request_kind.as_str(),
                 "raw_spool_append_encode",
                 stats.encode_seconds,
             );
             metrics.observe_request_phase_seconds(
-                lane.as_str(),
+                request_kind.as_str(),
                 "raw_spool_append_write",
                 stats.write_seconds,
             );
             metrics.observe_request_phase_seconds(
-                lane.as_str(),
+                request_kind.as_str(),
                 "raw_spool_append_fsync",
                 stats.fsync_seconds,
             );
@@ -381,7 +380,7 @@ impl Ingestor {
 
     fn record_raw_spool_checkpoint_batch_metrics(
         metrics: &Metrics,
-        lane: OtlpRequestKind,
+        request_kind: OtlpRequestKind,
         stats: CheckpointBatchStats,
     ) {
         if stats.records == 0 {
@@ -389,17 +388,17 @@ impl Ingestor {
         }
         metrics.inc(
             "canardstack_raw_spool_checkpoint_batches_total",
-            &[("request_kind", lane.as_str())],
+            &[("request_kind", request_kind.as_str())],
             1,
         );
         metrics.inc(
             "canardstack_raw_spool_checkpoint_batch_records_total",
-            &[("request_kind", lane.as_str())],
+            &[("request_kind", request_kind.as_str())],
             stats.records as u64,
         );
         metrics.inc(
             "canardstack_raw_spool_checkpoint_batch_commands_total",
-            &[("request_kind", lane.as_str())],
+            &[("request_kind", request_kind.as_str())],
             stats.commands as u64,
         );
         // Gated like the append micro-timings; the coarse
@@ -407,13 +406,13 @@ impl Ingestor {
         #[cfg(feature = "detailed-metrics")]
         {
             metrics.observe_request_phase_seconds_n(
-                lane.as_str(),
+                request_kind.as_str(),
                 "raw_spool_checkpoint_queue_wait",
                 stats.records as u64,
                 stats.queue_seconds,
             );
             metrics.observe_request_phase_seconds(
-                lane.as_str(),
+                request_kind.as_str(),
                 "raw_spool_checkpoint_batch_wait",
                 stats.wait_seconds,
             );
@@ -489,13 +488,13 @@ impl Ingestor {
                 .or_default()
                 .push(raw_spool_ref.id);
         }
-        for (lane, ids) in by_lane_ids {
+        for (request_kind, ids) in by_lane_ids {
             let stats = self
-                .raw_spool_for(lane)?
+                .raw_spool_for(request_kind)?
                 .mark_committed_batch(&ids)
-                .with_context(|| format!("checkpoint {lane} raw spool records"))?;
+                .with_context(|| format!("checkpoint {request_kind} raw spool records"))?;
             if let Some(metrics) = metrics {
-                Self::record_raw_spool_checkpoint_batch_metrics(metrics, lane, stats);
+                Self::record_raw_spool_checkpoint_batch_metrics(metrics, request_kind, stats);
             }
         }
         if let Some(metrics) = metrics {
@@ -524,11 +523,11 @@ impl Ingestor {
             healthy: true,
             ..Default::default()
         };
-        for lane in OtlpRequestKind::ALL {
+        for request_kind in OtlpRequestKind::ALL {
             let stats = self
-                .raw_spool_for(lane)?
+                .raw_spool_for(request_kind)?
                 .stats()
-                .with_context(|| format!("read {lane} raw spool stats"))?;
+                .with_context(|| format!("read {request_kind} raw spool stats"))?;
             merge_raw_spool_stats(&mut aggregate, &stats);
         }
         Ok(aggregate)
@@ -536,12 +535,12 @@ impl Ingestor {
 
     pub fn raw_spool_stats_by_lane(&self) -> Result<BTreeMap<&'static str, super::Stats>> {
         let mut stats_by_lane = BTreeMap::new();
-        for lane in OtlpRequestKind::ALL {
+        for request_kind in OtlpRequestKind::ALL {
             stats_by_lane.insert(
-                lane.as_str(),
-                self.raw_spool_for(lane)?
+                request_kind.as_str(),
+                self.raw_spool_for(request_kind)?
                     .stats()
-                    .with_context(|| format!("read {lane} raw spool stats"))?,
+                    .with_context(|| format!("read {request_kind} raw spool stats"))?,
             );
         }
         Ok(stats_by_lane)
@@ -551,8 +550,8 @@ impl Ingestor {
     /// that cannot read its stats (thread stopped/poisoned) or is in the fatal
     /// append/fsync latch counts as unhealthy so readiness reports NOT ready.
     pub fn raw_spool_healthy(&self) -> bool {
-        OtlpRequestKind::ALL.into_iter().all(|lane| {
-            self.raw_spool_for(lane)
+        OtlpRequestKind::ALL.into_iter().all(|request_kind| {
+            self.raw_spool_for(request_kind)
                 .and_then(|spool| spool.stats())
                 .map(|stats| stats.healthy)
                 .unwrap_or(false)
@@ -565,95 +564,102 @@ impl Ingestor {
     #[doc(hidden)]
     pub fn force_raw_spool_unhealthy(
         &self,
-        lane: OtlpRequestKind,
+        request_kind: OtlpRequestKind,
         message: impl Into<String>,
     ) -> Result<()> {
-        self.raw_spool_for(lane)?.inject_fatal(message)
+        self.raw_spool_for(request_kind)?.inject_fatal(message)
     }
 
     /// Per-lane raw-spool writer health, with the latched error message for
     /// any unhealthy lane so the health JSON can show which lane is wedged.
     pub fn raw_spool_health_by_lane(&self) -> BTreeMap<&'static str, (bool, Option<String>)> {
         let mut health = BTreeMap::new();
-        for lane in OtlpRequestKind::ALL {
-            let entry = match self.raw_spool_for(lane).and_then(|spool| spool.stats()) {
+        for request_kind in OtlpRequestKind::ALL {
+            let entry = match self
+                .raw_spool_for(request_kind)
+                .and_then(|spool| spool.stats())
+            {
                 Ok(stats) => (stats.healthy, stats.error),
                 Err(err) => (false, Some(err.to_string())),
             };
-            health.insert(lane.as_str(), entry);
+            health.insert(request_kind.as_str(), entry);
         }
         health
     }
 
     pub fn record_raw_spool_metrics(&self, metrics: &Metrics) {
-        // Only per-lane series are emitted; the aggregate is derivable as
-        // `sum without(request_kind)` and was dropped in the metrics diet.
-        for lane in OtlpRequestKind::ALL {
-            let Ok(stats) = self.raw_spool_for(lane).and_then(|spool| spool.stats()) else {
+        // Only per-request-kind series are emitted; the aggregate is derivable
+        // as `sum without(request_kind)` and was dropped in the metrics diet.
+        for request_kind in OtlpRequestKind::ALL {
+            let Ok(stats) = self
+                .raw_spool_for(request_kind)
+                .and_then(|spool| spool.stats())
+            else {
                 continue;
             };
             metrics.gauge(
                 "canardstack_raw_spool_segment_bytes",
-                &[("request_kind", lane.as_str())],
+                &[("request_kind", request_kind.as_str())],
                 stats.segment_bytes as f64,
             );
             metrics.gauge(
                 "canardstack_raw_spool_segments",
-                &[("request_kind", lane.as_str())],
+                &[("request_kind", request_kind.as_str())],
                 stats.segment_count as f64,
             );
             metrics.gauge(
                 "canardstack_raw_spool_pending_records",
-                &[("request_kind", lane.as_str())],
+                &[("request_kind", request_kind.as_str())],
                 stats.pending_records as f64,
             );
             metrics.gauge(
                 "canardstack_raw_spool_pending_bytes",
-                &[("request_kind", lane.as_str())],
+                &[("request_kind", request_kind.as_str())],
                 stats.pending_bytes as f64,
             );
             metrics.gauge(
                 "canardstack_raw_spool_unsynced_records",
-                &[("request_kind", lane.as_str())],
+                &[("request_kind", request_kind.as_str())],
                 stats.unsynced_records as f64,
             );
             metrics.gauge(
                 "canardstack_raw_spool_unsynced_bytes",
-                &[("request_kind", lane.as_str())],
+                &[("request_kind", request_kind.as_str())],
                 stats.unsynced_bytes as f64,
             );
             metrics.gauge(
                 "canardstack_raw_spool_unsynced_age_seconds",
-                &[("request_kind", lane.as_str())],
+                &[("request_kind", request_kind.as_str())],
                 stats.unsynced_age_seconds,
             );
             metrics.gauge(
                 "canardstack_raw_spool_healthy",
-                &[("request_kind", lane.as_str())],
+                &[("request_kind", request_kind.as_str())],
                 if stats.healthy { 1.0 } else { 0.0 },
             );
             metrics.set_counter(
                 "canardstack_raw_spool_append_syncs_total",
-                &[("request_kind", lane.as_str())],
+                &[("request_kind", request_kind.as_str())],
                 stats.append_syncs_total,
             );
             metrics.set_counter(
                 "canardstack_raw_spool_append_sync_failures_total",
-                &[("request_kind", lane.as_str())],
+                &[("request_kind", request_kind.as_str())],
                 stats.append_sync_failures_total,
             );
             metrics.set_counter(
                 "canardstack_raw_spool_append_file_fsyncs_total",
-                &[("request_kind", lane.as_str())],
+                &[("request_kind", request_kind.as_str())],
                 stats.append_sync_file_fsyncs_total,
             );
-            // The per-lane fsync phase observation is a fine micro-timing; gate
-            // it behind `detailed-metrics` alongside the other spool internals.
+            // The per-request-kind fsync phase observation is a fine
+            // micro-timing; gate it behind `detailed-metrics` alongside the
+            // other spool internals.
             #[cfg(feature = "detailed-metrics")]
             metrics.set_observation(
                 "canardstack_phase_duration_seconds",
                 &[
-                    ("request_kind", lane.as_str()),
+                    ("request_kind", request_kind.as_str()),
                     ("phase", "raw_spool_append_fsync"),
                 ],
                 stats.append_syncs_total,
@@ -662,10 +668,10 @@ impl Ingestor {
         }
     }
 
-    fn raw_spool_for(&self, lane: OtlpRequestKind) -> Result<&Writer> {
+    fn raw_spool_for(&self, request_kind: OtlpRequestKind) -> Result<&Writer> {
         self.raw_spools
-            .get(&lane)
-            .with_context(|| format!("raw spool writer for {lane} is unavailable"))
+            .get(&request_kind)
+            .with_context(|| format!("raw spool writer for {request_kind} is unavailable"))
     }
 }
 

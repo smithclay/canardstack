@@ -63,7 +63,7 @@ OTLP/HTTP (JSON or protobuf, optional gzip)
   -> local fsync raw spool
   -> otlp2records -> Arrow RecordBatch grouped by storage signal
   -> freshness-first admission (freshness budget + per-storage-signal in-flight ceiling)
-  -> ingest worker pool inserts into the storage immutable buffer
+  -> ingest worker pool inserts into the Arrow write buffer
   -> scheduler single seal driver -> immutable Parquet segment files registered with DuckLake
   -> bounded compat query adapters for Prometheus / Loki / Tempo subsets
 ```
@@ -81,7 +81,7 @@ Top-level modules map to pipeline stages or boundaries. Subdirectories group hel
 - `src/http.rs` - hand-rolled std-library HTTP/1.1 server with bounded per-connection threads and non-blocking accept shutdown.
 - `src/validation.rs` - auth, content-type, size, compression, timestamp-skew checks, `ApiError`, and error envelopes.
 - `src/otlp.rs` - OTLP JSON/protobuf decode and `Transformed` payload construction.
-- `src/ingest/` - request flow, freshness-first admission, per-signal in-flight accounting, the durable raw spool, and the ingest worker pool that inserts into the storage immutable buffer.
+- `src/ingest/` - request flow, freshness-first admission, per-signal in-flight accounting, the durable raw spool, and the ingest worker pool that inserts into the Arrow write buffer.
 - `src/admission_control.rs` - seal admission, freshness-budget ingest admission, and cheap/heavy query admission.
 - `src/storage/` - DuckDB lifecycle, DuckLake `ATTACH`, extension install, immutable segment writes, `StorageProbe`, retention, and maintenance SQL.
 - `src/query/` - bounded query helpers, shared query plans, and Prometheus/Loki/Tempo selector parsing.

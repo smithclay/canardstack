@@ -701,7 +701,10 @@ fn admin_ingest_health_includes_raw_spool_backlog() {
         16 * 1024 * 1024
     );
     assert_eq!(response.json_body()["raw_spool"]["healthy"], true);
-    assert_eq!(response.json_body()["queues"][0]["storage_signal"], "logs");
+    assert_eq!(
+        response.json_body()["inflight"][0]["storage_signal"],
+        "logs"
+    );
 }
 
 #[test]
@@ -746,7 +749,9 @@ fn unhealthy_raw_spool_writer_makes_readiness_not_ready() {
         .cloned()
         .unwrap_or_default();
     assert!(
-        unhealthy.iter().any(|entry| entry["spool_lane"] == "logs"),
+        unhealthy
+            .iter()
+            .any(|entry| entry["request_kind"] == "logs"),
         "expected logs raw-spool lane listed as unhealthy: {}",
         response.json_body()
     );

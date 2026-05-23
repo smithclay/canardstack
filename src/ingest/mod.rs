@@ -103,8 +103,8 @@ pub(in crate::ingest) struct SpooledIngestWork {
 impl Ingestor {
     pub fn new(config: Config) -> Result<Self> {
         let mut raw_spools = BTreeMap::new();
-        for lane in OtlpRequestKind::ALL {
-            raw_spools.insert(lane, spawn_raw_spool_writer(&config, lane)?);
+        for request_kind in OtlpRequestKind::ALL {
+            raw_spools.insert(request_kind, spawn_raw_spool_writer(&config, request_kind)?);
         }
         Ok(Self {
             runtime_memory_reserved_bytes: Arc::new(AtomicUsize::new(0)),
@@ -702,10 +702,10 @@ fn transformed_rows_by_signal(transformed: &Transformed) -> Vec<(StorageSignal, 
         .collect()
 }
 
-fn spawn_raw_spool_writer(config: &Config, lane: OtlpRequestKind) -> Result<Writer> {
+fn spawn_raw_spool_writer(config: &Config, request_kind: OtlpRequestKind) -> Result<Writer> {
     Writer::spawn(
         Options {
-            dir: config.raw_spool_dir.join(lane.as_str()),
+            dir: config.raw_spool_dir.join(request_kind.as_str()),
             max_segment_bytes: config.raw_spool_max_segment_bytes as u64,
             max_record_bytes: config.raw_spool_max_record_bytes as u64,
             max_total_bytes: config.raw_spool_max_total_bytes as u64,
@@ -718,7 +718,7 @@ fn spawn_raw_spool_writer(config: &Config, lane: OtlpRequestKind) -> Result<Writ
         config.raw_spool_group_commit_records,
         config.raw_spool_group_commit_delay,
     )
-    .with_context(|| format!("spawn {lane} raw spool writer"))
+    .with_context(|| format!("spawn {request_kind} raw spool writer"))
 }
 
 fn pending_batch_totals(
