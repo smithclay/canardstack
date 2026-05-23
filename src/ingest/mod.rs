@@ -8,7 +8,7 @@ use crate::LockExt;
 use anyhow::{Context, Result};
 use serde::Serialize;
 use serde_json::{json, Value};
-use spool::{FlushRef, Options, RecordId, Writer};
+use spool::{Options, RecordId, SealRef, Writer};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::sync::atomic::AtomicUsize;
@@ -101,7 +101,7 @@ pub struct Ingestor {
     inflight: Arc<admission::InflightBytes>,
     raw_spools: BTreeMap<Signal, Writer>,
     metric_raw_spool_next: AtomicUsize,
-    raw_spool_flush_refs: Arc<Mutex<BTreeMap<(Signal, RecordId), FlushRef>>>,
+    raw_spool_seal_refs: Arc<Mutex<BTreeMap<(Signal, RecordId), SealRef>>>,
     ingest_workers: Mutex<Option<IngestWorkerPool>>,
     config: Config,
 }
@@ -128,7 +128,7 @@ impl Ingestor {
             inflight: Arc::new(admission::InflightBytes::new(&config)),
             raw_spools,
             metric_raw_spool_next: AtomicUsize::new(0),
-            raw_spool_flush_refs: Arc::new(Mutex::new(BTreeMap::new())),
+            raw_spool_seal_refs: Arc::new(Mutex::new(BTreeMap::new())),
             ingest_workers: Mutex::new(None),
             config,
         })
@@ -208,7 +208,7 @@ impl Ingestor {
             runtime_memory_reservation,
             metrics: async_metrics,
         };
-        self.dispatch_ingest_work(spooled, metrics, true)
+        self.dispatch_ingest_work(spooled, storage, metrics)
     }
 
     pub(in crate::ingest) fn process_spooled_ingest(
@@ -432,126 +432,80 @@ impl Ingestor {
     fn dispatch_ingest_work(
         &self,
         work: SpooledIngestWork,
+        storage: &Storage,
         metrics: &Metrics,
-        accept_after_spool: bool,
     ) -> ApiResult<Value> {
         let signal = work.signal;
         let route = work.route;
         // Round-robin to the first worker with buffer space. On a successful send
-        // the function returns directly from inside the loop; only the
-        // all-workers-full / all-disconnected paths fall through to the rejection
-        // handling below (so `work` is always still owned there).
-        let send_err = {
+        // the function returns directly from inside the loop; if every worker is
+        // full (or the pool is gone) the still-owned `work` falls through to the
+        // caller-runs path below.
+        let work = {
             let mut pool = self.ingest_workers.lock_or_poisoned();
-            let Some(dispatcher) = pool.as_mut() else {
-                return Err(ApiError::new(
-                    503,
-                    "ingest_workers_unavailable",
-                    "ingest workers are not available",
-                )
-                .with_retry_after(5));
-            };
-            if dispatcher.commands.is_empty() {
-                return Err(ApiError::new(
-                    503,
-                    "ingest_workers_unavailable",
-                    "ingest workers are stopped",
-                )
-                .with_retry_after(5));
-            }
-            let start = dispatcher.next_worker % dispatcher.commands.len();
             let mut work = work;
-            let mut disconnected = false;
-            for offset in 0..dispatcher.commands.len() {
-                let worker_idx = (start + offset) % dispatcher.commands.len();
-                match dispatcher.commands[worker_idx].try_send(work) {
-                    Ok(()) => {
-                        dispatcher.next_worker = worker_idx.wrapping_add(1);
-                        metrics.ingest_request(route.as_str(), 202, "accepted");
-                        self.record_worker_queue_metrics(metrics);
-                        metrics.inc(
-                            "canardstack_ingest_requests_queued_total",
-                            &[("signal", signal.as_str()), ("status", "queued")],
-                            1,
-                        );
-                        return Ok(json!({
-                            "accepted": true,
-                            "acknowledgement": "locally_spooled"
-                        }));
-                    }
-                    Err(TrySendError::Full(returned)) => {
-                        work = returned;
-                    }
-                    Err(TrySendError::Disconnected(returned)) => {
-                        disconnected = true;
-                        work = returned;
+            if let Some(dispatcher) = pool.as_mut() {
+                let worker_count = dispatcher.commands.len();
+                if worker_count > 0 {
+                    let start = dispatcher.next_worker % worker_count;
+                    for offset in 0..worker_count {
+                        let worker_idx = (start + offset) % worker_count;
+                        match dispatcher.commands[worker_idx].try_send(work) {
+                            Ok(()) => {
+                                dispatcher.next_worker = worker_idx.wrapping_add(1);
+                                metrics.ingest_request(route.as_str(), 202, "accepted");
+                                self.record_worker_queue_metrics(metrics);
+                                metrics.inc(
+                                    "canardstack_ingest_requests_queued_total",
+                                    &[("signal", signal.as_str()), ("status", "queued")],
+                                    1,
+                                );
+                                return Ok(json!({
+                                    "accepted": true,
+                                    "acknowledgement": "locally_spooled"
+                                }));
+                            }
+                            Err(TrySendError::Full(returned)) => work = returned,
+                            Err(TrySendError::Disconnected(returned)) => work = returned,
+                        }
                     }
                 }
             }
-            if disconnected {
-                TrySendError::Disconnected(work)
-            } else {
-                TrySendError::Full(work)
-            }
+            work
         };
-        match send_err {
-            TrySendError::Full(work) => {
-                {
-                    let SpooledIngestWork {
-                        inflight_reservation: _inflight_reservation,
-                        runtime_memory_reservation: _runtime_memory_reservation,
-                        ..
-                    } = work;
-                }
-                self.record_inflight_metrics(metrics);
-                metrics.inc(
-                    "canardstack_ingest_requests_queued_total",
-                    &[("signal", signal.as_str()), ("status", "buffer_full")],
-                    1,
-                );
-                if accept_after_spool {
-                    metrics.ingest_request(route.as_str(), 202, "accepted_pending_replay");
-                    Ok(json!({
-                        "accepted": true,
-                        "acknowledgement": "locally_spooled"
-                    }))
-                } else {
-                    Err(
-                        ApiError::new(429, "ingest_buffer_full", "ingest worker buffer is full")
-                            .with_retry_after(5),
-                    )
-                }
-            }
-            TrySendError::Disconnected(work) => {
-                {
-                    let SpooledIngestWork {
-                        inflight_reservation: _inflight_reservation,
-                        runtime_memory_reservation: _runtime_memory_reservation,
-                        ..
-                    } = work;
-                }
-                self.record_inflight_metrics(metrics);
-                metrics.inc(
-                    "canardstack_ingest_requests_queued_total",
-                    &[("signal", signal.as_str()), ("status", "disconnected")],
-                    1,
-                );
-                if accept_after_spool {
-                    metrics.ingest_request(route.as_str(), 202, "accepted_pending_replay");
-                    Ok(json!({
-                        "accepted": true,
-                        "acknowledgement": "locally_spooled"
-                    }))
-                } else {
-                    Err(ApiError::new(
-                        503,
-                        "ingest_workers_unavailable",
-                        "ingest workers are stopped",
-                    )
-                    .with_retry_after(5))
-                }
-            }
+
+        // Caller-runs: no worker could take the handoff, so process the already
+        // durably-spooled work inline on this thread instead of dropping it for
+        // restart replay. This keeps the 202 honest (the rows reach the immutable
+        // buffer now, not only after the next process restart) and applies
+        // natural backpressure: request latency rises under worker saturation.
+        metrics.inc(
+            "canardstack_ingest_requests_queued_total",
+            &[("signal", signal.as_str()), ("status", "processed_inline")],
+            1,
+        );
+        let result = self.process_spooled_ingest(work, storage);
+        self.record_inflight_metrics(metrics);
+        // The raw request is durably spooled, so the 202 acknowledgement holds
+        // regardless of the inline transform outcome — matching the async worker
+        // contract where 202 means spooled-and-accepted, not transformed.
+        // `process_spooled_ingest` has already disposed of the record (terminal
+        // checkpoint for bad payloads, left pending for retryable storage faults).
+        if let Err(err) = result {
+            tracing::warn!(
+                event = "ingest_inline_process_failed",
+                signal = signal.as_str(),
+                status = err.status,
+                reason = err.reason,
+                message = %err.message,
+                "inline ingest processing failed after worker saturation; raw request stays durably spooled"
+            );
         }
+        metrics.ingest_request(route.as_str(), 202, "accepted_inline");
+        Ok(json!({
+            "accepted": true,
+            "acknowledgement": "locally_spooled"
+        }))
     }
 
     fn ensure_ingest_workers_available(&self, signal: Signal, metrics: &Metrics) -> ApiResult<()> {
@@ -714,7 +668,7 @@ impl Ingestor {
                 )
             });
         FreshnessInputs {
-            queued_bytes: self.inflight_bytes(),
+            inflight_bytes: self.inflight_bytes(),
             incoming_bytes: 0,
             // Admitted bytes move straight from the worker into the immutable
             // buffer; there is no separate in-memory queue to age out, so queue

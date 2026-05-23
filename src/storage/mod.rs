@@ -30,7 +30,7 @@ use ducklake::{
     attach_ducklake_connection, configure_base_connection, configure_write_connection,
     ducklake_attach_plan,
 };
-pub use immutable::ImmutableFlushOutcome;
+pub use immutable::ImmutableSealOutcome;
 use immutable::ImmutableSegmentBuffer;
 use schema::create_tables_on;
 
@@ -91,7 +91,7 @@ pub struct ImmutableBufferMetric {
 pub struct Storage {
     /// Write-side connection. Held for inserts, DDL, and DuckLake maintenance.
     /// Reader path never touches this mutex — that decoupling keeps /healthz,
-    /// /metrics, and queries responsive while a flush is in flight.
+    /// /metrics, and queries responsive while a seal is in flight.
     writer: Mutex<Connection>,
     /// Cloned from `writer` at startup after ATTACH + DDL; shares the
     /// underlying Database (attached schemas survive `try_clone`). Source of
@@ -142,29 +142,6 @@ impl std::fmt::Display for QueryTimeoutError {
 }
 
 impl std::error::Error for QueryTimeoutError {}
-
-/// Storage insert failed after one or more smaller transactions may already
-/// have committed. Callers use `committed_rows` to avoid retrying rows that
-/// DuckDB has already accepted.
-#[derive(Debug)]
-pub struct InsertRecordsError {
-    pub table: Signal,
-    pub committed_rows: usize,
-    pub attempted_rows: usize,
-    pub source: anyhow::Error,
-}
-
-impl std::fmt::Display for InsertRecordsError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "insert failed for {} after committing {}/{} row(s): {}",
-            self.table, self.committed_rows, self.attempted_rows, self.source
-        )
-    }
-}
-
-impl std::error::Error for InsertRecordsError {}
 
 pub struct ArrowBatchBuffer<'a> {
     pub table: Signal,

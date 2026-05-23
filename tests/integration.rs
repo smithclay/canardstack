@@ -71,7 +71,7 @@ fn flush_all(state: &AppState) -> usize {
     // Wait for in-flight ingest workers to finish buffering (admission credits
     // released after the buffer append), then run the single seal+checkpoint path
     // the scheduler uses so rows become query-visible and the raw spool is
-    // checkpointed. A bare flush_immutable_segments would seal without
+    // checkpointed. A bare seal_immutable_segments would seal without
     // checkpointing the raw spool, leaving records pending forever.
     let deadline = Instant::now() + StdDuration::from_secs(5);
     while Instant::now() < deadline {
@@ -82,7 +82,7 @@ fn flush_all(state: &AppState) -> usize {
     }
     state
         .ingestor
-        .flush_committed_to_storage(&state.storage, &state.metrics)
+        .seal_committed_to_storage(&state.storage, &state.metrics)
         .unwrap();
     state
         .storage
@@ -181,7 +181,7 @@ fn seeded_app() -> SeededApp {
         assert_eq!(response.status(), 202, "{path}: {}", response.json_body());
     }
     flush_all(&state);
-    state.storage.refresh_metadata().unwrap();
+    state.storage.refresh_metadata_limited(usize::MAX).unwrap();
 
     let from = now - Duration::minutes(5);
     let to = now + Duration::minutes(5);
@@ -361,7 +361,7 @@ fn append_gauge_rows(state: &AppState, rows: &[(i64, &str, f64, &str)], source_f
         .storage
         .buffer_arrow_records(Signal::MetricGauge, &batch, source_format)
         .unwrap();
-    state.storage.flush_immutable_segments(true).unwrap();
+    state.storage.seal_immutable_segments(true).unwrap();
 }
 
 fn append_log_rows(state: &AppState, rows: &[(i64, &str, &str)], source_format: &str) {
@@ -422,8 +422,8 @@ fn append_log_rows(state: &AppState, rows: &[(i64, &str, &str)], source_format: 
         .storage
         .buffer_arrow_records(Signal::Logs, &batch, source_format)
         .unwrap();
-    state.storage.flush_immutable_segments(true).unwrap();
-    state.storage.refresh_metadata().unwrap();
+    state.storage.seal_immutable_segments(true).unwrap();
+    state.storage.refresh_metadata_limited(usize::MAX).unwrap();
 }
 
 #[test]
@@ -496,8 +496,8 @@ fn operator_metrics_snapshot_is_written_to_metric_store() {
         .write_snapshot_to_storage(&state.storage)
         .unwrap();
     assert!(rows >= 3, "expected operator metric rows, got {rows}");
-    state.storage.flush_immutable_segments(true).unwrap();
-    state.storage.refresh_metadata().unwrap();
+    state.storage.seal_immutable_segments(true).unwrap();
+    state.storage.refresh_metadata_limited(usize::MAX).unwrap();
 
     let now = Utc::now();
     let response = http::route(
@@ -886,10 +886,9 @@ fn dependency_unhealthy_returns_503() {
 fn queue_pressure_returns_429() {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
-    config.per_signal_queue_bytes = 16;
+    config.per_signal_inflight_bytes = 16;
     config.process_ingest_bytes = 64;
-    config.max_rows_per_flush = 10_000;
-    config.max_bytes_per_flush = 10_000;
+    config.seal_rate_seed_bytes = 10_000;
     let state = AppState::new(config).unwrap();
     let body = log_fixture(Utc::now().timestamp_nanos_opt().unwrap()).to_string();
     let response = http::route(
@@ -923,8 +922,8 @@ fn freshness_budget_rejects_before_raw_spool_append() {
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
     config.raw_spool_dir = dir.path().join("raw-spool");
     config.lane_freshness_sla = StdDuration::from_millis(1);
-    config.max_age = StdDuration::from_secs(1);
-    config.max_bytes_per_flush = 1_000;
+    config.seal_rate_seed_window = StdDuration::from_secs(1);
+    config.seal_rate_seed_bytes = 1_000;
     let state = AppState::new(config).unwrap();
     let body = log_fixture(Utc::now().timestamp_nanos_opt().unwrap()).to_string();
     let response = http::route(
@@ -1026,7 +1025,7 @@ fn serve_roles_partition_ingest_and_query_routes() {
     assert_eq!(ingest.status(), 404, "{}", ingest.json_body());
     let maintenance = http::route(
         "POST",
-        "/api/admin/maintenance/flush",
+        "/api/admin/maintenance/seal",
         &HashMap::new(),
         &admin_headers(&query_state),
         b"{}",
@@ -1783,8 +1782,7 @@ fn metric_flush_drains_oversized_batch_and_preserves_queue_accounting() {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
     config.local_storage_dir = dir.path().join("storage");
-    config.max_rows_per_flush = 2;
-    config.max_bytes_per_flush = 10 * 1024 * 1024;
+    config.seal_rate_seed_bytes = 10 * 1024 * 1024;
     let state = AppState::new(config).unwrap();
     let body = gauge_payload(Utc::now().timestamp_nanos_opt().unwrap(), 5).to_string();
 
@@ -1809,8 +1807,7 @@ fn metric_due_flush_preserves_gauge_sum_pairing() {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
     config.local_storage_dir = dir.path().join("storage");
-    config.max_rows_per_flush = 1;
-    config.max_bytes_per_flush = 10_000_000;
+    config.seal_rate_seed_bytes = 10_000_000;
     let state = AppState::new(config).unwrap();
     let body = metric_fixture(Utc::now().timestamp_nanos_opt().unwrap()).to_string();
 
@@ -2210,7 +2207,10 @@ fn metadata_cache_invalidates_after_new_flush_bumps_generation() {
     );
     assert_eq!(ingest.status(), 202, "{}", ingest.json_body());
     flush_all(&app.state);
-    app.state.storage.refresh_metadata().unwrap();
+    app.state
+        .storage
+        .refresh_metadata_limited(usize::MAX)
+        .unwrap();
     assert!(
         app.state.storage.metadata_generation() > generation_before,
         "refreshing dirtied buckets must advance the metadata generation"
@@ -2456,7 +2456,7 @@ fn ingest_flush_and_query_vertical_slice() {
         assert_eq!(response.status(), 202, "{path}: {}", response.json_body());
     }
     flush_all(&state);
-    state.storage.refresh_metadata().unwrap();
+    state.storage.refresh_metadata_limited(usize::MAX).unwrap();
 
     let from = (now - Duration::minutes(5)).to_rfc3339();
     let to = (now + Duration::minutes(5)).to_rfc3339();
@@ -2594,7 +2594,6 @@ fn remote_ducklake_attach_uri_smoke() {
         env::var("CANARDSTACK_DUCKLAKE_ATTACH_URI")
             .unwrap_or_else(|_| "md:test-ducklake".to_string()),
     );
-    config.max_rows_per_flush = 1;
     if let Ok(extension_dir) = env::var("CANARDSTACK_DUCKDB_EXTENSION_DIR") {
         config.duckdb_extension_dir = Some(extension_dir.into());
     }
@@ -2645,8 +2644,7 @@ fn remote_ducklake_attach_uri_smoke() {
 fn seal_before_raw_spool_checkpoint_survives_restart() {
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("canardstack.duckdb");
-    let mut config = Config::test(db_path.clone());
-    config.max_rows_per_flush = 10_000;
+    let config = Config::test(db_path.clone());
     let state = AppState::new(config.clone()).unwrap();
     let now = Utc::now();
     let body = log_fixture(now.timestamp_nanos_opt().unwrap()).to_string();
@@ -2727,7 +2725,7 @@ fn scheduler_seals_threshold_ingest_into_visible_rows() {
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
     config.local_storage_dir = dir.path().join("storage");
     config.scheduler_enabled = true;
-    config.scheduler_flush_interval = StdDuration::from_millis(20);
+    config.scheduler_seal_interval = StdDuration::from_millis(20);
     config.immutable_segment_max_age = StdDuration::from_millis(10);
     config.immutable_segment_target_bytes = 1;
 
@@ -2775,10 +2773,8 @@ fn disabled_scheduler_requires_manual_flush_for_visibility() {
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
     config.local_storage_dir = dir.path().join("storage");
     config.scheduler_enabled = false;
-    config.max_age = StdDuration::from_secs(60);
-    config.high_pressure_max_age = StdDuration::from_secs(60);
-    config.max_rows_per_flush = 1;
-    config.max_bytes_per_flush = 10_000_000;
+    config.seal_rate_seed_window = StdDuration::from_secs(60);
+    config.seal_rate_seed_bytes = 10_000_000;
 
     let state = AppState::new(config).unwrap();
     let body = log_fixture(Utc::now().timestamp_nanos_opt().unwrap()).to_string();
@@ -2984,7 +2980,7 @@ fn admin_endpoints_reject_data_key_and_unauthenticated_requests() {
         ("GET", "/api/admin/health/queries"),
         ("POST", "/api/admin/maintenance/pause"),
         ("POST", "/api/admin/maintenance/resume"),
-        ("POST", "/api/admin/maintenance/flush"),
+        ("POST", "/api/admin/maintenance/seal"),
         ("POST", "/api/admin/maintenance/retention/dry-run"),
         ("POST", "/api/admin/maintenance/retention/run"),
     ];
@@ -3109,7 +3105,7 @@ fn pause_does_not_block_manual_flush() {
 
     let flush = http::route(
         "POST",
-        "/api/admin/maintenance/flush",
+        "/api/admin/maintenance/seal",
         &HashMap::new(),
         &admin_headers(&state),
         &[],
@@ -3183,7 +3179,7 @@ fn config_validate_rejects_zero_scheduler_intervals() {
     );
 
     let mutations: [fn(&mut Config); 4] = [
-        |c| c.scheduler_flush_interval = std::time::Duration::ZERO,
+        |c| c.scheduler_seal_interval = std::time::Duration::ZERO,
         |c| c.scheduler_metadata_interval = std::time::Duration::ZERO,
         |c| c.scheduler_metrics_interval = std::time::Duration::ZERO,
         |c| c.scheduler_retention_interval = std::time::Duration::ZERO,
@@ -3207,9 +3203,8 @@ fn config_validate_rejects_zero_flush_freshness_ages() {
         "baseline test config must validate"
     );
 
-    let mutations: [fn(&mut Config); 3] = [
-        |c| c.max_age = std::time::Duration::ZERO,
-        |c| c.high_pressure_max_age = std::time::Duration::ZERO,
+    let mutations: [fn(&mut Config); 2] = [
+        |c| c.seal_rate_seed_window = std::time::Duration::ZERO,
         |c| c.immutable_segment_max_age = std::time::Duration::ZERO,
     ];
     for mutate in mutations {

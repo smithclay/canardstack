@@ -166,7 +166,7 @@ flowchart LR
         Storage["Storage<br/>writer + reader"]
         Compat["Compat Query APIs"]
         Ingest --> Queues
-        Queues -->|flush| Storage
+        Queues -->|seal| Storage
         Compat -->|reader clone| Storage
     end
 

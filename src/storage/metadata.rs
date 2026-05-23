@@ -15,21 +15,14 @@ impl Storage {
         merge_dirty_metadata(&mut self.dirty_metadata.lock_or_poisoned(), affected);
     }
 
-    /// Re-aggregate `metadata_summary` for every signal/date bucket dirtied by
-    /// a committed insert. Runs on the `metadata_refresh` scheduler job so the
-    /// full day-partition scan stays off the ingest commit path. On failure the
-    /// drained buckets are re-queued so the next tick retries them — committed
-    /// telemetry must not stay invisible to the discovery APIs.
-    pub fn refresh_metadata(&self) -> Result<usize> {
-        self.refresh_metadata_limited(usize::MAX)
-    }
-
     /// Re-aggregate at most `max_buckets` dirtied signal/date buckets.
     ///
-    /// Scheduler refreshes use this bounded form so metadata discovery work
-    /// cannot monopolize the writer connection while ingest queues are growing.
-    /// Explicit/admin refreshes use `refresh_metadata()` to drain all pending
-    /// buckets.
+    /// Each `metadata_summary` re-aggregation is driven by this bounded form so
+    /// metadata discovery work cannot monopolize the writer connection while
+    /// ingest is under load. The `metadata_refresh` scheduler job passes a small
+    /// limit; pass `usize::MAX` to drain every pending bucket in one pass. On
+    /// failure the drained buckets are re-queued so the next call retries them —
+    /// committed telemetry must not stay invisible to the discovery APIs.
     pub fn refresh_metadata_limited(&self, max_buckets: usize) -> Result<usize> {
         let affected = {
             let mut dirty = self.dirty_metadata.lock_or_poisoned();

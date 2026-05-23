@@ -116,7 +116,7 @@ impl InflightBytes {
     pub(super) fn new(config: &Config) -> Self {
         Self {
             counters: std::array::from_fn(|_| AtomicUsize::new(0)),
-            per_signal_capacity_bytes: config.per_signal_queue_bytes.max(1),
+            per_signal_capacity_bytes: config.per_signal_inflight_bytes.max(1),
         }
     }
 
@@ -145,7 +145,7 @@ impl InflightBytes {
         inflight_estimate_by_signal(signal, headers, compressed_body_bytes, max_body_bytes)
     }
 
-    /// Reserve the per-signal estimate, rejecting with `signal_queue_full` if a
+    /// Reserve the per-signal estimate, rejecting with `signal_inflight_full` if a
     /// signal would exceed its in-flight ceiling. The returned guard releases
     /// the reservation on drop, so an ingest worker that panics mid-process
     /// returns its bytes instead of leaking toward a permanent 429.
@@ -176,7 +176,7 @@ impl InflightBytes {
                 );
                 return Err(ApiError::new(
                     429,
-                    "signal_queue_full",
+                    "signal_inflight_full",
                     format!("{signal} queue is full"),
                 )
                 .with_retry_after(5));
@@ -383,7 +383,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let mut config = Config::test(dir.path().join("canardstack.duckdb"));
-        config.per_signal_queue_bytes = 16;
+        config.per_signal_inflight_bytes = 16;
         let tracker = Arc::new(InflightBytes::new(&config));
 
         let err = match tracker.reserve(BTreeMap::from([(Signal::Logs, 64)])) {
@@ -391,7 +391,7 @@ mod tests {
             Err(err) => err,
         };
         assert_eq!(err.status, 429);
-        assert_eq!(err.reason, "signal_queue_full");
+        assert_eq!(err.reason, "signal_inflight_full");
         assert_eq!(
             tracker.total_bytes(),
             0,

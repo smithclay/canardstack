@@ -173,7 +173,7 @@ impl Storage {
     }
 
     fn check_health_target(&self) -> Result<()> {
-        // Reader, not writer — a stuck flush must not hang /healthz.
+        // Reader, not writer — a stuck seal must not hang /healthz.
         let conn = self.reader.lock_or_poisoned();
         conn.query_row("SELECT 1", [], |_| Ok(()))?;
         let sql = format!("SELECT * FROM {}logs LIMIT 0", self.target_prefix);

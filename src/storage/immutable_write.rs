@@ -3,7 +3,7 @@ use super::ducklake::configure_write_connection;
 use super::immutable::{
     distribute_commit_seconds, distributed_segment_timing, immutable_buffer_snapshot,
     register_ducklake_data_file, split_batch_by_immutable_partition, write_immutable_segment,
-    ImmutableFlushOutcome, ImmutableSealResult, SealedSegment,
+    ImmutableSealOutcome, ImmutableSealResult, SealedSegment,
 };
 use super::{
     ArrowBatchBuffer, ArrowBatchBufferResult, ArrowBatchBufferTiming, ImmutableBufferMetric,
@@ -147,7 +147,7 @@ impl Storage {
         })
     }
 
-    pub fn flush_immutable_segments(&self, force: bool) -> Result<ImmutableFlushOutcome> {
+    pub fn seal_immutable_segments(&self, force: bool) -> Result<ImmutableSealOutcome> {
         let mut to_seal = BTreeMap::new();
         {
             let mut buffers = self.immutable_buffers.lock_or_poisoned();
@@ -166,7 +166,7 @@ impl Storage {
                 .collect::<Vec<_>>();
 
             if tables_to_seal.is_empty() {
-                return Ok(ImmutableFlushOutcome {
+                return Ok(ImmutableSealOutcome {
                     force,
                     sealed_files: 0,
                     sealed_rows: 0,
@@ -192,7 +192,7 @@ impl Storage {
         *self.last_error.lock_or_poisoned() = None;
         self.mark_metadata_dirty(seal_result.affected);
 
-        Ok(ImmutableFlushOutcome {
+        Ok(ImmutableSealOutcome {
             force,
             sealed_files: seal_result.files,
             sealed_rows: seal_result.rows,
@@ -210,7 +210,7 @@ impl Storage {
         let mut affected = BTreeMap::new();
 
         // Encode each table's buffer to Parquet in parallel via scoped threads:
-        // they borrow the buffers directly (no per-flush full-buffer clone) and
+        // they borrow the buffers directly (no per-seal full-buffer clone) and
         // are all joined before the scope returns. The DuckLake register+commit
         // below stays serialized under the single writer lock.
         let storage_dir = self.local_storage_dir.as_path();

@@ -11,7 +11,7 @@ The current MVP architecture is:
 ```text
 OTLP/HTTP -> cheap validation + freshness/runtime/queue admission
   -> fsynced local raw spool write -> ingest worker transform -> immutable buffer
-  -> scheduler single seal driver (protected flush lane) -> immutable Parquet segments
+  -> scheduler single seal driver (protected seal lane) -> immutable Parquet segments
   -> DuckLake registration -> logical DuckLake SQL compatibility APIs
 ```
 
@@ -27,7 +27,7 @@ Current product constraints:
   for bounded processing. It does not mean rows are committed or query-visible.
 - QueryEngine and compatibility APIs read registered logical DuckLake tables,
   not raw Parquet file paths.
-- Logical lane admission reserves flush capacity before query capacity. Cheap
+- Logical lane admission reserves seal capacity before query capacity. Cheap
   discovery/probe/instant-ish queries retain a protected lane; heavy range/search
   queries degrade or reject first under freshness debt.
 - Metrics performance is TBD. The current MVP envelope is for logs and traces.
@@ -43,7 +43,7 @@ The MVP gates prove these behaviors:
   least `128 MiB` pending raw spool data if the fixture reaches that first.
 - **Operator surface:** `/metrics`, `/healthz`, and
   `/api/admin/health/ingest` distinguish accepted, raw-spooled, pending replay,
-  queued, flushed/sealed, DuckLake-visible, checkpointed, spool full, and
+  queued, sealed, DuckLake-visible, checkpointed, spool full, and
   storage unavailable states.
 - **Query path:** backward Loki `query_range` and Tempo search/lookup use
   bounded logical DuckLake queries. There is no active raw-Parquet shadow mode
@@ -76,7 +76,7 @@ scripts/raw-spool-promotion-gates.sh
 The promotion script builds the release binary and runs:
 
 1. SIGTERM during sustained log ingest with scheduler disabled.
-2. Replay backlog seed, restart, flush, and pending-count drain.
+2. Replay backlog seed, restart, seal, and pending-count drain.
 3. Mixed log ingest plus backward Loki `query_range` pressure.
 4. Mixed trace ingest plus Tempo search pressure.
 
@@ -150,9 +150,9 @@ Reports include:
 - ingest and query latency p50/p95/p99
 - freshness lag
 - queue trends
-- raw-spool, transform, enqueue, flush, seal, checkpoint, and storage-visible
+- raw-spool, transform, buffer, seal, checkpoint, and storage-visible
   stage throughput
-- lane capacity/in-use, projected flush seconds, projected buffer seconds,
+- lane capacity/in-use, projected seal seconds, projected buffer seconds,
   projected visibility seconds, freshness-budget rejections, and heavy-query
   lane reductions when emitted
 - Loki query latency for log runs
@@ -169,9 +169,9 @@ Latest full gate:
 Replay and shutdown:
 
 - SIGTERM gate: `100` successful `202`s before/while shutdown drained;
-  restart plus flush produced `logical_rows.logs=100`.
+  restart plus seal produced `logical_rows.logs=100`.
 - Backlog gate: `10,000` pending raw records, `6.33 MB` pending spool bytes,
-  seed time `1061s`, restart/replay rounded to `1s`, post-flush
+  seed time `1061s`, restart/replay rounded to `1s`, post-seal
   `logical_rows.logs=10000`, pending records returned to zero.
 - The fixture hit the `10,000`-record target before the `128 MiB` byte target.
 

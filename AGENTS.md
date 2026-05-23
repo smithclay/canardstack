@@ -82,12 +82,12 @@ Top-level modules map to pipeline stages or boundaries. Subdirectories group hel
 - `src/validation.rs` - auth, content-type, size, compression, timestamp-skew checks, `ApiError`, and error envelopes.
 - `src/otlp.rs` - OTLP JSON/protobuf decode and `Transformed` payload construction.
 - `src/ingest/` - request flow, freshness-first admission, per-signal in-flight accounting, the durable raw spool, and the ingest worker pool that inserts into the storage immutable buffer.
-- `src/lanes.rs` - minimal logical lane controller for flush reservation, freshness-budget ingest admission, and cheap/heavy query admission.
+- `src/lanes.rs` - minimal logical lane controller for seal reservation, freshness-budget ingest admission, and cheap/heavy query admission.
 - `src/storage/` - DuckDB lifecycle, DuckLake `ATTACH`, extension install, immutable segment writes, `StorageProbe`, retention, and maintenance SQL.
 - `src/query/` - bounded query helpers, shared query plans, and Prometheus/Loki/Tempo selector parsing.
 - `src/compat/` - Prometheus/Loki/Tempo route adapters and the v0 public query surface.
 - `src/metadata.rs` - bounded discovery-metadata adapters over `metadata_summary`, with a generation-keyed in-process cache.
-- `src/maintenance.rs` - `Scheduler` background thread for flush, metadata refresh, operator-metrics snapshot, compaction, retention, and maintenance pause.
+- `src/maintenance.rs` - `Scheduler` background thread for seal, metadata refresh, operator-metrics snapshot, compaction, retention, and maintenance pause.
 - `src/metrics.rs` - Prometheus-style operator metrics at `/metrics`.
 - `src/db/sql.rs` - shared SQL fragment helpers used by `storage`, `query`, and `compat`.
 - `src/runtime/memory.rs` - runtime memory-pressure probing.
@@ -99,8 +99,8 @@ Top-level modules map to pipeline stages or boundaries. Subdirectories group hel
 - Use OS threads plus `Arc<Mutex<_>>`. Prefer `LockExt::lock_or_poisoned()` over `.lock().unwrap()` for shared state.
 - Treat ingest as at-least-once after local durable spool: a 2xx response means the raw request was fsynced to the local raw spool and accepted for bounded processing. It does not mean the rows are DuckLake-committed or query-visible yet.
 - Preserve pressure behavior: ingest admission returns 429 under pressure, and storage/dependency failures surface as 503 where appropriate.
-- Preserve freshness-first admission: request-path checks may reject with 429 before raw-spool append when projected flush visibility exceeds the configured freshness SLA.
-- Preserve flush/query lane priority: flush capacity is reserved before query capacity; cheap metadata/probe/discovery/instant-ish queries keep a protected lane, and heavy range/search queries degrade or reject first under freshness debt.
+- Preserve freshness-first admission: request-path checks may reject with 429 before raw-spool append when projected seal visibility exceeds the configured freshness SLA.
+- Preserve seal/query lane priority: seal capacity is reserved before query capacity; cheap metadata/probe/discovery/instant-ish queries keep a protected lane, and heavy range/search queries degrade or reject first under freshness debt.
 - Keep query routes bounded by time range, row limit, timeout, DuckDB memory limit, and concurrency caps through `QueryEngine`.
 - Do not expose arbitrary SQL through the compatibility APIs. Direct SQL is intentionally an external DuckDB CLI / MotherDuck path.
 - Preserve the Prometheus/Loki error envelope shape: `{"status":"error","errorType":"...","error":"..."}`.

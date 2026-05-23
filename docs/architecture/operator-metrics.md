@@ -20,11 +20,11 @@ Labels stay low-cardinality:
 - `table`: `logs`, `spans`, `metric_gauge`, `metric_sum`, or `all`.
 - `status`: HTTP status code or grouped class.
 - `reason`: bounded rejection or failure reason.
-- `job`: maintenance job name (`flush`, `metadata_refresh`, `metrics_snapshot`, `retention`).
+- `job`: maintenance job name (`seal`, `metadata_refresh`, `metrics_snapshot`, `retention`).
 - `query_class`: route path (e.g. `/api/v1/query_range`).
 - `encoding`: `identity`, `gzip`.
-- `triggered_by`: who initiated a partial-commit flush.
-- `lane`: `flush`, `query_cheap`, `query_heavy`, `ingest`, or `query`.
+- `triggered_by`: who initiated a partial-commit seal.
+- `lane`: `seal`, `query_cheap`, `query_heavy`, `ingest`, or `query`.
 
 Do not label metrics by `service_name`, trace id, query text, API key, or arbitrary attributes.
 
@@ -128,8 +128,8 @@ accepted requests are fsynced before acknowledgement.
 | `canardstack_lane_capacity` | Gauge | `lane` | Current logical lane capacity. Heavy query capacity reports the effective capacity after freshness degradation. |
 | `canardstack_lane_in_use` | Gauge | `lane` | Current logical lane occupancy. |
 | `canardstack_lane_rejections_total` | Counter | `lane`, `reason` | Rejections at the lane controller. |
-| `canardstack_flush_ewma_bytes_per_second` | Gauge | none | EWMA queue-byte flush throughput used for freshness-budget admission. |
-| `canardstack_projected_flush_seconds` | Gauge | none | Queue byte debt divided by EWMA flush throughput. |
+| `canardstack_seal_ewma_bytes_per_second` | Gauge | none | EWMA queue-byte seal throughput used for freshness-budget admission. |
+| `canardstack_projected_seal_seconds` | Gauge | none | Queue byte debt divided by EWMA seal throughput. |
 | `canardstack_projected_buffer_seconds` | Gauge | none | Immutable-buffer visibility debt past configured segment target or max age. |
 | `canardstack_projected_visibility_seconds` | Gauge | none | Max of process-queue visibility debt and immutable-buffer visibility debt. |
 | `canardstack_observed_freshness_lag_seconds` | Gauge | none | Max cached query-visible freshness lag from the last operator gauge refresh. |
@@ -140,7 +140,7 @@ accepted requests are fsynced before acknowledgement.
 | --- | --- | --- | --- |
 | `canardstack_maintenance_runs_total` | Counter | `job`, `status`, `reason` | Job outcomes (`status=ok` or `status=error`). |
 | `canardstack_maintenance_duration_seconds` | Histogram (`_count` / `_sum`) | `job`, `table=all` | Job runtime. |
-| `canardstack_maintenance_failures_total` | Counter | `job`, `reason` | Failures only, broken out by classified reason. Bounded reason set: `disk_full`, `flush_failed`, `metadata_refresh_failed`, `metrics_snapshot_failed`, `retention_failed`, `scheduler_job_failed`. Reasons derive from the job name where possible (so dependency wording changes do not silently re-route alerts); only `disk_full` substring-matches OS / DuckDB errors. |
+| `canardstack_maintenance_failures_total` | Counter | `job`, `reason` | Failures only, broken out by classified reason. Bounded reason set: `disk_full`, `seal_failed`, `metadata_refresh_failed`, `metrics_snapshot_failed`, `retention_failed`, `scheduler_job_failed`. Reasons derive from the job name where possible (so dependency wording changes do not silently re-route alerts); only `disk_full` substring-matches OS / DuckDB errors. |
 | `canardstack_maintenance_consecutive_failures` | Gauge | `job` | Consecutive failure count; resets to 0 on success. Drives exponential backoff. |
 | `canardstack_maintenance_paused` | Gauge | none | `1` when scheduled maintenance is paused. |
 

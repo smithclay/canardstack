@@ -161,7 +161,7 @@ fn run() -> Result<(Report, PathBuf)> {
     ));
 
     let _ = client.post_body(
-        "/api/admin/maintenance/flush",
+        "/api/admin/maintenance/seal",
         Some(&admin_key),
         "application/json",
         b"{}",

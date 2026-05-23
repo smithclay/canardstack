@@ -36,7 +36,7 @@ pub(super) struct ImmutableSealResult {
     pub(super) affected: BTreeMap<Signal, BTreeSet<String>>,
 }
 
-pub struct ImmutableFlushOutcome {
+pub struct ImmutableSealOutcome {
     pub force: bool,
     pub sealed_files: usize,
     pub sealed_rows: usize,
@@ -44,7 +44,7 @@ pub struct ImmutableFlushOutcome {
     pub active_buffers: Value,
 }
 
-impl ImmutableFlushOutcome {
+impl ImmutableSealOutcome {
     pub fn to_json(&self) -> Value {
         json!({
             "supported": true,

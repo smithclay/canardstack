@@ -21,7 +21,7 @@ canardstack is currently shaped as:
 - Local raw spool for the `202` acceptance boundary, with append fsync completed
   before acknowledgement.
 - Bounded per-signal in-memory queues with row, byte, age, and pressure checks.
-- Logical lanes for freshness-budget ingest admission, protected flush, cheap
+- Logical lanes for freshness-budget ingest admission, protected seal, cheap
   query, heavy query, and operator/control traffic.
 - DuckDB through `duckdb-rs`.
 - DuckLake through DuckDB's official `ducklake` extension SQL surface. The
@@ -134,7 +134,7 @@ cargo test remote_ducklake_attach_uri_smoke -- --ignored --nocapture
 ```
 
 The normal test suite does not contact remote services. It verifies the attach
-plan offline; the ignored smoke verifies startup, ingest, flush, and
+plan offline; the ignored smoke verifies startup, ingest, seal, and
 compatibility query visibility against the configured remote DuckLake.
 
 ## Host Workflow
@@ -205,7 +205,7 @@ cargo run -- smoke
 ```
 
 The smoke command starts the app in-process, ingests representative OTLP JSON
-logs, traces, gauge metrics, and sum metrics, flushes process queues, calls
+logs, traces, gauge metrics, and sum metrics, seals buffered rows, calls
 representative compatibility query endpoints, and prints health.
 
 ## Query Surface
@@ -253,7 +253,7 @@ Supported ingest response behavior:
 - `401` for missing API key.
 - `403` for bad API key.
 - `429` for retryable raw-spool, queue, or process ingest pressure.
-- `429 freshness_budget_exceeded` before raw-spool append when projected flush
+- `429 freshness_budget_exceeded` before raw-spool append when projected seal
   visibility exceeds the configured freshness SLA.
 - `503` when the raw spool is unavailable or storage dependencies are unhealthy.
 
@@ -323,7 +323,7 @@ loop without operator action:
   when per-signal size or age thresholds fire, or on the freshness cadence, then
   checkpoints the raw spool. Ingest workers insert Arrow batches into the
   immutable buffer; request threads do not perform DuckDB/DuckLake writes inline.
-- A periodic flush seals immutable buffers to Parquet and registers the files
+- A periodic seal writes immutable buffers to Parquet and registers the files
   with DuckLake.
 - DuckLake adjacent-file compaction is disabled for immutable telemetry
   segments and is not exposed as a v0 maintenance control; segment sizing is
@@ -331,7 +331,7 @@ loop without operator action:
 - A retention pass enforces the configured retention days, expires DuckLake
   snapshots, and cleans old files.
 
-`POST /api/admin/maintenance/pause` pauses scheduled jobs only; manual flush and
+`POST /api/admin/maintenance/pause` pauses scheduled jobs only; manual seal and
 retention endpoints remain available for repair workflows. The base cadence is
 configurable as `scheduler.maintenance_interval_secs` in `config.toml` or via
 `CANARDSTACK_MAINTENANCE_INTERVAL_SECS`.
@@ -341,13 +341,13 @@ cleanly when `serve` exits.
 
 ## Lane Controller
 
-`src/lanes.rs` owns the logical lane counters and queue-flush throughput EWMA.
+`src/lanes.rs` owns the logical lane counters and queue-seal throughput EWMA.
 It is intentionally not a generic scheduler. The request path asks it one
 direct question before raw-spool append: will the process queue debt plus
 immutable-buffer visibility debt stay within `CANARDSTACK_FRESHNESS_SLA_SECS`
 or `_MS`?
 
-Flush jobs reserve the flush lane before doing DuckDB/DuckLake work and record
+Seal jobs reserve the seal lane before doing DuckDB/DuckLake work and record
 successful queue-byte drain into the EWMA. Compatibility routes reserve either
 the cheap lane (labels, metadata, probe, instant-ish queries) or the heavy lane
 (range/search/trace lookups). Heavy query capacity is reduced first under

@@ -67,20 +67,18 @@ pub struct Config {
     pub postgres_dsn: Option<String>,
     pub ducklake_attach_uri: Option<String>,
     pub max_body_bytes: usize,
-    pub per_signal_queue_bytes: usize,
+    pub per_signal_inflight_bytes: usize,
     pub process_ingest_bytes: usize,
     pub runtime_memory_limit_bytes: Option<usize>,
-    pub max_rows_per_flush: usize,
-    pub max_bytes_per_flush: usize,
-    pub max_age: Duration,
-    pub high_pressure_max_age: Duration,
+    pub seal_rate_seed_bytes: usize,
+    pub seal_rate_seed_window: Duration,
     pub duckdb_write_memory_limit: String,
     pub late_accept_secs: i64,
     pub future_accept_secs: i64,
     pub immutable_segment_target_bytes: usize,
     pub immutable_segment_max_age: Duration,
     pub query_interactive: QueryLane,
-    pub lane_flush_capacity: usize,
+    pub lane_seal_capacity: usize,
     pub lane_cheap_query_capacity: usize,
     pub lane_heavy_query_degraded_capacity: usize,
     pub lane_freshness_sla: Duration,
@@ -88,7 +86,7 @@ pub struct Config {
     pub spans_retention_days: i64,
     pub metrics_retention_days: i64,
     pub scheduler_enabled: bool,
-    pub scheduler_flush_interval: Duration,
+    pub scheduler_seal_interval: Duration,
     pub scheduler_metadata_interval: Duration,
     pub scheduler_metrics_interval: Duration,
     pub scheduler_retention_interval: Duration,
@@ -126,15 +124,15 @@ impl Config {
         let ingest_memory_bytes = env_usize("CANARDSTACK_INGEST_MEMORY_BYTES")?
             .or(file.usize(&["ingest", "memory_bytes"])?)
             .unwrap_or(2 * 1024 * 1024 * 1024);
-        let flush_target_bytes = env_usize("CANARDSTACK_FLUSH_TARGET_BYTES")?
-            .or(file.usize(&["ingest", "flush_target_bytes"])?)
+        let seal_rate_seed_bytes = env_usize("CANARDSTACK_SEAL_RATE_SEED_BYTES")?
+            .or(file.usize(&["ingest", "seal_rate_seed_bytes"])?)
             .unwrap_or(4 * 1024 * 1024);
-        let flush_max_age = duration_ms_or_secs(
+        let seal_rate_seed_window = duration_ms_or_secs(
             &file,
-            &["ingest", "flush_max_age_ms"],
-            &["ingest", "flush_max_age_secs"],
-            "CANARDSTACK_FLUSH_MAX_AGE_MS",
-            "CANARDSTACK_FLUSH_MAX_AGE_SECS",
+            &["ingest", "seal_rate_seed_window_ms"],
+            &["ingest", "seal_rate_seed_window_secs"],
+            "CANARDSTACK_SEAL_RATE_SEED_WINDOW_MS",
+            "CANARDSTACK_SEAL_RATE_SEED_WINDOW_SECS",
             10,
         )?;
         let query_concurrency = env_usize("CANARDSTACK_QUERY_CONCURRENCY")?
@@ -187,7 +185,7 @@ impl Config {
                 None => file.optional_string(&["ducklake", "attach_uri"])?,
             },
             max_body_bytes,
-            per_signal_queue_bytes: (ingest_memory_bytes / 4).max(max_body_bytes),
+            per_signal_inflight_bytes: (ingest_memory_bytes / 4).max(max_body_bytes),
             process_ingest_bytes: ingest_memory_bytes,
             runtime_memory_limit_bytes: match env_optional_usize(
                 "CANARDSTACK_PROCESS_MEMORY_LIMIT_BYTES",
@@ -195,10 +193,8 @@ impl Config {
                 Some(value) => value,
                 None => file.usize(&["ingest", "process_memory_limit_bytes"])?,
             },
-            max_rows_per_flush: 5_000,
-            max_bytes_per_flush: flush_target_bytes,
-            max_age: flush_max_age,
-            high_pressure_max_age: (flush_max_age / 5).max(Duration::from_millis(500)),
+            seal_rate_seed_bytes,
+            seal_rate_seed_window,
             duckdb_write_memory_limit: env_string("CANARDSTACK_DUCKDB_MEMORY_LIMIT")?
                 .or(file.string(&["duckdb", "memory_limit"])?)
                 .unwrap_or_else(|| "1GiB".to_string()),
@@ -224,8 +220,8 @@ impl Config {
                 timeout_secs: query_timeout_secs,
                 memory_limit: query_memory_limit,
             },
-            lane_flush_capacity: env_usize("CANARDSTACK_FLUSH_LANE_CAPACITY")?
-                .or(file.usize(&["lanes", "flush_capacity"])?)
+            lane_seal_capacity: env_usize("CANARDSTACK_SEAL_LANE_CAPACITY")?
+                .or(file.usize(&["lanes", "seal_capacity"])?)
                 .unwrap_or(1),
             lane_cheap_query_capacity: env_usize("CANARDSTACK_CHEAP_QUERY_LANE_CAPACITY")?
                 .or(file.usize(&["lanes", "cheap_query_capacity"])?)
@@ -249,15 +245,15 @@ impl Config {
             scheduler_enabled: env_bool("CANARDSTACK_SCHEDULER_ENABLED")?
                 .or(file.bool(&["scheduler", "enabled"])?)
                 .unwrap_or(true),
-            // Seal cadence for the single flush driver. Decoupled from the coarse
+            // Seal cadence for the single seal driver. Decoupled from the coarse
             // maintenance interval: it must stay well under the freshness SLA so
             // immutable-buffer age never approaches the lane reject threshold.
-            scheduler_flush_interval: duration_ms_or_secs(
+            scheduler_seal_interval: duration_ms_or_secs(
                 &file,
-                &["scheduler", "flush_interval_ms"],
-                &["scheduler", "flush_interval_secs"],
-                "CANARDSTACK_FLUSH_INTERVAL_MS",
-                "CANARDSTACK_FLUSH_INTERVAL_SECS",
+                &["scheduler", "seal_interval_ms"],
+                &["scheduler", "seal_interval_secs"],
+                "CANARDSTACK_SEAL_INTERVAL_MS",
+                "CANARDSTACK_SEAL_INTERVAL_SECS",
                 1,
             )?,
             scheduler_metadata_interval: maintenance_interval,
@@ -325,13 +321,11 @@ impl Config {
             postgres_dsn: None,
             ducklake_attach_uri: None,
             max_body_bytes: 8 * 1024 * 1024,
-            per_signal_queue_bytes: 1024 * 1024,
+            per_signal_inflight_bytes: 1024 * 1024,
             process_ingest_bytes: 4 * 1024 * 1024,
             runtime_memory_limit_bytes: None,
-            max_rows_per_flush: 100,
-            max_bytes_per_flush: 256 * 1024,
-            max_age: Duration::from_millis(50),
-            high_pressure_max_age: Duration::from_millis(10),
+            seal_rate_seed_bytes: 256 * 1024,
+            seal_rate_seed_window: Duration::from_millis(50),
             duckdb_write_memory_limit: "512MiB".to_string(),
             late_accept_secs: 24 * 60 * 60,
             future_accept_secs: 10 * 60,
@@ -342,7 +336,7 @@ impl Config {
                 timeout_secs: 15,
                 memory_limit: "512MiB".to_string(),
             },
-            lane_flush_capacity: 1,
+            lane_seal_capacity: 1,
             lane_cheap_query_capacity: 1,
             lane_heavy_query_degraded_capacity: 1,
             lane_freshness_sla: Duration::from_secs(15),
@@ -350,7 +344,7 @@ impl Config {
             spans_retention_days: 14,
             metrics_retention_days: 30,
             scheduler_enabled: false,
-            scheduler_flush_interval: Duration::from_millis(200),
+            scheduler_seal_interval: Duration::from_millis(200),
             scheduler_metadata_interval: Duration::from_millis(200),
             scheduler_metrics_interval: Duration::from_millis(200),
             scheduler_retention_interval: Duration::from_secs(3_600),
@@ -387,27 +381,27 @@ impl Config {
                 "CANARDSTACK_API_KEY and CANARDSTACK_ADMIN_API_KEY must differ; reusing a single key collapses the admin authorization gate"
             );
         }
-        if self.per_signal_queue_bytes > self.process_ingest_bytes {
+        if self.per_signal_inflight_bytes > self.process_ingest_bytes {
             anyhow::bail!(
-                "derived per-signal ingest queue bytes ({}) must be <= CANARDSTACK_INGEST_MEMORY_BYTES ({})",
-                self.per_signal_queue_bytes,
+                "derived per-signal ingest in-flight bytes ({}) must be <= CANARDSTACK_INGEST_MEMORY_BYTES ({})",
+                self.per_signal_inflight_bytes,
                 self.process_ingest_bytes
             );
         }
         if self.max_body_bytes == 0 {
             anyhow::bail!("CANARDSTACK_MAX_BODY_BYTES must be > 0");
         }
-        if self.process_ingest_bytes == 0 || self.per_signal_queue_bytes == 0 {
+        if self.process_ingest_bytes == 0 || self.per_signal_inflight_bytes == 0 {
             anyhow::bail!("ingest memory caps must be > 0");
         }
         if matches!(self.runtime_memory_limit_bytes, Some(0)) {
             anyhow::bail!("CANARDSTACK_PROCESS_MEMORY_LIMIT_BYTES must be > 0 when set");
         }
-        if self.max_rows_per_flush == 0 || self.max_bytes_per_flush == 0 {
-            anyhow::bail!("flush thresholds must be > 0");
+        if self.seal_rate_seed_bytes == 0 {
+            anyhow::bail!("seal-rate seed bytes must be > 0");
         }
-        if self.max_age.is_zero() || self.high_pressure_max_age.is_zero() {
-            anyhow::bail!("flush age controls must be > 0");
+        if self.seal_rate_seed_window.is_zero() {
+            anyhow::bail!("seal-rate seed window must be > 0");
         }
         if self.duckdb_write_memory_limit.trim().is_empty() {
             anyhow::bail!("CANARDSTACK_DUCKDB_MEMORY_LIMIT must not be empty");
@@ -417,11 +411,6 @@ impl Config {
         }
         if self.immutable_segment_max_age.is_zero() {
             anyhow::bail!("CANARDSTACK_SEGMENT_MAX_AGE_MS/SECS must be > 0");
-        }
-        if self.high_pressure_max_age > self.max_age {
-            anyhow::bail!(
-                "derived high-pressure flush age must be <= CANARDSTACK_FLUSH_MAX_AGE_MS/SECS"
-            );
         }
         if self.logs_retention_days <= 0
             || self.spans_retention_days <= 0
@@ -435,7 +424,7 @@ impl Config {
         if self.query_interactive.concurrency == 0 {
             anyhow::bail!("query concurrency limits must be > 0");
         }
-        if self.lane_flush_capacity == 0
+        if self.lane_seal_capacity == 0
             || self.lane_cheap_query_capacity == 0
             || self.lane_heavy_query_degraded_capacity == 0
         {
@@ -446,11 +435,11 @@ impl Config {
         }
         if self.query_interactive.concurrency
             <= self
-                .lane_flush_capacity
+                .lane_seal_capacity
                 .saturating_add(self.lane_cheap_query_capacity)
         {
             anyhow::bail!(
-                "CANARDSTACK_QUERY_CONCURRENCY must leave at least one heavy query slot after flush and cheap-query lane reservations"
+                "CANARDSTACK_QUERY_CONCURRENCY must leave at least one heavy query slot after seal and cheap-query lane reservations"
             );
         }
         if self.query_interactive.timeout_secs == 0 {
@@ -489,7 +478,7 @@ impl Config {
                 "CANARDSTACK_MAX_BODY_BYTES must be <= CANARDSTACK_RAW_SPOOL_CAPACITY_BYTES"
             );
         }
-        if self.scheduler_flush_interval.is_zero()
+        if self.scheduler_seal_interval.is_zero()
             || self.scheduler_metadata_interval.is_zero()
             || self.scheduler_metrics_interval.is_zero()
             || self.scheduler_retention_interval.is_zero()
@@ -704,9 +693,9 @@ mod tests {
         "CANARDSTACK_MAX_BODY_BYTES",
         "CANARDSTACK_INGEST_MEMORY_BYTES",
         "CANARDSTACK_PROCESS_MEMORY_LIMIT_BYTES",
-        "CANARDSTACK_FLUSH_TARGET_BYTES",
-        "CANARDSTACK_FLUSH_MAX_AGE_MS",
-        "CANARDSTACK_FLUSH_MAX_AGE_SECS",
+        "CANARDSTACK_SEAL_RATE_SEED_BYTES",
+        "CANARDSTACK_SEAL_RATE_SEED_WINDOW_MS",
+        "CANARDSTACK_SEAL_RATE_SEED_WINDOW_SECS",
         "CANARDSTACK_DUCKDB_MEMORY_LIMIT",
         "CANARDSTACK_ACCEPT_LATE_SECS",
         "CANARDSTACK_ACCEPT_FUTURE_SECS",
@@ -716,7 +705,7 @@ mod tests {
         "CANARDSTACK_QUERY_CONCURRENCY",
         "CANARDSTACK_QUERY_TIMEOUT_SECS",
         "CANARDSTACK_QUERY_MEMORY_LIMIT",
-        "CANARDSTACK_FLUSH_LANE_CAPACITY",
+        "CANARDSTACK_SEAL_LANE_CAPACITY",
         "CANARDSTACK_CHEAP_QUERY_LANE_CAPACITY",
         "CANARDSTACK_HEAVY_QUERY_DEGRADED_CAPACITY",
         "CANARDSTACK_FRESHNESS_SLA_MS",
@@ -803,8 +792,8 @@ attach_uri = "md:file"
 max_body_bytes = 12345
 memory_bytes = 3000000
 process_memory_limit_bytes = 4000000
-flush_target_bytes = 654321
-flush_max_age_secs = 11
+seal_rate_seed_bytes = 654321
+seal_rate_seed_window_secs = 11
 workers = 3
 buffer_capacity = 33
 
@@ -822,7 +811,7 @@ timeout_secs = 7
 memory_limit = "384MiB"
 
 [lanes]
-flush_capacity = 1
+seal_capacity = 1
 cheap_query_capacity = 2
 heavy_query_degraded_capacity = 1
 freshness_sla_secs = 9
@@ -833,7 +822,7 @@ days = 5
 [scheduler]
 enabled = false
 maintenance_interval_secs = 40
-flush_interval_ms = 250
+seal_interval_ms = 250
 
 [raw_spool]
 capacity_bytes = 16384
@@ -850,7 +839,7 @@ http_keepalive = true
         unsafe {
             env::set_var(CONFIG_PATH_ENV, &config_path);
             env::set_var("CANARDSTACK_BIND", "127.0.0.1:4319");
-            env::set_var("CANARDSTACK_FLUSH_MAX_AGE_MS", "125");
+            env::set_var("CANARDSTACK_SEAL_RATE_SEED_WINDOW_MS", "125");
             env::set_var("CANARDSTACK_DUCKLAKE_ATTACH_URI", "");
         }
 
@@ -870,25 +859,24 @@ http_keepalive = true
         assert_eq!(config.ducklake_attach_uri, None);
         assert_eq!(config.max_body_bytes, 12345);
         assert_eq!(config.process_ingest_bytes, 3_000_000);
-        assert_eq!(config.per_signal_queue_bytes, 750_000);
+        assert_eq!(config.per_signal_inflight_bytes, 750_000);
         assert_eq!(config.runtime_memory_limit_bytes, Some(4_000_000));
-        assert_eq!(config.max_bytes_per_flush, 654_321);
-        assert_eq!(config.max_age, Duration::from_millis(125));
-        assert_eq!(config.high_pressure_max_age, Duration::from_millis(500));
+        assert_eq!(config.seal_rate_seed_bytes, 654_321);
+        assert_eq!(config.seal_rate_seed_window, Duration::from_millis(125));
         assert_eq!(config.duckdb_write_memory_limit, "2GiB");
         assert_eq!(config.immutable_segment_target_bytes, 777);
         assert_eq!(config.immutable_segment_max_age, Duration::from_secs(12));
         assert_eq!(config.query_interactive.concurrency, 6);
         assert_eq!(config.query_interactive.timeout_secs, 7);
         assert_eq!(config.query_interactive.memory_limit, "384MiB");
-        assert_eq!(config.lane_flush_capacity, 1);
+        assert_eq!(config.lane_seal_capacity, 1);
         assert_eq!(config.lane_cheap_query_capacity, 2);
         assert_eq!(config.lane_heavy_query_degraded_capacity, 1);
         assert_eq!(config.lane_freshness_sla, Duration::from_secs(9));
         assert_eq!(config.logs_retention_days, 5);
         assert_eq!(config.metrics_retention_days, 5);
         assert!(!config.scheduler_enabled);
-        assert_eq!(config.scheduler_flush_interval, Duration::from_millis(250));
+        assert_eq!(config.scheduler_seal_interval, Duration::from_millis(250));
         assert_eq!(config.scheduler_metadata_interval, Duration::from_secs(40));
         assert_eq!(config.scheduler_metrics_interval, Duration::from_secs(80));
         assert_eq!(

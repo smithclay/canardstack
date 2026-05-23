@@ -23,32 +23,32 @@ The contract is:
 Where a step below says "check /api/admin/health/...", the expected paging
 status is the HTTP code, not just the body.
 
-## 1. DuckLake Flushes Are Stuck
+## 1. Seals Are Stuck
 
 ### Symptoms
 
-- `canardstack_maintenance_consecutive_failures{job="flush"}` rises.
+- `canardstack_maintenance_consecutive_failures{job="seal"}` rises.
 - `canardstack_observed_freshness_lag_seconds` rises.
 - Query freshness gets worse even though ingest is accepting data.
-- Maintenance logs show flush/checkpoint failures.
+- Maintenance logs show seal/checkpoint failures.
 
 ### Metrics
 
-- `canardstack_maintenance_runs_total{job="flush",status="error"}`.
-- `canardstack_maintenance_failures_total{job="flush"}`.
-- `canardstack_maintenance_consecutive_failures{job="flush"}`.
+- `canardstack_maintenance_runs_total{job="seal",status="error"}`.
+- `canardstack_maintenance_failures_total{job="seal"}`.
+- `canardstack_maintenance_consecutive_failures{job="seal"}`.
 - `canardstack_ingest_inflight_bytes{signal}`.
 - `canardstack_observed_freshness_lag_seconds`.
 - `canardstack_ingest_to_query_lag_seconds{table}`.
 - `canardstack_projected_visibility_seconds`.
-- `canardstack_flush_ewma_bytes_per_second`.
+- `canardstack_seal_ewma_bytes_per_second`.
 - `canardstack_storage_physical_bytes{table="all"}`.
 
 ### Immediate Mitigation
 
 1. Check `/api/admin/health/storage` and `/api/admin/health/maintenance`.
-2. Trigger `POST /api/admin/maintenance/flush`.
-3. If flush still fails, reduce upstream exporter concurrency or batch volume.
+2. Trigger `POST /api/admin/maintenance/seal`.
+3. If the seal still fails, reduce upstream exporter concurrency or batch volume.
 4. Watch `canardstack_ingest_requests_total{status=~"429|503"}` and queue gauges.
 5. If storage health is unsafe, keep returning `503` for ingest until the dependency recovers.
 
@@ -56,15 +56,15 @@ status is the HTTP code, not just the body.
 
 - Keep existing queries available if they do not increase storage pressure.
 - Prefer `429` over accepting more data into full queues.
-- Heavy query lane admission should degrade before flush is starved. If query
-  load still contends with flush, lower `CANARDSTACK_QUERY_CONCURRENCY` while
-  preserving at least one heavy slot after flush and cheap-query reservations.
+- Heavy query lane admission should degrade before the seal lane is starved. If query
+  load still contends with the seal lane, lower `CANARDSTACK_QUERY_CONCURRENCY` while
+  preserving at least one heavy slot after seal and cheap-query reservations.
 
 ### Escalation
 
-- Inspect DuckLake flush errors for object storage auth, network, or catalog lock contention.
+- Inspect seal errors for object storage auth, network, or catalog lock contention.
 - Add storage capacity if disk is the immediate risk.
-- If flush cannot be recovered, snapshot diagnostics and prepare for restore from last known good catalog backup.
+- If the seal cannot be recovered, snapshot diagnostics and prepare for restore from last known good catalog backup.
 
 ## 2. DuckDB Query OOM Takes Down The Query Role
 
@@ -93,7 +93,7 @@ endpoint. Steps 2 and 3 require an operator-driven restart.
 2. Lower query memory by 50%: set `CANARDSTACK_QUERY_MEMORY_LIMIT`
    (e.g. `256MiB`) and restart.
 3. Lower global query concurrency, keeping it greater than
-   `CANARDSTACK_FLUSH_LANE_CAPACITY + CANARDSTACK_CHEAP_QUERY_LANE_CAPACITY`;
+   `CANARDSTACK_SEAL_LANE_CAPACITY + CANARDSTACK_CHEAP_QUERY_LANE_CAPACITY`;
    with defaults, use `CANARDSTACK_QUERY_CONCURRENCY=3` or higher.
 4. Lower heavy degraded capacity only if needed:
    `CANARDSTACK_HEAVY_QUERY_DEGRADED_CAPACITY=1`.
@@ -113,11 +113,11 @@ endpoint. Steps 2 and 3 require an operator-driven restart.
   reverse proxy / Grafana datasource until a server-side allow-list lands.)
 - Add preflight estimates or query templates that avoid full scans.
 
-## 3. Object Storage 5xx Storm Causes Flush Backlog
+## 3. Object Storage 5xx Storm Causes Seal Backlog
 
 ### Symptoms
 
-- DuckLake inserts or flushes fail with object storage 5xx.
+- DuckLake inserts or seals fail with object storage 5xx.
 - Freshness lag grows.
 - Maintenance retries increase.
 - `503` may begin for ingest if storage health is unsafe.
@@ -135,7 +135,7 @@ endpoint. Steps 2 and 3 require an operator-driven restart.
 
 1. Confirm whether the object storage incident is regional or credential-related.
 2. Reduce upstream exporter concurrency.
-3. Trigger `POST /api/admin/maintenance/flush` after the storage incident clears.
+3. Trigger `POST /api/admin/maintenance/seal` after the storage incident clears.
 4. Let admission control return `429` while queue memory is full but storage is healthy.
 5. Return `503` if accepting data would endanger memory, catalog, or disk.
 
@@ -143,7 +143,7 @@ endpoint. Steps 2 and 3 require an operator-driven restart.
 
 - Serve queries from already committed data.
 - Surface stale freshness watermarks in Grafana.
-- Prioritize flush recovery; compaction and orphan cleanup are not implemented v0 controls.
+- Prioritize seal recovery; compaction and orphan cleanup are not implemented v0 controls.
 
 ### Escalation
 
@@ -179,7 +179,7 @@ endpoint. Steps 2 and 3 require an operator-driven restart.
 2. Increase exporter batch interval or reduce exporter concurrency if controlled by the operator.
 3. Temporarily drop lower-priority signals upstream if configured in the exporter or Collector.
 4. Increase process memory or add a larger instance if CPU/memory bound.
-5. If `freshness_budget_exceeded` rises, prioritize flush recovery before
+5. If `freshness_budget_exceeded` rises, prioritize seal recovery before
    increasing ingest limits.
 6. Keep returning retryable failures until queues return below 70%.
 
@@ -218,9 +218,9 @@ endpoint. Steps 2 and 3 require an operator-driven restart.
 
 ### Immediate Mitigation
 
-1. Check `/api/admin/health/ingest`; `raw_spool.pending_records` should fall after replay and flush.
+1. Check `/api/admin/health/ingest`; `raw_spool.pending_records` should fall after replay and seal.
 2. Check `/metrics` for replay failures. Any `status="failed"` increase is page-worthy.
-3. Trigger `POST /api/admin/maintenance/flush` if the scheduler is disabled or lagging.
+3. Trigger `POST /api/admin/maintenance/seal` if the scheduler is disabled or lagging.
 4. Watch `canardstack_storage_logical_rows{table}` and `canardstack_raw_spool_checkpointed_records_total`.
 
 ### Safe Degradation

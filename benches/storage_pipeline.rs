@@ -70,7 +70,7 @@ fn run() -> Result<()> {
             }])?;
             phase_stats.record_timings(result.timings);
         }
-        let flush = storage.flush_immutable_segments(true)?;
+        let flush = storage.seal_immutable_segments(true)?;
         sealed_rows += flush.sealed_rows;
         sealed_files += flush.sealed_files;
         phase_stats.record_timings(flush.timings);

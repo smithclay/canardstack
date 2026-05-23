@@ -57,11 +57,11 @@ flowchart LR
 ```
 
 Admission is freshness-first: before the durable raw-spool append, the request
-projects flush visibility through the lane controller and is shed with `429`
+projects seal visibility through the lane controller and is shed with `429`
 when projected visibility exceeds the freshness budget. A cheap per-signal
-in-flight ceiling (`signal_queue_full`) keeps one signal's burst from
+in-flight ceiling (`signal_inflight_full`) keeps one signal's burst from
 monopolizing the accepted-but-not-yet-buffered window. There is no separate
-in-memory queue and no flush worker: ingest workers insert directly into the
+in-memory queue and no seal worker: ingest workers insert directly into the
 storage immutable buffer, and a single scheduler-driven seal driver is the only
 path that seals that buffer to durable Parquet and checkpoints the raw spool.
 
@@ -72,9 +72,11 @@ A successful ingest response is `202`.
 `202` means:
 
 - The API key, content type, compressed body size, dependency health,
-  freshness, runtime-memory, and worker-buffer admission checks passed.
+  freshness, and runtime-memory admission checks passed.
 - The compressed raw request was written and fsynced to the local raw spool.
-- The request was accepted for bounded worker processing or durable replay.
+- The request was handed to an ingest worker, or — when every worker buffer is
+  full — processed inline on the request thread, so accepted work always reaches
+  the immutable buffer without waiting for restart replay.
 
 `202` does not mean:
 
@@ -101,7 +103,9 @@ Retryable failure behavior:
 
 - `429 raw_spool_full` when the raw-spool byte budget is exhausted.
 - `429 raw_spool_queue_full` when the raw-spool writer queue is saturated.
-- `429` for freshness-budget, worker-queue, process-memory, or runtime-memory pressure.
+- `429` for freshness-budget, process-memory, or runtime-memory pressure. (Worker
+  buffer saturation does not reject: the request thread processes the spooled work
+  inline, which raises latency as natural backpressure.)
 - `503 raw_spool_unavailable` when the local spool cannot be opened, written,
   or append-synced.
 - `503 dependency_unhealthy` when storage is unavailable.
@@ -130,7 +134,7 @@ open segment -> append record on raw-spool writer
 
 Startup replays uncheckpointed records found by checksummed segment scanning
 before scheduler work starts.
-Replay enters the same decode, transform, queue, flush, and DuckLake commit path
+Replay enters the same decode, transform, buffer, seal, and DuckLake commit path
 as normal ingest.
 
 The raw-spool writer is on the ingest acknowledgement path through local file
@@ -159,64 +163,65 @@ current lanes are logs, spans, metric gauge, and metric sum, so worst-case
 aggregate raw-spool disk use can reach roughly four times the configured value.
 Size the local data directory for the aggregate budget, not just one lane.
 
-## Queues And Flush
+## Worker Buffers And Seal
 
 HTTP request threads run only cheap validation and rejectable admission gates,
 then hand durably-spooled work to a fixed pool of ingest workers over bounded
-queue reservations. Workers perform decompression, `otlp2records` transform,
-timestamp-skew validation, and immutable-buffer insertion. Malformed or
+worker buffers. Workers perform decompression, `otlp2records` transform,
+timestamp-skew validation, and immutable-buffer insertion. When every worker
+buffer is full the request thread processes that spooled work inline rather than
+deferring it, so accepted data is never stranded until a restart. Malformed or
 skew-rejected accepted payloads are durably terminal-checkpointed so they do
 not replay forever. The ingest worker pool is the single "parallel ingest
 across OS threads" concept; there is no separate dataflow topology or
-storage-sink stage. Queue ownership is intentionally low-cardinality: signal
-plus source encoding.
+storage-sink stage. Worker-buffer ownership is intentionally low-cardinality:
+signal plus source encoding.
 
-Memory and queue guardrails:
+Memory and worker-buffer guardrails:
 
 - `CANARDSTACK_MAX_BODY_BYTES`, default 8 MiB.
-- `CANARDSTACK_INGEST_MEMORY_BYTES`, default 2 GiB. Per-signal queues derive
-  from this total budget.
+- `CANARDSTACK_INGEST_MEMORY_BYTES`, default 2 GiB. The per-signal in-flight
+  ceiling derives from this total budget.
 - `CANARDSTACK_INGEST_WORKERS`, default 4 ingest workers.
 - `CANARDSTACK_INGEST_BUFFER_CAPACITY`, default 1024 in-flight handoffs, split
   across workers.
 - Optional `CANARDSTACK_PROCESS_MEMORY_LIMIT_BYTES`.
 
-Flush triggers:
+Seal triggers:
 
-- `CANARDSTACK_FLUSH_TARGET_BYTES`, default 4 MiB.
-- `CANARDSTACK_FLUSH_MAX_AGE_SECS` or `_MS`, default 10 seconds. The
-  high-pressure age is derived as one fifth of this value, with a 500ms floor.
+- `CANARDSTACK_SEAL_RATE_SEED_BYTES`, default 4 MiB.
+- `CANARDSTACK_SEAL_RATE_SEED_WINDOW_SECS` or `_MS`, default 10 seconds.
 
 A single scheduler-driven seal driver is the only seal path. It seals on a frequent
-cadence (`CANARDSTACK_FLUSH_INTERVAL_MS`, default 1s) or earlier when a buffered
+cadence (`CANARDSTACK_SEAL_INTERVAL_MS`, default 1s) or earlier when a buffered
 signal reaches its size (`CANARDSTACK_SEGMENT_TARGET_BYTES`) or age
 (`CANARDSTACK_SEGMENT_MAX_AGE_*`) threshold. The cadence must stay well under the
 freshness SLA so immutable-buffer age never approaches the lane reject threshold;
 it is deliberately decoupled from the coarse maintenance interval. Each seal
 captures the set of pending raw-spool records, force-seals the immutable buffer
-to Parquet under the flush lane, registers the files in DuckLake, and then
+to Parquet under the seal lane, registers the files in DuckLake, and then
 checkpoints exactly the captured records. Capturing before sealing is
 load-bearing for at-least-once: a record appended after the capture is
-checkpointed on a later flush, never before its rows are durable. Admin flush
+checkpointed on a later seal, never before its rows are durable. Admin seal
 uses the same path on demand.
 
 Freshness-budget admission happens before raw-spool append. The request path
 uses two local debt signals:
 
-- process-queue debt: queue-credit bytes and oldest queue age before the
-  process flush moves batches into storage buffers.
+- in-flight debt: accepted-but-not-yet-buffered (in-flight) bytes and oldest
+  age before ingest workers move batches into storage buffers.
 - visibility-buffer debt: immutable storage-buffer bytes and age beyond the
   configured segment target and max age, before files are DuckLake-registered.
 
 The lane controller estimates:
 
 ```text
-projected_flush_seconds = queued_bytes / ewma_flush_bytes_per_sec
+projected_seal_seconds = inflight_bytes / ewma_seal_bytes_per_sec
 projected_buffer_seconds =
   excess_buffer_bytes / immutable_buffer_bytes_per_sec
   + max(0, oldest_buffer_age_seconds - immutable_segment_max_age_seconds)
 projected_visibility_seconds =
-  max(oldest_queue_age_seconds + projected_flush_seconds,
+  max(oldest_queue_age_seconds + projected_seal_seconds,
       projected_buffer_seconds)
 ```
 
@@ -231,14 +236,14 @@ The process has logical lanes, implemented by one small in-process controller:
 
 - ingest admission lane: checks the projected-visibility freshness budget and a
   per-signal in-flight ceiling before durable raw-spool append.
-- flush lane: reserves capacity for the scheduled seal driver and manual flush
+- seal lane: reserves capacity for the scheduled seal driver and manual seal
   before query capacity is considered.
 - query lane: splits compatibility routes into cheap and heavy classes.
 - operator/control lane: keeps health, metrics, and admin health available in
   every serve role.
 
 Heavy range/search/trace queries consume only the remaining query capacity after
-the flush and cheap-query reservations. When projected visibility debt reaches
+the seal and cheap-query reservations. When projected visibility debt reaches
 the freshness SLA, heavy query capacity degrades to
 `CANARDSTACK_HEAVY_QUERY_DEGRADED_CAPACITY`. If debt keeps rising, heavy queries
 return a protocol-compatible `429 freshness_debt` envelope. Cheap metadata,
@@ -247,7 +252,7 @@ label, probe, and instant-ish routes retain
 
 Lane knobs:
 
-- `CANARDSTACK_FLUSH_LANE_CAPACITY`, default `1`.
+- `CANARDSTACK_SEAL_LANE_CAPACITY`, default `1`.
 - `CANARDSTACK_CHEAP_QUERY_LANE_CAPACITY`, default `1`.
 - `CANARDSTACK_HEAVY_QUERY_DEGRADED_CAPACITY`, default `1`.
 - `CANARDSTACK_FRESHNESS_SLA_SECS` or `_MS`, default `15s`.
@@ -318,7 +323,7 @@ The operator surface distinguishes:
 - raw-spooled records and bytes
 - pending replay records and bytes
 - queued rows and bytes
-- flushed and sealed rows
+- sealed rows
 - DuckLake-visible rows and files
 - checkpointed raw-spool records
 - raw-spool full
@@ -347,7 +352,7 @@ Scheduler jobs:
 Maintenance can be paused and resumed through admin endpoints. There is no
 Postgres-backed maintenance lease yet, so assume one in-process scheduler and
 one writer. Pause applies to scheduled jobs only; manual repair endpoints such
-as flush and retention remain available.
+as seal and retention remain available.
 
 In `serve --role query`, ingest routes and maintenance mutation routes are not
 served. Public health, `/metrics`, and admin health endpoints stay available.

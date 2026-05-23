@@ -28,8 +28,8 @@ memory_limit = "1GiB"
 max_body_bytes = 8388608
 memory_bytes = 2147483648
 # process_memory_limit_bytes = 3221225472
-flush_target_bytes = 4194304
-flush_max_age_secs = 10
+seal_rate_seed_bytes = 4194304
+seal_rate_seed_window_secs = 10
 # Parallel transform across OS threads; the scheduler is the single seal driver.
 # workers = 4
 # buffer_capacity = 1024
@@ -52,7 +52,7 @@ timeout_secs = 15
 memory_limit = "1GiB"
 
 [lanes]
-flush_capacity = 1
+seal_capacity = 1
 cheap_query_capacity = 1
 heavy_query_degraded_capacity = 1
 freshness_sla_secs = 15
@@ -63,9 +63,9 @@ days = 14
 [scheduler]
 enabled = true
 maintenance_interval_secs = 30
-# Seal cadence for the single flush driver. Keep well under the freshness SLA so
+# Seal cadence for the single seal driver. Keep well under the freshness SLA so
 # immutable-buffer age never approaches the lane reject threshold (default 1000ms).
-# flush_interval_ms = 1000
+# seal_interval_ms = 1000
 
 [bench]
 http_keepalive = true

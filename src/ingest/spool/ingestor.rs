@@ -2,7 +2,7 @@ use super::{full_info, AppendBatchStats, CheckpointBatchStats, Record, RecordId,
 use crate::ingest::{all_signals, IngestRoute, Ingestor, Signal};
 use crate::lanes::LaneController;
 use crate::metrics::Metrics;
-use crate::storage::{ImmutableFlushOutcome, Storage, TimingPhase};
+use crate::storage::{ImmutableSealOutcome, Storage, TimingPhase};
 use crate::validation::{self, ApiError, ApiResult};
 use crate::LockExt;
 use anyhow::{Context, Result};
@@ -12,13 +12,13 @@ use std::sync::Arc;
 use std::time::Instant;
 
 #[derive(Clone, Copy, Debug)]
-pub(in crate::ingest) struct FlushRef {
+pub(in crate::ingest) struct SealRef {
     pub(in crate::ingest) signal: Signal,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub(in crate::ingest) struct AppendRef {
-    pub(in crate::ingest) shard: Signal,
+    pub(in crate::ingest) spool: Signal,
     pub(in crate::ingest) id: RecordId,
 }
 
@@ -62,7 +62,7 @@ impl Ingestor {
                 match self.ingest_replayed_raw_record(
                     RecoveredWork {
                         raw_spool_ref: AppendRef {
-                            shard: signal,
+                            spool: signal,
                             id: recovered.id,
                         },
                         signal: recovered.record.signal,
@@ -158,44 +158,44 @@ impl Ingestor {
             runtime_memory_reservation,
             metrics: metrics.clone(),
         };
-        self.dispatch_ingest_work(work, metrics.as_ref(), false)
+        self.dispatch_ingest_work(work, storage, metrics.as_ref())
             .map(|_| ())
             .map_err(|err| anyhow::anyhow!(err.message.clone()))
     }
 
     /// Record that a durably-spooled request's rows are now in the storage
     /// immutable buffer. The scheduler checkpoints the record after the next
-    /// durable seal (see [`Ingestor::flush_committed_to_storage`]). Called only
+    /// durable seal (see [`Ingestor::seal_committed_to_storage`]). Called only
     /// after a successful buffer append so a tracked ref always implies buffered rows.
     pub(in crate::ingest) fn track_raw_spool_record(
         &self,
         raw_spool_ref: AppendRef,
         signal: Signal,
     ) {
-        self.raw_spool_flush_refs
+        self.raw_spool_seal_refs
             .lock_or_poisoned()
-            .insert((raw_spool_ref.shard, raw_spool_ref.id), FlushRef { signal });
+            .insert((raw_spool_ref.spool, raw_spool_ref.id), SealRef { signal });
     }
 
     /// Single seal driver: capture the records to checkpoint, force-seal the
     /// whole immutable buffer to durable storage, then checkpoint exactly the
     /// captured records. Capturing before sealing is load-bearing for
     /// at-least-once: a record appended after the capture is not checkpointed
-    /// until a later flush, so we never checkpoint rows that were not sealed.
-    pub fn flush_committed_to_storage(
+    /// until a later seal, so we never checkpoint rows that were not sealed.
+    pub fn seal_committed_to_storage(
         &self,
         storage: &Storage,
         metrics: &Metrics,
-    ) -> Result<ImmutableFlushOutcome> {
+    ) -> Result<ImmutableSealOutcome> {
         let captured = self.capture_committed_refs();
-        let outcome = match storage.flush_immutable_segments(true) {
+        let outcome = match storage.seal_immutable_segments(true) {
             Ok(outcome) => outcome,
             Err(err) => {
                 self.restore_committed_refs(captured);
                 return Err(err);
             }
         };
-        observe_immutable_flush(metrics, &outcome);
+        observe_immutable_seal(metrics, &outcome);
         if let Err(err) =
             self.checkpoint_raw_spool_batch(&captured, "storage_committed", Some(metrics))
         {
@@ -212,14 +212,14 @@ impl Ingestor {
     }
 
     fn capture_committed_refs(&self) -> Vec<(Signal, AppendRef)> {
-        let mut refs = self.raw_spool_flush_refs.lock_or_poisoned();
+        let mut refs = self.raw_spool_seal_refs.lock_or_poisoned();
         let captured = refs
             .iter()
-            .map(|((lane, id), flush_ref)| {
+            .map(|((spool, id), seal_ref)| {
                 (
-                    flush_ref.signal,
+                    seal_ref.signal,
                     AppendRef {
-                        shard: *lane,
+                        spool: *spool,
                         id: *id,
                     },
                 )
@@ -230,10 +230,10 @@ impl Ingestor {
     }
 
     fn restore_committed_refs(&self, captured: Vec<(Signal, AppendRef)>) {
-        let mut refs = self.raw_spool_flush_refs.lock_or_poisoned();
+        let mut refs = self.raw_spool_seal_refs.lock_or_poisoned();
         for (signal, append_ref) in captured {
-            refs.entry((append_ref.shard, append_ref.id))
-                .or_insert(FlushRef { signal });
+            refs.entry((append_ref.spool, append_ref.id))
+                .or_insert(SealRef { signal });
         }
     }
 
@@ -244,17 +244,17 @@ impl Ingestor {
         compressed_body: Vec<u8>,
         metrics: &Metrics,
     ) -> ApiResult<(AppendRef, Vec<u8>)> {
-        let shard = self.raw_spool_shard_for_append(signal);
+        let spool = self.spool_for_append(signal);
         let content_type = headers.get("content-type").cloned().unwrap_or_default();
         let content_encoding = headers.get("content-encoding").cloned();
         let compressed_body_len = compressed_body.len();
         let started = Instant::now();
         let record = Record::new(signal, content_type, content_encoding, compressed_body);
         let result = self
-            .raw_spool_for(shard)
+            .raw_spool_for(spool)
             .and_then(|raw_spool| raw_spool.append(record));
         metrics.observe_phase_seconds(
-            shard.as_str(),
+            spool.as_str(),
             "raw_spool_append",
             None,
             started.elapsed().as_secs_f64(),
@@ -262,25 +262,25 @@ impl Ingestor {
         match result {
             Ok(ack) => {
                 if let Some(stats) = ack.batch_stats {
-                    Self::record_raw_spool_append_batch_metrics(metrics, shard, stats);
+                    Self::record_raw_spool_append_batch_metrics(metrics, spool, stats);
                 }
                 metrics.inc(
                     "canardstack_raw_spool_records_total",
-                    &[("signal", shard.as_str()), ("status", "spooled")],
+                    &[("signal", spool.as_str()), ("status", "spooled")],
                     1,
                 );
                 metrics.inc(
                     "canardstack_raw_spool_bytes_total",
-                    &[("signal", shard.as_str())],
+                    &[("signal", spool.as_str())],
                     compressed_body_len as u64,
                 );
-                Ok((AppendRef { shard, id: ack.id }, ack.compressed_body))
+                Ok((AppendRef { spool, id: ack.id }, ack.compressed_body))
             }
             Err(err) => {
                 if full_info(&err).is_some() {
                     metrics.inc(
                         "canardstack_raw_spool_records_total",
-                        &[("signal", shard.as_str()), ("status", "full")],
+                        &[("signal", spool.as_str()), ("status", "full")],
                         1,
                     );
                     Err(ApiError::new(
@@ -291,7 +291,7 @@ impl Ingestor {
                 } else if err.to_string().contains("raw spool writer queue is full") {
                     metrics.inc(
                         "canardstack_raw_spool_records_total",
-                        &[("signal", shard.as_str()), ("status", "queue_full")],
+                        &[("signal", spool.as_str()), ("status", "queue_full")],
                         1,
                     );
                     Err(ApiError::new(
@@ -303,7 +303,7 @@ impl Ingestor {
                 } else {
                     metrics.inc(
                         "canardstack_raw_spool_records_total",
-                        &[("signal", shard.as_str()), ("status", "error")],
+                        &[("signal", spool.as_str()), ("status", "error")],
                         1,
                     );
                     Err(ApiError::new(
@@ -460,12 +460,12 @@ impl Ingestor {
     ) -> Result<()> {
         let started = Instant::now();
         let stats = self
-            .raw_spool_for(raw_spool_ref.shard)?
+            .raw_spool_for(raw_spool_ref.spool)?
             .mark_committed(raw_spool_ref.id)
             .context("checkpoint raw spool record")?;
         if let Some(metrics) = metrics {
             let seconds = started.elapsed().as_secs_f64();
-            Self::record_raw_spool_checkpoint_batch_metrics(metrics, raw_spool_ref.shard, stats);
+            Self::record_raw_spool_checkpoint_batch_metrics(metrics, raw_spool_ref.spool, stats);
             metrics.observe_seconds(
                 "canardstack_phase_duration_seconds",
                 &[
@@ -498,7 +498,7 @@ impl Ingestor {
         let mut by_signal_ids = BTreeMap::<Signal, Vec<RecordId>>::new();
         for (_, raw_spool_ref) in records {
             by_signal_ids
-                .entry(raw_spool_ref.shard)
+                .entry(raw_spool_ref.spool)
                 .or_default()
                 .push(raw_spool_ref.id);
         }
@@ -740,7 +740,7 @@ impl Ingestor {
             .with_context(|| format!("raw spool writer for {signal} is unavailable"))
     }
 
-    fn raw_spool_shard_for_append(&self, signal: Signal) -> Signal {
+    fn spool_for_append(&self, signal: Signal) -> Signal {
         if signal.is_metric() {
             if self
                 .metric_raw_spool_next
@@ -757,7 +757,7 @@ impl Ingestor {
     }
 }
 
-fn observe_immutable_flush(metrics: &Metrics, outcome: &ImmutableFlushOutcome) {
+fn observe_immutable_seal(metrics: &Metrics, outcome: &ImmutableSealOutcome) {
     for timing in &outcome.timings {
         metrics.observe_phase_seconds(
             timing.table.as_str(),

@@ -22,9 +22,6 @@ struct FailureRecord {
     consecutive: u32,
 }
 
-#[derive(Clone, Copy, Default)]
-pub struct FlushOptions;
-
 pub struct Maintenance {
     paused: AtomicBool,
     last_runs: Mutex<BTreeMap<String, String>>,
@@ -98,16 +95,15 @@ impl Maintenance {
         })
     }
 
-    pub fn run_flush(
+    pub fn run_seal(
         &self,
         ingestor: &Ingestor,
         storage: &Storage,
         metrics: &Metrics,
-        _options: FlushOptions,
     ) -> Result<Value> {
         let started = Instant::now();
-        let immutable = ingestor.flush_committed_to_storage(storage, metrics)?;
-        self.record_run("flush");
+        let immutable = ingestor.seal_committed_to_storage(storage, metrics)?;
+        self.record_run("seal");
         Ok(json!({
             "status": "ok",
             "immutable_segments": immutable.to_json(),
@@ -200,7 +196,7 @@ impl Drop for Scheduler {
 }
 
 fn scheduler_loop(state: Arc<AppState>, stop: Arc<AtomicBool>) {
-    let flush_cadence = state.config.scheduler_flush_interval;
+    let seal_cadence = state.config.scheduler_seal_interval;
     let segment_target_bytes = state.config.immutable_segment_target_bytes;
     let segment_max_age_seconds = state.config.immutable_segment_max_age.as_secs_f64();
     let metadata_every = state.config.scheduler_metadata_interval;
@@ -209,12 +205,12 @@ fn scheduler_loop(state: Arc<AppState>, stop: Arc<AtomicBool>) {
     // Poll fast enough to seal on the freshness cadence and to catch a
     // size-due buffer promptly; the maintenance jobs are gated by their own
     // (coarse) timers regardless of how often we wake.
-    let tick = flush_cadence
+    let tick = seal_cadence
         .min(metadata_every)
         .min(Duration::from_millis(250))
         .max(Duration::from_millis(10));
-    let mut next_flush = Instant::now() + flush_cadence;
-    let mut flush_backoff_until = Instant::now();
+    let mut next_seal = Instant::now() + seal_cadence;
+    let mut seal_backoff_until = Instant::now();
     let mut next_metadata = Instant::now() + metadata_every;
     let mut next_metrics = Instant::now() + metrics_every;
     let mut next_retention = Instant::now() + retention_every;
@@ -237,21 +233,21 @@ fn scheduler_loop(state: Arc<AppState>, stop: Arc<AtomicBool>) {
         // threshold, or on the freshness cadence, keeping immutable-buffer age
         // well under the lane SLA so ingest is never shed for freshness debt. A
         // failed seal backs off so a broken catalog cannot spin the writer.
-        if now >= flush_backoff_until {
+        if now >= seal_backoff_until {
             let buffers = state.storage.immutable_buffer_metrics();
             let buffered = buffers.iter().any(|metric| metric.bytes > 0);
             let threshold_due = buffers.iter().any(|metric| {
                 metric.bytes >= segment_target_bytes
                     || metric.age_seconds >= segment_max_age_seconds
             });
-            if buffered && (threshold_due || now >= next_flush) {
-                let ok = run_flush_tick(&state);
-                next_flush = now + flush_cadence;
+            if buffered && (threshold_due || now >= next_seal) {
+                let ok = run_seal_tick(&state);
+                next_seal = now + seal_cadence;
                 if !ok {
-                    flush_backoff_until = now + flush_cadence;
+                    seal_backoff_until = now + seal_cadence;
                 }
-            } else if now >= next_flush {
-                next_flush = now + flush_cadence;
+            } else if now >= next_seal {
+                next_seal = now + seal_cadence;
             }
         }
 
@@ -292,8 +288,8 @@ fn scheduler_loop(state: Arc<AppState>, stop: Arc<AtomicBool>) {
     }
 }
 
-fn run_flush_tick(state: &AppState) -> bool {
-    run_job(state, "flush", |s| {
+fn run_seal_tick(state: &AppState) -> bool {
+    run_job(state, "seal", |s| {
         let pending_bytes: usize = s
             .storage
             .immutable_buffer_metrics()
@@ -302,12 +298,10 @@ fn run_flush_tick(state: &AppState) -> bool {
             .sum();
         let mut guard = s
             .lanes
-            .reserve_flush(&s.metrics)
+            .reserve_seal(&s.metrics)
             .map_err(|err| anyhow::anyhow!(err.message.clone()))?;
         guard.record_bytes(pending_bytes);
-        let result = s
-            .maintenance
-            .run_flush(&s.ingestor, &s.storage, &s.metrics, FlushOptions);
+        let result = s.maintenance.run_seal(&s.ingestor, &s.storage, &s.metrics);
         guard.finish(&s.metrics);
         result
     })
@@ -389,7 +383,7 @@ fn classify_job_error(err: &anyhow::Error, job: &str) -> &'static str {
         return "disk_full";
     }
     match job {
-        "flush" => "flush_failed",
+        "seal" => "seal_failed",
         "metadata_refresh" => "metadata_refresh_failed",
         "metrics_snapshot" => "metrics_snapshot_failed",
         "retention" | "retention_dry_run" => "retention_failed",

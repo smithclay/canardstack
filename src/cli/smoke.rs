@@ -56,7 +56,7 @@ pub fn run() -> anyhow::Result<()> {
     }
     state
         .ingestor
-        .flush_committed_to_storage(&state.storage, &state.metrics)?;
+        .seal_committed_to_storage(&state.storage, &state.metrics)?;
 
     let mut admin_headers = HashMap::new();
     admin_headers.insert(

@@ -29,7 +29,7 @@ impl QueryClass {
 
 #[derive(Clone, Copy, Debug)]
 pub struct FreshnessInputs {
-    pub queued_bytes: usize,
+    pub inflight_bytes: usize,
     pub incoming_bytes: usize,
     pub oldest_queue_age_seconds: f64,
     pub buffered_bytes: usize,
@@ -39,15 +39,15 @@ pub struct FreshnessInputs {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct LaneSnapshot {
-    pub flush_active: usize,
-    pub flush_capacity: usize,
+    pub seal_active: usize,
+    pub seal_capacity: usize,
     pub cheap_query_active: usize,
     pub cheap_query_capacity: usize,
     pub heavy_query_active: usize,
     pub heavy_query_capacity: usize,
     pub heavy_query_effective_capacity: usize,
-    pub ewma_flush_bytes_per_second: f64,
-    pub projected_flush_seconds: f64,
+    pub ewma_seal_bytes_per_second: f64,
+    pub projected_seal_seconds: f64,
     pub projected_buffer_seconds: f64,
     pub projected_visibility_seconds: f64,
     pub observed_freshness_lag_seconds: f64,
@@ -59,23 +59,23 @@ pub struct LaneSnapshot {
 
 pub struct LaneController {
     inner: Mutex<LaneState>,
-    flush_capacity: usize,
+    seal_capacity: usize,
     cheap_query_capacity: usize,
     heavy_query_capacity: usize,
     heavy_query_degraded_capacity: usize,
     freshness_sla_seconds: f64,
     visibility_buffer_target_bytes: usize,
     visibility_buffer_max_age_seconds: f64,
-    visibility_flush_bytes_per_second: f64,
+    visibility_seal_bytes_per_second: f64,
 }
 
 #[derive(Debug)]
 struct LaneState {
-    flush_active: usize,
+    seal_active: usize,
     cheap_query_active: usize,
     heavy_query_active: usize,
-    ewma_flush_bytes_per_second: f64,
-    projected_flush_seconds: f64,
+    ewma_seal_bytes_per_second: f64,
+    projected_seal_seconds: f64,
     projected_buffer_seconds: f64,
     projected_visibility_seconds: f64,
     observed_freshness_lag_seconds: f64,
@@ -86,12 +86,12 @@ struct LaneState {
 
 impl LaneController {
     pub fn new(config: &Config) -> Self {
-        let flush_capacity = config.lane_flush_capacity.max(1);
+        let seal_capacity = config.lane_seal_capacity.max(1);
         let cheap_query_capacity = config
             .lane_cheap_query_capacity
             .min(config.query_interactive.concurrency)
             .max(1);
-        let reserved_query_capacity = flush_capacity.saturating_add(cheap_query_capacity);
+        let reserved_query_capacity = seal_capacity.saturating_add(cheap_query_capacity);
         let heavy_query_capacity = config
             .query_interactive
             .concurrency
@@ -101,17 +101,17 @@ impl LaneController {
             .lane_heavy_query_degraded_capacity
             .min(heavy_query_capacity)
             .max(1);
-        let initial_flush_bytes_per_second =
-            config.max_bytes_per_flush as f64 / config.max_age.as_secs_f64().max(0.001);
-        let visibility_flush_bytes_per_second = config.immutable_segment_target_bytes as f64
+        let initial_seal_bytes_per_second = config.seal_rate_seed_bytes as f64
+            / config.seal_rate_seed_window.as_secs_f64().max(0.001);
+        let visibility_seal_bytes_per_second = config.immutable_segment_target_bytes as f64
             / config.immutable_segment_max_age.as_secs_f64().max(0.001);
         Self {
             inner: Mutex::new(LaneState {
-                flush_active: 0,
+                seal_active: 0,
                 cheap_query_active: 0,
                 heavy_query_active: 0,
-                ewma_flush_bytes_per_second: initial_flush_bytes_per_second.max(1.0),
-                projected_flush_seconds: 0.0,
+                ewma_seal_bytes_per_second: initial_seal_bytes_per_second.max(1.0),
+                projected_seal_seconds: 0.0,
                 projected_buffer_seconds: 0.0,
                 projected_visibility_seconds: 0.0,
                 observed_freshness_lag_seconds: 0.0,
@@ -119,34 +119,34 @@ impl LaneController {
                 query_rejections_total: 0,
                 ingest_freshness_rejections_total: 0,
             }),
-            flush_capacity,
+            seal_capacity,
             cheap_query_capacity,
             heavy_query_capacity,
             heavy_query_degraded_capacity,
             freshness_sla_seconds: config.lane_freshness_sla.as_secs_f64(),
             visibility_buffer_target_bytes: config.immutable_segment_target_bytes.max(1),
             visibility_buffer_max_age_seconds: config.immutable_segment_max_age.as_secs_f64(),
-            visibility_flush_bytes_per_second: visibility_flush_bytes_per_second.max(1.0),
+            visibility_seal_bytes_per_second: visibility_seal_bytes_per_second.max(1.0),
         }
     }
 
-    pub fn reserve_flush(&self, metrics: &Metrics) -> ApiResult<FlushLaneGuard<'_>> {
+    pub fn reserve_seal(&self, metrics: &Metrics) -> ApiResult<SealLaneGuard<'_>> {
         let mut state = self.inner.lock_or_poisoned();
-        if state.flush_active >= self.flush_capacity {
+        if state.seal_active >= self.seal_capacity {
             metrics.inc(
                 "canardstack_lane_rejections_total",
-                &[("lane", "flush"), ("reason", "flush_lane_full")],
+                &[("lane", "seal"), ("reason", "seal_lane_full")],
                 1,
             );
             return Err(
-                ApiError::new(503, "flush_lane_full", "flush lane capacity is exhausted")
+                ApiError::new(503, "seal_lane_full", "seal lane capacity is exhausted")
                     .with_retry_after(1),
             );
         }
-        state.flush_active += 1;
+        state.seal_active += 1;
         drop(state);
         self.record_metrics(metrics, FreshnessInputs::default());
-        Ok(FlushLaneGuard {
+        Ok(SealLaneGuard {
             lanes: self,
             started: Instant::now(),
             bytes: 0,
@@ -236,7 +236,7 @@ impl LaneController {
             return Err(ApiError::new(
                 429,
                 "freshness_budget_exceeded",
-                "projected flush visibility exceeds freshness budget",
+                "projected seal visibility exceeds freshness budget",
             )
             .with_retry_after(5));
         }
@@ -252,15 +252,15 @@ impl LaneController {
         self.record_metrics(metrics, FreshnessInputs::default());
     }
 
-    pub fn record_flush_bytes(&self, bytes: usize, seconds: f64, metrics: &Metrics) {
+    pub fn record_seal_bytes(&self, bytes: usize, seconds: f64, metrics: &Metrics) {
         if bytes == 0 || seconds <= 0.0 {
             self.record_metrics(metrics, FreshnessInputs::default());
             return;
         }
         let observed = bytes as f64 / seconds.max(0.001);
         let mut state = self.inner.lock_or_poisoned();
-        state.ewma_flush_bytes_per_second =
-            EWMA_ALPHA * observed + (1.0 - EWMA_ALPHA) * state.ewma_flush_bytes_per_second;
+        state.ewma_seal_bytes_per_second =
+            EWMA_ALPHA * observed + (1.0 - EWMA_ALPHA) * state.ewma_seal_bytes_per_second;
         drop(state);
         self.record_metrics(metrics, FreshnessInputs::default());
     }
@@ -271,7 +271,7 @@ impl LaneController {
         let heavy_query_effective_capacity = self.effective_heavy_capacity_locked(&state);
         snapshot_locked(
             &state,
-            self.flush_capacity,
+            self.seal_capacity,
             self.cheap_query_capacity,
             self.heavy_query_capacity,
             heavy_query_effective_capacity,
@@ -283,13 +283,13 @@ impl LaneController {
         let snapshot = self.snapshot_for(inputs);
         metrics.gauge(
             "canardstack_lane_capacity",
-            &[("lane", "flush")],
-            snapshot.flush_capacity as f64,
+            &[("lane", "seal")],
+            snapshot.seal_capacity as f64,
         );
         metrics.gauge(
             "canardstack_lane_in_use",
-            &[("lane", "flush")],
-            snapshot.flush_active as f64,
+            &[("lane", "seal")],
+            snapshot.seal_active as f64,
         );
         metrics.gauge(
             "canardstack_lane_capacity",
@@ -312,14 +312,14 @@ impl LaneController {
             snapshot.heavy_query_active as f64,
         );
         metrics.gauge(
-            "canardstack_flush_ewma_bytes_per_second",
+            "canardstack_seal_ewma_bytes_per_second",
             &[],
-            snapshot.ewma_flush_bytes_per_second,
+            snapshot.ewma_seal_bytes_per_second,
         );
         metrics.gauge(
-            "canardstack_projected_flush_seconds",
+            "canardstack_projected_seal_seconds",
             &[],
-            snapshot.projected_flush_seconds,
+            snapshot.projected_seal_seconds,
         );
         metrics.gauge(
             "canardstack_projected_buffer_seconds",
@@ -369,17 +369,17 @@ impl LaneController {
     }
 
     fn update_projection_locked(&self, state: &mut LaneState, inputs: FreshnessInputs) {
-        let queued_bytes = inputs.queued_bytes.saturating_add(inputs.incoming_bytes);
-        state.projected_flush_seconds =
-            queued_bytes as f64 / state.ewma_flush_bytes_per_second.max(1.0);
+        let projected_bytes = inputs.inflight_bytes.saturating_add(inputs.incoming_bytes);
+        state.projected_seal_seconds =
+            projected_bytes as f64 / state.ewma_seal_bytes_per_second.max(1.0);
         let queue_visibility_seconds =
-            inputs.oldest_queue_age_seconds + state.projected_flush_seconds;
+            inputs.oldest_queue_age_seconds + state.projected_seal_seconds;
         let allowed_buffer_bytes = self
             .visibility_buffer_target_bytes
             .saturating_mul(inputs.buffered_active_count);
         let excess_buffer_bytes = inputs.buffered_bytes.saturating_sub(allowed_buffer_bytes);
         let buffer_size_debt_seconds =
-            excess_buffer_bytes as f64 / self.visibility_flush_bytes_per_second.max(1.0);
+            excess_buffer_bytes as f64 / self.visibility_seal_bytes_per_second.max(1.0);
         let buffer_age_debt_seconds =
             (inputs.oldest_buffer_age_seconds - self.visibility_buffer_max_age_seconds).max(0.0);
         state.projected_buffer_seconds = buffer_size_debt_seconds + buffer_age_debt_seconds;
@@ -392,7 +392,7 @@ impl LaneController {
 impl Default for FreshnessInputs {
     fn default() -> Self {
         Self {
-            queued_bytes: 0,
+            inflight_bytes: 0,
             incoming_bytes: 0,
             oldest_queue_age_seconds: 0.0,
             buffered_bytes: 0,
@@ -402,14 +402,14 @@ impl Default for FreshnessInputs {
     }
 }
 
-pub struct FlushLaneGuard<'a> {
+pub struct SealLaneGuard<'a> {
     lanes: &'a LaneController,
     started: Instant,
     bytes: usize,
     released: bool,
 }
 
-impl FlushLaneGuard<'_> {
+impl SealLaneGuard<'_> {
     pub fn record_bytes(&mut self, bytes: usize) {
         self.bytes = self.bytes.saturating_add(bytes);
     }
@@ -418,7 +418,7 @@ impl FlushLaneGuard<'_> {
         let bytes = self.bytes;
         let seconds = self.started.elapsed().as_secs_f64();
         self.release();
-        self.lanes.record_flush_bytes(bytes, seconds, metrics);
+        self.lanes.record_seal_bytes(bytes, seconds, metrics);
     }
 
     fn release(&mut self) {
@@ -426,12 +426,12 @@ impl FlushLaneGuard<'_> {
             return;
         }
         let mut state = self.lanes.inner.lock_or_poisoned();
-        state.flush_active = state.flush_active.saturating_sub(1);
+        state.seal_active = state.seal_active.saturating_sub(1);
         self.released = true;
     }
 }
 
-impl Drop for FlushLaneGuard<'_> {
+impl Drop for SealLaneGuard<'_> {
     fn drop(&mut self) {
         self.release();
     }
@@ -458,22 +458,22 @@ impl Drop for QueryLaneGuard<'_> {
 
 fn snapshot_locked(
     state: &LaneState,
-    flush_capacity: usize,
+    seal_capacity: usize,
     cheap_query_capacity: usize,
     heavy_query_capacity: usize,
     heavy_query_effective_capacity: usize,
     freshness_sla_seconds: f64,
 ) -> LaneSnapshot {
     LaneSnapshot {
-        flush_active: state.flush_active,
-        flush_capacity,
+        seal_active: state.seal_active,
+        seal_capacity,
         cheap_query_active: state.cheap_query_active,
         cheap_query_capacity,
         heavy_query_active: state.heavy_query_active,
         heavy_query_capacity,
         heavy_query_effective_capacity,
-        ewma_flush_bytes_per_second: state.ewma_flush_bytes_per_second,
-        projected_flush_seconds: state.projected_flush_seconds,
+        ewma_seal_bytes_per_second: state.ewma_seal_bytes_per_second,
+        projected_seal_seconds: state.projected_seal_seconds,
         projected_buffer_seconds: state.projected_buffer_seconds,
         projected_visibility_seconds: state.projected_visibility_seconds,
         observed_freshness_lag_seconds: state.observed_freshness_lag_seconds,
@@ -517,8 +517,8 @@ mod tests {
         let mut config = Config::test(dir.path().join("canardstack.duckdb"));
         config.query_interactive.concurrency = 4;
         config.lane_freshness_sla = std::time::Duration::from_secs(10);
-        config.max_bytes_per_flush = 1_000;
-        config.max_age = std::time::Duration::from_secs(1);
+        config.seal_rate_seed_bytes = 1_000;
+        config.seal_rate_seed_window = std::time::Duration::from_secs(1);
         config.immutable_segment_target_bytes = 1_000;
         config.immutable_segment_max_age = std::time::Duration::from_secs(1);
         LaneController::new(&config)
@@ -536,7 +536,7 @@ mod tests {
             .reserve_query(QueryClass::Cheap, inputs, &metrics)
             .unwrap();
 
-        assert!(lanes.reserve_flush(&metrics).is_ok());
+        assert!(lanes.reserve_seal(&metrics).is_ok());
     }
 
     #[test]
@@ -544,7 +544,7 @@ mod tests {
         let lanes = controller();
         let metrics = Metrics::default();
         let inputs = FreshnessInputs {
-            queued_bytes: 16_000,
+            inflight_bytes: 16_000,
             incoming_bytes: 0,
             oldest_queue_age_seconds: 0.0,
             ..FreshnessInputs::default()
@@ -563,7 +563,7 @@ mod tests {
         let lanes = controller();
         let metrics = Metrics::default();
         let inputs = FreshnessInputs {
-            queued_bytes: 16_000,
+            inflight_bytes: 16_000,
             incoming_bytes: 0,
             oldest_queue_age_seconds: 0.0,
             ..FreshnessInputs::default()
@@ -579,7 +579,7 @@ mod tests {
         let lanes = controller();
         let metrics = Metrics::default();
         let inputs = FreshnessInputs {
-            queued_bytes: 9_000,
+            inflight_bytes: 9_000,
             incoming_bytes: 0,
             oldest_queue_age_seconds: 0.0,
             ..FreshnessInputs::default()
@@ -598,7 +598,7 @@ mod tests {
         let lanes = controller();
         let metrics = Metrics::default();
         let inputs = FreshnessInputs {
-            queued_bytes: 12_000,
+            inflight_bytes: 12_000,
             incoming_bytes: 0,
             oldest_queue_age_seconds: 0.0,
             ..FreshnessInputs::default()
@@ -623,7 +623,7 @@ mod tests {
         let err = lanes
             .admit_ingest(
                 FreshnessInputs {
-                    queued_bytes: 60_000,
+                    inflight_bytes: 60_000,
                     incoming_bytes: 1,
                     oldest_queue_age_seconds: 0.0,
                     ..FreshnessInputs::default()
@@ -643,7 +643,7 @@ mod tests {
         let err = lanes
             .admit_ingest(
                 FreshnessInputs {
-                    queued_bytes: 0,
+                    inflight_bytes: 0,
                     buffered_bytes: 12_000,
                     incoming_bytes: 1,
                     oldest_queue_age_seconds: 0.0,
@@ -666,7 +666,7 @@ mod tests {
         lanes
             .admit_ingest(
                 FreshnessInputs {
-                    queued_bytes: 0,
+                    inflight_bytes: 0,
                     incoming_bytes: 1,
                     oldest_queue_age_seconds: 0.0,
                     ..FreshnessInputs::default()
@@ -685,7 +685,7 @@ mod tests {
         lanes
             .admit_ingest(
                 FreshnessInputs {
-                    queued_bytes: 1,
+                    inflight_bytes: 1,
                     incoming_bytes: 1,
                     oldest_queue_age_seconds: 0.0,
                     ..FreshnessInputs::default()

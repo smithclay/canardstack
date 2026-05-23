@@ -40,9 +40,8 @@ pub fn run(args: impl Iterator<Item = String>) -> Result<()> {
         ingest_fixture(&client, &api_key, "/v1/logs", log_fixture(nanos))?;
         ingest_fixture(&client, &api_key, "/v1/traces", trace_fixture(nanos))?;
         ingest_fixture(&client, &api_key, "/v1/metrics", metric_fixture(nanos))?;
-        let flush =
-            client.post_json("/api/admin/maintenance/flush", Some(&admin_key), json!({}))?;
-        ensure_status(&flush, 200, "admin flush")?;
+        let seal = client.post_json("/api/admin/maintenance/seal", Some(&admin_key), json!({}))?;
+        ensure_status(&seal, 200, "admin seal")?;
     }
 
     if mode == Mode::ExpectEmpty {

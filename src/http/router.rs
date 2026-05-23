@@ -216,12 +216,11 @@ fn route_inner(
             state.maintenance.resume();
             Ok(json!({"paused": false}))
         }),
-        ("POST", "/api/admin/maintenance/flush") => admin(headers, state, || {
+        ("POST", "/api/admin/maintenance/seal") => admin(headers, state, || {
             ensure_maintenance_allowed(state)?;
             let started = Instant::now();
-            let result =
-                run_flush_with_lane(state, "admin_flush", crate::maintenance::FlushOptions);
-            record_maintenance_metrics(state, "flush", &result, started);
+            let result = run_seal_with_lane(state, "admin_seal");
+            record_maintenance_metrics(state, "seal", &result, started);
             result
         }),
         ("POST", "/api/admin/maintenance/retention/dry-run") => admin(headers, state, || {
@@ -299,15 +298,11 @@ fn run_maintenance_job(
     result
 }
 
-fn run_flush_with_lane(
-    state: &AppState,
-    triggered_by: &'static str,
-    options: crate::maintenance::FlushOptions,
-) -> Result<Value, ApiError> {
-    let guard = state.lanes.reserve_flush(&state.metrics)?;
+fn run_seal_with_lane(state: &AppState, triggered_by: &'static str) -> Result<Value, ApiError> {
+    let guard = state.lanes.reserve_seal(&state.metrics)?;
     let result = state
         .maintenance
-        .run_flush(&state.ingestor, &state.storage, &state.metrics, options)
+        .run_seal(&state.ingestor, &state.storage, &state.metrics)
         .map_err(storage_error);
     let _ = triggered_by;
     guard.finish(&state.metrics);

@@ -19,7 +19,7 @@ use codec::{
     read_completed_sequences, scan_segment, segment_ids, segment_path, sync_dir, EncodedRecord,
     PreparedRecord,
 };
-pub(in crate::ingest) use ingestor::{AppendRef, FlushRef};
+pub(in crate::ingest) use ingestor::{AppendRef, SealRef};
 pub use writer::Writer;
 
 const RECORD_MAGIC: &[u8; 8] = b"CSRAW01\n";
