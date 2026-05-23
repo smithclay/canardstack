@@ -92,7 +92,7 @@ fn route_inner(
             // the node must report NOT ready even when storage is fine.
             let unhealthy_spools: Vec<Value> = state
                 .ingestor
-                .raw_spool_health_by_lane()
+                .raw_spool_health_by_request_kind()
                 .into_iter()
                 .filter(|(_, (healthy, _))| !healthy)
                 .map(|(request_kind, (_, error))| json!({"request_kind": request_kind, "error": error}))
@@ -176,9 +176,9 @@ fn route_inner(
                     .raw_spool_stats()
                     .map(|stats| json!(stats))
                     .unwrap_or_else(|err| json!({"error": err.to_string()}));
-                let raw_spool_by_lane = state
+                let raw_spool_by_request_kind = state
                     .ingestor
-                    .raw_spool_stats_by_lane()
+                    .raw_spool_stats_by_request_kind()
                     .map(|stats| json!(stats))
                     .unwrap_or_else(|err| json!({"error": err.to_string()}));
                 let body = json!({
@@ -186,7 +186,7 @@ fn route_inner(
                     "inflight": state.ingestor.snapshots(),
                     "admission": state.admission.snapshot_for(state.ingestor.freshness_budget_inputs(&state.storage)),
                     "raw_spool": raw_spool,
-                    "raw_spool_by_lane": raw_spool_by_lane,
+                    "raw_spool_by_request_kind": raw_spool_by_request_kind,
                     "raw_spool_config": {
                         "writer_queue_capacity": state.config.raw_spool_writer_queue_capacity,
                         "group_commit_records": state.config.raw_spool_group_commit_records,

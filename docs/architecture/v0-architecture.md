@@ -172,10 +172,11 @@ Main knobs:
 - `CANARDSTACK_RAW_SPOOL_APPEND_SYNC_MS`
 - `CANARDSTACK_RAW_SPOOL_APPEND_SYNC_BYTES`
 
-`CANARDSTACK_RAW_SPOOL_CAPACITY_BYTES` applies to each raw-spool lane. The
-current lanes are logs, traces, and metrics, so worst-case aggregate raw-spool
-disk use can reach roughly three times the configured value.
-Size the local data directory for the aggregate budget, not just one lane.
+`CANARDSTACK_RAW_SPOOL_CAPACITY_BYTES` applies to each per-request-kind raw
+spool. The current request kinds are logs, traces, and metrics, so worst-case
+aggregate raw-spool disk use can reach roughly three times the configured value.
+Size the local data directory for the aggregate budget, not just one request
+kind.
 
 ## Worker Buffers And Seal
 

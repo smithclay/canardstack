@@ -486,14 +486,14 @@ impl Ingestor {
             return Ok(());
         }
         let started = Instant::now();
-        let mut by_lane_ids = BTreeMap::<OtlpRequestKind, Vec<RecordId>>::new();
+        let mut by_request_kind_ids = BTreeMap::<OtlpRequestKind, Vec<RecordId>>::new();
         for (_, raw_spool_ref) in records {
-            by_lane_ids
+            by_request_kind_ids
                 .entry(raw_spool_ref.spool)
                 .or_default()
                 .push(raw_spool_ref.id);
         }
-        for (request_kind, ids) in by_lane_ids {
+        for (request_kind, ids) in by_request_kind_ids {
             let stats = self
                 .raw_spool_for(request_kind)?
                 .mark_committed_batch(&ids)
@@ -538,20 +538,20 @@ impl Ingestor {
         Ok(aggregate)
     }
 
-    pub fn raw_spool_stats_by_lane(&self) -> Result<BTreeMap<&'static str, super::Stats>> {
-        let mut stats_by_lane = BTreeMap::new();
+    pub fn raw_spool_stats_by_request_kind(&self) -> Result<BTreeMap<&'static str, super::Stats>> {
+        let mut stats_by_request_kind = BTreeMap::new();
         for request_kind in OtlpRequestKind::ALL {
-            stats_by_lane.insert(
+            stats_by_request_kind.insert(
                 request_kind.as_str(),
                 self.raw_spool_for(request_kind)?
                     .stats()
                     .with_context(|| format!("read {request_kind} raw spool stats"))?,
             );
         }
-        Ok(stats_by_lane)
+        Ok(stats_by_request_kind)
     }
 
-    /// True only when every raw-spool lane writer is healthy. A writer
+    /// True only when every raw-spool request-kind writer is healthy. A writer
     /// that cannot read its stats (thread stopped/poisoned) or is in the fatal
     /// append/fsync latch counts as unhealthy so readiness reports NOT ready.
     pub fn raw_spool_healthy(&self) -> bool {
@@ -563,7 +563,7 @@ impl Ingestor {
         })
     }
 
-    /// Force a single raw-spool lane writer into the fatal/unhealthy latch,
+    /// Force a single raw-spool request-kind writer into the fatal/unhealthy latch,
     /// mirroring a real append/fsync failure. Intended for tests that exercise
     /// readiness wiring; gated to debug builds.
     #[doc(hidden)]
@@ -575,9 +575,12 @@ impl Ingestor {
         self.raw_spool_for(request_kind)?.inject_fatal(message)
     }
 
-    /// Per-lane raw-spool writer health, with the latched error message for
-    /// any unhealthy lane so the health JSON can show which lane is wedged.
-    pub fn raw_spool_health_by_lane(&self) -> BTreeMap<&'static str, (bool, Option<String>)> {
+    /// Per-request-kind raw-spool writer health, with the latched error message
+    /// for any unhealthy request kind so the health JSON can show which writer is
+    /// wedged.
+    pub fn raw_spool_health_by_request_kind(
+        &self,
+    ) -> BTreeMap<&'static str, (bool, Option<String>)> {
         let mut health = BTreeMap::new();
         for request_kind in OtlpRequestKind::ALL {
             let entry = match self

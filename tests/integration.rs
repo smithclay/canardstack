@@ -667,15 +667,15 @@ fn admin_ingest_health_includes_raw_spool_backlog() {
     assert_eq!(response.status(), 200, "{}", response.json_body());
     assert_eq!(response.json_body()["raw_spool"]["pending_records"], 1);
     assert_eq!(
-        response.json_body()["raw_spool_by_lane"]["logs"]["pending_records"],
+        response.json_body()["raw_spool_by_request_kind"]["logs"]["pending_records"],
         1
     );
     assert_eq!(
-        response.json_body()["raw_spool_by_lane"]["traces"]["pending_records"],
+        response.json_body()["raw_spool_by_request_kind"]["traces"]["pending_records"],
         0
     );
     assert_eq!(
-        response.json_body()["raw_spool_by_lane"]["metrics"]["pending_records"],
+        response.json_body()["raw_spool_by_request_kind"]["metrics"]["pending_records"],
         0
     );
     assert!(
@@ -726,13 +726,13 @@ fn unhealthy_raw_spool_writer_makes_readiness_not_ready() {
     assert_eq!(healthy.status(), 200, "{}", healthy.json_body());
     assert_eq!(healthy.json_body()["raw_spool_healthy"], true);
 
-    // Wedge one raw-spool lane writer (mirrors a fatal append/fsync failure).
+    // Wedge one raw-spool request-kind writer (mirrors a fatal append/fsync failure).
     state
         .ingestor
         .force_raw_spool_unhealthy(OtlpRequestKind::Logs, "injected fatal for test")
         .unwrap();
 
-    // /healthz must now report NOT ready and name the wedged raw-spool lane.
+    // /healthz must now report NOT ready and name the wedged raw-spool request kind.
     let response = http::route(
         "GET",
         "/healthz",
@@ -752,7 +752,7 @@ fn unhealthy_raw_spool_writer_makes_readiness_not_ready() {
         unhealthy
             .iter()
             .any(|entry| entry["request_kind"] == "logs"),
-        "expected logs raw-spool lane listed as unhealthy: {}",
+        "expected logs raw-spool request kind listed as unhealthy: {}",
         response.json_body()
     );
 
@@ -768,15 +768,15 @@ fn unhealthy_raw_spool_writer_makes_readiness_not_ready() {
     assert_eq!(ingest_health.status(), 503, "{}", ingest_health.json_body());
     assert_eq!(ingest_health.json_body()["raw_spool_healthy"], false);
     assert_eq!(
-        ingest_health.json_body()["raw_spool_by_lane"]["logs"]["healthy"],
+        ingest_health.json_body()["raw_spool_by_request_kind"]["logs"]["healthy"],
         false
     );
     assert_eq!(
-        ingest_health.json_body()["raw_spool_by_lane"]["traces"]["healthy"],
+        ingest_health.json_body()["raw_spool_by_request_kind"]["traces"]["healthy"],
         true
     );
     assert_eq!(
-        ingest_health.json_body()["raw_spool_by_lane"]["metrics"]["healthy"],
+        ingest_health.json_body()["raw_spool_by_request_kind"]["metrics"]["healthy"],
         true
     );
 }
