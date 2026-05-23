@@ -600,16 +600,16 @@ mod snapshot_tests {
             10,
         );
 
-        // Ingest lifecycle stage funnel (per request) and seal-stage funnel
-        // (per seal operation). Both reuse `IngestStage::as_str` vocabulary.
+        // Ingest durable-boundary funnel (per request) and seal-boundary funnel
+        // (per seal operation).
         metrics.inc(
             "canardstack_ingest_stage_total",
-            &[("request_kind", "logs"), ("stage", "durably_spooled")],
+            &[("request_kind", "logs"), ("stage", "spooled")],
             1,
         );
         metrics.inc(
             "canardstack_ingest_seal_stage_total",
-            &[("stage", "ducklake_committed")],
+            &[("stage", "committed")],
             1,
         );
 

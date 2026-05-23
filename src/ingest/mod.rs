@@ -25,6 +25,7 @@ mod worker;
 
 pub use batches::IngestSnapshot;
 pub(in crate::ingest) use lifecycle::IngestStage;
+pub(in crate::ingest) use lifecycle::SealStage;
 use worker::IngestWorkerPool;
 pub(crate) use worker::INGEST_WORKER_CHANNEL_CAPACITY;
 
@@ -84,10 +85,6 @@ pub(in crate::ingest) struct SpooledIngestWork {
     inflight_reservation: admission::InflightReservation,
     runtime_memory_reservation: admission::RuntimeMemoryReservation,
     pub(in crate::ingest) metrics: Arc<Metrics>,
-    /// Explicit lifecycle stage for tracing and the stage counters. See
-    /// [`crate::ingest::lifecycle`] for the authoritative stage map. Advancing it
-    /// never changes control flow.
-    pub(in crate::ingest) stage: IngestStage,
 }
 
 impl Ingestor {
@@ -162,10 +159,9 @@ impl Ingestor {
             metrics.ingest_request(route.as_str(), err.status, err.reason);
             return Err(err);
         }
-        // Every request-path gate passed; the request is admitted but not yet
-        // durably spooled. Enter the lifecycle through the centralized chokepoint.
-        // See `crate::ingest::lifecycle`.
-        let mut stage = lifecycle::enter_admitted(metrics, route);
+        // Every request-path gate passed: the request is accepted. See
+        // `crate::ingest::lifecycle`.
+        lifecycle::record(metrics, route, IngestStage::Accepted);
         let (raw_spool_ref, compressed_body) =
             match self.append_raw_spool(route, headers, compressed_body, metrics) {
                 Ok(appended) => appended,
@@ -175,7 +171,7 @@ impl Ingestor {
                 }
             };
         // `append_raw_spool` succeeded, so the raw request is fsynced.
-        lifecycle::advance(&mut stage, metrics, route, IngestStage::DurablySpooled);
+        lifecycle::record(metrics, route, IngestStage::Spooled);
         let spooled = SpooledIngestWork {
             route,
             headers: headers.clone(),
@@ -184,8 +180,6 @@ impl Ingestor {
             inflight_reservation,
             runtime_memory_reservation,
             metrics: async_metrics,
-            // Carries the local lifecycle stage advanced above.
-            stage,
         };
         self.dispatch_ingest_work(spooled, storage, metrics)
     }
@@ -203,21 +197,12 @@ impl Ingestor {
             mut inflight_reservation,
             mut runtime_memory_reservation,
             metrics,
-            // Lifecycle stage on entry: `DurablySpooled` (set at construction),
-            // or `WorkerDispatched` / `InlineProcessed` if `dispatch_ingest_work`
-            // stamped a dispatch decision. Advanced below as the request walks
-            // toward `ArrowBuffered`; see `crate::ingest::lifecycle`.
-            mut stage,
         } = work;
         let metrics_arc = metrics;
         let metrics = metrics_arc.as_ref();
-        // Record the dispatch decision (`WorkerDispatched` / `InlineProcessed`,
-        // or `DurablySpooled` on replay) before it is advanced through the
-        // per-request stages. See `crate::ingest::lifecycle`.
         tracing::trace!(
             event = "ingest_processing_started",
             request_kind = route.as_str(),
-            stage = stage.as_str(),
         );
         let started = Instant::now();
         let body_result = otlp::decompress_if_needed(
@@ -238,13 +223,7 @@ impl Ingestor {
                 } else {
                     "decode_failed"
                 };
-                self.checkpoint_raw_spool_terminal(
-                    &mut stage,
-                    raw_spool_ref,
-                    route,
-                    reason,
-                    metrics,
-                )?;
+                self.checkpoint_raw_spool_terminal(raw_spool_ref, route, reason, metrics)?;
                 return Err(err);
             }
         };
@@ -253,13 +232,7 @@ impl Ingestor {
             std::borrow::Cow::Owned(bytes) => bytes.len(),
         };
         if let Err(err) = validation::validate_body_size(body.len(), &self.config) {
-            self.checkpoint_raw_spool_terminal(
-                &mut stage,
-                raw_spool_ref,
-                route,
-                "body_size_invalid",
-                metrics,
-            )?;
+            self.checkpoint_raw_spool_terminal(raw_spool_ref, route, "body_size_invalid", metrics)?;
             return Err(err);
         }
         let started = Instant::now();
@@ -276,7 +249,6 @@ impl Ingestor {
             Ok(transformed) => transformed,
             Err(err) => {
                 self.checkpoint_raw_spool_terminal(
-                    &mut stage,
                     raw_spool_ref,
                     route,
                     "transform_failed",
@@ -286,7 +258,7 @@ impl Ingestor {
             }
         };
         // otlp2records produced Arrow batches; see `crate::ingest::lifecycle`.
-        lifecycle::advance(&mut stage, metrics, route, IngestStage::Transformed);
+        lifecycle::record(metrics, route, IngestStage::Transformed);
         let unsupported_histograms = transformed.unsupported_histograms;
         let started = Instant::now();
         let skew_result = self.validate_skew(&transformed);
@@ -297,7 +269,6 @@ impl Ingestor {
         );
         if let Err(err) = skew_result {
             self.checkpoint_raw_spool_terminal(
-                &mut stage,
                 raw_spool_ref,
                 route,
                 "timestamp_rejected",
@@ -329,23 +300,11 @@ impl Ingestor {
             .saturating_add(decoded_body_materialized_bytes)
             .saturating_add(pending_bytes);
         if let Err(err) = runtime_memory_reservation.reserve_at_least(peak_bytes, route, metrics) {
-            self.checkpoint_raw_spool_terminal(
-                &mut stage,
-                raw_spool_ref,
-                route,
-                "memory_rejected",
-                metrics,
-            )?;
+            self.checkpoint_raw_spool_terminal(raw_spool_ref, route, "memory_rejected", metrics)?;
             return Err(err);
         }
         if batches.is_empty() {
-            self.checkpoint_raw_spool_terminal(
-                &mut stage,
-                raw_spool_ref,
-                route,
-                "transform_empty",
-                metrics,
-            )?;
+            self.checkpoint_raw_spool_terminal(raw_spool_ref, route, "transform_empty", metrics)?;
             return Ok(());
         }
 
@@ -380,7 +339,6 @@ impl Ingestor {
                 tracing::warn!(
                     event = "ingest_storage_insert_failed",
                     request_kind = route.as_str(),
-                    stage = stage.as_str(),
                     error = %err
                 );
                 return Err(
@@ -391,7 +349,7 @@ impl Ingestor {
         };
         // Rows reached the Arrow write buffer; the per-request phase terminus.
         // See `crate::ingest::lifecycle`.
-        lifecycle::advance(&mut stage, metrics, route, IngestStage::ArrowBuffered);
+        lifecycle::record(metrics, route, IngestStage::Buffered);
         observe_storage_timings(metrics, &buffered.timings);
         metrics.inc(
             "canardstack_ingest_storage_insert_total",
@@ -406,11 +364,7 @@ impl Ingestor {
         // for the seal-side hops that take the tracked record to a checkpoint.
         self.track_raw_spool_record(raw_spool_ref, route);
         drop(inflight_reservation);
-        tracing::debug!(
-            event = "ingest_buffered",
-            request_kind = route.as_str(),
-            stage = stage.as_str(),
-        );
+        tracing::debug!(event = "ingest_buffered", request_kind = route.as_str(),);
 
         let accepted = buffered_totals
             .values()
@@ -462,11 +416,8 @@ impl Ingestor {
         // Round-robin to the first worker with buffer space. On a successful send
         // the function returns directly from inside the loop; if every worker is
         // full (or the pool is gone) the still-owned `work` falls through to the
-        // caller-runs path below. The single authoritative `work.stage` carries the
-        // dispatch hop: the receiving worker advances `WorkerDispatched` on receipt
-        // (`run_ingest_worker`), and the caller-runs path below advances
-        // `InlineProcessed`. See `crate::ingest::lifecycle`.
-        let mut work = {
+        // caller-runs path below.
+        let work = {
             let mut pool = self.ingest_workers.lock_or_poisoned();
             let mut work = work;
             if let Some(dispatcher) = pool.as_mut() {
@@ -490,11 +441,6 @@ impl Ingestor {
                                     &[("request_kind", route.as_str()), ("outcome", "queued")],
                                     1,
                                 );
-                                // Lifecycle funnel: the receiving worker advances the
-                                // single authoritative `work.stage` to
-                                // `WorkerDispatched` on receipt (`run_ingest_worker`),
-                                // so the stage travels with the work rather than a
-                                // mirror. See `crate::ingest::lifecycle`.
                                 return Ok(json!({
                                     "accepted": true,
                                     "acknowledgement": "locally_spooled"
@@ -542,16 +488,9 @@ impl Ingestor {
                 "ingest worker pool saturated; processing inline on the connection thread (back-pressure via latency)"
             );
         }
-        // Caller-runs path: no worker took the handoff, so advance the single
-        // authoritative `work.stage` to `InlineProcessed` through the centralized
-        // chokepoint (the `DurablySpooled -> InlineProcessed` hop) and process
-        // inline. See `crate::ingest::lifecycle`.
-        lifecycle::advance(
-            &mut work.stage,
-            metrics,
-            route,
-            IngestStage::InlineProcessed,
-        );
+        // Caller-runs path: no worker took the handoff, so process the work inline
+        // on this thread. The per-request boundary counters fire inside
+        // `process_spooled_ingest` itself. See `crate::ingest::lifecycle`.
         let result = self.process_spooled_ingest(work, storage);
         self.record_inflight_metrics(metrics);
         // The raw request is durably spooled, so the 202 acknowledgement holds

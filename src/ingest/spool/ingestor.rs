@@ -1,6 +1,6 @@
 use super::{full_info, AppendBatchStats, CheckpointBatchStats, Record, RecordId, Writer};
 use crate::admission_control::AdmissionController;
-use crate::ingest::{IngestStage, Ingestor, OtlpRequestKind};
+use crate::ingest::{lifecycle, IngestStage, Ingestor, OtlpRequestKind, SealStage};
 use crate::metrics::Metrics;
 use crate::storage::{ArrowFlushOutcome, Storage, TimingPhase};
 use crate::validation::{self, ApiError, ApiResult};
@@ -147,6 +147,9 @@ impl Ingestor {
             .map_err(|err| anyhow::anyhow!(err.message.clone()))?;
         self.ensure_ingest_workers_available(route, metrics.as_ref())
             .map_err(|err| anyhow::anyhow!(err.message.clone()))?;
+        // The recovered record is already durably spooled; emit the `spooled`
+        // boundary for funnel consistency. See `crate::ingest::lifecycle`.
+        lifecycle::record(metrics.as_ref(), route, IngestStage::Spooled);
         let work = crate::ingest::SpooledIngestWork {
             route,
             headers: headers.clone(),
@@ -155,10 +158,6 @@ impl Ingestor {
             inflight_reservation,
             runtime_memory_reservation,
             metrics: metrics.clone(),
-            // Replayed from the durable raw spool, so the record begins already
-            // durably spooled. Enter the lifecycle through the centralized
-            // chokepoint. See `crate::ingest::lifecycle`.
-            stage: crate::ingest::lifecycle::enter_spooled(metrics.as_ref(), route),
         };
         self.dispatch_ingest_work(work, storage, metrics.as_ref())
             .map(|_| ())
@@ -166,7 +165,7 @@ impl Ingestor {
     }
 
     /// Record that a durably-spooled request's rows are now in the Arrow write
-    /// buffer (the [`IngestStage::ArrowBuffered`] hop in
+    /// buffer (the [`IngestStage::Buffered`] boundary in
     /// [`crate::ingest::lifecycle`]). The scheduler checkpoints the record after
     /// the next durable DuckLake commit (see
     /// [`Ingestor::seal_committed_to_storage`]). Called only after a successful
@@ -184,12 +183,12 @@ impl Ingestor {
         );
     }
 
-    /// Single seal driver, walking the seal-phase stages in
-    /// [`crate::ingest::lifecycle`]: capture the records to checkpoint
-    /// ([`IngestStage::CapturedForSeal`]), force-flush the whole Arrow write
-    /// buffer to durable DuckLake storage ([`IngestStage::DuckLakeCommitted`]),
-    /// then checkpoint exactly the captured records
-    /// ([`IngestStage::RawSpoolCheckpointed`]). Capturing before flushing is
+    /// Single seal driver, emitting the seal-phase boundaries in
+    /// [`crate::ingest::lifecycle`]: capture the records to checkpoint, force-flush
+    /// the whole Arrow write buffer to durable DuckLake storage
+    /// ([`SealStage::Committed`]), then checkpoint exactly the captured records
+    /// ([`SealStage::Checkpointed`]), or mark [`SealStage::DuplicateRisk`] if the
+    /// checkpoint fails after the commit. Capturing before flushing is
     /// load-bearing for at-least-once: a record appended after the capture is not
     /// checkpointed until a later seal, so we never checkpoint rows that were not
     /// storage-committed.
@@ -199,25 +198,15 @@ impl Ingestor {
         metrics: &Metrics,
     ) -> Result<ArrowFlushOutcome> {
         let captured = self.capture_committed_refs();
-        // Per-seal-operation funnel (NOT per record), enforced through the
-        // centralized seal chokepoint. Guarded on a non-empty capture so the
-        // periodic scheduler seal that finds nothing buffered does not inflate the
-        // count: an idle seal still flushes/commits an empty buffer but
-        // checkpoints no records, so counting it would muddy the funnel. The
-        // `seal_stage` var carries the seal lifecycle through `seal_advance`. See
-        // `crate::ingest::lifecycle`.
-        let mut seal_stage = IngestStage::CapturedForSeal;
-        // Context-rich seal-phase trace, carrying the stage as a field (context,
-        // not the centralized stage event/counter — those fire in `seal_enter` /
-        // `seal_advance`).
+        // The seal counters are guarded on a non-empty capture so the periodic
+        // scheduler seal that finds nothing buffered does not inflate the funnel:
+        // an idle seal still flushes/commits an empty buffer but checkpoints no
+        // records.
+        let seal_records = !captured.is_empty();
         tracing::debug!(
             event = "seal_captured_refs",
-            stage = IngestStage::CapturedForSeal.as_str(),
             captured_records = captured.len(),
         );
-        if !captured.is_empty() {
-            seal_stage = crate::ingest::lifecycle::seal_enter(metrics);
-        }
         let outcome = match storage.flush_arrow_write_buffer(true) {
             Ok(outcome) => outcome,
             Err(err) => {
@@ -227,60 +216,39 @@ impl Ingestor {
         };
         tracing::debug!(
             event = "seal_ducklake_committed",
-            stage = IngestStage::DuckLakeCommitted.as_str(),
             flushed_rows = outcome.flushed_rows,
         );
-        if !captured.is_empty() {
-            crate::ingest::lifecycle::seal_advance(
-                &mut seal_stage,
-                metrics,
-                IngestStage::DuckLakeCommitted,
-            );
+        if seal_records {
+            lifecycle::record_seal(metrics, SealStage::Committed);
         }
         observe_arrow_flush(metrics, &outcome);
         match self.checkpoint_raw_spool_batch(&captured, "storage_committed", Some(metrics)) {
             Ok(()) => {
                 tracing::debug!(
                     event = "seal_raw_spool_checkpointed",
-                    stage = IngestStage::RawSpoolCheckpointed.as_str(),
                     checkpointed_records = captured.len(),
                 );
-                if !captured.is_empty() {
-                    crate::ingest::lifecycle::seal_advance(
-                        &mut seal_stage,
-                        metrics,
-                        IngestStage::RawSpoolCheckpointed,
-                    );
+                if seal_records {
+                    lifecycle::record_seal(metrics, SealStage::Checkpointed);
                 }
             }
             Err(err) => {
                 // Rows are durably committed; only the raw-spool checkpoint
-                // failed. This is the `CommittedNotCheckpointed` duplicate-risk
-                // stage: the records stay pending and replay as duplicate ROWS in
+                // failed. The records stay pending and replay as duplicate ROWS in
                 // storage on a future restart. The checkpoint deliberately
                 // follows the DuckLake COMMIT (capture before flush, checkpoint
                 // after commit), so any crash or checkpoint failure between commit
                 // and checkpoint re-ingests already-committed records. v0 does NOT
                 // dedup, so those duplicate rows are surfaced verbatim to queries
-                // after crash-replay. See `crate::ingest::lifecycle`.
+                // after crash-replay. This branch only runs for a non-empty
+                // capture (an empty checkpoint batch returns Ok), so it is always a
+                // real per-seal duplicate-risk event. See `crate::ingest::lifecycle`.
                 tracing::error!(
                     event = "raw_spool_checkpoint_failed",
-                    stage = IngestStage::CommittedNotCheckpointed.as_str(),
                     error = %err,
                     "Arrow flush committed but raw spool checkpoint failed; records left pending"
                 );
-                // The duplicate-risk signal: committed to DuckLake but the
-                // raw-spool checkpoint failed. This branch only runs for a
-                // non-empty capture (an empty checkpoint batch returns Ok), so it
-                // is always a real per-seal duplicate-risk event; advance the seal
-                // lifecycle through the centralized chokepoint (the single emit of
-                // the `committed_not_checkpointed` seal counter). See
-                // `crate::ingest::lifecycle`.
-                crate::ingest::lifecycle::seal_advance(
-                    &mut seal_stage,
-                    metrics,
-                    IngestStage::CommittedNotCheckpointed,
-                );
+                lifecycle::record_seal(metrics, SealStage::DuplicateRisk);
             }
         }
         Ok(outcome)
@@ -492,17 +460,14 @@ impl Ingestor {
     }
 
     /// Terminal disposition for a payload that can never succeed: checkpoint the
-    /// raw-spool record so it will not replay. This is the
-    /// [`IngestStage::TerminallyRejectedCheckpointed`] hop in
-    /// [`crate::ingest::lifecycle`]; the caller returns the rejection afterward.
-    /// (Retryable storage faults do NOT take this path — they leave the record
-    /// pending so it replays on restart.) Advances the per-request lifecycle
-    /// through the centralized chokepoint, so the legal from-stage
-    /// (`WorkerDispatched` / `InlineProcessed` / `Transformed`) is `debug_assert!`
-    /// -enforced and the stage counter is emitted from exactly one place.
+    /// raw-spool record so it will not replay; the caller returns the rejection
+    /// afterward. (Retryable storage faults do NOT take this path — they leave the
+    /// record pending so it replays on restart.) A terminally-rejected request is
+    /// dropped from the lifecycle funnel and stays covered by
+    /// `canardstack_raw_spool_checkpointed_records_total{reason}` and
+    /// `canardstack_ingest_requests_total{reason}`; no stage counter is emitted.
     pub(in crate::ingest) fn checkpoint_raw_spool_terminal(
         &self,
-        stage: &mut IngestStage,
         raw_spool_ref: AppendRef,
         route: OtlpRequestKind,
         reason: &'static str,
@@ -511,14 +476,7 @@ impl Ingestor {
         tracing::debug!(
             event = "ingest_terminally_rejected",
             request_kind = route.as_str(),
-            stage = IngestStage::TerminallyRejectedCheckpointed.as_str(),
             reason,
-        );
-        crate::ingest::lifecycle::advance(
-            stage,
-            metrics,
-            route,
-            IngestStage::TerminallyRejectedCheckpointed,
         );
         self.checkpoint_raw_spool(raw_spool_ref, route, reason, Some(metrics))
             .map_err(|err| {

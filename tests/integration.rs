@@ -1161,18 +1161,12 @@ fn ingest_stage_metrics_separate_transform_enqueue_and_storage_visibility() {
         "{metrics}"
     );
 
-    // The lifecycle stage counters track this same path end to end (the contract
-    // behind the test name). Pin the WHOLE happy-path funnel: every per-request hop
-    // from admission through the worker to the Arrow buffer, then every seal hop
-    // from capture through checkpoint.
+    // The durable-boundary counters track this same path end to end (the contract
+    // behind the test name). Pin the WHOLE happy-path funnel: every per-request
+    // boundary from admission through to the Arrow buffer, then the seal
+    // boundaries from commit through checkpoint.
     let metrics = metrics_text(&state);
-    for stage in [
-        "admitted_not_spooled",
-        "durably_spooled",
-        "worker_dispatched",
-        "transformed",
-        "arrow_buffered",
-    ] {
+    for stage in ["accepted", "spooled", "transformed", "buffered"] {
         assert!(
             metrics.contains(&format!(
                 "canardstack_ingest_stage_total{{request_kind=\"logs\",stage=\"{stage}\"}} 1"
@@ -1180,11 +1174,7 @@ fn ingest_stage_metrics_separate_transform_enqueue_and_storage_visibility() {
             "missing ingest stage {stage}: {metrics}"
         );
     }
-    for stage in [
-        "captured_for_seal",
-        "ducklake_committed",
-        "raw_spool_checkpointed",
-    ] {
+    for stage in ["committed", "checkpointed"] {
         assert!(
             metrics.contains(&format!(
                 "canardstack_ingest_seal_stage_total{{stage=\"{stage}\"}} 1"
@@ -1192,19 +1182,12 @@ fn ingest_stage_metrics_separate_transform_enqueue_and_storage_visibility() {
             "missing seal stage {stage}: {metrics}"
         );
     }
-    // The happy worker path takes neither alternative branch: no inline fallback,
-    // no terminal rejection, no commit-without-checkpoint. Pinning their absence
-    // completes the lifecycle contract (which hops fire AND which do not).
-    for absent in [
-        "canardstack_ingest_stage_total{request_kind=\"logs\",stage=\"inline_processed\"}",
-        "canardstack_ingest_stage_total{request_kind=\"logs\",stage=\"terminally_rejected_checkpointed\"}",
-        "canardstack_ingest_seal_stage_total{stage=\"committed_not_checkpointed\"}",
-    ] {
-        assert!(
-            !metrics.contains(absent),
-            "unexpected stage on the happy worker path: {absent}\n{metrics}"
-        );
-    }
+    // The happy path commits AND checkpoints, so the at-least-once duplicate-risk
+    // hazard marker must be absent.
+    assert!(
+        !metrics.contains("canardstack_ingest_seal_stage_total{stage=\"duplicate_risk\"}"),
+        "unexpected duplicate_risk on the happy seal path: {metrics}"
+    );
 }
 
 #[test]
