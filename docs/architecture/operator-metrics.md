@@ -85,9 +85,7 @@ Do not label metrics by `service_name`, trace id, query text, API key, or arbitr
 | `canardstack_ingest_unsupported_histograms_total` | Counter | `request_kind` | Histogram datapoints observed and dropped by the v0 metrics transformer. Emitted only when nonzero. |
 | `canardstack_ingest_buffered_rows_total` | Counter | `storage_signal` | Rows appended to the Arrow write buffer. |
 | `canardstack_ingest_buffered_bytes_total` | Counter | `storage_signal` | Approximate Arrow bytes appended to the Arrow write buffer. |
-| `canardstack_ingest_inflight_bytes` | Gauge | `storage_signal` | Bytes admitted (spooled, handed to a worker) but not yet appended to the Arrow write buffer. Peaks are derivable with `max_over_time()`. |
-| `canardstack_ingest_inflight_capacity_bytes` | Gauge | `storage_signal` | Per-storage-signal in-flight pressure reference (the `inflight_pressure` denominator). Not an admission ceiling — freshness-first admission is the sole soft shed. |
-| `canardstack_ingest_inflight_pressure` | Gauge | `storage_signal` | In-flight bytes as a fraction of the per-storage-signal pressure reference (`0..1`). Peaks are derivable with `max_over_time()`. |
+| `canardstack_ingest_inflight_bytes` | Gauge | `storage_signal` | Bytes admitted (spooled, handed to a worker) but not yet appended to the Arrow write buffer. Feeds the freshness in-flight total. Peaks are derivable with `max_over_time()`. |
 | `canardstack_ingest_worker_queue_capacity` | Gauge | `state=capacity` | Configured bounded worker channel capacity. |
 | `canardstack_ingest_worker_dispatch_total` | Counter | `request_kind`, `outcome` | Worker-channel handoff outcomes: `queued`, `processed_inline`, or `workers_unavailable`. A rising `outcome="processed_inline"` rate signals worker-pool saturation: every worker channel was full, so the request was processed inline on the connection thread (back-pressure via latency). The first transition into each saturation episode also emits the `ingest_worker_pool_saturated` log event (logged once per episode, cleared on the next successful queued dispatch). |
 | `canardstack_ingest_storage_insert_total` | Counter | `request_kind`, `status` | Worker appends of Arrow batches into the Arrow write buffer. |
@@ -216,6 +214,7 @@ The metrics diet dropped the following derivable / superseded series. Use the
 listed replacement instead:
 
 - `canardstack_ingest_inflight_bytes_max`, `canardstack_ingest_inflight_pressure_max` (use `max_over_time()` of the live gauges).
+- `canardstack_ingest_inflight_capacity_bytes`, `canardstack_ingest_inflight_pressure` (vestigial of the dropped per-signal in-flight ceiling; freshness-first admission is the sole soft shed, so there is no per-signal capacity denominator to express a pressure fraction against).
 - `canardstack_raw_spool_append_batch_records`, `canardstack_raw_spool_append_batch_encoded_bytes` gauges (the `*_total` counters remain; per-batch averages are derivable).
 - The aggregate (no-`request_kind`) copies of the raw-spool gauges/counters (use `sum without(request_kind)`).
 - `canardstack_ingest_rejections_total`, `canardstack_query_rejections_total` (use the `status=~"429\|503"` / `status="429"` subset of `*_requests_total`).

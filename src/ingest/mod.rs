@@ -566,8 +566,8 @@ impl Ingestor {
     /// Single ingest admission gate: project visibility through the freshness
     /// budget (the sole soft shed) before the durable raw-spool append, so a
     /// rejection never spools. On admission, take the per-storage-signal
-    /// in-flight reservation — pure accounting that feeds the freshness total and
-    /// the pressure gauges; it never rejects.
+    /// in-flight reservation — pure accounting that feeds the freshness total;
+    /// it never rejects.
     fn admit_and_reserve_inflight(
         &self,
         route: OtlpRequestKind,
@@ -616,21 +616,11 @@ impl Ingestor {
     }
 
     pub fn snapshots(&self) -> Vec<IngestSnapshot> {
-        let capacity = self.inflight.capacity_bytes();
         StorageSignal::ALL
             .into_iter()
-            .map(|signal| {
-                let inflight_bytes = self.inflight.signal_bytes(signal);
-                IngestSnapshot {
-                    storage_signal: signal.as_str(),
-                    inflight_bytes,
-                    inflight_capacity_bytes: capacity,
-                    inflight_pressure: if capacity == 0 {
-                        0.0
-                    } else {
-                        inflight_bytes as f64 / capacity as f64
-                    },
-                }
+            .map(|signal| IngestSnapshot {
+                storage_signal: signal.as_str(),
+                inflight_bytes: self.inflight.signal_bytes(signal),
             })
             .collect()
     }
@@ -641,16 +631,6 @@ impl Ingestor {
                 "canardstack_ingest_inflight_bytes",
                 &[("storage_signal", snapshot.storage_signal)],
                 snapshot.inflight_bytes as f64,
-            );
-            metrics.gauge(
-                "canardstack_ingest_inflight_pressure",
-                &[("storage_signal", snapshot.storage_signal)],
-                snapshot.inflight_pressure,
-            );
-            metrics.gauge(
-                "canardstack_ingest_inflight_capacity_bytes",
-                &[("storage_signal", snapshot.storage_signal)],
-                snapshot.inflight_capacity_bytes as f64,
             );
         }
     }

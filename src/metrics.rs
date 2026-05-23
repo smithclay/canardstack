@@ -600,21 +600,12 @@ mod snapshot_tests {
             10,
         );
 
-        // In-flight gauges (the `_max` derivatives were dropped).
+        // In-flight gauge (the `_max`, `_pressure`, and `_capacity_bytes`
+        // derivatives were dropped).
         metrics.gauge(
             "canardstack_ingest_inflight_bytes",
             &[("storage_signal", "logs")],
             0.0,
-        );
-        metrics.gauge(
-            "canardstack_ingest_inflight_pressure",
-            &[("storage_signal", "logs")],
-            0.0,
-        );
-        metrics.gauge(
-            "canardstack_ingest_inflight_capacity_bytes",
-            &[("storage_signal", "logs")],
-            1.0,
         );
 
         // Runtime memory.
@@ -900,9 +891,7 @@ mod snapshot_tests {
             "canardstack_ingest_buffered_rows_total",
             "canardstack_ingest_decoded_bytes_total",
             "canardstack_ingest_inflight_bytes",
-            "canardstack_ingest_inflight_capacity_bytes",
             "canardstack_ingest_inflight_memory_bound_bytes",
-            "canardstack_ingest_inflight_pressure",
             "canardstack_ingest_records_total",
             "canardstack_ingest_request_bytes_total",
             "canardstack_ingest_requests_total",
@@ -963,6 +952,8 @@ mod snapshot_tests {
     const DROPPED_NAMES: &[&str] = &[
         "canardstack_ingest_inflight_bytes_max",
         "canardstack_ingest_inflight_pressure_max",
+        "canardstack_ingest_inflight_capacity_bytes",
+        "canardstack_ingest_inflight_pressure",
         "canardstack_raw_spool_append_batch_records",
         "canardstack_raw_spool_append_batch_encoded_bytes",
         "canardstack_ingest_rejections_total",

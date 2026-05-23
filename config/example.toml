@@ -26,7 +26,6 @@ memory_limit = "1GiB"
 
 [ingest]
 max_body_bytes = 8388608
-memory_bytes = 2147483648
 # process_memory_limit_bytes = 3221225472
 seal_rate_seed_bytes = 4194304
 seal_rate_seed_window_secs = 10

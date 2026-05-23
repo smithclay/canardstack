@@ -62,7 +62,7 @@ OTLP/HTTP (JSON or protobuf, optional gzip)
   -> validation (auth, content type, size, timestamp skew)
   -> local fsync raw spool
   -> otlp2records -> Arrow RecordBatch grouped by storage signal
-  -> freshness-first admission (freshness budget; per-storage-signal in-flight bytes are accounting + pressure reference)
+  -> freshness-first admission (freshness budget; per-storage-signal in-flight bytes are pure accounting that feeds the freshness total)
   -> ingest worker pool inserts into the Arrow write buffer
   -> scheduler single seal driver -> immutable Parquet segment files registered with DuckLake
   -> bounded compat query adapters for Prometheus / Loki / Tempo subsets

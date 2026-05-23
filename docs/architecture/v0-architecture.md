@@ -62,11 +62,9 @@ projects seal visibility through the admission controller and is shed with `429`
 when projected visibility exceeds the freshness budget. That freshness
 projection is the sole soft shed; the optional process RSS limit
 (`runtime_memory_full`) is the sole hard cap. The per-storage-signal in-flight
-bytes are pure accounting plus a soft pressure reference: the freshness
-projection consumes their total, and the
-`canardstack_ingest_inflight_pressure` / `canardstack_ingest_inflight_capacity_bytes`
-gauges expose per-signal occupancy against that reference. They no longer gate
-admission. There is no separate in-memory queue and no separate storage-sink
+bytes are pure accounting: the freshness projection consumes their total, and
+the `canardstack_ingest_inflight_bytes` gauge exposes per-signal occupancy.
+They do not gate admission. There is no separate in-memory queue and no separate storage-sink
 worker: ingest workers insert directly into the Arrow write buffer, and a single
 scheduler-driven seal driver is the only path that flushes that buffer to
 DuckLake and checkpoints the raw spool.
@@ -195,8 +193,8 @@ storage signal plus source encoding.
 Memory and worker-buffer guardrails:
 
 - `CANARDSTACK_MAX_BODY_BYTES`, default 8 MiB.
-- `CANARDSTACK_INGEST_MEMORY_BYTES`, default 2 GiB. The per-signal in-flight
-  ceiling derives from this total budget.
+- There is no per-signal ingest memory budget knob; the freshness projection
+  (and the optional process RSS limit) are the only memory backstops.
 - `CANARDSTACK_INGEST_WORKERS`, default 4 ingest workers.
 - `CANARDSTACK_INGEST_WORKER_CHANNEL_CAPACITY`, default 1024 in-flight handoffs,
   split across workers.

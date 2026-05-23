@@ -106,25 +106,18 @@ impl Drop for RuntimeMemoryReservation {
 /// soft shed for ingest: it projects seal visibility from the in-flight TOTAL
 /// this tracker exposes and rejects with 429 when projected visibility exceeds
 /// the freshness budget. The optional process RSS limit
-/// ([`RuntimeMemoryReservation`]) is the sole hard cap. This tracker is now
-/// pure accounting plus a soft pressure reference; it no longer enforces a
-/// per-signal admission ceiling and never rejects. It is lock-free: the former
-/// watermark/hysteresis credit ledger collapsed into plain atomics.
+/// ([`RuntimeMemoryReservation`]) is the sole hard cap. This tracker is pure
+/// per-signal accounting that feeds the freshness in-flight total; it enforces
+/// no admission ceiling and never rejects. It is lock-free: the per-signal
+/// counters are plain atomics.
 pub(super) struct InflightBytes {
     counters: [AtomicUsize; StorageSignal::ALL.len()],
-    /// Soft pressure reference only: the denominator for `inflight_pressure`,
-    /// consumed by the scheduler's metadata-yield heuristic and exported via the
-    /// `canardstack_ingest_inflight_capacity_bytes` /
-    /// `canardstack_ingest_inflight_pressure` gauges. It is NOT an admission
-    /// ceiling — freshness-first admission is the sole soft shed.
-    per_signal_pressure_reference_bytes: usize,
 }
 
 impl InflightBytes {
-    pub(super) fn new(config: &Config) -> Self {
+    pub(super) fn new(_config: &Config) -> Self {
         Self {
             counters: std::array::from_fn(|_| AtomicUsize::new(0)),
-            per_signal_pressure_reference_bytes: config.per_signal_inflight_bytes.max(1),
         }
     }
 
@@ -137,10 +130,6 @@ impl InflightBytes {
 
     pub(super) fn signal_bytes(&self, signal: StorageSignal) -> usize {
         self.counters[signal_index(signal)].load(Ordering::Acquire)
-    }
-
-    pub(super) fn capacity_bytes(&self) -> usize {
-        self.per_signal_pressure_reference_bytes
     }
 
     pub(super) fn estimate_for_request(

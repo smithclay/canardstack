@@ -1,6 +1,5 @@
 use crate::app::AppState;
 use crate::config::Config;
-use crate::ingest::IngestSnapshot;
 use crate::storage::{RetentionPolicy, Storage};
 use crate::LockExt;
 use anyhow::Result;
@@ -12,7 +11,11 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 const SCHEDULER_METADATA_REFRESH_BUCKET_LIMIT: usize = 1;
-const METADATA_REFRESH_INFLIGHT_PRESSURE_YIELD: f64 = 0.70;
+/// Fraction of the freshness-budget SLA (max Arrow-write-buffer age / SLA) at
+/// which the scheduler yields the metadata-refresh tick, so discovery
+/// re-aggregation never competes with the writer while a seal is approaching
+/// due.
+const METADATA_REFRESH_BUFFER_AGE_YIELD: f64 = 0.70;
 /// Fraction of the freshness-budget SLA at which the single scheduler thread
 /// stops running non-seal maintenance (metadata refresh, metrics snapshot,
 /// retention) for the tick. Past this point the Arrow-write-buffer age is close
@@ -271,12 +274,10 @@ fn scheduler_loop(state: Arc<AppState>, stop: Arc<AtomicBool>) {
 
         if !seal_priority_active && now >= next_metadata {
             let ok = run_job(&state, "metadata_refresh", |s| {
-                let snapshots = s.ingestor.snapshots();
-                if metadata_refresh_should_yield_to_ingest(&snapshots, buffer_age_pressure) {
+                if metadata_refresh_should_yield_to_ingest(buffer_age_pressure) {
                     return Ok(json!({
                         "status": "skipped",
                         "reason": "ingest_pressure",
-                        "max_inflight_pressure": max_inflight_pressure(&snapshots),
                         "buffer_age_pressure": buffer_age_pressure
                     }));
                 }
@@ -387,23 +388,12 @@ fn next_interval(state: &AppState, job: &str, base: Duration, ok: bool) -> Durat
     backoff.min(Duration::from_secs(300)).max(base)
 }
 
-/// Yield the metadata-refresh tick when either ingest in-flight pressure or
-/// Arrow-write-buffer age pressure (max buffer age / freshness SLA) crosses the
-/// yield threshold, so discovery re-aggregation never competes with the writer
-/// while ingest is hot or a seal is approaching due.
-fn metadata_refresh_should_yield_to_ingest(
-    snapshots: &[IngestSnapshot],
-    buffer_age_pressure: f64,
-) -> bool {
-    max_inflight_pressure(snapshots) >= METADATA_REFRESH_INFLIGHT_PRESSURE_YIELD
-        || buffer_age_pressure >= METADATA_REFRESH_INFLIGHT_PRESSURE_YIELD
-}
-
-fn max_inflight_pressure(snapshots: &[IngestSnapshot]) -> f64 {
-    snapshots
-        .iter()
-        .map(|snapshot| snapshot.inflight_pressure)
-        .fold(0.0, f64::max)
+/// Yield the metadata-refresh tick when Arrow-write-buffer age pressure (max
+/// buffer age / freshness SLA) crosses the yield threshold, so discovery
+/// re-aggregation never competes with the writer while a seal is approaching
+/// due.
+fn metadata_refresh_should_yield_to_ingest(buffer_age_pressure: f64) -> bool {
+    buffer_age_pressure >= METADATA_REFRESH_BUFFER_AGE_YIELD
 }
 
 /// Bounded `reason` label. Most reasons derive from `job` (a static str we
@@ -426,41 +416,17 @@ fn classify_job_error(err: &anyhow::Error, job: &str) -> &'static str {
 mod tests {
     use super::*;
 
-    fn snapshot(signal: &'static str, inflight_pressure: f64) -> IngestSnapshot {
-        IngestSnapshot {
-            storage_signal: signal,
-            inflight_bytes: 0,
-            inflight_capacity_bytes: 0,
-            inflight_pressure,
-        }
-    }
-
     #[test]
-    fn metadata_refresh_yields_to_high_inflight_pressure() {
-        assert!(metadata_refresh_should_yield_to_ingest(
-            &[
-                snapshot("logs", 0.10),
-                snapshot("spans", METADATA_REFRESH_INFLIGHT_PRESSURE_YIELD),
-            ],
-            0.0,
-        ));
-    }
-
-    #[test]
-    fn metadata_refresh_runs_when_inflight_pressure_below_threshold() {
-        assert!(!metadata_refresh_should_yield_to_ingest(
-            &[snapshot("logs", 0.69), snapshot("spans", 0.10)],
-            0.0,
-        ));
+    fn metadata_refresh_runs_when_buffer_age_pressure_below_threshold() {
+        assert!(!metadata_refresh_should_yield_to_ingest(0.69));
     }
 
     #[test]
     fn metadata_refresh_yields_to_high_buffer_age_pressure_alone() {
-        // No inflight pressure, but the oldest buffer is past the yield
-        // threshold fraction of the SLA -> still yield so the seal stays ahead.
+        // The oldest buffer is past the yield threshold fraction of the SLA ->
+        // yield so the seal stays ahead of discovery re-aggregation.
         assert!(metadata_refresh_should_yield_to_ingest(
-            &[snapshot("logs", 0.10), snapshot("spans", 0.10)],
-            METADATA_REFRESH_INFLIGHT_PRESSURE_YIELD,
+            METADATA_REFRESH_BUFFER_AGE_YIELD
         ));
     }
 }
