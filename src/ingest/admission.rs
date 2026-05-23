@@ -285,24 +285,22 @@ fn inflight_estimate_by_request(
     compressed_body_bytes: usize,
     max_body_bytes: usize,
 ) -> BTreeMap<StorageSignal, usize> {
-    match route {
-        OtlpRequestKind::Logs => BTreeMap::from([(
-            StorageSignal::Logs,
-            inflight_estimate_bytes(headers, compressed_body_bytes, max_body_bytes),
-        )]),
-        OtlpRequestKind::Traces => BTreeMap::from([(
-            StorageSignal::Spans,
-            inflight_estimate_bytes(headers, compressed_body_bytes, max_body_bytes),
-        )]),
+    // Metric requests fan out into gauge+sum and carry more per-byte expansion;
+    // pick the estimate once, then assign it to each storage signal the request
+    // fans out to.
+    let bytes = match route {
         OtlpRequestKind::Metrics => {
-            let bytes =
-                metric_inflight_estimate_bytes(headers, compressed_body_bytes, max_body_bytes);
-            BTreeMap::from([
-                (StorageSignal::MetricGauge, bytes),
-                (StorageSignal::MetricSum, bytes),
-            ])
+            metric_inflight_estimate_bytes(headers, compressed_body_bytes, max_body_bytes)
         }
-    }
+        OtlpRequestKind::Logs | OtlpRequestKind::Traces => {
+            inflight_estimate_bytes(headers, compressed_body_bytes, max_body_bytes)
+        }
+    };
+    route
+        .storage_signals()
+        .iter()
+        .map(|&signal| (signal, bytes))
+        .collect()
 }
 
 fn metric_inflight_estimate_bytes(
@@ -346,6 +344,22 @@ fn sub_saturating(counter: &AtomicUsize, bytes: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn storage_signals_fan_out_matches_request_kind() {
+        assert_eq!(
+            OtlpRequestKind::Logs.storage_signals(),
+            &[StorageSignal::Logs]
+        );
+        assert_eq!(
+            OtlpRequestKind::Traces.storage_signals(),
+            &[StorageSignal::Spans]
+        );
+        assert_eq!(
+            OtlpRequestKind::Metrics.storage_signals(),
+            &[StorageSignal::MetricGauge, StorageSignal::MetricSum]
+        );
+    }
 
     #[test]
     fn metric_inflight_estimate_reserves_both_metric_signals() {

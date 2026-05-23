@@ -49,6 +49,16 @@ impl OtlpRequestKind {
             Self::Metrics => "metrics",
         }
     }
+
+    /// The storage signal(s) a request of this kind fans out to. A metrics
+    /// request splits across both metric tables; logs and traces map 1:1.
+    pub fn storage_signals(self) -> &'static [StorageSignal] {
+        match self {
+            Self::Logs => &[StorageSignal::Logs],
+            Self::Traces => &[StorageSignal::Spans],
+            Self::Metrics => &[StorageSignal::MetricGauge, StorageSignal::MetricSum],
+        }
+    }
 }
 
 impl fmt::Display for OtlpRequestKind {
