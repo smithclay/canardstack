@@ -162,20 +162,9 @@ impl Ingestor {
             return Err(err);
         }
         // Every request-path gate passed; the request is admitted but not yet
-        // durably spooled. See `crate::ingest::lifecycle`.
-        tracing::trace!(
-            event = "ingest_admitted",
-            request_kind = route.as_str(),
-            stage = IngestStage::AdmittedNotSpooled.as_str(),
-        );
-        metrics.inc(
-            "canardstack_ingest_stage_total",
-            &[
-                ("request_kind", route.as_str()),
-                ("stage", IngestStage::AdmittedNotSpooled.as_str()),
-            ],
-            1,
-        );
+        // durably spooled. Enter the lifecycle through the centralized chokepoint.
+        // See `crate::ingest::lifecycle`.
+        let mut stage = lifecycle::enter_admitted(metrics, route);
         let (raw_spool_ref, compressed_body) =
             match self.append_raw_spool(route, headers, compressed_body, metrics) {
                 Ok(appended) => appended,
@@ -184,14 +173,8 @@ impl Ingestor {
                     return Err(err);
                 }
             };
-        metrics.inc(
-            "canardstack_ingest_stage_total",
-            &[
-                ("request_kind", route.as_str()),
-                ("stage", IngestStage::DurablySpooled.as_str()),
-            ],
-            1,
-        );
+        // `append_raw_spool` succeeded, so the raw request is fsynced.
+        lifecycle::advance(&mut stage, metrics, route, IngestStage::DurablySpooled);
         let spooled = SpooledIngestWork {
             route,
             headers: headers.clone(),
@@ -200,8 +183,8 @@ impl Ingestor {
             inflight_reservation,
             runtime_memory_reservation,
             metrics: async_metrics,
-            // `append_raw_spool` succeeded above, so the raw request is fsynced.
-            stage: IngestStage::DurablySpooled,
+            // Carries the local lifecycle stage advanced above.
+            stage,
         };
         self.dispatch_ingest_work(spooled, storage, metrics)
     }
@@ -251,7 +234,13 @@ impl Ingestor {
                 } else {
                     "decode_failed"
                 };
-                self.checkpoint_raw_spool_terminal(raw_spool_ref, route, reason, metrics)?;
+                self.checkpoint_raw_spool_terminal(
+                    &mut stage,
+                    raw_spool_ref,
+                    route,
+                    reason,
+                    metrics,
+                )?;
                 return Err(err);
             }
         };
@@ -260,7 +249,13 @@ impl Ingestor {
             std::borrow::Cow::Owned(bytes) => bytes.len(),
         };
         if let Err(err) = validation::validate_body_size(body.len(), &self.config) {
-            self.checkpoint_raw_spool_terminal(raw_spool_ref, route, "body_size_invalid", metrics)?;
+            self.checkpoint_raw_spool_terminal(
+                &mut stage,
+                raw_spool_ref,
+                route,
+                "body_size_invalid",
+                metrics,
+            )?;
             return Err(err);
         }
         let started = Instant::now();
@@ -277,6 +272,7 @@ impl Ingestor {
             Ok(transformed) => transformed,
             Err(err) => {
                 self.checkpoint_raw_spool_terminal(
+                    &mut stage,
                     raw_spool_ref,
                     route,
                     "transform_failed",
@@ -286,15 +282,7 @@ impl Ingestor {
             }
         };
         // otlp2records produced Arrow batches; see `crate::ingest::lifecycle`.
-        stage = IngestStage::Transformed;
-        metrics.inc(
-            "canardstack_ingest_stage_total",
-            &[
-                ("request_kind", route.as_str()),
-                ("stage", IngestStage::Transformed.as_str()),
-            ],
-            1,
-        );
+        lifecycle::advance(&mut stage, metrics, route, IngestStage::Transformed);
         let unsupported_histograms = transformed.unsupported_histograms;
         let started = Instant::now();
         let skew_result = self.validate_skew(&transformed);
@@ -305,6 +293,7 @@ impl Ingestor {
         );
         if let Err(err) = skew_result {
             self.checkpoint_raw_spool_terminal(
+                &mut stage,
                 raw_spool_ref,
                 route,
                 "timestamp_rejected",
@@ -336,11 +325,23 @@ impl Ingestor {
             .saturating_add(decoded_body_materialized_bytes)
             .saturating_add(pending_bytes);
         if let Err(err) = runtime_memory_reservation.reserve_at_least(peak_bytes, route, metrics) {
-            self.checkpoint_raw_spool_terminal(raw_spool_ref, route, "memory_rejected", metrics)?;
+            self.checkpoint_raw_spool_terminal(
+                &mut stage,
+                raw_spool_ref,
+                route,
+                "memory_rejected",
+                metrics,
+            )?;
             return Err(err);
         }
         if batches.is_empty() {
-            self.checkpoint_raw_spool_terminal(raw_spool_ref, route, "transform_empty", metrics)?;
+            self.checkpoint_raw_spool_terminal(
+                &mut stage,
+                raw_spool_ref,
+                route,
+                "transform_empty",
+                metrics,
+            )?;
             return Ok(());
         }
 
@@ -386,15 +387,7 @@ impl Ingestor {
         };
         // Rows reached the Arrow write buffer; the per-request phase terminus.
         // See `crate::ingest::lifecycle`.
-        stage = IngestStage::ArrowBuffered;
-        metrics.inc(
-            "canardstack_ingest_stage_total",
-            &[
-                ("request_kind", route.as_str()),
-                ("stage", IngestStage::ArrowBuffered.as_str()),
-            ],
-            1,
-        );
+        lifecycle::advance(&mut stage, metrics, route, IngestStage::ArrowBuffered);
         observe_storage_timings(metrics, &buffered.timings);
         metrics.inc(
             "canardstack_ingest_storage_insert_total",
@@ -462,6 +455,13 @@ impl Ingestor {
         metrics: &Metrics,
     ) -> ApiResult<Value> {
         let route = work.route;
+        // Mirror of the dispatch decision used only to drive the centralized
+        // lifecycle emit. Stays `DurablySpooled` (the work's entry stage on every
+        // dispatch path) until exactly one of the two dispatch hops fires through
+        // `lifecycle::advance`: `WorkerDispatched` on a successful queued send, or
+        // `InlineProcessed` on the caller-runs fall-through. See
+        // `crate::ingest::lifecycle`.
+        let mut decision_stage = IngestStage::DurablySpooled;
         // Round-robin to the first worker with buffer space. On a successful send
         // the function returns directly from inside the loop; if every worker is
         // full (or the pool is gone) the still-owned `work` falls through to the
@@ -476,10 +476,12 @@ impl Ingestor {
                     let start = dispatcher.next_worker % worker_count;
                     for offset in 0..worker_count {
                         let worker_idx = (start + offset) % worker_count;
-                        // Stamp the dispatch decision before the value moves into
-                        // the worker channel. See `crate::ingest::lifecycle`. A
-                        // `Full`/`Disconnected` send returns `work` unchanged, so a
-                        // later inline fall-through restamps it `InlineProcessed`.
+                        // Stamp the dispatch decision onto the value before it
+                        // moves into the worker channel so the worker's failure log
+                        // and `process_spooled_ingest`'s entry stage see
+                        // `WorkerDispatched`. This is a field stamp only; the
+                        // centralized lifecycle emit fires once on success below. A
+                        // `Full`/`Disconnected` send returns `work` unchanged.
                         work.stage = IngestStage::WorkerDispatched;
                         match dispatcher.commands[worker_idx].try_send(work) {
                             Ok(()) => {
@@ -497,14 +499,15 @@ impl Ingestor {
                                     1,
                                 );
                                 // Lifecycle funnel: a worker accepted the handoff.
-                                // See `crate::ingest::lifecycle`.
-                                metrics.inc(
-                                    "canardstack_ingest_stage_total",
-                                    &[
-                                        ("request_kind", route.as_str()),
-                                        ("stage", IngestStage::WorkerDispatched.as_str()),
-                                    ],
-                                    1,
+                                // Emits the `worker_dispatched` stage counter
+                                // exactly once (the work has already moved, so this
+                                // advances the decision mirror). See
+                                // `crate::ingest::lifecycle`.
+                                lifecycle::advance(
+                                    &mut decision_stage,
+                                    metrics,
+                                    route,
+                                    IngestStage::WorkerDispatched,
                                 );
                                 return Ok(json!({
                                     "accepted": true,
@@ -553,17 +556,18 @@ impl Ingestor {
                 "ingest worker pool saturated; processing inline on the connection thread (back-pressure via latency)"
             );
         }
-        // Caller-runs path: restamp the dispatch decision (the worker-send attempt
-        // above set `WorkerDispatched`, but no worker took it). See
-        // `crate::ingest::lifecycle`.
+        // Caller-runs path: restamp the dispatch decision onto the value (the
+        // worker-send attempts above set `WorkerDispatched`, but no worker took
+        // it) so `process_spooled_ingest`'s entry stage is `InlineProcessed`, then
+        // emit the hop through the centralized chokepoint (the decision mirror is
+        // still `DurablySpooled`, so this is the `DurablySpooled -> InlineProcessed`
+        // hop). See `crate::ingest::lifecycle`.
         work.stage = IngestStage::InlineProcessed;
-        metrics.inc(
-            "canardstack_ingest_stage_total",
-            &[
-                ("request_kind", route.as_str()),
-                ("stage", IngestStage::InlineProcessed.as_str()),
-            ],
-            1,
+        lifecycle::advance(
+            &mut decision_stage,
+            metrics,
+            route,
+            IngestStage::InlineProcessed,
         );
         let result = self.process_spooled_ingest(work, storage);
         self.record_inflight_metrics(metrics);

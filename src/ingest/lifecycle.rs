@@ -9,9 +9,23 @@
 //! `stage` label on two counters that share this vocabulary via
 //! [`IngestStage::as_str`] — `canardstack_ingest_stage_total{request_kind,stage}`
 //! (per-request funnel) and `canardstack_ingest_seal_stage_total{stage}`
-//! (per-seal-operation funnel). It carries NO control flow and NO transition
-//! validation — advancing the stage never changes what the pipeline does, only
-//! how it is described in logs and metrics.
+//! (per-seal-operation funnel). It carries NO control flow: advancing the stage
+//! never changes what the pipeline does, only how it is described in logs and
+//! metrics.
+//!
+//! # Enforced transition chokepoint
+//!
+//! This module is the centralized, ENFORCED transition chokepoint for the
+//! lifecycle. Every advance goes through one of the functions here — [`advance`]
+//! for the per-request phase and [`seal_advance`] for the seal phase — and each
+//! illegal hop `debug_assert!`-fails against [`is_legal`] / [`is_legal_seal`].
+//! The transition tables ([`is_legal`], [`is_legal_seal`]) are the single
+//! authoritative encoding of the legal graph below. Each stage counter is
+//! emitted from EXACTLY ONE place (the entry/advance functions here), so there
+//! is no scattered, drift-prone `inc` for the two stage counters anywhere else.
+//! The `debug_assert!` is the only runtime cost added over the prior hand-rolled
+//! advances and is compiled out of release builds; release behavior (counter
+//! names, labels, per-stage values, and the stage `tracing` events) is identical.
 //!
 //! # The two phases
 //!
@@ -83,7 +97,8 @@
 /// stamped on seal-side `tracing` events. See the module-level docs for the
 /// authoritative description of each stage and the function that owns the hop
 /// into it. Observability-only (tracing + the two stage counters): no control
-/// flow, no transition validation.
+/// flow. Transitions between stages are enforced through [`advance`] /
+/// [`seal_advance`], which `debug_assert!` against the legal graph.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) enum IngestStage {
     /// Passed request-path admission; not yet written to the durable raw spool.
@@ -116,6 +131,9 @@ pub(crate) enum IngestStage {
     CommittedNotCheckpointed,
 }
 
+use crate::ingest::OtlpRequestKind;
+use crate::metrics::Metrics;
+
 impl IngestStage {
     /// Stable snake_case identifier for `tracing` fields. The strings are a
     /// public-ish surface (operators key dashboards/log queries off them), so
@@ -137,9 +155,220 @@ impl IngestStage {
     }
 }
 
+/// Authoritative per-request transition table. Returns whether `from -> to` is a
+/// legal hop in the per-request phase (admission → Arrow write buffer). This is
+/// the single encoding of the per-request graph; [`advance`] `debug_assert!`s
+/// against it on every hop.
+fn is_legal(from: IngestStage, to: IngestStage) -> bool {
+    use IngestStage::*;
+    matches!(
+        (from, to),
+        (AdmittedNotSpooled, DurablySpooled)
+            | (DurablySpooled, WorkerDispatched)
+            | (DurablySpooled, InlineProcessed)
+            | (WorkerDispatched, Transformed)
+            | (WorkerDispatched, TerminallyRejectedCheckpointed)
+            | (InlineProcessed, Transformed)
+            | (InlineProcessed, TerminallyRejectedCheckpointed)
+            | (Transformed, ArrowBuffered)
+            | (Transformed, TerminallyRejectedCheckpointed)
+    )
+}
+
+/// Authoritative seal-phase transition table. Returns whether `from -> to` is a
+/// legal hop in the seal phase (Arrow write buffer → durable DuckLake commit →
+/// raw-spool checkpoint). [`seal_advance`] `debug_assert!`s against it.
+fn is_legal_seal(from: IngestStage, to: IngestStage) -> bool {
+    use IngestStage::*;
+    matches!(
+        (from, to),
+        (CapturedForSeal, DuckLakeCommitted)
+            | (DuckLakeCommitted, RawSpoolCheckpointed)
+            | (DuckLakeCommitted, CommittedNotCheckpointed)
+    )
+}
+
+/// Emit the per-request stage counter and the per-request stage `tracing` event
+/// for `stage`. The ONLY place `canardstack_ingest_stage_total` is incremented;
+/// every per-request hop funnels through here (via [`enter_admitted`],
+/// [`enter_spooled`], and [`advance`]).
+fn emit_request_stage(metrics: &Metrics, request_kind: OtlpRequestKind, stage: IngestStage) {
+    tracing::trace!(
+        event = "ingest_stage",
+        request_kind = request_kind.as_str(),
+        stage = stage.as_str(),
+    );
+    metrics.inc(
+        "canardstack_ingest_stage_total",
+        &[
+            ("request_kind", request_kind.as_str()),
+            ("stage", stage.as_str()),
+        ],
+        1,
+    );
+}
+
+/// Emit the per-seal-operation stage counter and the seal stage `tracing` event
+/// for `stage`. The ONLY place `canardstack_ingest_seal_stage_total` is
+/// incremented; every seal hop funnels through here (via [`seal_enter`] and
+/// [`seal_advance`]). Callers keep the existing non-empty-capture guard.
+fn emit_seal_stage(metrics: &Metrics, stage: IngestStage) {
+    tracing::debug!(event = "ingest_seal_stage", stage = stage.as_str());
+    metrics.inc(
+        "canardstack_ingest_seal_stage_total",
+        &[("stage", stage.as_str())],
+        1,
+    );
+}
+
+/// Per-request phase entry: the request passed every request-path gate but is
+/// not yet durably spooled. Emits the `admitted_not_spooled` counter + stage
+/// event and returns the starting [`IngestStage::AdmittedNotSpooled`]. No prior
+/// stage exists, so there is nothing to validate.
+pub(in crate::ingest) fn enter_admitted(
+    metrics: &Metrics,
+    request_kind: OtlpRequestKind,
+) -> IngestStage {
+    emit_request_stage(metrics, request_kind, IngestStage::AdmittedNotSpooled);
+    IngestStage::AdmittedNotSpooled
+}
+
+/// Per-request phase entry for the restart-replay path, which begins already
+/// durably spooled (the record is recovered from the fsynced raw spool). Emits
+/// the `durably_spooled` counter + stage event and returns
+/// [`IngestStage::DurablySpooled`].
+pub(in crate::ingest) fn enter_spooled(
+    metrics: &Metrics,
+    request_kind: OtlpRequestKind,
+) -> IngestStage {
+    emit_request_stage(metrics, request_kind, IngestStage::DurablySpooled);
+    IngestStage::DurablySpooled
+}
+
+/// Advance the per-request lifecycle to `to`: `debug_assert!` the hop is legal
+/// against [`is_legal`], emit the stage counter + stage event, then store the
+/// new stage. The single chokepoint for per-request stage transitions.
+pub(in crate::ingest) fn advance(
+    stage: &mut IngestStage,
+    metrics: &Metrics,
+    request_kind: OtlpRequestKind,
+    to: IngestStage,
+) {
+    debug_assert!(
+        is_legal(*stage, to),
+        "illegal ingest transition {:?} -> {:?}",
+        *stage,
+        to
+    );
+    emit_request_stage(metrics, request_kind, to);
+    *stage = to;
+}
+
+/// Seal phase entry: the tracked raw-spool refs were captured and the tracking
+/// map cleared (capture before flush). Emits the `captured_for_seal` counter +
+/// stage event and returns the starting [`IngestStage::CapturedForSeal`]. The
+/// caller wraps this in the existing non-empty-capture guard.
+pub(in crate::ingest) fn seal_enter(metrics: &Metrics) -> IngestStage {
+    emit_seal_stage(metrics, IngestStage::CapturedForSeal);
+    IngestStage::CapturedForSeal
+}
+
+/// Advance the seal lifecycle to `to`: `debug_assert!` the hop is legal against
+/// [`is_legal_seal`], emit the seal stage counter + stage event, then store the
+/// new stage. The single chokepoint for seal stage transitions. The caller
+/// wraps this in the existing non-empty-capture guard.
+pub(in crate::ingest) fn seal_advance(stage: &mut IngestStage, metrics: &Metrics, to: IngestStage) {
+    debug_assert!(
+        is_legal_seal(*stage, to),
+        "illegal ingest seal transition {:?} -> {:?}",
+        *stage,
+        to
+    );
+    emit_seal_stage(metrics, to);
+    *stage = to;
+}
+
 #[cfg(test)]
 mod tests {
-    use super::IngestStage;
+    use super::{is_legal, is_legal_seal, IngestStage};
+
+    /// The complete set of legal per-request hops, pinned independently of the
+    /// matcher in [`is_legal`] so the enforced graph cannot silently drift.
+    const LEGAL_REQUEST: &[(IngestStage, IngestStage)] = {
+        use IngestStage::*;
+        &[
+            (AdmittedNotSpooled, DurablySpooled),
+            (DurablySpooled, WorkerDispatched),
+            (DurablySpooled, InlineProcessed),
+            (WorkerDispatched, Transformed),
+            (WorkerDispatched, TerminallyRejectedCheckpointed),
+            (InlineProcessed, Transformed),
+            (InlineProcessed, TerminallyRejectedCheckpointed),
+            (Transformed, ArrowBuffered),
+            (Transformed, TerminallyRejectedCheckpointed),
+        ]
+    };
+
+    /// The complete set of legal seal hops, pinned independently of
+    /// [`is_legal_seal`].
+    const LEGAL_SEAL: &[(IngestStage, IngestStage)] = {
+        use IngestStage::*;
+        &[
+            (CapturedForSeal, DuckLakeCommitted),
+            (DuckLakeCommitted, RawSpoolCheckpointed),
+            (DuckLakeCommitted, CommittedNotCheckpointed),
+        ]
+    };
+
+    const ALL_STAGES: &[IngestStage] = {
+        use IngestStage::*;
+        &[
+            AdmittedNotSpooled,
+            DurablySpooled,
+            WorkerDispatched,
+            InlineProcessed,
+            Transformed,
+            TerminallyRejectedCheckpointed,
+            ArrowBuffered,
+            CapturedForSeal,
+            DuckLakeCommitted,
+            RawSpoolCheckpointed,
+            CommittedNotCheckpointed,
+        ]
+    };
+
+    /// `is_legal` accepts exactly the per-request graph and rejects every other
+    /// ordered pair. This is the table the `debug_assert!` in `advance` enforces;
+    /// the integration tests then prove production walks only these hops.
+    #[test]
+    fn is_legal_matches_request_table() {
+        for &from in ALL_STAGES {
+            for &to in ALL_STAGES {
+                let expected = LEGAL_REQUEST.contains(&(from, to));
+                assert_eq!(
+                    is_legal(from, to),
+                    expected,
+                    "is_legal({from:?}, {to:?}) should be {expected}"
+                );
+            }
+        }
+    }
+
+    /// `is_legal_seal` accepts exactly the seal graph and rejects every other
+    /// ordered pair.
+    #[test]
+    fn is_legal_seal_matches_seal_table() {
+        for &from in ALL_STAGES {
+            for &to in ALL_STAGES {
+                let expected = LEGAL_SEAL.contains(&(from, to));
+                assert_eq!(
+                    is_legal_seal(from, to),
+                    expected,
+                    "is_legal_seal({from:?}, {to:?}) should be {expected}"
+                );
+            }
+        }
+    }
 
     /// Cheap guard against an accidental rename of a stage's stable string. If a
     /// variant's snake_case identifier changes, update operator dashboards/log
