@@ -83,8 +83,9 @@ pub(in crate::ingest) struct SpooledIngestWork {
     inflight_reservation: admission::InflightReservation,
     runtime_memory_reservation: admission::RuntimeMemoryReservation,
     pub(in crate::ingest) metrics: Arc<Metrics>,
-    /// Explicit lifecycle stage for tracing. See [`crate::ingest::lifecycle`]
-    /// for the authoritative stage map. Advancing it never changes control flow.
+    /// Explicit lifecycle stage for tracing and the stage counters. See
+    /// [`crate::ingest::lifecycle`] for the authoritative stage map. Advancing it
+    /// never changes control flow.
     pub(in crate::ingest) stage: IngestStage,
 }
 
@@ -167,6 +168,14 @@ impl Ingestor {
             request_kind = route.as_str(),
             stage = IngestStage::AdmittedNotSpooled.as_str(),
         );
+        metrics.inc(
+            "canardstack_ingest_stage_total",
+            &[
+                ("request_kind", route.as_str()),
+                ("stage", IngestStage::AdmittedNotSpooled.as_str()),
+            ],
+            1,
+        );
         let (raw_spool_ref, compressed_body) =
             match self.append_raw_spool(route, headers, compressed_body, metrics) {
                 Ok(appended) => appended,
@@ -175,6 +184,14 @@ impl Ingestor {
                     return Err(err);
                 }
             };
+        metrics.inc(
+            "canardstack_ingest_stage_total",
+            &[
+                ("request_kind", route.as_str()),
+                ("stage", IngestStage::DurablySpooled.as_str()),
+            ],
+            1,
+        );
         let spooled = SpooledIngestWork {
             route,
             headers: headers.clone(),
@@ -270,6 +287,14 @@ impl Ingestor {
         };
         // otlp2records produced Arrow batches; see `crate::ingest::lifecycle`.
         stage = IngestStage::Transformed;
+        metrics.inc(
+            "canardstack_ingest_stage_total",
+            &[
+                ("request_kind", route.as_str()),
+                ("stage", IngestStage::Transformed.as_str()),
+            ],
+            1,
+        );
         let unsupported_histograms = transformed.unsupported_histograms;
         let started = Instant::now();
         let skew_result = self.validate_skew(&transformed);
@@ -362,6 +387,14 @@ impl Ingestor {
         // Rows reached the Arrow write buffer; the per-request phase terminus.
         // See `crate::ingest::lifecycle`.
         stage = IngestStage::ArrowBuffered;
+        metrics.inc(
+            "canardstack_ingest_stage_total",
+            &[
+                ("request_kind", route.as_str()),
+                ("stage", IngestStage::ArrowBuffered.as_str()),
+            ],
+            1,
+        );
         observe_storage_timings(metrics, &buffered.timings);
         metrics.inc(
             "canardstack_ingest_storage_insert_total",
@@ -463,6 +496,16 @@ impl Ingestor {
                                     &[("request_kind", route.as_str()), ("outcome", "queued")],
                                     1,
                                 );
+                                // Lifecycle funnel: a worker accepted the handoff.
+                                // See `crate::ingest::lifecycle`.
+                                metrics.inc(
+                                    "canardstack_ingest_stage_total",
+                                    &[
+                                        ("request_kind", route.as_str()),
+                                        ("stage", IngestStage::WorkerDispatched.as_str()),
+                                    ],
+                                    1,
+                                );
                                 return Ok(json!({
                                     "accepted": true,
                                     "acknowledgement": "locally_spooled"
@@ -514,6 +557,14 @@ impl Ingestor {
         // above set `WorkerDispatched`, but no worker took it). See
         // `crate::ingest::lifecycle`.
         work.stage = IngestStage::InlineProcessed;
+        metrics.inc(
+            "canardstack_ingest_stage_total",
+            &[
+                ("request_kind", route.as_str()),
+                ("stage", IngestStage::InlineProcessed.as_str()),
+            ],
+            1,
+        );
         let result = self.process_spooled_ingest(work, storage);
         self.record_inflight_metrics(metrics);
         // The raw request is durably spooled, so the 202 acknowledgement holds

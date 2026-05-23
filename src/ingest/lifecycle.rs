@@ -4,10 +4,14 @@
 //! lifecycle vocabulary; inline comments elsewhere point here rather than
 //! re-describing the hops.
 //!
-//! [`IngestStage`] is a tracing-only annotation: it is stamped on the in-flight
-//! work value and emitted on existing `tracing` events. It carries NO control
-//! flow, NO metrics, and NO transition validation — advancing the stage never
-//! changes what the pipeline does, only how it is described in logs.
+//! [`IngestStage`] is an observability-only annotation: it is stamped on the
+//! in-flight work value and emitted on existing `tracing` events AND as the
+//! `stage` label on two counters that share this vocabulary via
+//! [`IngestStage::as_str`] — `canardstack_ingest_stage_total{request_kind,stage}`
+//! (per-request funnel) and `canardstack_ingest_seal_stage_total{stage}`
+//! (per-seal-operation funnel). It carries NO control flow and NO transition
+//! validation — advancing the stage never changes what the pipeline does, only
+//! how it is described in logs and metrics.
 //!
 //! # The two phases
 //!
@@ -78,7 +82,8 @@
 /// Explicit ingest lifecycle stage threaded through the per-request path and
 /// stamped on seal-side `tracing` events. See the module-level docs for the
 /// authoritative description of each stage and the function that owns the hop
-/// into it. Tracing-only: no control flow, no metrics, no transition validation.
+/// into it. Observability-only (tracing + the two stage counters): no control
+/// flow, no transition validation.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) enum IngestStage {
     /// Passed request-path admission; not yet written to the durable raw spool.

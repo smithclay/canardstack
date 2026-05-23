@@ -600,6 +600,19 @@ mod snapshot_tests {
             10,
         );
 
+        // Ingest lifecycle stage funnel (per request) and seal-stage funnel
+        // (per seal operation). Both reuse `IngestStage::as_str` vocabulary.
+        metrics.inc(
+            "canardstack_ingest_stage_total",
+            &[("request_kind", "logs"), ("stage", "durably_spooled")],
+            1,
+        );
+        metrics.inc(
+            "canardstack_ingest_seal_stage_total",
+            &[("stage", "ducklake_committed")],
+            1,
+        );
+
         // In-flight gauge (the `_max`, `_pressure`, and `_capacity_bytes`
         // derivatives were dropped).
         metrics.gauge(
@@ -896,6 +909,8 @@ mod snapshot_tests {
             "canardstack_ingest_request_bytes_total",
             "canardstack_ingest_requests_total",
             "canardstack_ingest_runtime_memory_unknown_total",
+            "canardstack_ingest_seal_stage_total",
+            "canardstack_ingest_stage_total",
             "canardstack_ingest_storage_insert_total",
             "canardstack_ingest_to_query_lag_seconds",
             "canardstack_ingest_transformed_rows_total",

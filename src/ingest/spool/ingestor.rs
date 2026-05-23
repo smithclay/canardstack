@@ -203,6 +203,17 @@ impl Ingestor {
             stage = IngestStage::CapturedForSeal.as_str(),
             captured_records = captured.len(),
         );
+        // Per-seal-operation counter (NOT per record). Guarded on a non-empty
+        // capture so the periodic scheduler seal that finds nothing buffered does
+        // not inflate the count: an idle seal still flushes/commits an empty
+        // buffer but checkpoints no records, so counting it would muddy the funnel.
+        if !captured.is_empty() {
+            metrics.inc(
+                "canardstack_ingest_seal_stage_total",
+                &[("stage", IngestStage::CapturedForSeal.as_str())],
+                1,
+            );
+        }
         let outcome = match storage.flush_arrow_write_buffer(true) {
             Ok(outcome) => outcome,
             Err(err) => {
@@ -215,6 +226,13 @@ impl Ingestor {
             stage = IngestStage::DuckLakeCommitted.as_str(),
             flushed_rows = outcome.flushed_rows,
         );
+        if !captured.is_empty() {
+            metrics.inc(
+                "canardstack_ingest_seal_stage_total",
+                &[("stage", IngestStage::DuckLakeCommitted.as_str())],
+                1,
+            );
+        }
         observe_arrow_flush(metrics, &outcome);
         match self.checkpoint_raw_spool_batch(&captured, "storage_committed", Some(metrics)) {
             Ok(()) => {
@@ -223,6 +241,13 @@ impl Ingestor {
                     stage = IngestStage::RawSpoolCheckpointed.as_str(),
                     checkpointed_records = captured.len(),
                 );
+                if !captured.is_empty() {
+                    metrics.inc(
+                        "canardstack_ingest_seal_stage_total",
+                        &[("stage", IngestStage::RawSpoolCheckpointed.as_str())],
+                        1,
+                    );
+                }
             }
             Err(err) => {
                 // Rows are durably committed; only the raw-spool checkpoint
@@ -239,6 +264,15 @@ impl Ingestor {
                     stage = IngestStage::CommittedNotCheckpointed.as_str(),
                     error = %err,
                     "Arrow flush committed but raw spool checkpoint failed; records left pending"
+                );
+                // The duplicate-risk signal: committed to DuckLake but the
+                // raw-spool checkpoint failed. This branch only runs for a
+                // non-empty capture (an empty checkpoint batch returns Ok), so it
+                // is always a real per-seal duplicate-risk event.
+                metrics.inc(
+                    "canardstack_ingest_seal_stage_total",
+                    &[("stage", IngestStage::CommittedNotCheckpointed.as_str())],
+                    1,
                 );
             }
         }
@@ -468,6 +502,17 @@ impl Ingestor {
             request_kind = route.as_str(),
             stage = IngestStage::TerminallyRejectedCheckpointed.as_str(),
             reason,
+        );
+        metrics.inc(
+            "canardstack_ingest_stage_total",
+            &[
+                ("request_kind", route.as_str()),
+                (
+                    "stage",
+                    IngestStage::TerminallyRejectedCheckpointed.as_str(),
+                ),
+            ],
+            1,
         );
         self.checkpoint_raw_spool(raw_spool_ref, route, reason, Some(metrics))
             .map_err(|err| {
