@@ -1,4 +1,4 @@
-use super::{Ingestor, SpooledIngestWork};
+use super::{lifecycle, IngestStage, Ingestor, SpooledIngestWork};
 use crate::storage::Storage;
 use crate::LockExt;
 use anyhow::{Context, Result};
@@ -86,10 +86,19 @@ fn run_ingest_worker(
         };
         let route = work.route;
         let metrics = Arc::clone(&work.metrics);
-        // Dispatch-time lifecycle stage (`WorkerDispatched`); the per-request
-        // stage advances inside `process_spooled_ingest`, but `work` moves into
-        // it, so capture the entry stage here for the failure log. See
-        // `crate::ingest::lifecycle`.
+        // Lifecycle funnel: this worker picked up the handoff. Advance the single
+        // authoritative `work.stage` through the centralized chokepoint
+        // (`DurablySpooled -> WorkerDispatched`), emitting the stage counter exactly
+        // once on receipt. See `crate::ingest::lifecycle`.
+        let mut work = work;
+        lifecycle::advance(
+            &mut work.stage,
+            &metrics,
+            route,
+            IngestStage::WorkerDispatched,
+        );
+        // Entry stage for the failure log; `work` moves into
+        // `process_spooled_ingest`, which advances its own destructured copy.
         let stage = work.stage;
         let started = Instant::now();
         match ingestor.process_spooled_ingest(work, &storage) {

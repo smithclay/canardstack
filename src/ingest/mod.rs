@@ -456,18 +456,13 @@ impl Ingestor {
         metrics: &Metrics,
     ) -> ApiResult<Value> {
         let route = work.route;
-        // Mirror of the dispatch decision used only to drive the centralized
-        // lifecycle emit. Stays `DurablySpooled` (the work's entry stage on every
-        // dispatch path) until exactly one of the two dispatch hops fires through
-        // `lifecycle::advance`: `WorkerDispatched` on a successful queued send, or
-        // `InlineProcessed` on the caller-runs fall-through. See
-        // `crate::ingest::lifecycle`.
-        let mut decision_stage = IngestStage::DurablySpooled;
         // Round-robin to the first worker with buffer space. On a successful send
         // the function returns directly from inside the loop; if every worker is
         // full (or the pool is gone) the still-owned `work` falls through to the
-        // caller-runs path below. The two outcomes (`WorkerDispatched` vs
-        // `InlineProcessed`) are the dispatch hop in `crate::ingest::lifecycle`.
+        // caller-runs path below. The single authoritative `work.stage` carries the
+        // dispatch hop: the receiving worker advances `WorkerDispatched` on receipt
+        // (`run_ingest_worker`), and the caller-runs path below advances
+        // `InlineProcessed`. See `crate::ingest::lifecycle`.
         let mut work = {
             let mut pool = self.ingest_workers.lock_or_poisoned();
             let mut work = work;
@@ -477,13 +472,6 @@ impl Ingestor {
                     let start = dispatcher.next_worker % worker_count;
                     for offset in 0..worker_count {
                         let worker_idx = (start + offset) % worker_count;
-                        // Stamp the dispatch decision onto the value before it
-                        // moves into the worker channel so the worker's failure log
-                        // and `process_spooled_ingest`'s entry stage see
-                        // `WorkerDispatched`. This is a field stamp only; the
-                        // centralized lifecycle emit fires once on success below. A
-                        // `Full`/`Disconnected` send returns `work` unchanged.
-                        work.stage = IngestStage::WorkerDispatched;
                         match dispatcher.commands[worker_idx].try_send(work) {
                             Ok(()) => {
                                 dispatcher.next_worker = worker_idx.wrapping_add(1);
@@ -499,17 +487,11 @@ impl Ingestor {
                                     &[("request_kind", route.as_str()), ("outcome", "queued")],
                                     1,
                                 );
-                                // Lifecycle funnel: a worker accepted the handoff.
-                                // Emits the `worker_dispatched` stage counter
-                                // exactly once (the work has already moved, so this
-                                // advances the decision mirror). See
-                                // `crate::ingest::lifecycle`.
-                                lifecycle::advance(
-                                    &mut decision_stage,
-                                    metrics,
-                                    route,
-                                    IngestStage::WorkerDispatched,
-                                );
+                                // Lifecycle funnel: the receiving worker advances the
+                                // single authoritative `work.stage` to
+                                // `WorkerDispatched` on receipt (`run_ingest_worker`),
+                                // so the stage travels with the work rather than a
+                                // mirror. See `crate::ingest::lifecycle`.
                                 return Ok(json!({
                                     "accepted": true,
                                     "acknowledgement": "locally_spooled"
@@ -557,15 +539,12 @@ impl Ingestor {
                 "ingest worker pool saturated; processing inline on the connection thread (back-pressure via latency)"
             );
         }
-        // Caller-runs path: restamp the dispatch decision onto the value (the
-        // worker-send attempts above set `WorkerDispatched`, but no worker took
-        // it) so `process_spooled_ingest`'s entry stage is `InlineProcessed`, then
-        // emit the hop through the centralized chokepoint (the decision mirror is
-        // still `DurablySpooled`, so this is the `DurablySpooled -> InlineProcessed`
-        // hop). See `crate::ingest::lifecycle`.
-        work.stage = IngestStage::InlineProcessed;
+        // Caller-runs path: no worker took the handoff, so advance the single
+        // authoritative `work.stage` to `InlineProcessed` through the centralized
+        // chokepoint (the `DurablySpooled -> InlineProcessed` hop) and process
+        // inline. See `crate::ingest::lifecycle`.
         lifecycle::advance(
-            &mut decision_stage,
+            &mut work.stage,
             metrics,
             route,
             IngestStage::InlineProcessed,
