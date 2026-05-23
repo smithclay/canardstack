@@ -750,11 +750,11 @@ fn spawn_raw_spool_writer(config: &Config, request_kind: OtlpRequestKind) -> Res
             max_total_bytes: config.raw_spool_max_total_bytes as u64,
             append_sync_interval: config.raw_spool_append_sync_interval,
             append_sync_bytes: config.raw_spool_append_sync_bytes as u64,
-            checkpoint_fsync_records: config.raw_spool_checkpoint_fsync_records,
-            checkpoint_fsync_delay: config.raw_spool_checkpoint_fsync_delay,
+            checkpoint_fsync_records: spool::RAW_SPOOL_CHECKPOINT_FSYNC_RECORDS,
+            checkpoint_fsync_delay: spool::RAW_SPOOL_CHECKPOINT_FSYNC_DELAY,
         },
-        config.raw_spool_writer_queue_capacity,
-        config.raw_spool_group_commit_records,
+        spool::RAW_SPOOL_WRITER_QUEUE_CAPACITY,
+        spool::RAW_SPOOL_GROUP_COMMIT_RECORDS,
         config.raw_spool_group_commit_delay,
     )
     .with_context(|| format!("spawn {request_kind} raw spool writer"))

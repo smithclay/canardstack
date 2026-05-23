@@ -189,13 +189,13 @@ fn route_inner(
                     "raw_spool": raw_spool,
                     "raw_spool_by_request_kind": raw_spool_by_request_kind,
                     "raw_spool_config": {
-                        "writer_queue_capacity": state.config.raw_spool_writer_queue_capacity,
-                        "group_commit_records": state.config.raw_spool_group_commit_records,
+                        "writer_queue_capacity": crate::ingest::spool::RAW_SPOOL_WRITER_QUEUE_CAPACITY,
+                        "group_commit_records": crate::ingest::spool::RAW_SPOOL_GROUP_COMMIT_RECORDS,
                         "group_commit_ms": state.config.raw_spool_group_commit_delay.as_millis(),
                         "append_sync_ms": state.config.raw_spool_append_sync_interval.as_millis(),
                         "append_sync_bytes": state.config.raw_spool_append_sync_bytes,
-                        "checkpoint_fsync_records": state.config.raw_spool_checkpoint_fsync_records,
-                        "checkpoint_fsync_ms": state.config.raw_spool_checkpoint_fsync_delay.as_millis()
+                        "checkpoint_fsync_records": crate::ingest::spool::RAW_SPOOL_CHECKPOINT_FSYNC_RECORDS,
+                        "checkpoint_fsync_ms": crate::ingest::spool::RAW_SPOOL_CHECKPOINT_FSYNC_DELAY.as_millis()
                     }
                 });
                 (raw_spool_healthy, body)

@@ -55,8 +55,26 @@ pub struct QueryLimits {
     pub memory_limit: String,
 }
 
+/// One config struct for the whole process. Fields fall into two groups,
+/// flagged by the banner comments below:
+///
+/// - OPERATOR POLICY: the public, supported surface operators set to run a
+///   deployment (endpoints, auth, catalog, retention, query limits, freshness
+///   SLA, admission capacities, memory limits, body/connection caps, socket
+///   timeouts).
+/// - KEPT-BUT-ADVANCED MECHANICS: still env-tunable, but internal knobs
+///   operators rarely touch (seal-rate seed, Arrow write-buffer target/age,
+///   raw-spool max sizes + append-sync + group-commit cadence, ingest worker
+///   pool sizing, scheduler intervals, bench keepalive).
+///
+/// Purely internal raw-spool batching/durability mechanics with no operator
+/// meaning are NOT fields here; they live as consts in `ingest::spool`.
+///
+/// Field order is kept stable (matching `from_env`/`test`) to limit churn, so a
+/// few fields sit in the "wrong" group and are noted inline.
 #[derive(Clone, Debug)]
 pub struct Config {
+    // --- OPERATOR POLICY ---
     pub serve_role: ServeRole,
     pub bind: String,
     pub api_key: String,
@@ -68,13 +86,17 @@ pub struct Config {
     pub ducklake_attach_uri: Option<String>,
     pub max_body_bytes: usize,
     pub runtime_memory_limit_bytes: Option<usize>,
+    // advanced mechanics (kept here to preserve field order)
     pub seal_rate_seed_bytes: usize,
     pub seal_rate_seed_window: Duration,
+    // operator policy
     pub duckdb_write_memory_limit: String,
     pub late_accept_secs: i64,
     pub future_accept_secs: i64,
+    // advanced mechanics (kept here to preserve field order)
     pub arrow_write_buffer_target_bytes: usize,
     pub arrow_write_buffer_max_age: Duration,
+    // operator policy
     pub query_interactive: QueryLimits,
     pub seal_admission_capacity: usize,
     pub cheap_query_admission_capacity: usize,
@@ -83,26 +105,25 @@ pub struct Config {
     pub logs_retention_days: i64,
     pub spans_retention_days: i64,
     pub metrics_retention_days: i64,
+    // --- KEPT-BUT-ADVANCED MECHANICS ---
     pub scheduler_enabled: bool,
     pub scheduler_seal_interval: Duration,
     pub scheduler_metadata_interval: Duration,
     pub scheduler_metrics_interval: Duration,
     pub scheduler_retention_interval: Duration,
+    // operator policy (kept here to preserve field order)
     pub max_concurrent_connections: usize,
     pub socket_read_timeout: Duration,
     pub socket_write_timeout: Duration,
+    // --- KEPT-BUT-ADVANCED MECHANICS (continued) ---
     pub bench_http_keepalive: bool,
     pub raw_spool_dir: PathBuf,
     pub raw_spool_max_segment_bytes: usize,
     pub raw_spool_max_record_bytes: usize,
     pub raw_spool_max_total_bytes: usize,
-    pub raw_spool_writer_queue_capacity: usize,
-    pub raw_spool_group_commit_records: usize,
     pub raw_spool_group_commit_delay: Duration,
     pub raw_spool_append_sync_interval: Duration,
     pub raw_spool_append_sync_bytes: usize,
-    pub raw_spool_checkpoint_fsync_records: usize,
-    pub raw_spool_checkpoint_fsync_delay: Duration,
     pub ingest_workers: usize,
     pub ingest_worker_channel_capacity: usize,
     /// When true, the scheduler's metrics-snapshot job writes a snapshot of the
@@ -280,8 +301,6 @@ impl Config {
             raw_spool_max_segment_bytes: (64 * 1024 * 1024).min(raw_spool_capacity_bytes),
             raw_spool_max_record_bytes: max_body_bytes,
             raw_spool_max_total_bytes: raw_spool_capacity_bytes,
-            raw_spool_writer_queue_capacity: 1024,
-            raw_spool_group_commit_records: 64,
             raw_spool_group_commit_delay: Duration::from_millis(
                 env_usize("CANARDSTACK_RAW_SPOOL_GROUP_COMMIT_MS")?
                     .or(file.usize(&["raw_spool", "group_commit_ms"])?)
@@ -295,8 +314,6 @@ impl Config {
             raw_spool_append_sync_bytes: env_usize("CANARDSTACK_RAW_SPOOL_APPEND_SYNC_BYTES")?
                 .or(file.usize(&["raw_spool", "append_sync_bytes"])?)
                 .unwrap_or(16 * 1024 * 1024),
-            raw_spool_checkpoint_fsync_records: 1024,
-            raw_spool_checkpoint_fsync_delay: Duration::from_millis(1000),
             ingest_workers: env_usize("CANARDSTACK_INGEST_WORKERS")?
                 .or(file.usize(&["ingest", "workers"])?)
                 .unwrap_or(4),
@@ -360,13 +377,9 @@ impl Config {
             raw_spool_max_segment_bytes: 64 * 1024 * 1024,
             raw_spool_max_record_bytes: 8 * 1024 * 1024,
             raw_spool_max_total_bytes: 1024 * 1024 * 1024,
-            raw_spool_writer_queue_capacity: 1024,
-            raw_spool_group_commit_records: 64,
             raw_spool_group_commit_delay: Duration::from_millis(1),
             raw_spool_append_sync_interval: Duration::from_millis(500),
             raw_spool_append_sync_bytes: 16 * 1024 * 1024,
-            raw_spool_checkpoint_fsync_records: 1024,
-            raw_spool_checkpoint_fsync_delay: Duration::from_millis(1000),
             ingest_workers: 4,
             ingest_worker_channel_capacity: 1024,
             operator_metrics_to_storage: false,
@@ -446,10 +459,7 @@ impl Config {
         if self.raw_spool_max_segment_bytes == 0
             || self.raw_spool_max_record_bytes == 0
             || self.raw_spool_max_total_bytes == 0
-            || self.raw_spool_writer_queue_capacity == 0
-            || self.raw_spool_group_commit_records == 0
             || self.raw_spool_append_sync_bytes == 0
-            || self.raw_spool_checkpoint_fsync_records == 0
         {
             anyhow::bail!("raw spool limits must be > 0");
         }
@@ -458,9 +468,6 @@ impl Config {
         }
         if self.raw_spool_append_sync_interval.is_zero() {
             anyhow::bail!("CANARDSTACK_RAW_SPOOL_APPEND_SYNC_MS must be > 0");
-        }
-        if self.raw_spool_checkpoint_fsync_delay.is_zero() {
-            anyhow::bail!("raw spool checkpoint fsync delay must be > 0");
         }
         if self.ingest_workers == 0 {
             anyhow::bail!("CANARDSTACK_INGEST_WORKERS must be > 0");
@@ -887,11 +894,6 @@ http_keepalive = true
             Duration::from_millis(250)
         );
         assert_eq!(config.raw_spool_append_sync_bytes, 8192);
-        assert_eq!(config.raw_spool_checkpoint_fsync_records, 1024);
-        assert_eq!(
-            config.raw_spool_checkpoint_fsync_delay,
-            Duration::from_millis(1000)
-        );
         assert_eq!(config.ingest_workers, 3);
         assert_eq!(config.ingest_worker_channel_capacity, 33);
         assert!(config.bench_http_keepalive);

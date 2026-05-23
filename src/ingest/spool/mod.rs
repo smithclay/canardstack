@@ -27,6 +27,14 @@ const RECORD_HEADER_BYTES: u64 = 8 + 4 + 8;
 const DEFAULT_MAX_SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
 const DEFAULT_MAX_RECORD_BYTES: u64 = 8 * 1024 * 1024;
 
+// Internal raw-spool batching/durability mechanics, not operator policy: these
+// have no env knob or config-file key and are always the hardcoded defaults.
+pub(crate) const RAW_SPOOL_WRITER_QUEUE_CAPACITY: usize = 1024;
+pub(crate) const RAW_SPOOL_GROUP_COMMIT_RECORDS: usize = 64;
+pub(crate) const RAW_SPOOL_CHECKPOINT_FSYNC_RECORDS: usize = 1024;
+pub(crate) const RAW_SPOOL_CHECKPOINT_FSYNC_DELAY: std::time::Duration =
+    std::time::Duration::from_millis(1000);
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub struct RecordId {
     pub segment: u64,
