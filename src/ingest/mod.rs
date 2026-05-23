@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 use spool::{Options, RecordId, SealRef, Writer};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::mpsc::TrySendError;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -97,6 +97,10 @@ pub struct Ingestor {
     raw_spools: BTreeMap<OtlpRequestKind, Writer>,
     raw_spool_seal_refs: Arc<Mutex<BTreeMap<(OtlpRequestKind, RecordId), SealRef>>>,
     ingest_workers: Mutex<Option<IngestWorkerPool>>,
+    /// First-transition latch so worker-pool saturation (caller-runs fallback)
+    /// logs once per episode rather than once per saturated request. Set on the
+    /// caller-runs path, cleared on the next successful queued dispatch.
+    worker_pool_saturated: AtomicBool,
     config: Config,
 }
 
@@ -122,6 +126,7 @@ impl Ingestor {
             raw_spools,
             raw_spool_seal_refs: Arc::new(Mutex::new(BTreeMap::new())),
             ingest_workers: Mutex::new(None),
+            worker_pool_saturated: AtomicBool::new(false),
             config,
         })
     }
@@ -432,6 +437,11 @@ impl Ingestor {
                         match dispatcher.commands[worker_idx].try_send(work) {
                             Ok(()) => {
                                 dispatcher.next_worker = worker_idx.wrapping_add(1);
+                                // A worker accepted the handoff: clear the
+                                // saturation latch so a later caller-runs episode
+                                // logs again on its first transition.
+                                self.worker_pool_saturated
+                                    .store(false, std::sync::atomic::Ordering::Release);
                                 metrics.ingest_request(route.as_str(), 202, "accepted");
                                 self.record_worker_queue_metrics(metrics);
                                 metrics.inc(
@@ -466,6 +476,26 @@ impl Ingestor {
             ],
             1,
         );
+        // Loud-once on the first transition into saturation so the inline
+        // degrade mode is visible in logs, not only in the `processed_inline`
+        // counter. Mirrors the raw-spool fatal first-transition latch; the next
+        // successful queued dispatch clears it.
+        if self
+            .worker_pool_saturated
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            tracing::warn!(
+                event = "ingest_worker_pool_saturated",
+                request_kind = route.as_str(),
+                "ingest worker pool saturated; processing inline on the connection thread (back-pressure via latency)"
+            );
+        }
         let result = self.process_spooled_ingest(work, storage);
         self.record_inflight_metrics(metrics);
         // The raw request is durably spooled, so the 202 acknowledgement holds

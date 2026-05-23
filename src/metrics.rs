@@ -793,6 +793,7 @@ mod snapshot_tests {
         metrics.gauge("canardstack_projected_buffer_seconds", &[], 0.0);
         metrics.gauge("canardstack_projected_visibility_seconds", &[], 0.0);
         metrics.gauge("canardstack_observed_freshness_lag_seconds", &[], 0.0);
+        metrics.gauge("canardstack_ingest_inflight_memory_bound_bytes", &[], 1.0);
 
         // Maintenance.
         metrics.maintenance_run("seal", "ok", "ok", 0.01);
@@ -900,6 +901,7 @@ mod snapshot_tests {
             "canardstack_ingest_decoded_bytes_total",
             "canardstack_ingest_inflight_bytes",
             "canardstack_ingest_inflight_capacity_bytes",
+            "canardstack_ingest_inflight_memory_bound_bytes",
             "canardstack_ingest_inflight_pressure",
             "canardstack_ingest_records_total",
             "canardstack_ingest_request_bytes_total",

@@ -89,7 +89,7 @@ Do not label metrics by `service_name`, trace id, query text, API key, or arbitr
 | `canardstack_ingest_inflight_capacity_bytes` | Gauge | `storage_signal` | Per-storage-signal in-flight pressure reference (the `inflight_pressure` denominator). Not an admission ceiling — freshness-first admission is the sole soft shed. |
 | `canardstack_ingest_inflight_pressure` | Gauge | `storage_signal` | In-flight bytes as a fraction of the per-storage-signal pressure reference (`0..1`). Peaks are derivable with `max_over_time()`. |
 | `canardstack_ingest_worker_queue_capacity` | Gauge | `state=capacity` | Configured bounded worker channel capacity. |
-| `canardstack_ingest_worker_dispatch_total` | Counter | `request_kind`, `outcome` | Worker-channel handoff outcomes: `queued`, `processed_inline`, or `workers_unavailable`. |
+| `canardstack_ingest_worker_dispatch_total` | Counter | `request_kind`, `outcome` | Worker-channel handoff outcomes: `queued`, `processed_inline`, or `workers_unavailable`. A rising `outcome="processed_inline"` rate signals worker-pool saturation: every worker channel was full, so the request was processed inline on the connection thread (back-pressure via latency). The first transition into each saturation episode also emits the `ingest_worker_pool_saturated` log event (logged once per episode, cleared on the next successful queued dispatch). |
 | `canardstack_ingest_storage_insert_total` | Counter | `request_kind`, `status` | Worker appends of Arrow batches into the Arrow write buffer. |
 | `canardstack_ingest_worker_completed_total` | Counter | `request_kind`, `status` | Ingest worker tasks completed, by outcome. |
 | `canardstack_duckdb_arrow_appends_total` | Counter | `storage_signal` | DuckDB Arrow appender calls per flushed storage signal. |
@@ -163,6 +163,7 @@ because accepted requests are fsynced before acknowledgement.
 | `canardstack_projected_buffer_seconds` | Gauge | none | Arrow write-buffer visibility debt past configured buffer target or max age. |
 | `canardstack_projected_visibility_seconds` | Gauge | none | Max of process-queue visibility debt and Arrow write-buffer visibility debt. |
 | `canardstack_observed_freshness_lag_seconds` | Gauge | none | Max cached query-visible freshness lag from the last operator gauge refresh. |
+| `canardstack_ingest_inflight_memory_bound_bytes` | Gauge | none | Approximate in-flight byte bound implied by freshness-first admission (`0.95 x freshness_budget_sla_seconds x ewma_seal_bytes_per_second`). The 0.95 is the headline `INGEST_FRESHNESS_BUDGET_FRACTION`; the with-heavy-query path tightens to 0.90. During EWMA warm-up it rides on the configured seal-rate seed. This is the implicit memory backstop now that the per-signal in-flight ceiling is gone and the RSS hard cap is opt-in. |
 
 ## Maintenance Metrics
 

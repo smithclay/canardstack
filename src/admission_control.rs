@@ -400,6 +400,20 @@ impl AdmissionController {
             &[],
             snapshot.observed_freshness_lag_seconds,
         );
+        // Approximate in-flight byte bound implied by freshness-first admission:
+        // because admit_ingest rejects once projected_seal_seconds exceeds the
+        // budget fraction of the SLA, in-flight bytes are transitively capped at
+        // ~`fraction x SLA x ewma_seal_bytes_per_second`. The headline fraction is
+        // 0.95 (INGEST_FRESHNESS_BUDGET_FRACTION); the with-heavy-query path
+        // tightens it to 0.90. During EWMA warm-up this rides on the seal-rate
+        // seed until measured seal throughput takes over.
+        metrics.gauge(
+            "canardstack_ingest_inflight_memory_bound_bytes",
+            &[],
+            FreshnessModel::INGEST_FRESHNESS_BUDGET_FRACTION
+                * snapshot.freshness_budget_sla_seconds
+                * snapshot.ewma_seal_bytes_per_second,
+        );
         metrics.set_counter(
             "canardstack_admission_reductions_total",
             &[],
