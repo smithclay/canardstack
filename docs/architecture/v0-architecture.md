@@ -99,11 +99,19 @@ Crash behavior:
 - If an append fsync fails before `202`, canardstack rejects that request with
   `503 raw_spool_unavailable` and marks the raw spool unhealthy.
 
-At-least-once duplicate window:
+Delivery semantics (at-least-once, duplicate rows possible):
 
-- If the process crashes after DuckLake storage commit but before raw-spool
-  checkpoint, restart replay can duplicate that raw request.
-- Exactly-once or request-id dedupe is post-MVP.
+- A `202` means the raw request was durably spooled (written and fsynced), and
+  the system is at-least-once from that point on.
+- The raw-spool checkpoint deliberately follows the DuckLake commit
+  (capture-before-flush, checkpoint-after-commit) so that only storage-committed
+  records are ever checkpointed.
+- The consequence: if the process crashes after DuckLake storage commit but
+  before raw-spool checkpoint, restart replay re-ingests that raw request,
+  producing duplicate ROWS in storage.
+- v0 does NOT dedup. Those duplicate rows are surfaced verbatim, so query results
+  can contain duplicates after a crash-recovery. Exactly-once or request-id
+  dedupe is post-MVP.
 
 Retryable failure behavior:
 
@@ -251,6 +259,17 @@ The process has one small admission controller with three distinct primitives:
 
 Operator/control routes keep health, metrics, and admin health available in
 every serve role without using query admission.
+
+Default memory backstop: the freshness budget is the default ingest memory
+backstop. The former per-signal in-flight ceiling was removed, and the process
+RSS hard cap is opt-in and OFF by default. Because admit_ingest rejects when
+projected seal visibility exceeds ~0.95x the SLA, it transitively bounds
+in-flight bytes at roughly
+`0.95 x freshness_budget_sla_seconds x ewma_seal_bytes_per_second`. During EWMA
+warm-up that bound rides on the configured seal-rate seed
+(`CANARDSTACK_SEAL_RATE_SEED_BYTES` / `_WINDOW`). Operators who want an explicit
+RSS hard cap must set `CANARDSTACK_PROCESS_MEMORY_LIMIT_BYTES` /
+`runtime_memory_limit_bytes`.
 
 Heavy range/search/trace queries consume only the remaining query capacity after
 the seal and cheap-query reservations. When projected visibility debt reaches

@@ -12,6 +12,10 @@ All telemetry query paths use the internal query engine protections:
 - DuckDB memory limits.
 - Query concurrency guards.
 
+Ingest is at-least-once and v0 does not dedup, so query results can contain
+duplicate rows after a crash-recovery (see "Delivery semantics" in
+`v0-architecture.md`).
+
 ## Discovery Metadata Spine
 
 Prometheus label values, Prometheus series, Prometheus metric metadata, Loki

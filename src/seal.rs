@@ -7,6 +7,13 @@ use std::time::Instant;
 /// the Arrow write buffer to DuckLake, feed the observed throughput back into the
 /// admission EWMA, and record the run. The single named entry point for "perform
 /// a seal", used by both the scheduler tick and the admin maintenance route.
+///
+/// Delivery semantics: the raw-spool checkpoint happens AFTER the DuckLake COMMIT
+/// (capture before flush, checkpoint after commit). This ordering is deliberate
+/// and load-bearing for at-least-once — we never checkpoint rows that were not
+/// storage-committed. The consequence is that a crash between COMMIT and
+/// checkpoint replays those records on restart, producing duplicate ROWS in
+/// storage, which v0 surfaces to queries without dedup.
 pub fn run(state: &AppState) -> ApiResult<Value> {
     let started = Instant::now();
     let pending_bytes: usize = state

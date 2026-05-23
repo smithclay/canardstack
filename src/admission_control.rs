@@ -30,6 +30,20 @@
 //!   ([`FreshnessModel::HEAVY_QUERY_REJECT_FRACTION`]).
 //! - Cheap queries keep protected admission and seal capacity is reserved ahead
 //!   of all query capacity.
+//!
+//! Default memory backstop: in the default config the freshness projection in
+//! [`AdmissionController::admit_ingest`] is the SOLE enforced ingest gate. The
+//! former per-signal in-flight ceiling was removed, and the process RSS hard cap
+//! ([`crate::ingest`]'s `RuntimeMemoryReservation`) is opt-in and OFF by default
+//! (`config.runtime_memory_limit_bytes: None`). Because admit_ingest rejects when
+//! `projected_seal_seconds = inflight_bytes / observed_seal_rate` exceeds
+//! `INGEST_FRESHNESS_BUDGET_FRACTION` (~0.95) of the SLA, it transitively bounds
+//! in-flight bytes at approximately
+//! `0.95 x freshness_budget_sla_seconds x ewma_seal_bytes_per_second`. During
+//! EWMA warm-up this bound rides on the configured seal-rate seed
+//! (`seal_rate_seed_bytes` / `seal_rate_seed_window`) until measured throughput
+//! takes over. Operators who want an explicit RSS hard cap must set
+//! `runtime_memory_limit_bytes`.
 
 use crate::config::Config;
 use crate::metrics::Metrics;

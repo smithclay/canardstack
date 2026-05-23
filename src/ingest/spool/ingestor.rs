@@ -203,8 +203,13 @@ impl Ingestor {
             self.checkpoint_raw_spool_batch(&captured, "storage_committed", Some(metrics))
         {
             // Rows are durably committed; only the raw-spool checkpoint failed.
-            // The records stay pending and replay (as duplicates) on a future
-            // restart, which at-least-once allows.
+            // The records stay pending and replay (as duplicate ROWS in storage)
+            // on a future restart. This is the at-least-once contract: the spool
+            // checkpoint deliberately follows the DuckLake COMMIT (capture before
+            // flush, checkpoint after commit), so any crash or checkpoint failure
+            // between commit and checkpoint re-ingests already-committed records.
+            // v0 does NOT dedup, so those duplicate rows are surfaced verbatim to
+            // queries after crash-replay.
             tracing::error!(
                 event = "raw_spool_checkpoint_failed",
                 error = %err,

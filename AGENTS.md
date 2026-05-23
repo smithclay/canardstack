@@ -97,7 +97,7 @@ Top-level modules map to pipeline stages or boundaries. Subdirectories group hel
 
 - Keep the code synchronous. Do not add `tokio`, `async fn`, gRPC, Kafka, a second binary, or another long-running service unless the task explicitly changes the architecture.
 - Use OS threads plus `Arc<Mutex<_>>`. Prefer `LockExt::lock_or_poisoned()` over `.lock().unwrap()` for shared state.
-- Treat ingest as at-least-once after local durable spool: a 2xx response means the raw request was fsynced to the local raw spool and accepted for bounded processing. It does not mean the rows are DuckLake-committed or query-visible yet.
+- Treat ingest as at-least-once after local durable spool: a 2xx response means the raw request was fsynced to the local raw spool and accepted for bounded processing. It does not mean the rows are DuckLake-committed or query-visible yet. Because the raw-spool checkpoint follows the DuckLake commit, a crash between commit and checkpoint replays records as duplicate rows that v0 surfaces to queries without dedup.
 - Preserve pressure behavior: ingest admission returns 429 under pressure, and storage/dependency failures surface as 503 where appropriate.
 - Preserve freshness-first admission: request-path checks may reject with 429 before raw-spool append when projected seal visibility exceeds the configured freshness SLA.
 - Preserve seal/query admission priority: seal capacity is reserved before query capacity; cheap metadata/probe/discovery/instant-ish queries keep protected admission, and heavy range/search queries degrade or reject first under freshness debt.
