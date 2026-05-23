@@ -35,8 +35,39 @@ impl Default for Metrics {
 
 #[derive(Default)]
 struct MetricsInner {
-    counters: BTreeMap<String, u64>,
-    gauges: BTreeMap<String, f64>,
+    counters: BTreeMap<MetricId, u64>,
+    gauges: BTreeMap<MetricId, f64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct MetricId {
+    name: String,
+    labels: Vec<(String, String)>,
+}
+
+impl MetricId {
+    fn new(name: &str, labels: &[(&str, &str)]) -> Self {
+        Self {
+            name: name.to_string(),
+            labels: labels
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                .collect(),
+        }
+    }
+
+    fn render_prometheus(&self) -> String {
+        if self.labels.is_empty() {
+            return self.name.clone();
+        }
+        let rendered = self
+            .labels
+            .iter()
+            .map(|(key, value)| format!("{key}=\"{}\"", escape_label_value(value)))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!("{}{{{rendered}}}", self.name)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -81,45 +112,46 @@ pub enum MetricKind {
 }
 
 impl Metrics {
-    /// Select the lock shard for a rendered metric key. A given key always maps
+    /// Select the lock shard for a metric id. A given id always maps
     /// to the same shard, so read-modify-write counters/gauges remain correct
     /// without a single global lock. FNV-1a keeps this branch-free and cheap.
-    fn shard_for(&self, metric_key: &str) -> &Mutex<MetricsInner> {
+    fn shard_for(&self, metric_id: &MetricId) -> &Mutex<MetricsInner> {
         let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-        for byte in metric_key.as_bytes() {
-            hash ^= u64::from(*byte);
-            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        hash_metric_part(&mut hash, metric_id.name.as_bytes());
+        for (key, value) in &metric_id.labels {
+            hash_metric_part(&mut hash, key.as_bytes());
+            hash_metric_part(&mut hash, value.as_bytes());
         }
         &self.shards[(hash as usize) & (METRICS_SHARDS - 1)]
     }
 
     pub fn inc(&self, name: &str, labels: &[(&str, &str)], by: u64) {
-        let metric_key = key(name, labels);
-        let mut inner = self.shard_for(&metric_key).lock_or_poisoned();
-        *inner.counters.entry(metric_key).or_default() += by;
+        let metric_id = MetricId::new(name, labels);
+        let mut inner = self.shard_for(&metric_id).lock_or_poisoned();
+        *inner.counters.entry(metric_id).or_default() += by;
     }
 
     pub fn set_counter(&self, name: &str, labels: &[(&str, &str)], value: u64) {
-        let metric_key = key(name, labels);
-        self.shard_for(&metric_key)
+        let metric_id = MetricId::new(name, labels);
+        self.shard_for(&metric_id)
             .lock_or_poisoned()
             .counters
-            .insert(metric_key, value);
+            .insert(metric_id, value);
     }
 
     pub fn gauge(&self, name: &str, labels: &[(&str, &str)], value: f64) {
-        let metric_key = key(name, labels);
-        self.shard_for(&metric_key)
+        let metric_id = MetricId::new(name, labels);
+        self.shard_for(&metric_id)
             .lock_or_poisoned()
             .gauges
-            .insert(metric_key, value);
+            .insert(metric_id, value);
     }
 
     pub fn gauge_max(&self, name: &str, labels: &[(&str, &str)], value: f64) {
-        let metric_key = key(name, labels);
-        let mut inner = self.shard_for(&metric_key).lock_or_poisoned();
-        let current = inner.gauges.get(&metric_key).copied().unwrap_or(value);
-        inner.gauges.insert(metric_key, current.max(value));
+        let metric_id = MetricId::new(name, labels);
+        let mut inner = self.shard_for(&metric_id).lock_or_poisoned();
+        let current = inner.gauges.get(&metric_id).copied().unwrap_or(value);
+        inner.gauges.insert(metric_id, current.max(value));
     }
 
     pub fn observe_seconds(&self, name: &str, labels: &[(&str, &str)], seconds: f64) {
@@ -130,28 +162,28 @@ impl Metrics {
         if count == 0 {
             return;
         }
-        let count_key = key(&format!("{name}_count"), labels);
-        let sum_key = key(&format!("{name}_sum"), labels);
+        let count_id = MetricId::new(&format!("{name}_count"), labels);
+        let sum_id = MetricId::new(&format!("{name}_sum"), labels);
         {
-            let mut inner = self.shard_for(&count_key).lock_or_poisoned();
-            *inner.counters.entry(count_key).or_default() += count;
+            let mut inner = self.shard_for(&count_id).lock_or_poisoned();
+            *inner.counters.entry(count_id).or_default() += count;
         }
-        let mut inner = self.shard_for(&sum_key).lock_or_poisoned();
-        let current = inner.gauges.get(&sum_key).copied().unwrap_or(0.0);
-        inner.gauges.insert(sum_key, current + seconds);
+        let mut inner = self.shard_for(&sum_id).lock_or_poisoned();
+        let current = inner.gauges.get(&sum_id).copied().unwrap_or(0.0);
+        inner.gauges.insert(sum_id, current + seconds);
     }
 
     pub fn set_observation(&self, name: &str, labels: &[(&str, &str)], count: u64, seconds: f64) {
-        let count_key = key(&format!("{name}_count"), labels);
-        let sum_key = key(&format!("{name}_sum"), labels);
-        self.shard_for(&count_key)
+        let count_id = MetricId::new(&format!("{name}_count"), labels);
+        let sum_id = MetricId::new(&format!("{name}_sum"), labels);
+        self.shard_for(&count_id)
             .lock_or_poisoned()
             .counters
-            .insert(count_key, count);
-        self.shard_for(&sum_key)
+            .insert(count_id, count);
+        self.shard_for(&sum_id)
             .lock_or_poisoned()
             .gauges
-            .insert(sum_key, seconds);
+            .insert(sum_id, seconds);
     }
 
     pub fn observe_phase_seconds(
@@ -281,14 +313,14 @@ impl Metrics {
     pub fn render_prometheus(&self) -> String {
         let (counters, gauges) = self.merged_shards();
         let mut out = String::new();
-        for (k, v) in &counters {
-            out.push_str(k);
+        for (id, v) in &counters {
+            out.push_str(&id.render_prometheus());
             out.push(' ');
             out.push_str(&v.to_string());
             out.push('\n');
         }
-        for (k, v) in &gauges {
-            out.push_str(k);
+        for (id, v) in &gauges {
+            out.push_str(&id.render_prometheus());
             out.push(' ');
             out.push_str(&format!("{v:.6}"));
             out.push('\n');
@@ -300,23 +332,21 @@ impl Metrics {
         let (counters, gauges) = self.merged_shards();
         counters
             .iter()
-            .map(|(k, v)| {
-                let (name, labels) = split_metric_key(k);
-                MetricSample::counter(name, labels, *v as f64)
-            })
-            .chain(gauges.iter().map(|(k, v)| {
-                let (name, labels) = split_metric_key(k);
-                MetricSample::gauge(name, labels, *v)
-            }))
+            .map(|(id, v)| MetricSample::counter(id.name.clone(), metric_labels_map(id), *v as f64))
+            .chain(
+                gauges
+                    .iter()
+                    .map(|(id, v)| MetricSample::gauge(id.name.clone(), metric_labels_map(id), *v)),
+            )
             .collect()
     }
 
     /// Merge all shards into sorted maps for a stable, deduplicated read. Each
     /// key lives in exactly one shard, so the merge never collides. Locks one
     /// shard at a time, so it cannot deadlock against the per-key writers.
-    fn merged_shards(&self) -> (BTreeMap<String, u64>, BTreeMap<String, f64>) {
-        let mut counters: BTreeMap<String, u64> = BTreeMap::new();
-        let mut gauges: BTreeMap<String, f64> = BTreeMap::new();
+    fn merged_shards(&self) -> (BTreeMap<MetricId, u64>, BTreeMap<MetricId, f64>) {
+        let mut counters: BTreeMap<MetricId, u64> = BTreeMap::new();
+        let mut gauges: BTreeMap<MetricId, f64> = BTreeMap::new();
         for shard in &self.shards {
             let inner = shard.lock_or_poisoned();
             counters.extend(inner.counters.iter().map(|(k, v)| (k.clone(), *v)));
@@ -393,78 +423,21 @@ fn status_label(status: u16) -> Cow<'static, str> {
     }
 }
 
-fn key(name: &str, labels: &[(&str, &str)]) -> String {
-    if labels.is_empty() {
-        return name.to_string();
+fn hash_metric_part(hash: &mut u64, bytes: &[u8]) {
+    for byte in bytes {
+        *hash ^= u64::from(*byte);
+        *hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
-    let rendered = labels
-        .iter()
-        .map(|(k, v)| format!("{k}=\"{}\"", escape_label_value(v)))
-        .collect::<Vec<_>>()
-        .join(",");
-    format!("{name}{{{rendered}}}")
+    *hash ^= 0xff;
+    *hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
 }
 
-/// Escape a label value for the `name{k="v"}` key format. Both `\` and `"` are
-/// escaped so `split_metric_key` can round-trip values containing either.
+fn metric_labels_map(metric_id: &MetricId) -> BTreeMap<String, String> {
+    metric_id.labels.iter().cloned().collect()
+}
+
 fn escape_label_value(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
-}
-
-fn split_metric_key(key: &str) -> (String, BTreeMap<String, String>) {
-    let Some((name, rest)) = key.split_once('{') else {
-        return (key.to_string(), BTreeMap::new());
-    };
-    let Some(labels) = rest.strip_suffix('}') else {
-        return (key.to_string(), BTreeMap::new());
-    };
-    (name.to_string(), parse_labels(labels))
-}
-
-/// Parse the `k1="v1",k2="v2"` body produced by `key`. Quote-aware so a `,` or
-/// escaped `"` inside a value does not split or terminate it early.
-fn parse_labels(input: &str) -> BTreeMap<String, String> {
-    let mut out = BTreeMap::new();
-    let mut chars = input.chars().peekable();
-    loop {
-        let mut name = String::new();
-        while let Some(&ch) = chars.peek() {
-            if ch == '=' {
-                break;
-            }
-            name.push(ch);
-            chars.next();
-        }
-        if chars.next() != Some('=') || chars.next() != Some('"') {
-            break;
-        }
-        let mut value = String::new();
-        let mut closed = false;
-        while let Some(ch) = chars.next() {
-            match ch {
-                '\\' => {
-                    if let Some(escaped) = chars.next() {
-                        value.push(escaped);
-                    }
-                }
-                '"' => {
-                    closed = true;
-                    break;
-                }
-                _ => value.push(ch),
-            }
-        }
-        if !closed {
-            break;
-        }
-        if !name.is_empty() {
-            out.insert(name, value);
-        }
-        if chars.next() != Some(',') {
-            break;
-        }
-    }
-    out
 }
 
 fn metric_samples_batch(samples: &[MetricSample], signal: Signal) -> Result<RecordBatch> {
