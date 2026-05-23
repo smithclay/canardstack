@@ -25,7 +25,7 @@ fn log_startup_storage_mode(probe: &crate::storage::StorageProbe) {
     tracing::info!(
         event = "storage_mode",
         mode = probe.mode,
-        "telemetry lands in immutable DuckLake data files"
+        "telemetry lands through DuckDB Arrow append into DuckLake"
     );
 }
 

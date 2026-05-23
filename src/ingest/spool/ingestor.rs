@@ -2,7 +2,7 @@ use super::{full_info, AppendBatchStats, CheckpointBatchStats, Record, RecordId,
 use crate::admission_control::AdmissionController;
 use crate::ingest::{Ingestor, OtlpRequestKind, RawSpoolLane};
 use crate::metrics::Metrics;
-use crate::storage::{ImmutableSealOutcome, Storage, TimingPhase};
+use crate::storage::{ArrowFlushOutcome, Storage, TimingPhase};
 use crate::validation::{self, ApiError, ApiResult};
 use crate::LockExt;
 use anyhow::{Context, Result};
@@ -165,10 +165,11 @@ impl Ingestor {
             .map_err(|err| anyhow::anyhow!(err.message.clone()))
     }
 
-    /// Record that a durably-spooled request's rows are now in the storage
-    /// immutable buffer. The scheduler checkpoints the record after the next
-    /// durable seal (see [`Ingestor::seal_committed_to_storage`]). Called only
-    /// after a successful buffer append so a tracked ref always implies buffered rows.
+    /// Record that a durably-spooled request's rows are now in the Arrow write
+    /// buffer. The scheduler checkpoints the record after the next durable
+    /// DuckLake commit (see [`Ingestor::seal_committed_to_storage`]). Called
+    /// only after a successful buffer append so a tracked ref always implies
+    /// buffered rows.
     pub(in crate::ingest) fn track_raw_spool_record(
         &self,
         raw_spool_ref: AppendRef,
@@ -182,35 +183,36 @@ impl Ingestor {
         );
     }
 
-    /// Single seal driver: capture the records to checkpoint, force-seal the
-    /// whole immutable buffer to durable storage, then checkpoint exactly the
-    /// captured records. Capturing before sealing is load-bearing for
-    /// at-least-once: a record appended after the capture is not checkpointed
-    /// until a later seal, so we never checkpoint rows that were not sealed.
+    /// Single seal driver: capture the records to checkpoint, force-flush the
+    /// whole Arrow write buffer to durable DuckLake storage, then checkpoint
+    /// exactly the captured records. Capturing before flushing is load-bearing
+    /// for at-least-once: a record appended after the capture is not
+    /// checkpointed until a later seal, so we never checkpoint rows that were
+    /// not storage-committed.
     pub fn seal_committed_to_storage(
         &self,
         storage: &Storage,
         metrics: &Metrics,
-    ) -> Result<ImmutableSealOutcome> {
+    ) -> Result<ArrowFlushOutcome> {
         let captured = self.capture_committed_refs();
-        let outcome = match storage.seal_immutable_segments(true) {
+        let outcome = match storage.flush_arrow_write_buffer(true) {
             Ok(outcome) => outcome,
             Err(err) => {
                 self.restore_committed_refs(captured);
                 return Err(err);
             }
         };
-        observe_immutable_seal(metrics, &outcome);
+        observe_arrow_flush(metrics, &outcome);
         if let Err(err) =
             self.checkpoint_raw_spool_batch(&captured, "storage_committed", Some(metrics))
         {
-            // Rows are durably sealed; only the raw-spool checkpoint failed. The
-            // records stay pending and replay (as duplicates) on a future
+            // Rows are durably committed; only the raw-spool checkpoint failed.
+            // The records stay pending and replay (as duplicates) on a future
             // restart, which at-least-once allows.
             tracing::error!(
                 event = "raw_spool_checkpoint_failed",
                 error = %err,
-                "segments sealed but raw spool checkpoint failed; records left pending"
+                "Arrow flush committed but raw spool checkpoint failed; records left pending"
             );
         }
         Ok(outcome)
@@ -737,7 +739,7 @@ impl Ingestor {
     }
 }
 
-fn observe_immutable_seal(metrics: &Metrics, outcome: &ImmutableSealOutcome) {
+fn observe_arrow_flush(metrics: &Metrics, outcome: &ArrowFlushOutcome) {
     for timing in &outcome.timings {
         metrics.observe_storage_signal_phase_seconds(
             timing.table.as_str(),
@@ -745,20 +747,31 @@ fn observe_immutable_seal(metrics: &Metrics, outcome: &ImmutableSealOutcome) {
             timing.seconds,
         );
     }
-    if outcome.sealed_rows == 0 && outcome.sealed_files == 0 {
+    if outcome.flushed_rows == 0 {
         return;
     }
     for timing in &outcome.timings {
-        if timing.phase == TimingPhase::ParquetEncode {
+        if timing.phase == TimingPhase::DuckdbArrowAppend {
             metrics.inc(
-                "canardstack_immutable_segments_sealed_files_total",
+                "canardstack_duckdb_arrow_appends_total",
                 &[("storage_signal", timing.table.as_str())],
                 1,
             );
             metrics.inc(
-                "canardstack_immutable_segments_sealed_rows_total",
+                "canardstack_duckdb_arrow_appended_rows_total",
                 &[("storage_signal", timing.table.as_str())],
                 timing.rows as u64,
+            );
+        } else if timing.phase == TimingPhase::DucklakeCommit {
+            metrics.inc(
+                "canardstack_arrow_flush_rows_total",
+                &[("storage_signal", timing.table.as_str())],
+                timing.rows as u64,
+            );
+            metrics.inc(
+                "canardstack_arrow_flushes_total",
+                &[("storage_signal", timing.table.as_str())],
+                1,
             );
         }
     }

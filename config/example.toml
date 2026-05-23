@@ -39,8 +39,8 @@ accept_late_secs = 86400
 accept_future_secs = 600
 
 [storage]
-segment_target_bytes = 67108864
-segment_max_age_secs = 10
+arrow_write_buffer_target_bytes = 67108864
+arrow_write_buffer_max_age_secs = 10
 
 [raw_spool]
 capacity_bytes = 1073741824
@@ -64,7 +64,7 @@ days = 14
 enabled = true
 maintenance_interval_secs = 30
 # Seal cadence for the single seal driver. Keep well under the freshness SLA so
-# immutable-buffer age never approaches the freshness-budget reject threshold (default 1000ms).
+# Arrow write-buffer age never approaches the freshness-budget reject threshold (default 1000ms).
 # seal_interval_ms = 1000
 
 [bench]

@@ -1200,12 +1200,10 @@ fn print_summary(report: &Report, path: &Path) {
         .collect::<Vec<_>>();
     println!("phase_top={}", top_phases.join("; "));
     if let Some(storage) = &report.storage {
-        if !storage.ducklake_parquet_files.is_empty() || !storage.ducklake_inlined_rows.is_empty() {
+        if !storage.ducklake_active_data_files.is_empty() {
             println!(
-                "ducklake_layout parquet_files={:?} parquet_rows={:?} inlined_rows={:?}",
-                storage.ducklake_parquet_files,
-                storage.ducklake_parquet_rows,
-                storage.ducklake_inlined_rows
+                "ducklake_layout active_data_files={:?} active_data_file_rows={:?}",
+                storage.ducklake_active_data_files, storage.ducklake_active_data_file_rows
             );
         }
     }
@@ -2619,24 +2617,17 @@ fn scrape_metrics(text: &str) -> ScrapedMetrics {
                         .insert(table.clone(), metric.value as u64);
                 }
             }
-            "canardstack_ducklake_parquet_files" => {
+            "canardstack_ducklake_active_data_files" => {
                 if let Some(table) = metric.labels.get("table") {
                     out.storage
-                        .ducklake_parquet_files
+                        .ducklake_active_data_files
                         .insert(table.clone(), metric.value as u64);
                 }
             }
-            "canardstack_ducklake_parquet_rows" => {
+            "canardstack_ducklake_active_data_file_rows" => {
                 if let Some(table) = metric.labels.get("table") {
                     out.storage
-                        .ducklake_parquet_rows
-                        .insert(table.clone(), metric.value as u64);
-                }
-            }
-            "canardstack_ducklake_inlined_rows" => {
-                if let Some(table) = metric.labels.get("table") {
-                    out.storage
-                        .ducklake_inlined_rows
+                        .ducklake_active_data_file_rows
                         .insert(table.clone(), metric.value as u64);
                 }
             }
@@ -2995,9 +2986,8 @@ struct QueueReport {
 struct StorageReport {
     physical_bytes: Option<u64>,
     logical_rows: BTreeMap<String, u64>,
-    ducklake_parquet_files: BTreeMap<String, u64>,
-    ducklake_parquet_rows: BTreeMap<String, u64>,
-    ducklake_inlined_rows: BTreeMap<String, u64>,
+    ducklake_active_data_files: BTreeMap<String, u64>,
+    ducklake_active_data_file_rows: BTreeMap<String, u64>,
 }
 
 #[derive(Clone, Serialize)]
@@ -3141,13 +3131,13 @@ impl LokiProgressiveQueryReport {
         );
         let final_total_log_files = labeled_metric_value(
             end_metrics,
-            "canardstack_ducklake_parquet_files",
+            "canardstack_ducklake_active_data_files",
             "table",
             "logs",
         );
         let final_total_log_rows = labeled_metric_value(
             end_metrics,
-            "canardstack_ducklake_parquet_rows",
+            "canardstack_ducklake_active_data_file_rows",
             "table",
             "logs",
         );
@@ -3289,14 +3279,14 @@ impl StageThroughputReport {
                 kind: StageMetricKind::Counter,
             },
             StageMetric {
-                stage: "immutable_sealed_rows",
-                metric: "canardstack_immutable_segments_sealed_rows_total",
+                stage: "duckdb_arrow_appended_rows",
+                metric: "canardstack_duckdb_arrow_appended_rows_total",
                 label: "storage_signal",
                 kind: StageMetricKind::Counter,
             },
             StageMetric {
-                stage: "immutable_sealed_files",
-                metric: "canardstack_immutable_segments_sealed_files_total",
+                stage: "arrow_flush_rows",
+                metric: "canardstack_arrow_flush_rows_total",
                 label: "storage_signal",
                 kind: StageMetricKind::Counter,
             },
@@ -3313,14 +3303,14 @@ impl StageThroughputReport {
                 kind: StageMetricKind::GaugeDelta,
             },
             StageMetric {
-                stage: "ducklake_parquet_rows",
-                metric: "canardstack_ducklake_parquet_rows",
+                stage: "ducklake_active_data_file_rows",
+                metric: "canardstack_ducklake_active_data_file_rows",
                 label: "table",
                 kind: StageMetricKind::GaugeDelta,
             },
             StageMetric {
-                stage: "ducklake_parquet_files",
-                metric: "canardstack_ducklake_parquet_files",
+                stage: "ducklake_active_data_files",
+                metric: "canardstack_ducklake_active_data_files",
                 label: "table",
                 kind: StageMetricKind::GaugeDelta,
             },

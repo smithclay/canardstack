@@ -55,21 +55,23 @@ Do not label metrics by `service_name`, trace id, query text, API key, or arbitr
 | `canardstack_raw_spool_healthy` | Gauge | optional `spool_lane` | `1` when the writer is accepting appends; `0` after a fatal append sync failure. |
 | `canardstack_raw_spool_segment_bytes` | Gauge | optional `spool_lane` | Total raw-spool segment bytes on disk. |
 | `canardstack_raw_spool_segments` | Gauge | optional `spool_lane` | Raw-spool segment file count. |
-| `canardstack_ingest_records_total` | Counter | `request_kind` | Records accepted into the immutable buffer. |
+| `canardstack_ingest_records_total` | Counter | `request_kind` | Records accepted into the Arrow write buffer. |
 | `canardstack_ingest_transformed_rows_total` | Counter | `storage_signal`, `request_kind` | Rows produced by worker-side `otlp2records` transform. |
 | `canardstack_ingest_unsupported_histograms_total` | Counter | `request_kind` | Histogram datapoints observed and dropped by the v0 metrics transformer. Emitted only when nonzero. |
-| `canardstack_ingest_buffered_rows_total` | Counter | `storage_signal` | Rows appended to the storage immutable buffer. |
-| `canardstack_ingest_buffered_bytes_total` | Counter | `storage_signal` | Approximate Arrow bytes appended to the storage immutable buffer. |
-| `canardstack_ingest_inflight_bytes` | Gauge | `storage_signal` | Bytes admitted (spooled, handed to a worker) but not yet appended to the immutable buffer. |
+| `canardstack_ingest_buffered_rows_total` | Counter | `storage_signal` | Rows appended to the Arrow write buffer. |
+| `canardstack_ingest_buffered_bytes_total` | Counter | `storage_signal` | Approximate Arrow bytes appended to the Arrow write buffer. |
+| `canardstack_ingest_inflight_bytes` | Gauge | `storage_signal` | Bytes admitted (spooled, handed to a worker) but not yet appended to the Arrow write buffer. |
 | `canardstack_ingest_inflight_capacity_bytes` | Gauge | `storage_signal` | Per-storage-signal in-flight ceiling. |
 | `canardstack_ingest_inflight_pressure` | Gauge | `storage_signal` | In-flight bytes as a fraction of the per-storage-signal ceiling (`0..1`). |
 | `canardstack_ingest_worker_queue_capacity` | Gauge | `state=capacity` | Configured bounded worker channel capacity. |
-| `canardstack_ingest_storage_insert_total` | Counter | `request_kind`, `status` | Worker appends of Arrow batches into the immutable buffer. |
+| `canardstack_ingest_storage_insert_total` | Counter | `request_kind`, `status` | Worker appends of Arrow batches into the Arrow write buffer. |
 | `canardstack_ingest_worker_completed_total` | Counter | `request_kind`, `status` | Ingest worker tasks completed, by outcome. |
 | `canardstack_ingest_rejections_total` | Counter | `request_kind`, `status`, `reason` | Admission-control rejections (subset of `_ingest_requests_total`). |
 | `canardstack_ingest_freshness_budget_rejections_total` | Counter | none | Requests rejected before raw-spool append because projected visibility exceeded the freshness-budget SLA. |
-| `canardstack_immutable_segments_sealed_rows_total` | Counter | `storage_signal` | Rows sealed into immutable Parquet segments. |
-| `canardstack_immutable_segments_sealed_files_total` | Counter | `storage_signal` | Immutable Parquet files written and registered with DuckLake. |
+| `canardstack_duckdb_arrow_appends_total` | Counter | `storage_signal` | DuckDB Arrow appender calls per flushed storage signal. |
+| `canardstack_duckdb_arrow_appended_rows_total` | Counter | `storage_signal` | Rows handed to DuckDB through the Arrow appender. |
+| `canardstack_arrow_flushes_total` | Counter | `storage_signal` | Arrow write-buffer flushes that reached DuckLake commit. |
+| `canardstack_arrow_flush_rows_total` | Counter | `storage_signal` | Rows made durable by DuckLake commit. |
 
 ## HTTP Metrics
 
@@ -86,14 +88,13 @@ scans.
 | --- | --- | --- | --- |
 | `canardstack_storage_logical_rows` | Gauge | `table` | Row count per table from DuckDB. |
 | `canardstack_storage_physical_bytes` | Gauge | `table=all` | Local storage directory size on disk. |
-| `canardstack_ducklake_parquet_files` | Gauge | `table` | Active DuckLake Parquet data files per table. |
-| `canardstack_ducklake_parquet_rows` | Gauge | `table` | Active rows stored in DuckLake Parquet data files per table. |
+| `canardstack_ducklake_active_data_files` | Gauge | `table` | Active DuckLake data files per table. |
+| `canardstack_ducklake_active_data_file_rows` | Gauge | `table` | Active rows stored in DuckLake data files per table. |
 
 The shared phase metric `canardstack_phase_duration_seconds` also records
 storage proof phases with `storage_signal` and `phase` labels:
-`storage_prepare`, `storage_buffer`, `storage_partition_split`,
-`storage_parquet_encode`, `storage_file_write`, `storage_file_fsync`,
-`storage_file_rename`, `storage_ducklake_register`, and
+`storage_prepare`, `storage_arrow_write_buffer`,
+`storage_arrow_write_coalesce`, `storage_duckdb_arrow_append`, and
 `storage_ducklake_commit`.
 
 `/api/admin/health/ingest` returns queue snapshots, raw-spool stats
@@ -132,8 +133,8 @@ accepted requests are fsynced before acknowledgement.
 | `canardstack_admission_rejections_total` | Counter | `admission`, `reason` | Rejections at the admission controller. |
 | `canardstack_seal_ewma_bytes_per_second` | Gauge | none | EWMA queue-byte seal throughput used for freshness-budget admission. |
 | `canardstack_projected_seal_seconds` | Gauge | none | Queue byte debt divided by EWMA seal throughput. |
-| `canardstack_projected_buffer_seconds` | Gauge | none | Immutable-buffer visibility debt past configured segment target or max age. |
-| `canardstack_projected_visibility_seconds` | Gauge | none | Max of process-queue visibility debt and immutable-buffer visibility debt. |
+| `canardstack_projected_buffer_seconds` | Gauge | none | Arrow write-buffer visibility debt past configured buffer target or max age. |
+| `canardstack_projected_visibility_seconds` | Gauge | none | Max of process-queue visibility debt and Arrow write-buffer visibility debt. |
 | `canardstack_observed_freshness_lag_seconds` | Gauge | none | Max cached query-visible freshness lag from the last operator gauge refresh. |
 
 ## Maintenance Metrics

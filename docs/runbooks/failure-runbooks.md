@@ -117,7 +117,7 @@ endpoint. Steps 2 and 3 require an operator-driven restart.
 
 ### Symptoms
 
-- DuckLake inserts or seals fail with object storage 5xx.
+- DuckDB Arrow appends, DuckLake commits, or seal/checkpoint cycles fail with object storage 5xx.
 - Freshness lag grows.
 - Maintenance retries increase.
 - `503` may begin for ingest if storage health is unsafe.
@@ -143,7 +143,9 @@ endpoint. Steps 2 and 3 require an operator-driven restart.
 
 - Serve queries from already committed data.
 - Surface stale freshness watermarks in Grafana.
-- Prioritize seal recovery; compaction and orphan cleanup are not implemented v0 controls.
+- Prioritize seal recovery. Snapshot expiration and old-file cleanup are safe
+  retention controls; physical file compaction remains disabled until proven
+  stable.
 
 ### Escalation
 

@@ -99,7 +99,7 @@ impl Drop for RuntimeMemoryReservation {
 }
 
 /// Per-signal accounting of bytes that have been admitted (durably spooled and
-/// handed to an ingest worker) but not yet appended to the immutable buffer.
+/// handed to an ingest worker) but not yet appended to the Arrow write buffer.
 ///
 /// Freshness-first admission in
 /// [`crate::admission_control::AdmissionController::admit_ingest`] is

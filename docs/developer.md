@@ -9,8 +9,8 @@ For a practitioner-focused overview, start with the [README](../README.md).
 
 ```text
 OTLP/HTTP -> cheap validation -> freshness-first admission -> fsynced local raw spool
-  -> ingest worker transform -> immutable buffer -> scheduler seal driver -> immutable Parquet segments
-  -> DuckLake registration -> logical queries
+  -> ingest worker transform -> Arrow write buffer -> scheduler seal driver
+  -> DuckDB Arrow append -> DuckLake commit -> logical queries
 ```
 
 canardstack is currently shaped as:
@@ -26,7 +26,7 @@ canardstack is currently shaped as:
   cheap query, and heavy query traffic.
 - DuckDB through `duckdb-rs`.
 - DuckLake through DuckDB's official `ducklake` extension SQL surface. The
-  default local mode is a local DuckLake catalog and local immutable data files.
+  default local mode is a local DuckLake catalog and local DuckLake-managed data files.
 - Prometheus, Loki, and Tempo compatibility adapters over bounded query helpers.
 - HTTP routes for ingest, smoke checks, and compatibility queries.
 - Query execution with time range, limit, timeout, memory, and concurrency
@@ -80,12 +80,12 @@ under `CANARDSTACK_DATA_DIR` and local file storage under
 `CANARDSTACK_DATA_DIR/storage`. Postgres catalogs and object storage are later
 deployment modes, not required for the Docker quickstart.
 
-Default v0 writes buffer prepared Arrow batches, seal immutable Parquet segment
-files with `otlp2records`, and register sealed files with
-`ducklake_add_data_files`. `CANARDSTACK_SEGMENT_TARGET_BYTES` defaults to 64
-MiB and `CANARDSTACK_SEGMENT_MAX_AGE_SECS` defaults to
-10 seconds. Managed DuckLake adjacent-file compaction is disabled for immutable
-segments.
+Default v0 writes prepared Arrow batches into an Arrow write buffer, then the
+scheduler flushes that buffer through DuckDB's Arrow appender into DuckLake
+tables inside an explicit transaction. `CANARDSTACK_ARROW_WRITE_BUFFER_TARGET_BYTES`
+defaults to 64 MiB and `CANARDSTACK_ARROW_WRITE_BUFFER_MAX_AGE_SECS` defaults to
+10 seconds. DuckLake adjacent-file compaction is disabled until
+`ducklake_merge_adjacent_files` is proven stable for this write pattern.
 
 The Docker image build runs `canardstack install-ducklake-extension` and stores
 the DuckDB DuckLake extension under `/usr/local/lib/duckdb/extensions`. That
@@ -206,7 +206,7 @@ cargo run -- smoke
 ```
 
 The smoke command starts the app in-process, ingests representative OTLP JSON
-logs, traces, gauge metrics, and sum metrics, seals buffered rows, calls
+logs, traces, gauge metrics, and sum metrics, flushes buffered rows, calls
 representative compatibility query endpoints, and prints health.
 
 ## Query Surface
@@ -320,15 +320,16 @@ scripts/smoke-docker-local.sh
 The `serve` command spawns one background thread that closes the maintenance
 loop without operator action:
 
-- A single seal driver seals the storage immutable buffer to durable Parquet
-  when per-signal size or age thresholds fire, or on the freshness cadence, then
-  checkpoints the raw spool. Ingest workers insert Arrow batches into the
-  immutable buffer; request threads do not perform DuckDB/DuckLake writes inline.
-- A periodic seal writes immutable buffers to Parquet and registers the files
-  with DuckLake.
-- DuckLake adjacent-file compaction is disabled for immutable telemetry
-  segments and is not exposed as a v0 maintenance control; segment sizing is
-  controlled by immutable target bytes and max age.
+- A single seal driver flushes the storage Arrow write buffer through DuckDB's
+  Arrow appender when per-signal size or age thresholds fire, or on the
+  freshness cadence, then checkpoints the raw spool after DuckLake commit.
+  Ingest workers insert Arrow batches into the Arrow write buffer; request
+  threads do not perform DuckDB/DuckLake writes inline.
+- A periodic seal writes Arrow buffers through DuckDB Arrow append and commits
+  DuckLake.
+- DuckLake adjacent-file compaction is disabled and is not exposed as a v0
+  maintenance control until `ducklake_merge_adjacent_files` is proven stable;
+  flush sizing is controlled by Arrow write-buffer target bytes and max age.
 - A retention pass enforces the configured retention days, expires DuckLake
   snapshots, and cleans old files.
 
@@ -345,7 +346,7 @@ cleanly when `serve` exits.
 `src/admission_control.rs` owns seal admission, query admission, and freshness
 budget projection. It is intentionally not a generic scheduler. The request path
 asks it one direct question before raw-spool append: will the process queue debt
-plus immutable-buffer visibility debt stay within
+plus Arrow write-buffer visibility debt stay within
 `CANARDSTACK_FRESHNESS_BUDGET_SLA_SECS` or `_MS`?
 
 Seal jobs reserve seal admission before doing DuckDB/DuckLake work and record

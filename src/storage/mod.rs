@@ -15,23 +15,23 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 mod arrow;
+mod arrow_write;
+mod arrow_write_buffer;
 mod ducklake;
 mod health;
-mod immutable;
-mod immutable_write;
 mod maintenance;
 mod metadata;
 mod metadata_refresh;
 mod query_conn;
 mod schema;
 
+pub use arrow_write::ArrowFlushOutcome;
+use arrow_write::ArrowWriteBuffer;
 pub use ducklake::install_ducklake_extension;
 use ducklake::{
     attach_ducklake_connection, configure_base_connection, configure_write_connection,
     ducklake_attach_plan,
 };
-pub use immutable::ImmutableSealOutcome;
-use immutable::ImmutableSegmentBuffer;
 use schema::create_tables_on;
 
 #[derive(Clone, Debug, Serialize)]
@@ -81,7 +81,7 @@ pub struct StorageCapabilities {
 }
 
 #[derive(Clone, Debug, Serialize)]
-pub struct ImmutableBufferMetric {
+pub struct ArrowWriteBufferMetric {
     pub table: StorageSignal,
     pub rows: usize,
     pub bytes: usize,
@@ -107,9 +107,9 @@ pub struct Storage {
     local_storage_dir: PathBuf,
     ducklake_required: bool,
     ducklake_managed_maintenance: bool,
-    immutable_segment_target_bytes: usize,
-    immutable_segment_max_age: Duration,
-    immutable_buffers: Mutex<BTreeMap<StorageSignal, ImmutableSegmentBuffer>>,
+    arrow_write_buffer_target_bytes: usize,
+    arrow_write_buffer_max_age: Duration,
+    arrow_write_buffers: Mutex<BTreeMap<StorageSignal, ArrowWriteBuffer>>,
     write_memory_limit: String,
     last_error: Mutex<Option<String>>,
     /// Cache-invalidation token for discovery metadata. Bumped only after a
@@ -153,14 +153,9 @@ pub struct ArrowBatchBuffer<'a> {
 pub enum TimingPhase {
     Coalesce,
     Prepare,
-    ImmutableCoalesce,
-    Buffer,
-    PartitionSplit,
-    ParquetEncode,
-    FileWrite,
-    FileFsync,
-    FileRename,
-    DucklakeRegister,
+    ArrowWriteCoalesce,
+    ArrowWriteBuffer,
+    DuckdbArrowAppend,
     DucklakeCommit,
 }
 
@@ -169,14 +164,9 @@ impl TimingPhase {
         match self {
             TimingPhase::Coalesce => "storage_coalesce",
             TimingPhase::Prepare => "storage_prepare",
-            TimingPhase::ImmutableCoalesce => "storage_immutable_coalesce",
-            TimingPhase::Buffer => "storage_buffer",
-            TimingPhase::PartitionSplit => "storage_partition_split",
-            TimingPhase::ParquetEncode => "storage_parquet_encode",
-            TimingPhase::FileWrite => "storage_file_write",
-            TimingPhase::FileFsync => "storage_file_fsync",
-            TimingPhase::FileRename => "storage_file_rename",
-            TimingPhase::DucklakeRegister => "storage_ducklake_register",
+            TimingPhase::ArrowWriteCoalesce => "storage_arrow_write_coalesce",
+            TimingPhase::ArrowWriteBuffer => "storage_arrow_write_buffer",
+            TimingPhase::DuckdbArrowAppend => "storage_duckdb_arrow_append",
             TimingPhase::DucklakeCommit => "storage_ducklake_commit",
         }
     }
@@ -234,7 +224,7 @@ impl Storage {
         )?;
         let target_prefix = "canardlake.".to_string();
         let plan = ducklake_attach_plan(config)?;
-        let mode = format!("{}_immutable_segments", plan.mode);
+        let mode = format!("{}_arrow_append", plan.mode);
         let ducklake_managed_maintenance = plan.managed_maintenance;
 
         create_tables_on(&writer, &target_prefix)?;
@@ -259,9 +249,9 @@ impl Storage {
             local_storage_dir: config.local_storage_dir.clone(),
             ducklake_required: true,
             ducklake_managed_maintenance,
-            immutable_segment_target_bytes: config.immutable_segment_target_bytes,
-            immutable_segment_max_age: config.immutable_segment_max_age,
-            immutable_buffers: Mutex::new(BTreeMap::new()),
+            arrow_write_buffer_target_bytes: config.arrow_write_buffer_target_bytes,
+            arrow_write_buffer_max_age: config.arrow_write_buffer_max_age,
+            arrow_write_buffers: Mutex::new(BTreeMap::new()),
             write_memory_limit: config.duckdb_write_memory_limit.clone(),
             last_error: Mutex::new(None),
             metadata_generation: AtomicU64::new(0),
@@ -272,8 +262,8 @@ impl Storage {
 
 #[cfg(test)]
 mod tests {
+    use super::arrow::batch_timestamp_days;
     use super::ducklake::build_ducklake_attach_plan;
-    use super::immutable::split_batch_by_immutable_partition;
     use super::metadata_refresh::metadata_refresh_sql;
     use super::*;
     use arrow58::array as arrow58_array;
@@ -406,7 +396,7 @@ mod tests {
     }
 
     #[test]
-    fn immutable_segment_split_preserves_timestamp_day_hour_partitions() {
+    fn arrow_write_buffer_tracks_distinct_timestamp_days() {
         fn timestamp_micros(year: i32, month: u32, day: u32, hour: u32) -> i64 {
             DateTime::<Utc>::from_naive_utc_and_offset(
                 NaiveDate::from_ymd_opt(year, month, day)
@@ -439,17 +429,8 @@ mod tests {
         )
         .unwrap();
 
-        let splits = split_batch_by_immutable_partition(&batch).unwrap();
+        let days = batch_timestamp_days(&batch).unwrap();
 
-        assert_eq!(splits.len(), 3);
-        assert_eq!(splits[0].0.timestamp_day, "2026-05-16");
-        assert_eq!(splits[0].0.hour, 0);
-        assert_eq!(splits[0].1.num_rows(), 1);
-        assert_eq!(splits[1].0.timestamp_day, "2026-05-16");
-        assert_eq!(splits[1].0.hour, 1);
-        assert_eq!(splits[1].1.num_rows(), 1);
-        assert_eq!(splits[2].0.timestamp_day, "2026-05-17");
-        assert_eq!(splits[2].0.hour, 0);
-        assert_eq!(splits[2].1.num_rows(), 1);
+        assert_eq!(days, vec!["2026-05-16", "2026-05-17"]);
     }
 }

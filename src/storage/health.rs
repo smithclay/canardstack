@@ -112,13 +112,13 @@ impl Storage {
             ))
         })?;
         for row in rows {
-            let (table_id, table_name, parquet_files, parquet_rows) = row?;
+            let (table_id, table_name, active_data_files, active_data_file_rows) = row?;
             tables.insert(
                 table_name,
                 json!({
                     "table_id": table_id,
-                    "parquet_files": parquet_files,
-                    "parquet_rows": parquet_rows
+                    "active_data_files": active_data_files,
+                    "active_data_file_rows": active_data_file_rows
                 }),
             );
         }

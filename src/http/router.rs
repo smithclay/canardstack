@@ -348,9 +348,9 @@ fn record_maintenance_metrics(
 pub(crate) fn record_operator_gauges(state: &AppState) {
     state.ingestor.record_inflight_metrics(&state.metrics);
     state.ingestor.record_raw_spool_metrics(&state.metrics);
-    let immutable_buffers = state
+    let arrow_write_buffers = state
         .storage
-        .immutable_buffer_metrics()
+        .arrow_write_buffer_metrics()
         .into_iter()
         .map(|buffer| (buffer.table, buffer))
         .collect::<HashMap<_, _>>();
@@ -360,30 +360,30 @@ pub(crate) fn record_operator_gauges(state: &AppState) {
         StorageSignal::MetricGauge,
         StorageSignal::MetricSum,
     ] {
-        let rows = immutable_buffers
+        let rows = arrow_write_buffers
             .get(&table)
             .map(|buffer| buffer.rows)
             .unwrap_or(0);
-        let bytes = immutable_buffers
+        let bytes = arrow_write_buffers
             .get(&table)
             .map(|buffer| buffer.bytes)
             .unwrap_or(0);
-        let age_seconds = immutable_buffers
+        let age_seconds = arrow_write_buffers
             .get(&table)
             .map(|buffer| buffer.age_seconds)
             .unwrap_or(0.0);
         state.metrics.gauge(
-            "canardstack_immutable_buffer_rows",
+            "canardstack_arrow_write_buffer_rows",
             &[("table", table.as_str())],
             rows as f64,
         );
         state.metrics.gauge(
-            "canardstack_immutable_buffer_bytes",
+            "canardstack_arrow_write_buffer_bytes",
             &[("table", table.as_str())],
             bytes as f64,
         );
         state.metrics.gauge(
-            "canardstack_immutable_buffer_age_seconds",
+            "canardstack_arrow_write_buffer_age_seconds",
             &[("table", table.as_str())],
             age_seconds,
         );
@@ -425,8 +425,14 @@ pub(crate) fn record_storage_operator_gauges(state: &AppState) {
     {
         for (table, value) in tables {
             for (metric, field) in [
-                ("canardstack_ducklake_parquet_files", "parquet_files"),
-                ("canardstack_ducklake_parquet_rows", "parquet_rows"),
+                (
+                    "canardstack_ducklake_active_data_files",
+                    "active_data_files",
+                ),
+                (
+                    "canardstack_ducklake_active_data_file_rows",
+                    "active_data_file_rows",
+                ),
             ] {
                 if let Some(count) = value.get(field).and_then(Value::as_i64) {
                     state

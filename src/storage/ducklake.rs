@@ -87,7 +87,7 @@ pub(super) fn build_ducklake_attach_plan(
         let is_ducklake = uri.starts_with("ducklake:");
         if !is_motherduck && !is_ducklake {
             anyhow::bail!(
-                "CANARDSTACK_DUCKLAKE_ATTACH_URI must be an md: or ducklake: URI because immutable ingest registers data files with DuckLake"
+                "CANARDSTACK_DUCKLAKE_ATTACH_URI must be an md: or ducklake: URI because Arrow appends write through DuckLake"
             );
         }
         return Ok(DuckLakeAttachPlan {

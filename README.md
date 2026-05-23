@@ -14,7 +14,7 @@
 
 canardstack is an experimental single-tenant observability backend powered by
 [DuckLake](https://ducklake.select/), an open lakehouse format built on DuckDB,
-Parquet, and object storage.
+Arrow appends, Parquet data files, and object storage.
 
 It accepts OpenTelemetry logs, traces, gauge metrics, and sum metrics over
 OTLP/HTTP. It stores normalized tables in DuckLake and exposes small
@@ -162,11 +162,11 @@ flowchart LR
     subgraph Canardstack["canardstack (single Rust process)"]
         direction TB
         Ingest["Ingest<br/>OTLP/HTTP · JSON + protobuf"]
-        Queues["Per-signal queues<br/>(bounded, 429 on overflow)"]
+        Queues["Per-signal admission<br/>(bounded, 429 on overflow)"]
         Storage["Storage<br/>writer + reader"]
         Compat["Compat Query APIs"]
         Ingest --> Queues
-        Queues -->|seal| Storage
+        Queues -->|Arrow write buffer<br/>DuckDB Arrow append| Storage
         Compat -->|reader clone| Storage
     end
 
@@ -174,7 +174,7 @@ flowchart LR
     Collector -->|OTLP| Ingest
     Grafana -->|PromQL · LogQL · trace lookup| Compat
 
-    Storage -->|immutable Parquet files| Lake[("DuckLake catalog<br/>")]
+    Storage -->|DuckLake commit| Lake[("DuckLake catalog<br/>")]
 ```
 
 ## Send Telemetry

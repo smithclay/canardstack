@@ -103,8 +103,8 @@ impl AdmissionController {
             .max(1);
         let initial_seal_bytes_per_second = config.seal_rate_seed_bytes as f64
             / config.seal_rate_seed_window.as_secs_f64().max(0.001);
-        let visibility_seal_bytes_per_second = config.immutable_segment_target_bytes as f64
-            / config.immutable_segment_max_age.as_secs_f64().max(0.001);
+        let visibility_seal_bytes_per_second = config.arrow_write_buffer_target_bytes as f64
+            / config.arrow_write_buffer_max_age.as_secs_f64().max(0.001);
         Self {
             inner: Mutex::new(AdmissionState {
                 seal_active: 0,
@@ -124,8 +124,8 @@ impl AdmissionController {
             heavy_query_capacity,
             heavy_query_degraded_capacity,
             freshness_budget_sla_seconds: config.freshness_budget_sla.as_secs_f64(),
-            visibility_buffer_target_bytes: config.immutable_segment_target_bytes.max(1),
-            visibility_buffer_max_age_seconds: config.immutable_segment_max_age.as_secs_f64(),
+            visibility_buffer_target_bytes: config.arrow_write_buffer_target_bytes.max(1),
+            visibility_buffer_max_age_seconds: config.arrow_write_buffer_max_age.as_secs_f64(),
             visibility_seal_bytes_per_second: visibility_seal_bytes_per_second.max(1.0),
         }
     }
@@ -527,8 +527,8 @@ mod tests {
         config.freshness_budget_sla = std::time::Duration::from_secs(10);
         config.seal_rate_seed_bytes = 1_000;
         config.seal_rate_seed_window = std::time::Duration::from_secs(1);
-        config.immutable_segment_target_bytes = 1_000;
-        config.immutable_segment_max_age = std::time::Duration::from_secs(1);
+        config.arrow_write_buffer_target_bytes = 1_000;
+        config.arrow_write_buffer_max_age = std::time::Duration::from_secs(1);
         AdmissionController::new(&config)
     }
 

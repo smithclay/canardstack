@@ -1,0 +1,153 @@
+use super::{ArrowBatchBufferTiming, PreparedArrowBatch};
+use crate::ingest::StorageSignal;
+use anyhow::{Context, Result};
+use arrow58::array as arrow58_array;
+use arrow58::array::Array as _;
+use arrow58::compute::concat_batches;
+use arrow58::record_batch::RecordBatch;
+use chrono::{DateTime, Utc};
+use serde_json::{json, Value};
+use std::collections::{BTreeMap, BTreeSet};
+use std::time::{Duration, Instant};
+
+#[derive(Clone)]
+pub(super) struct ArrowWriteBuffer {
+    pub(super) batches: Vec<RecordBatch>,
+    pub(super) rows: usize,
+    pub(super) bytes: usize,
+    pub(super) timestamp_days: BTreeSet<String>,
+    pub(super) opened_at: Instant,
+}
+
+pub(super) struct ArrowFlushResult {
+    pub(super) rows: usize,
+    pub(super) buffers: usize,
+    pub(super) timings: Vec<ArrowBatchBufferTiming>,
+    pub(super) affected: BTreeMap<StorageSignal, BTreeSet<String>>,
+}
+
+pub struct ArrowFlushOutcome {
+    pub force: bool,
+    pub flushed_rows: usize,
+    pub flushed_buffers: usize,
+    pub timings: Vec<ArrowBatchBufferTiming>,
+    pub active_write_buffers: Value,
+}
+
+impl ArrowFlushOutcome {
+    pub fn to_json(&self) -> Value {
+        json!({
+            "supported": true,
+            "force": self.force,
+            "flushed_rows": self.flushed_rows,
+            "flushed_buffers": self.flushed_buffers,
+            "timings": arrow_write_timing_snapshot(&self.timings),
+            "active_write_buffers": self.active_write_buffers,
+        })
+    }
+}
+
+impl ArrowWriteBuffer {
+    pub(super) fn new(now: Instant) -> Self {
+        Self {
+            batches: Vec::new(),
+            rows: 0,
+            bytes: 0,
+            timestamp_days: BTreeSet::new(),
+            opened_at: now,
+        }
+    }
+
+    pub(super) fn push(&mut self, prepared: PreparedArrowBatch) {
+        self.rows += prepared.rows;
+        self.bytes += prepared.batch.get_array_memory_size().max(prepared.rows);
+        self.timestamp_days.extend(prepared.timestamp_days);
+        self.batches.push(prepared.batch);
+    }
+
+    pub(super) fn append_buffer(&mut self, mut other: ArrowWriteBuffer) {
+        self.rows += other.rows;
+        self.bytes += other.bytes;
+        self.timestamp_days.append(&mut other.timestamp_days);
+        if other.opened_at < self.opened_at {
+            self.opened_at = other.opened_at;
+        }
+        self.batches.append(&mut other.batches);
+    }
+
+    pub(super) fn should_flush(
+        &self,
+        target_bytes: usize,
+        max_age: Duration,
+        now: Instant,
+    ) -> bool {
+        self.rows > 0
+            && (self.bytes >= target_bytes || now.duration_since(self.opened_at) >= max_age)
+    }
+
+    pub(super) fn record_batch(&self, table: StorageSignal) -> Result<RecordBatch> {
+        match self.batches.as_slice() {
+            [] => anyhow::bail!("Arrow write buffer for {table} is empty"),
+            [batch] => Ok(batch.clone()),
+            batches => {
+                let schema = batches[0].schema();
+                let refs = batches.iter().collect::<Vec<_>>();
+                concat_batches(&schema, refs)
+                    .with_context(|| format!("coalesce Arrow write buffer for {table}"))
+            }
+        }
+    }
+}
+
+pub(super) fn arrow_write_buffer_snapshot(
+    buffers: &BTreeMap<StorageSignal, ArrowWriteBuffer>,
+) -> Value {
+    let mut map = serde_json::Map::new();
+    for (table, buffer) in buffers {
+        map.insert(
+            table.as_str().to_string(),
+            json!({
+                "rows": buffer.rows,
+                "bytes": buffer.bytes,
+                "age_seconds": buffer.opened_at.elapsed().as_secs_f64(),
+            }),
+        );
+    }
+    Value::Object(map)
+}
+
+pub(super) fn arrow_write_timing_snapshot(timings: &[ArrowBatchBufferTiming]) -> Value {
+    Value::Array(
+        timings
+            .iter()
+            .map(|timing| {
+                json!({
+                    "table": timing.table.as_str(),
+                    "phase": timing.phase.as_str(),
+                    "rows": timing.rows,
+                    "seconds": timing.seconds,
+                })
+            })
+            .collect(),
+    )
+}
+
+pub(super) fn timestamp_day(
+    timestamps: &arrow58_array::TimestampMicrosecondArray,
+    row: usize,
+) -> Option<String> {
+    timestamp_utc(timestamps, row).map(|timestamp| timestamp.date_naive().to_string())
+}
+
+fn timestamp_utc(
+    timestamps: &arrow58_array::TimestampMicrosecondArray,
+    row: usize,
+) -> Option<DateTime<Utc>> {
+    if timestamps.is_null(row) {
+        return None;
+    }
+    let micros = timestamps.value(row);
+    let secs = micros.div_euclid(1_000_000);
+    let nanos = micros.rem_euclid(1_000_000) as u32 * 1_000;
+    DateTime::<Utc>::from_timestamp(secs, nanos)
+}

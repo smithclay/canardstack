@@ -102,11 +102,11 @@ impl Maintenance {
         metrics: &Metrics,
     ) -> Result<Value> {
         let started = Instant::now();
-        let immutable = ingestor.seal_committed_to_storage(storage, metrics)?;
+        let arrow_flush = ingestor.seal_committed_to_storage(storage, metrics)?;
         self.record_run("seal");
         Ok(json!({
             "status": "ok",
-            "immutable_segments": immutable.to_json(),
+            "arrow_flush": arrow_flush.to_json(),
             "duration_ms": started.elapsed().as_millis()
         }))
     }
@@ -130,6 +130,11 @@ impl Maintenance {
             "dry_run": dry_run,
             "retention": retention,
             "snapshot_expiration": snapshot_expiration,
+            "physical_file_compaction": {
+                "supported": false,
+                "enabled": false,
+                "reason": "ducklake_merge_adjacent_files is disabled until proven stable"
+            },
             "cleanup": cleanup,
             "duration_ms": started.elapsed().as_millis()
         }))
@@ -197,8 +202,8 @@ impl Drop for Scheduler {
 
 fn scheduler_loop(state: Arc<AppState>, stop: Arc<AtomicBool>) {
     let seal_cadence = state.config.scheduler_seal_interval;
-    let segment_target_bytes = state.config.immutable_segment_target_bytes;
-    let segment_max_age_seconds = state.config.immutable_segment_max_age.as_secs_f64();
+    let buffer_target_bytes = state.config.arrow_write_buffer_target_bytes;
+    let buffer_max_age_seconds = state.config.arrow_write_buffer_max_age.as_secs_f64();
     let metadata_every = state.config.scheduler_metadata_interval;
     let metrics_every = state.config.scheduler_metrics_interval;
     let retention_every = state.config.scheduler_retention_interval;
@@ -229,16 +234,15 @@ fn scheduler_loop(state: Arc<AppState>, stop: Arc<AtomicBool>) {
             continue;
         }
 
-        // Single seal driver. Seal when a buffered signal reaches its size/age
-        // threshold, or on the freshness cadence, keeping immutable-buffer age
-        // well under the freshness-budget SLA so ingest is never shed for freshness debt. A
-        // failed seal backs off so a broken catalog cannot spin the writer.
+        // Single seal driver. Flush when a buffered signal reaches its size/age
+        // threshold, or on the freshness cadence, keeping Arrow write-buffer age
+        // well under the freshness-budget SLA. A failed seal backs off so a
+        // broken catalog cannot spin the writer.
         if now >= seal_backoff_until {
-            let buffers = state.storage.immutable_buffer_metrics();
+            let buffers = state.storage.arrow_write_buffer_metrics();
             let buffered = buffers.iter().any(|metric| metric.bytes > 0);
             let threshold_due = buffers.iter().any(|metric| {
-                metric.bytes >= segment_target_bytes
-                    || metric.age_seconds >= segment_max_age_seconds
+                metric.bytes >= buffer_target_bytes || metric.age_seconds >= buffer_max_age_seconds
             });
             if buffered && (threshold_due || now >= next_seal) {
                 let ok = run_seal_tick(&state);
@@ -292,7 +296,7 @@ fn run_seal_tick(state: &AppState) -> bool {
     run_job(state, "seal", |s| {
         let pending_bytes: usize = s
             .storage
-            .immutable_buffer_metrics()
+            .arrow_write_buffer_metrics()
             .iter()
             .map(|metric| metric.bytes)
             .sum();

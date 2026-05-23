@@ -36,8 +36,8 @@ fn run() -> Result<()> {
     let mut phase_stats = PhaseStats::default();
     let mut total_rows = 0usize;
     let mut total_arrow_bytes = 0usize;
-    let mut sealed_rows = 0usize;
-    let mut sealed_files = 0usize;
+    let mut flushed_rows = 0usize;
+    let mut flushed_buffers = 0usize;
 
     eprintln!(
         "{BENCH_NAME}: signals={} rows_per_batch={} iterations={} data_dir={}",
@@ -70,22 +70,24 @@ fn run() -> Result<()> {
             }])?;
             phase_stats.record_timings(result.timings);
         }
-        let seal = storage.seal_immutable_segments(true)?;
-        sealed_rows += seal.sealed_rows;
-        sealed_files += seal.sealed_files;
-        phase_stats.record_timings(seal.timings);
+        let flush = storage.flush_arrow_write_buffer(true)?;
+        flushed_rows += flush.flushed_rows;
+        flushed_buffers += flush.flushed_buffers;
+        phase_stats.record_timings(flush.timings);
         storage_elapsed += started.elapsed();
     }
 
-    print_summary(
-        &args,
-        storage_elapsed,
+    print_summary(&SummaryInput {
+        args: &args,
+        elapsed: storage_elapsed,
         total_rows,
         total_arrow_bytes,
-        sealed_rows,
-        sealed_files,
-    );
+        flushed_rows,
+        flushed_buffers,
+    });
     phase_stats.print_csv();
+    print_storage_layout(&storage)?;
+    print_query_latencies(&storage)?;
     Ok(())
 }
 
@@ -95,44 +97,96 @@ fn storage_config(args: &Args) -> Result<(Config, Option<TempDir>)> {
             .with_context(|| format!("create data dir {}", data_dir.display()))?;
         let mut config = Config::test(data_dir.join("canardstack.duckdb"));
         config.local_storage_dir = data_dir.join("storage");
-        config.immutable_segment_target_bytes = args.segment_target_bytes;
-        config.immutable_segment_max_age = Duration::from_secs(3_600);
+        config.arrow_write_buffer_target_bytes = args.arrow_buffer_target_bytes;
+        config.arrow_write_buffer_max_age = Duration::from_secs(3_600);
         return Ok((config, None));
     }
 
     let tempdir = tempfile::tempdir().context("create temporary storage benchmark dir")?;
     let mut config = Config::test(tempdir.path().join("canardstack.duckdb"));
-    config.immutable_segment_target_bytes = args.segment_target_bytes;
-    config.immutable_segment_max_age = Duration::from_secs(3_600);
+    config.arrow_write_buffer_target_bytes = args.arrow_buffer_target_bytes;
+    config.arrow_write_buffer_max_age = Duration::from_secs(3_600);
     Ok((config, Some(tempdir)))
 }
 
-fn print_summary(
-    args: &Args,
+struct SummaryInput<'a> {
+    args: &'a Args,
     elapsed: Duration,
     total_rows: usize,
     total_arrow_bytes: usize,
-    sealed_rows: usize,
-    sealed_files: usize,
-) {
-    let seconds = elapsed.as_secs_f64();
-    let arrow_mib = total_arrow_bytes as f64 / 1024.0 / 1024.0;
+    flushed_rows: usize,
+    flushed_buffers: usize,
+}
+
+fn print_summary(input: &SummaryInput<'_>) {
+    let seconds = input.elapsed.as_secs_f64();
+    let arrow_mib = input.total_arrow_bytes as f64 / 1024.0 / 1024.0;
     println!(
-        "summary,name,signals,rows_per_batch,iterations,total_rows,sealed_rows,sealed_files,total_arrow_mib,total_seconds,rows_per_sec,arrow_mib_per_sec"
+        "summary,name,write_path,signals,rows_per_batch,iterations,total_rows,flushed_rows,flushed_buffers,total_arrow_mib,total_seconds,rows_per_sec,arrow_mib_per_sec"
     );
     println!(
-        "summary,{BENCH_NAME},{},{},{},{},{},{},{:.3},{:.6},{:.0},{:.3}",
-        args.signal,
-        args.rows,
-        args.iterations,
-        total_rows,
-        sealed_rows,
-        sealed_files,
+        "summary,{BENCH_NAME},duckdb_arrow_append,{},{},{},{},{},{},{:.3},{:.6},{:.0},{:.3}",
+        input.args.signal,
+        input.args.rows,
+        input.args.iterations,
+        input.total_rows,
+        input.flushed_rows,
+        input.flushed_buffers,
         arrow_mib,
         seconds,
-        total_rows as f64 / seconds,
+        input.total_rows as f64 / seconds,
         arrow_mib / seconds,
     );
+}
+
+fn print_storage_layout(storage: &Storage) -> Result<()> {
+    let health = storage.health();
+    println!("storage,physical_bytes,{}", health.physical_bytes);
+    if let Some(tables) = health
+        .ducklake_storage_layout
+        .get("tables")
+        .and_then(serde_json::Value::as_object)
+    {
+        println!("layout,table,active_data_files,active_data_file_rows");
+        for (table, value) in tables {
+            let active_data_files = value
+                .get("active_data_files")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0);
+            let active_data_file_rows = value
+                .get("active_data_file_rows")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0);
+            println!("layout,{table},{active_data_files},{active_data_file_rows}");
+        }
+    }
+    Ok(())
+}
+
+fn print_query_latencies(storage: &Storage) -> Result<()> {
+    println!("query,name,rows,latency_ms");
+    for (name, sql) in [
+        (
+            "logs_service_count",
+            "SELECT count(*)::DOUBLE FROM {prefix}logs WHERE service_name = 'bench-service-0'",
+        ),
+        (
+            "metric_gauge_avg",
+            "SELECT avg(value) FROM {prefix}metric_gauge WHERE metric_name = 'storage.pipeline.gauge'",
+        ),
+    ] {
+        let started = Instant::now();
+        let rows = storage.with_conn(|conn, prefix| {
+            let sql = sql.replace("{prefix}", prefix);
+            let value: Option<f64> = conn.query_row(&sql, [], |row| row.get(0))?;
+            Ok(value.unwrap_or(0.0))
+        })?;
+        println!(
+            "query,{name},{rows:.3},{:.3}",
+            started.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+    Ok(())
 }
 
 #[derive(Default)]
@@ -189,7 +243,7 @@ struct Args {
     iterations: usize,
     signal: SignalSelection,
     data_dir: Option<PathBuf>,
-    segment_target_bytes: usize,
+    arrow_buffer_target_bytes: usize,
     log_body_bytes: usize,
     trace_attribute_bytes: usize,
     metric_description_bytes: usize,
@@ -202,7 +256,7 @@ impl Args {
             iterations: DEFAULT_ITERATIONS,
             signal: SignalSelection::All,
             data_dir: None,
-            segment_target_bytes: 64 * 1024 * 1024,
+            arrow_buffer_target_bytes: 64 * 1024 * 1024,
             log_body_bytes: DEFAULT_LOG_BODY_BYTES,
             trace_attribute_bytes: DEFAULT_TRACE_ATTRIBUTE_BYTES,
             metric_description_bytes: DEFAULT_METRIC_DESCRIPTION_BYTES,
@@ -223,8 +277,9 @@ impl Args {
                         args.next().context("--data-dir requires a path")?,
                     ));
                 }
-                "--segment-target-bytes" => {
-                    parsed.segment_target_bytes = parse_next(&mut args, "--segment-target-bytes")?;
+                "--arrow-buffer-target-bytes" => {
+                    parsed.arrow_buffer_target_bytes =
+                        parse_next(&mut args, "--arrow-buffer-target-bytes")?;
                 }
                 "--log-body-bytes" => {
                     parsed.log_body_bytes = parse_next(&mut args, "--log-body-bytes")?;
@@ -306,7 +361,7 @@ impl std::str::FromStr for SignalSelection {
 
 fn print_help() {
     println!(
-        "cargo bench --bench storage_pipeline -- [--rows 50000] [--iterations 4] [--signal logs|spans|metric-gauge|metric-sum|all] [--data-dir DIR] [--segment-target-bytes BYTES]"
+        "cargo bench --bench storage_pipeline -- [--rows 50000] [--iterations 4] [--signal logs|spans|metric-gauge|metric-sum|all] [--data-dir DIR] [--arrow-buffer-target-bytes BYTES]"
     );
 }
 

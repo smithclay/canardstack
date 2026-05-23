@@ -1,4 +1,4 @@
-use super::immutable::timestamp_day;
+use super::arrow_write::timestamp_day;
 use super::schema::table_columns;
 use crate::ingest::StorageSignal;
 use anyhow::{Context, Result};

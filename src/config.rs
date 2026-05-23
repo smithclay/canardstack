@@ -75,8 +75,8 @@ pub struct Config {
     pub duckdb_write_memory_limit: String,
     pub late_accept_secs: i64,
     pub future_accept_secs: i64,
-    pub immutable_segment_target_bytes: usize,
-    pub immutable_segment_max_age: Duration,
+    pub arrow_write_buffer_target_bytes: usize,
+    pub arrow_write_buffer_max_age: Duration,
     pub query_interactive: QueryLimits,
     pub seal_admission_capacity: usize,
     pub cheap_query_admission_capacity: usize,
@@ -204,15 +204,17 @@ impl Config {
             future_accept_secs: env_i64("CANARDSTACK_ACCEPT_FUTURE_SECS")?
                 .or(file.i64(&["validation", "accept_future_secs"])?)
                 .unwrap_or(10 * 60),
-            immutable_segment_target_bytes: env_usize("CANARDSTACK_SEGMENT_TARGET_BYTES")?
-                .or(file.usize(&["storage", "segment_target_bytes"])?)
-                .unwrap_or(64 * 1024 * 1024),
-            immutable_segment_max_age: duration_ms_or_secs(
+            arrow_write_buffer_target_bytes: env_usize(
+                "CANARDSTACK_ARROW_WRITE_BUFFER_TARGET_BYTES",
+            )?
+            .or(file.usize(&["storage", "arrow_write_buffer_target_bytes"])?)
+            .unwrap_or(64 * 1024 * 1024),
+            arrow_write_buffer_max_age: duration_ms_or_secs(
                 &file,
-                &["storage", "segment_max_age_ms"],
-                &["storage", "segment_max_age_secs"],
-                "CANARDSTACK_SEGMENT_MAX_AGE_MS",
-                "CANARDSTACK_SEGMENT_MAX_AGE_SECS",
+                &["storage", "arrow_write_buffer_max_age_ms"],
+                &["storage", "arrow_write_buffer_max_age_secs"],
+                "CANARDSTACK_ARROW_WRITE_BUFFER_MAX_AGE_MS",
+                "CANARDSTACK_ARROW_WRITE_BUFFER_MAX_AGE_SECS",
                 10,
             )?,
             query_interactive: QueryLimits {
@@ -247,7 +249,7 @@ impl Config {
                 .unwrap_or(true),
             // Seal cadence for the single seal driver. Decoupled from the coarse
             // maintenance interval: it must stay well under the freshness-budget SLA so
-            // immutable-buffer age never approaches the freshness-budget reject threshold.
+            // Arrow write-buffer age never approaches the freshness-budget reject threshold.
             scheduler_seal_interval: duration_ms_or_secs(
                 &file,
                 &["scheduler", "seal_interval_ms"],
@@ -329,8 +331,8 @@ impl Config {
             duckdb_write_memory_limit: "512MiB".to_string(),
             late_accept_secs: 24 * 60 * 60,
             future_accept_secs: 10 * 60,
-            immutable_segment_target_bytes: 64 * 1024 * 1024,
-            immutable_segment_max_age: Duration::from_secs(10),
+            arrow_write_buffer_target_bytes: 64 * 1024 * 1024,
+            arrow_write_buffer_max_age: Duration::from_secs(10),
             query_interactive: QueryLimits {
                 concurrency: 4,
                 timeout_secs: 15,
@@ -406,11 +408,11 @@ impl Config {
         if self.duckdb_write_memory_limit.trim().is_empty() {
             anyhow::bail!("CANARDSTACK_DUCKDB_MEMORY_LIMIT must not be empty");
         }
-        if self.immutable_segment_target_bytes == 0 {
-            anyhow::bail!("CANARDSTACK_SEGMENT_TARGET_BYTES must be > 0");
+        if self.arrow_write_buffer_target_bytes == 0 {
+            anyhow::bail!("CANARDSTACK_ARROW_WRITE_BUFFER_TARGET_BYTES must be > 0");
         }
-        if self.immutable_segment_max_age.is_zero() {
-            anyhow::bail!("CANARDSTACK_SEGMENT_MAX_AGE_MS/SECS must be > 0");
+        if self.arrow_write_buffer_max_age.is_zero() {
+            anyhow::bail!("CANARDSTACK_ARROW_WRITE_BUFFER_MAX_AGE_MS/SECS must be > 0");
         }
         if self.logs_retention_days <= 0
             || self.spans_retention_days <= 0
@@ -699,9 +701,9 @@ mod tests {
         "CANARDSTACK_DUCKDB_MEMORY_LIMIT",
         "CANARDSTACK_ACCEPT_LATE_SECS",
         "CANARDSTACK_ACCEPT_FUTURE_SECS",
-        "CANARDSTACK_SEGMENT_TARGET_BYTES",
-        "CANARDSTACK_SEGMENT_MAX_AGE_MS",
-        "CANARDSTACK_SEGMENT_MAX_AGE_SECS",
+        "CANARDSTACK_ARROW_WRITE_BUFFER_TARGET_BYTES",
+        "CANARDSTACK_ARROW_WRITE_BUFFER_MAX_AGE_MS",
+        "CANARDSTACK_ARROW_WRITE_BUFFER_MAX_AGE_SECS",
         "CANARDSTACK_QUERY_CONCURRENCY",
         "CANARDSTACK_QUERY_TIMEOUT_SECS",
         "CANARDSTACK_QUERY_MEMORY_LIMIT",
@@ -802,8 +804,8 @@ accept_late_secs = 100
 accept_future_secs = 20
 
 [storage]
-segment_target_bytes = 777
-segment_max_age_secs = 12
+arrow_write_buffer_target_bytes = 777
+arrow_write_buffer_max_age_secs = 12
 
 [query]
 concurrency = 6
@@ -864,8 +866,8 @@ http_keepalive = true
         assert_eq!(config.seal_rate_seed_bytes, 654_321);
         assert_eq!(config.seal_rate_seed_window, Duration::from_millis(125));
         assert_eq!(config.duckdb_write_memory_limit, "2GiB");
-        assert_eq!(config.immutable_segment_target_bytes, 777);
-        assert_eq!(config.immutable_segment_max_age, Duration::from_secs(12));
+        assert_eq!(config.arrow_write_buffer_target_bytes, 777);
+        assert_eq!(config.arrow_write_buffer_max_age, Duration::from_secs(12));
         assert_eq!(config.query_interactive.concurrency, 6);
         assert_eq!(config.query_interactive.timeout_secs, 7);
         assert_eq!(config.query_interactive.memory_limit, "384MiB");
@@ -913,6 +915,17 @@ http_keepalive = true
         let config = Config::from_env().unwrap();
 
         assert!(config.bench_http_keepalive);
+    }
+
+    #[test]
+    fn arrow_write_buffer_defaults_to_current_flush_policy() {
+        let _guard = env_lock().lock_or_poisoned();
+        let _snapshot = EnvSnapshot::capture_and_clear();
+
+        let config = Config::from_env().unwrap();
+
+        assert_eq!(config.arrow_write_buffer_target_bytes, 64 * 1024 * 1024);
+        assert_eq!(config.arrow_write_buffer_max_age, Duration::from_secs(10));
     }
 
     #[test]

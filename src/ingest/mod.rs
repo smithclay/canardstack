@@ -350,7 +350,7 @@ impl Ingestor {
         let buffered = match buffer_result {
             Ok(result) => result,
             Err(err) => {
-                // The rows never reached the immutable buffer and the raw-spool
+                // The rows never reached the Arrow write buffer and the raw-spool
                 // record was not tracked, so it stays pending and replays on a
                 // future restart (at-least-once). Surface a retryable
                 // dependency error; the admission credit drops with this scope.
@@ -377,8 +377,8 @@ impl Ingestor {
             1,
         );
 
-        // Rows are now in the immutable buffer. Track the raw-spool record so the
-        // scheduler checkpoints it after the next durable seal, then release the
+        // Rows are now in the Arrow write buffer. Track the raw-spool record so the
+        // scheduler checkpoints it after the next durable DuckLake commit, then release the
         // admission credit (buffer occupancy is now reflected as buffered bytes
         // for freshness, not as a held queue credit).
         self.track_raw_spool_record(raw_spool_ref, route);
@@ -470,7 +470,7 @@ impl Ingestor {
 
         // Caller-runs: no worker could take the handoff, so process the already
         // durably-spooled work inline on this thread instead of dropping it for
-        // restart replay. This keeps the 202 honest (the rows reach the immutable
+        // restart replay. This keeps the 202 honest (the rows reach the Arrow write
         // buffer now, not only after the next process restart) and applies
         // natural backpressure: request latency rises under worker saturation.
         metrics.inc(
@@ -659,7 +659,7 @@ impl Ingestor {
 
     pub fn freshness_budget_inputs(&self, storage: &Storage) -> FreshnessBudgetInputs {
         let (buffered_bytes, buffered_active_count, oldest_buffer_age_seconds) = storage
-            .immutable_buffer_metrics()
+            .arrow_write_buffer_metrics()
             .into_iter()
             .fold((0usize, 0usize, 0.0f64), |(bytes, count, age), metric| {
                 (
@@ -671,7 +671,7 @@ impl Ingestor {
         FreshnessBudgetInputs {
             inflight_bytes: self.inflight_bytes(),
             incoming_bytes: 0,
-            // Admitted bytes move straight from the worker into the immutable
+            // Admitted bytes move straight from the worker into the Arrow write
             // buffer; there is no separate in-memory queue to age out, so queue
             // dwell is zero and buffer age is carried by oldest_buffer_age_seconds.
             oldest_queue_age_seconds: 0.0,

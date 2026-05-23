@@ -2,8 +2,8 @@
 
 Canardstack is a single-binary OTLP/HTTP observability backend. It accepts
 OpenTelemetry logs, traces, gauge metrics, and sum metrics; normalizes them with
-`otlp2records`; stores immutable Parquet segments registered in DuckLake; and
-serves bounded Prometheus, Loki, and Tempo compatibility APIs.
+`otlp2records`; appends Arrow `RecordBatch`es through DuckDB into DuckLake
+tables; and serves bounded Prometheus, Loki, and Tempo compatibility APIs.
 
 ## Boundaries
 
@@ -18,10 +18,9 @@ Canardstack keeps these constraints:
 - No async runtime, OTLP/gRPC, Kafka, separate hot store, bundled Collector,
   DataFusion, Vortex, arbitrary SQL HTTP API, or second long-running service.
 
-DuckLake/DuckDB is the source of truth for registered telemetry files and query
-execution. Compatibility APIs must not plan or read raw Parquet files directly,
-and canardstack must not maintain a custom manifest duplicating DuckLake file
-membership.
+DuckLake/DuckDB is the source of truth for telemetry rows, snapshots, and query
+execution. Compatibility APIs must not plan or read physical files directly, and
+canardstack must not maintain a custom manifest duplicating DuckLake membership.
 
 Metrics are supported for ingest and bounded compatibility behavior, but the
 current sustained MVP performance envelope is only claimed for logs and traces.
@@ -34,9 +33,10 @@ OTLP/HTTP (JSON or protobuf, optional gzip)
   -> dependency, freshness, runtime-memory, and worker-queue admission
   -> fsynced local raw spool write
   -> ingest worker decode, otlp2records transform, timestamp-skew validation
-  -> immutable buffer insert
-  -> scheduler single seal driver writes immutable Parquet segment files
-  -> ducklake_add_data_files registration
+  -> Arrow RecordBatch
+  -> Arrow write buffer
+  -> DuckDB Arrow appender into DuckLake tables
+  -> DuckLake commit
   -> raw spool checkpoint
   -> logical DuckLake SQL compatibility queries
 ```
@@ -48,12 +48,13 @@ flowchart LR
   C --> D["Dependency, freshness, memory, and worker-queue admission"]
   D --> E["Fsync raw request to local spool"]
   E --> F["Worker decode, transform, and timestamp validation"]
-  F --> G["Insert into immutable buffer"]
-  G --> H["Scheduler single seal driver: Parquet segment seal"]
-  H --> I["DuckLake registration"]
-  I --> J["Raw spool checkpoint"]
-  I --> K["Logical DuckLake SQL"]
-  K --> L["Prometheus / Loki / Tempo adapters"]
+  F --> G["Arrow RecordBatch"]
+  G --> H["Arrow write buffer"]
+  H --> I["DuckDB Arrow append"]
+  I --> J["DuckLake commit"]
+  J --> K["Raw spool checkpoint"]
+  J --> L["Logical DuckLake SQL"]
+  L --> M["Prometheus / Loki / Tempo adapters"]
 ```
 
 Admission is freshness-first: before the durable raw-spool append, the request
@@ -61,9 +62,10 @@ projects seal visibility through the admission controller and is shed with `429`
 when projected visibility exceeds the freshness budget. A cheap per-storage-signal
 in-flight ceiling (`signal_inflight_full`) keeps one storage signal's burst from
 monopolizing the accepted-but-not-yet-buffered window. There is no separate
-in-memory queue and no seal worker: ingest workers insert directly into the
-storage immutable buffer, and a single scheduler-driven seal driver is the only
-path that seals that buffer to durable Parquet and checkpoints the raw spool.
+in-memory queue and no separate storage-sink worker: ingest workers insert
+directly into the Arrow write buffer, and a single scheduler-driven seal driver
+is the only path that flushes that buffer to DuckLake and checkpoints the raw
+spool.
 
 ## Ingest Semantics
 
@@ -76,7 +78,7 @@ A successful ingest response is `202`.
 - The compressed raw request was written and fsynced to the local raw spool.
 - The request was handed to an ingest worker, or — when every worker buffer is
   full — processed inline on the request thread, so accepted work always reaches
-  the immutable buffer without waiting for restart replay.
+  the Arrow write buffer without waiting for restart replay.
 
 `202` does not mean:
 
@@ -127,14 +129,14 @@ Recovery sequence:
 ```text
 open segment -> append record on raw-spool writer
   -> write append batch -> force append fsync -> return 202
-  -> worker decode/transform/timestamp check -> immutable buffer insert
+  -> worker decode/transform/timestamp check -> Arrow write buffer insert
   -> DuckLake storage commit
   -> checkpoint raw-spool record -> delayed checkpoint fsync -> segment reclaimable
 ```
 
 Startup replays uncheckpointed records found by checksummed segment scanning
 before scheduler work starts.
-Replay enters the same decode, transform, buffer, seal, and DuckLake commit path
+Replay enters the same decode, transform, buffer, flush, and DuckLake commit path
 as normal ingest.
 
 The raw-spool writer is on the ingest acknowledgement path through local file
@@ -168,7 +170,7 @@ Size the local data directory for the aggregate budget, not just one lane.
 HTTP request threads run only cheap validation and rejectable admission gates,
 then hand durably-spooled work to a fixed pool of ingest workers over bounded
 worker buffers. Workers perform decompression, `otlp2records` transform,
-timestamp-skew validation, and immutable-buffer insertion. When every worker
+timestamp-skew validation, and Arrow write-buffer insertion. When every worker
 buffer is full the request thread processes that spooled work inline rather than
 deferring it, so accepted data is never stranded until a restart. Malformed or
 skew-rejected accepted payloads are durably terminal-checkpointed so they do
@@ -192,34 +194,35 @@ Seal triggers:
 - `CANARDSTACK_SEAL_RATE_SEED_BYTES`, default 4 MiB.
 - `CANARDSTACK_SEAL_RATE_SEED_WINDOW_SECS` or `_MS`, default 10 seconds.
 
-A single scheduler-driven seal driver is the only seal path. It seals on a frequent
-cadence (`CANARDSTACK_SEAL_INTERVAL_MS`, default 1s) or earlier when a buffered
-signal reaches its size (`CANARDSTACK_SEGMENT_TARGET_BYTES`) or age
-(`CANARDSTACK_SEGMENT_MAX_AGE_*`) threshold. The cadence must stay well under the
-freshness-budget SLA so immutable-buffer age never approaches the admission reject threshold;
-it is deliberately decoupled from the coarse maintenance interval. Each seal
-captures the set of pending raw-spool records, force-seals the immutable buffer
-to Parquet under seal admission, registers the files in DuckLake, and then
-checkpoints exactly the captured records. Capturing before sealing is
-load-bearing for at-least-once: a record appended after the capture is
-checkpointed on a later seal, never before its rows are durable. Admin seal
-uses the same path on demand.
+A single scheduler-driven seal driver is the only seal path. It flushes on a
+frequent cadence (`CANARDSTACK_SEAL_INTERVAL_MS`, default 1s) or earlier when a
+buffered signal reaches its size
+(`CANARDSTACK_ARROW_WRITE_BUFFER_TARGET_BYTES`) or age
+(`CANARDSTACK_ARROW_WRITE_BUFFER_MAX_AGE_*`) threshold. The cadence must stay
+well under the freshness-budget SLA so Arrow write-buffer age never approaches
+the admission reject threshold; it is deliberately decoupled from the coarse
+maintenance interval. Each seal captures the set of pending raw-spool records,
+force-flushes the Arrow write buffer under seal admission, appends rows through
+DuckDB's Arrow appender, commits DuckLake, and then checkpoints exactly the
+captured records. Capturing before flushing is load-bearing for at-least-once: a
+record appended after the capture is checkpointed on a later seal, never before
+its rows are durable. Admin seal uses the same path on demand.
 
 Freshness-budget admission happens before raw-spool append. The request path
 uses two local debt signals:
 
 - in-flight debt: accepted-but-not-yet-buffered (in-flight) bytes and oldest
   age before ingest workers move batches into storage buffers.
-- visibility-buffer debt: immutable storage-buffer bytes and age beyond the
-  configured segment target and max age, before files are DuckLake-registered.
+- visibility-buffer debt: Arrow write-buffer bytes and age beyond the
+  configured buffer target and max age, before rows are DuckLake-committed.
 
 The admission controller estimates freshness budget:
 
 ```text
 projected_seal_seconds = inflight_bytes / ewma_seal_bytes_per_sec
 projected_buffer_seconds =
-  excess_buffer_bytes / immutable_buffer_bytes_per_sec
-  + max(0, oldest_buffer_age_seconds - immutable_segment_max_age_seconds)
+  excess_buffer_bytes / arrow_write_buffer_bytes_per_sec
+  + max(0, oldest_buffer_age_seconds - arrow_write_buffer_max_age_seconds)
 projected_visibility_seconds =
   max(oldest_queue_age_seconds + projected_seal_seconds,
       projected_buffer_seconds)
@@ -262,8 +265,10 @@ Admission knobs:
 
 DuckLake is the storage coordinator. It owns snapshots, registered data-file
 membership, partition metadata, and table visibility. Canardstack writes
-immutable Parquet segment files and registers them through
-`ducklake_add_data_files`.
+prepared Arrow `RecordBatch`es to DuckLake tables through DuckDB's Arrow
+appender inside an explicit DuckDB transaction per flush batch. The appender is
+the only supported ingest write path; appender or commit failure restores the
+Arrow write buffer and leaves raw-spool records uncheckpointed for retry.
 
 Tables:
 
@@ -273,10 +278,10 @@ Tables:
 - `metric_sum`
 - `metadata_summary`
 
-Segment sizing is controlled by:
+Arrow write-buffer flushing is controlled by:
 
-- `CANARDSTACK_SEGMENT_TARGET_BYTES`
-- `CANARDSTACK_SEGMENT_MAX_AGE_SECS` or `_MS`
+- `CANARDSTACK_ARROW_WRITE_BUFFER_TARGET_BYTES`
+- `CANARDSTACK_ARROW_WRITE_BUFFER_MAX_AGE_SECS` or `_MS`
 
 Local DuckLake is the default. Remote DuckLake attach URIs are supported, but
 the core architecture remains the same.
@@ -324,8 +329,8 @@ The operator surface distinguishes:
 - raw-spooled records and bytes
 - pending replay records and bytes
 - queued rows and bytes
-- sealed rows
-- DuckLake-visible rows and files
+- Arrow-appended and DuckLake-flushed rows
+- DuckLake-visible rows and active data files
 - checkpointed raw-spool records
 - raw-spool full
 - raw-spool unavailable
@@ -343,8 +348,8 @@ sets the base cadence; individual job cadences are derived from it.
 
 Scheduler jobs:
 
-- single seal driver (seals the immutable buffer on size/age threshold or the
-  freshness cadence, then checkpoints the raw spool)
+- single seal driver (flushes the Arrow write buffer on size/age threshold or
+  the freshness cadence, then checkpoints the raw spool after DuckLake commit)
 - metadata refresh
 - operator metric snapshot
 - retention
@@ -367,8 +372,9 @@ Retention is whole-day oriented and bounded by `CANARDSTACK_RETENTION_DAYS`,
 default 14.
 
 The current implementation uses bounded table deletes plus DuckLake snapshot
-expiration/cleanup hooks where available. Physical day-table layouts are not
-part of the current MVP.
+expiration/cleanup hooks where available. Physical file compaction is not
+enabled until DuckLake `ducklake_merge_adjacent_files` is proven stable for this
+write pattern. Physical day-table layouts are not part of the current MVP.
 
 ## Compatibility Surface
 

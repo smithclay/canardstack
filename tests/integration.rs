@@ -69,9 +69,9 @@ fn metrics_text(state: &AppState) -> String {
 
 fn seal_all(state: &AppState) -> usize {
     // Wait for in-flight ingest workers to finish buffering (admission credits
-    // released after the buffer append), then run the single seal+checkpoint path
+    // released after the buffer append), then run the single flush+checkpoint path
     // the scheduler uses so rows become query-visible and the raw spool is
-    // checkpointed. A bare seal_immutable_segments would seal without
+    // checkpointed. A bare flush_arrow_write_buffer would flush without
     // checkpointing the raw spool, leaving records pending forever.
     let deadline = Instant::now() + StdDuration::from_secs(5);
     while Instant::now() < deadline {
@@ -361,7 +361,7 @@ fn append_gauge_rows(state: &AppState, rows: &[(i64, &str, f64, &str)], source_f
         .storage
         .buffer_arrow_records(StorageSignal::MetricGauge, &batch, source_format)
         .unwrap();
-    state.storage.seal_immutable_segments(true).unwrap();
+    state.storage.flush_arrow_write_buffer(true).unwrap();
 }
 
 fn append_log_rows(state: &AppState, rows: &[(i64, &str, &str)], source_format: &str) {
@@ -422,8 +422,59 @@ fn append_log_rows(state: &AppState, rows: &[(i64, &str, &str)], source_format: 
         .storage
         .buffer_arrow_records(StorageSignal::Logs, &batch, source_format)
         .unwrap();
-    state.storage.seal_immutable_segments(true).unwrap();
+    state.storage.flush_arrow_write_buffer(true).unwrap();
     state.storage.refresh_metadata_limited(usize::MAX).unwrap();
+}
+
+#[test]
+fn arrow_append_write_path_flushes_visible_rows() {
+    let (_dir, state) = app();
+    let now = Utc::now();
+    let body = log_fixture(now.timestamp_nanos_opt().unwrap()).to_string();
+    let ingest = http::route(
+        "POST",
+        "/v1/logs",
+        &HashMap::new(),
+        &headers(&state),
+        body.as_bytes(),
+        &state,
+    );
+    assert_eq!(ingest.status(), 202, "{}", ingest.json_body());
+    seal_all(&state);
+
+    let rows = state.storage.logical_rows().unwrap();
+    assert_eq!(rows["logs"], 1);
+    let metrics = metrics_text(&state);
+    assert!(
+        metrics.contains("phase=\"storage_duckdb_arrow_append\""),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains("canardstack_duckdb_arrow_appended_rows_total"),
+        "{metrics}"
+    );
+    assert!(!metrics.contains("storage_parquet_encode"), "{metrics}");
+    let response = http::route(
+        "GET",
+        "/loki/api/v1/query_range",
+        &HashMap::from([
+            (
+                "query".to_string(),
+                "{service_name=\"checkout\"} |= \"smoke\"".to_string(),
+            ),
+            (
+                "start".to_string(),
+                (now - Duration::minutes(1)).to_rfc3339(),
+            ),
+            ("end".to_string(), (now + Duration::minutes(1)).to_rfc3339()),
+            ("limit".to_string(), "10".to_string()),
+        ]),
+        &headers(&state),
+        &[],
+        &state,
+    );
+    assert_eq!(response.status(), 200, "{}", response.json_body());
+    assert!(response.json_body().to_string().contains("smoke"));
 }
 
 #[test]
@@ -496,7 +547,7 @@ fn operator_metrics_snapshot_is_written_to_metric_store() {
         .write_snapshot_to_storage(&state.storage)
         .unwrap();
     assert!(rows >= 3, "expected operator metric rows, got {rows}");
-    state.storage.seal_immutable_segments(true).unwrap();
+    state.storage.flush_arrow_write_buffer(true).unwrap();
     state.storage.refresh_metadata_limited(usize::MAX).unwrap();
 
     let now = Utc::now();
@@ -555,7 +606,7 @@ fn metrics_route_renders_core_metrics_without_storage_health_scan() {
         "{metrics}"
     );
     assert!(
-        metrics.contains("canardstack_immutable_buffer_rows"),
+        metrics.contains("canardstack_arrow_write_buffer_rows"),
         "{metrics}"
     );
     assert!(
@@ -563,7 +614,7 @@ fn metrics_route_renders_core_metrics_without_storage_health_scan() {
         "{metrics}"
     );
     assert!(
-        !metrics.contains("canardstack_ducklake_parquet_files"),
+        !metrics.contains("canardstack_ducklake_active_data_files"),
         "{metrics}"
     );
     assert!(
@@ -1084,15 +1135,11 @@ fn ingest_stage_metrics_separate_transform_enqueue_and_storage_visibility() {
         "{metrics}"
     );
     assert!(
-        metrics.contains(
-            "canardstack_immutable_segments_sealed_rows_total{storage_signal=\"logs\"} 1"
-        ),
+        metrics.contains("canardstack_duckdb_arrow_appended_rows_total{storage_signal=\"logs\"} 1"),
         "{metrics}"
     );
     assert!(
-        metrics.contains(
-            "canardstack_immutable_segments_sealed_files_total{storage_signal=\"logs\"} 1"
-        ),
+        metrics.contains("canardstack_arrow_flush_rows_total{storage_signal=\"logs\"} 1"),
         "{metrics}"
     );
 }
@@ -1432,7 +1479,7 @@ fn raw_spool_replay_failure_does_not_abort_boot() {
 }
 
 #[test]
-fn raw_spool_replays_accepted_unsealed_request_after_restart() {
+fn raw_spool_replays_accepted_uncommitted_request_after_restart() {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
     config.raw_spool_dir = dir.path().join("raw-spool");
@@ -2666,7 +2713,7 @@ fn remote_ducklake_attach_uri_smoke() {
 
     let state = AppState::new(config).unwrap();
     let health = state.storage.health();
-    assert!(health.mode.ends_with("_immutable_segments"));
+    assert!(health.mode.ends_with("_arrow_append"));
     assert!(health.ducklake_available);
     assert!(health.capabilities.insert);
 
@@ -2792,8 +2839,8 @@ fn scheduler_seals_threshold_ingest_into_visible_rows() {
     config.local_storage_dir = dir.path().join("storage");
     config.scheduler_enabled = true;
     config.scheduler_seal_interval = StdDuration::from_millis(20);
-    config.immutable_segment_max_age = StdDuration::from_millis(10);
-    config.immutable_segment_target_bytes = 1;
+    config.arrow_write_buffer_max_age = StdDuration::from_millis(10);
+    config.arrow_write_buffer_target_bytes = 1;
 
     let state = Arc::new(AppState::new(config).unwrap());
     let scheduler = Scheduler::spawn(state.clone());
@@ -3272,7 +3319,7 @@ fn config_validate_rejects_zero_seal_freshness_ages() {
 
     let mutations: [fn(&mut Config); 2] = [
         |c| c.seal_rate_seed_window = std::time::Duration::ZERO,
-        |c| c.immutable_segment_max_age = std::time::Duration::ZERO,
+        |c| c.arrow_write_buffer_max_age = std::time::Duration::ZERO,
     ];
     for mutate in mutations {
         let mut config = Config::test(path.clone());

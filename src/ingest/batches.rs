@@ -11,8 +11,8 @@ pub(super) struct PendingBatch {
 }
 
 /// Per-signal view of ingest in-flight pressure: bytes that have been admitted
-/// (durably spooled, handed to a worker) but not yet appended to the immutable
-/// buffer. There is no separate in-memory queue, so this is the only "queue"
+/// (durably spooled, handed to a worker) but not yet appended to the Arrow
+/// write buffer. There is no separate in-memory queue, so this is the only "queue"
 /// depth ingest exposes; freshness/visibility debt lives in the admission snapshot.
 #[derive(Debug, Serialize)]
 pub struct IngestSnapshot {
