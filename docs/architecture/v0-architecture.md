@@ -360,6 +360,19 @@ Postgres-backed maintenance lease yet, so assume one in-process scheduler and
 one writer. Pause applies to scheduled jobs only; manual repair endpoints such
 as seal and retention remain available.
 
+The single writer connection plus the single in-process scheduler is a
+deliberate throughput ceiling for v0, not an accident: all writes (seal flush,
+metadata refresh, retention) serialize on one DuckDB writer driven by one
+scheduler thread. On that thread seal is prioritized over the non-seal jobs —
+when the oldest Arrow write buffer approaches the freshness-budget SLA the
+scheduler skips metadata refresh, the operator-metric snapshot, and retention for
+that tick so a slow job cannot hold the thread and delay a due seal. The eventual
+answer to scaling maintenance horizontally is the Postgres-backed maintenance
+lease (not yet implemented), which would let more than one node coordinate writes
+safely. Until then, watch the `writer_lock_wait` phase on
+`canardstack_phase_duration_seconds` (emitted on both the seal flush and
+metadata-refresh paths) as the signal that this ceiling is being hit.
+
 In `serve --role query`, ingest routes and maintenance mutation routes are not
 served. Public health, `/metrics`, and admin health endpoints stay available.
 In `serve --role ingest`, ingest and maintenance mutation routes are served,

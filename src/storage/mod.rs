@@ -32,6 +32,7 @@ use ducklake::{
     attach_ducklake_connection, configure_base_connection, configure_write_connection,
     ducklake_attach_plan,
 };
+pub use metadata::MetadataRefreshOutcome;
 use schema::create_tables_on;
 
 #[derive(Clone, Debug, Serialize)]
@@ -157,6 +158,7 @@ pub enum TimingPhase {
     ArrowWriteBuffer,
     DuckdbArrowAppend,
     DucklakeCommit,
+    WriterLockWait,
 }
 
 impl TimingPhase {
@@ -168,6 +170,7 @@ impl TimingPhase {
             TimingPhase::ArrowWriteBuffer => "storage_arrow_write_buffer",
             TimingPhase::DuckdbArrowAppend => "storage_duckdb_arrow_append",
             TimingPhase::DucklakeCommit => "storage_ducklake_commit",
+            TimingPhase::WriterLockWait => "writer_lock_wait",
         }
     }
 }

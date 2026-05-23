@@ -202,10 +202,18 @@ impl Storage {
             .iter()
             .map(|(&table, buffer)| (table, buffer.timestamp_days.clone()))
             .collect::<BTreeMap<_, _>>();
+        // Time the wait to acquire the single writer connection so writer
+        // contention (seal vs. metadata-refresh on the same lock) is visible.
+        let writer_lock_wait_started = Instant::now();
         let conn = self.writer.lock_or_poisoned();
+        let writer_lock_wait_seconds = writer_lock_wait_started.elapsed().as_secs_f64();
         configure_write_connection(&conn, &self.write_memory_limit)?;
 
-        let mut timings = Vec::new();
+        let mut timings = distributed_buffer_timing(
+            TimingPhase::WriterLockWait,
+            buffers,
+            writer_lock_wait_seconds,
+        );
         append_buffers_to_ducklake(&conn, &self.catalog_name, buffers, &mut timings).with_context(
             || "DuckDB Arrow appender flush failed; no fallback write path is enabled",
         )?;

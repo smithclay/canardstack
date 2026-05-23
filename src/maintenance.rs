@@ -14,6 +14,12 @@ use std::time::{Duration, Instant};
 
 const SCHEDULER_METADATA_REFRESH_BUCKET_LIMIT: usize = 1;
 const METADATA_REFRESH_INFLIGHT_PRESSURE_YIELD: f64 = 0.70;
+/// Fraction of the freshness-budget SLA at which the single scheduler thread
+/// stops running non-seal maintenance (metadata refresh, metrics snapshot,
+/// retention) for the tick. Past this point the Arrow-write-buffer age is close
+/// enough to the SLA that letting a slow maintenance job hold the thread could
+/// delay the next due seal and burn the freshness budget.
+const SEAL_PRIORITY_SLA_FRACTION: f64 = 0.5;
 
 #[derive(Clone, Debug)]
 struct FailureRecord {
@@ -207,6 +213,7 @@ fn scheduler_loop(state: Arc<AppState>, stop: Arc<AtomicBool>) {
     let metadata_every = state.config.scheduler_metadata_interval;
     let metrics_every = state.config.scheduler_metrics_interval;
     let retention_every = state.config.scheduler_retention_interval;
+    let freshness_budget_sla_seconds = state.config.freshness_budget_sla.as_secs_f64();
     // Poll fast enough to seal on the freshness cadence and to catch a
     // size-due buffer promptly; the maintenance jobs are gated by their own
     // (coarse) timers regardless of how often we wake.
@@ -238,8 +245,12 @@ fn scheduler_loop(state: Arc<AppState>, stop: Arc<AtomicBool>) {
         // threshold, or on the freshness cadence, keeping Arrow write-buffer age
         // well under the freshness-budget SLA. A failed seal backs off so a
         // broken catalog cannot spin the writer.
+        let buffers = state.storage.arrow_write_buffer_metrics();
+        let max_buffer_age_seconds = buffers
+            .iter()
+            .map(|metric| metric.age_seconds)
+            .fold(0.0, f64::max);
         if now >= seal_backoff_until {
-            let buffers = state.storage.arrow_write_buffer_metrics();
             let buffered = buffers.iter().any(|metric| metric.bytes > 0);
             let threshold_due = buffers.iter().any(|metric| {
                 metric.bytes >= buffer_target_bytes || metric.age_seconds >= buffer_max_age_seconds
@@ -255,25 +266,44 @@ fn scheduler_loop(state: Arc<AppState>, stop: Arc<AtomicBool>) {
             }
         }
 
-        if now >= next_metadata {
+        // Seal priority: when the oldest Arrow write buffer is within
+        // SEAL_PRIORITY_SLA_FRACTION of the freshness SLA, skip the non-seal
+        // maintenance jobs this tick so a slow metadata/metrics/retention job
+        // cannot hold the scheduler thread and delay the next due seal. The
+        // skipped jobs do NOT advance their `next_*` timers, so they run as soon
+        // as the buffer-age pressure clears.
+        let buffer_age_pressure = if freshness_budget_sla_seconds > 0.0 {
+            max_buffer_age_seconds / freshness_budget_sla_seconds
+        } else {
+            0.0
+        };
+        let seal_priority_active = buffer_age_pressure >= SEAL_PRIORITY_SLA_FRACTION;
+
+        if !seal_priority_active && now >= next_metadata {
             let ok = run_job(&state, "metadata_refresh", |s| {
                 let snapshots = s.ingestor.snapshots();
-                if metadata_refresh_should_yield_to_ingest(&snapshots) {
+                if metadata_refresh_should_yield_to_ingest(&snapshots, buffer_age_pressure) {
                     return Ok(json!({
                         "status": "skipped",
                         "reason": "ingest_pressure",
-                        "max_inflight_pressure": max_inflight_pressure(&snapshots)
+                        "max_inflight_pressure": max_inflight_pressure(&snapshots),
+                        "buffer_age_pressure": buffer_age_pressure
                     }));
                 }
-                let buckets = s
+                let outcome = s
                     .storage
                     .refresh_metadata_limited(SCHEDULER_METADATA_REFRESH_BUCKET_LIMIT)?;
-                Ok(json!({"status": "ok", "buckets": buckets}))
+                s.metrics.observe_seconds(
+                    "canardstack_phase_duration_seconds",
+                    &[("phase", "writer_lock_wait"), ("path", "metadata_refresh")],
+                    outcome.writer_lock_wait_seconds,
+                );
+                Ok(json!({"status": "ok", "buckets": outcome.buckets}))
             });
             next_metadata = now + next_interval(&state, "metadata_refresh", metadata_every, ok);
         }
 
-        if now >= next_metrics {
+        if !seal_priority_active && now >= next_metrics {
             let ok = run_job(&state, "metrics_snapshot", |s| {
                 crate::http::record_operator_gauges(s);
                 crate::http::record_storage_operator_gauges(s);
@@ -283,7 +313,7 @@ fn scheduler_loop(state: Arc<AppState>, stop: Arc<AtomicBool>) {
             next_metrics = now + next_interval(&state, "metrics_snapshot", metrics_every, ok);
         }
 
-        if now >= next_retention {
+        if !seal_priority_active && now >= next_retention {
             let ok = run_job(&state, "retention", |s| {
                 s.maintenance.retention(&s.storage, false)
             });
@@ -368,8 +398,16 @@ fn next_interval(state: &AppState, job: &str, base: Duration, ok: bool) -> Durat
     backoff.min(Duration::from_secs(300)).max(base)
 }
 
-fn metadata_refresh_should_yield_to_ingest(snapshots: &[IngestSnapshot]) -> bool {
+/// Yield the metadata-refresh tick when either ingest in-flight pressure or
+/// Arrow-write-buffer age pressure (max buffer age / freshness SLA) crosses the
+/// yield threshold, so discovery re-aggregation never competes with the writer
+/// while ingest is hot or a seal is approaching due.
+fn metadata_refresh_should_yield_to_ingest(
+    snapshots: &[IngestSnapshot],
+    buffer_age_pressure: f64,
+) -> bool {
     max_inflight_pressure(snapshots) >= METADATA_REFRESH_INFLIGHT_PRESSURE_YIELD
+        || buffer_age_pressure >= METADATA_REFRESH_INFLIGHT_PRESSURE_YIELD
 }
 
 fn max_inflight_pressure(snapshots: &[IngestSnapshot]) -> f64 {
@@ -410,17 +448,30 @@ mod tests {
 
     #[test]
     fn metadata_refresh_yields_to_high_inflight_pressure() {
-        assert!(metadata_refresh_should_yield_to_ingest(&[
-            snapshot("logs", 0.10),
-            snapshot("spans", METADATA_REFRESH_INFLIGHT_PRESSURE_YIELD),
-        ]));
+        assert!(metadata_refresh_should_yield_to_ingest(
+            &[
+                snapshot("logs", 0.10),
+                snapshot("spans", METADATA_REFRESH_INFLIGHT_PRESSURE_YIELD),
+            ],
+            0.0,
+        ));
     }
 
     #[test]
     fn metadata_refresh_runs_when_inflight_pressure_below_threshold() {
-        assert!(!metadata_refresh_should_yield_to_ingest(&[
-            snapshot("logs", 0.69),
-            snapshot("spans", 0.10),
-        ]));
+        assert!(!metadata_refresh_should_yield_to_ingest(
+            &[snapshot("logs", 0.69), snapshot("spans", 0.10)],
+            0.0,
+        ));
+    }
+
+    #[test]
+    fn metadata_refresh_yields_to_high_buffer_age_pressure_alone() {
+        // No inflight pressure, but the oldest buffer is past the yield
+        // threshold fraction of the SLA -> still yield so the seal stays ahead.
+        assert!(metadata_refresh_should_yield_to_ingest(
+            &[snapshot("logs", 0.10), snapshot("spans", 0.10)],
+            METADATA_REFRESH_INFLIGHT_PRESSURE_YIELD,
+        ));
     }
 }
