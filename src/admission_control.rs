@@ -1,14 +1,15 @@
 //! Freshness-first admission control.
 //!
-//! Every admission decision is driven by one projection of how far behind the
-//! seal pipeline is, expressed in seconds of expected query-visibility delay:
+//! The central primitive is one value type, [`VisibilityDebt`]: a single
+//! projection of how far behind the seal pipeline is, expressed in seconds of
+//! expected query-visibility delay. Its pure constructor IS the projection:
 //!
 //! ```text
-//! projected_seal_seconds   = (inflight_bytes + incoming_bytes) / observed_seal_rate
-//! projected_buffer_seconds = buffer_size_debt + buffer_age_debt
+//! seal_seconds       = (inflight_bytes + incoming_bytes) / observed_seal_rate
+//! buffer_seconds     = buffer_size_debt + buffer_age_debt
 //!     buffer_size_debt = max(0, buffered_bytes - target*active) / observed_seal_rate
 //!     buffer_age_debt  = max(0, oldest_buffer_age - buffer_max_age)
-//! projected_visibility_seconds = max(projected_seal_seconds, projected_buffer_seconds)
+//! visibility_seconds = max(seal_seconds, buffer_seconds)
 //! ```
 //!
 //! `observed_seal_rate` is a single EWMA of measured seal throughput
@@ -16,20 +17,29 @@
 //! and used by BOTH the seal debt and the buffer-size debt so the two terms
 //! share one drain estimate.
 //!
-//! The projection feeds a single freshness band, relative to the configured SLA
-//! (`freshness_budget_sla_seconds`):
+//! Each admission decision is a small PURE policy over that one debt, relative
+//! to the configured SLA (`freshness_budget_sla_seconds`). The policy fns
+//! contain no metrics and mutate no state:
 //!
-//! - Ingest is admitted while projected visibility stays under 0.95x the SLA
-//!   ([`FreshnessModel::INGEST_FRESHNESS_BUDGET_FRACTION`]), tightened to 0.90x
-//!   while a heavy query is in flight
+//! - ingest ([`ingest_admit`]): admitted while visibility stays under 0.95x the
+//!   SLA ([`FreshnessModel::INGEST_FRESHNESS_BUDGET_FRACTION`]), tightened to
+//!   0.90x while a heavy query is in flight
 //!   ([`FreshnessModel::INGEST_FRESHNESS_BUDGET_WITH_HEAVY_FRACTION`]); over the
 //!   budget it returns 429.
-//! - Heavy queries keep full capacity below the SLA, degrade to reduced capacity
-//!   at >= 1.0x the SLA ([`FreshnessModel::HEAVY_QUERY_DEGRADE_FRACTION`]), and
-//!   are rejected outright at >= 1.5x the SLA
+//! - heavy query ([`effective_heavy_capacity`] + [`heavy_freshness_at_risk`]):
+//!   keeps full capacity below the SLA, degrades to reduced capacity at >= 1.0x
+//!   the SLA ([`FreshnessModel::HEAVY_QUERY_DEGRADE_FRACTION`]), and is rejected
+//!   outright at >= 1.5x the SLA
 //!   ([`FreshnessModel::HEAVY_QUERY_REJECT_FRACTION`]).
-//! - Cheap queries keep protected admission and seal capacity is reserved ahead
-//!   of all query capacity.
+//! - cheap query: capacity-only (debt-independent), protected admission.
+//! - seal: capacity-only (debt-independent), reserved ahead of all query
+//!   capacity.
+//!
+//! The public methods ([`AdmissionController::reserve_seal`],
+//! [`AdmissionController::reserve_query`], [`AdmissionController::admit_ingest`])
+//! are the orchestration layer: they lock, refresh the [`VisibilityDebt`], call
+//! the pure policy fn(s), mutate [`AdmissionState`], and emit metrics. Metrics
+//! emission lives ONLY in that orchestration layer, never in the policy fns.
 //!
 //! Default memory backstop: in the default config the freshness projection in
 //! [`AdmissionController::admit_ingest`] is the SOLE enforced ingest gate. The
@@ -73,6 +83,103 @@ impl FreshnessModel {
     const INGEST_FRESHNESS_BUDGET_FRACTION: f64 = 0.95;
     /// Tighter ingest headroom while a heavy query is in flight.
     const INGEST_FRESHNESS_BUDGET_WITH_HEAVY_FRACTION: f64 = 0.90;
+}
+
+/// The one freshness-first admission primitive: a projection of how far behind
+/// the seal pipeline is, in seconds of expected query-visibility delay.
+///
+/// Construct it with [`VisibilityDebt::project`]; every admission decision is a
+/// small pure policy over the resulting `visibility_seconds`.
+#[derive(Clone, Copy, Debug)]
+struct VisibilityDebt {
+    seal_seconds: f64,
+    buffer_seconds: f64,
+    visibility_seconds: f64,
+}
+
+impl VisibilityDebt {
+    /// Pure projection from the freshness inputs and the single observed seal
+    /// rate. This is the SOLE place the projection formula lives.
+    ///
+    /// ```text
+    /// seal_seconds       = (inflight_bytes + incoming_bytes) / ewma.max(1.0)
+    /// buffer_size_debt   = max(0, buffered_bytes - target*active) / ewma.max(1.0)
+    /// buffer_age_debt    = max(0, oldest_buffer_age - max_age)
+    /// buffer_seconds     = buffer_size_debt + buffer_age_debt
+    /// visibility_seconds = max(seal_seconds, buffer_seconds)
+    /// ```
+    fn project(
+        inputs: FreshnessBudgetInputs,
+        ewma_seal_bytes_per_second: f64,
+        arrow_write_buffer_target_bytes: usize,
+        arrow_write_buffer_max_age_seconds: f64,
+    ) -> Self {
+        let drain_rate = ewma_seal_bytes_per_second.max(1.0);
+        let projected_bytes = inputs.inflight_bytes.saturating_add(inputs.incoming_bytes);
+        let seal_seconds = projected_bytes as f64 / drain_rate;
+        let allowed_buffer_bytes =
+            arrow_write_buffer_target_bytes.saturating_mul(inputs.buffered_active_count);
+        let excess_buffer_bytes = inputs.buffered_bytes.saturating_sub(allowed_buffer_bytes);
+        // Buffer-size debt drains at the same observed seal rate as seal debt.
+        let buffer_size_debt_seconds = excess_buffer_bytes as f64 / drain_rate;
+        let buffer_age_debt_seconds =
+            (inputs.oldest_buffer_age_seconds - arrow_write_buffer_max_age_seconds).max(0.0);
+        let buffer_seconds = buffer_size_debt_seconds + buffer_age_debt_seconds;
+        let visibility_seconds = seal_seconds.max(buffer_seconds);
+        Self {
+            seal_seconds,
+            buffer_seconds,
+            visibility_seconds,
+        }
+    }
+}
+
+/// Ingest policy: pure decision over the visibility debt.
+///
+/// Budget fraction is 0.90x the SLA while a heavy query is in flight, 0.95x
+/// otherwise; ingest is rejected (`"freshness_budget_exceeded"`) when projected
+/// visibility exceeds that budget. No metrics, no state mutation.
+fn ingest_admit(
+    debt: &VisibilityDebt,
+    sla_seconds: f64,
+    heavy_in_flight: bool,
+) -> Result<(), &'static str> {
+    let budget_fraction = if heavy_in_flight {
+        FreshnessModel::INGEST_FRESHNESS_BUDGET_WITH_HEAVY_FRACTION
+    } else {
+        FreshnessModel::INGEST_FRESHNESS_BUDGET_FRACTION
+    };
+    let budget = sla_seconds * budget_fraction;
+    if debt.visibility_seconds > budget {
+        Err("freshness_budget_exceeded")
+    } else {
+        Ok(())
+    }
+}
+
+/// Heavy-query capacity policy: pure decision over the visibility debt.
+///
+/// Returns the degraded capacity once visibility reaches 1.0x the SLA, else the
+/// full capacity. No metrics, no state mutation.
+fn effective_heavy_capacity(
+    debt: &VisibilityDebt,
+    sla_seconds: f64,
+    full_capacity: usize,
+    degraded_capacity: usize,
+) -> usize {
+    if debt.visibility_seconds >= sla_seconds * FreshnessModel::HEAVY_QUERY_DEGRADE_FRACTION {
+        degraded_capacity
+    } else {
+        full_capacity
+    }
+}
+
+/// Heavy-query hard-reject policy: pure decision over the visibility debt.
+///
+/// Heavy queries are at risk (rejected) once visibility reaches 1.5x the SLA.
+/// No metrics, no state mutation.
+fn heavy_freshness_at_risk(debt: &VisibilityDebt, sla_seconds: f64) -> bool {
+    debt.visibility_seconds >= sla_seconds * FreshnessModel::HEAVY_QUERY_REJECT_FRACTION
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -136,9 +243,9 @@ struct AdmissionState {
     cheap_query_active: usize,
     heavy_query_active: usize,
     ewma_seal_bytes_per_second: f64,
-    projected_seal_seconds: f64,
-    projected_buffer_seconds: f64,
-    projected_visibility_seconds: f64,
+    /// The current freshness-first admission primitive: the last projected
+    /// visibility debt. Refreshed via `update_projection_locked`.
+    debt: VisibilityDebt,
     observed_freshness_lag_seconds: f64,
     heavy_query_reductions_total: u64,
     query_rejections_total: u64,
@@ -188,9 +295,11 @@ impl AdmissionController {
                 cheap_query_active: 0,
                 heavy_query_active: 0,
                 ewma_seal_bytes_per_second: initial_seal_bytes_per_second.max(1.0),
-                projected_seal_seconds: 0.0,
-                projected_buffer_seconds: 0.0,
-                projected_visibility_seconds: 0.0,
+                debt: VisibilityDebt {
+                    seal_seconds: 0.0,
+                    buffer_seconds: 0.0,
+                    visibility_seconds: 0.0,
+                },
                 observed_freshness_lag_seconds: 0.0,
                 heavy_query_reductions_total: 0,
                 query_rejections_total: 0,
@@ -296,27 +405,24 @@ impl AdmissionController {
     pub fn admit_ingest(&self, inputs: FreshnessBudgetInputs, metrics: &Metrics) -> ApiResult<()> {
         let mut state = self.inner.lock_or_poisoned();
         self.update_projection_locked(&mut state, inputs);
-        let budget_fraction = if state.heavy_query_active > 0 {
-            FreshnessModel::INGEST_FRESHNESS_BUDGET_WITH_HEAVY_FRACTION
-        } else {
-            FreshnessModel::INGEST_FRESHNESS_BUDGET_FRACTION
-        };
-        let budget = self.freshness_budget_sla_seconds * budget_fraction;
-        if state.projected_visibility_seconds > budget {
+        let heavy_in_flight = state.heavy_query_active > 0;
+        let decision = ingest_admit(
+            &state.debt,
+            self.freshness_budget_sla_seconds,
+            heavy_in_flight,
+        );
+        if let Err(reason) = decision {
             state.ingest_freshness_rejections_total += 1;
             metrics.inc(
                 "canardstack_admission_rejections_total",
-                &[
-                    ("admission", "freshness_budget"),
-                    ("reason", "freshness_budget_exceeded"),
-                ],
+                &[("admission", "freshness_budget"), ("reason", reason)],
                 1,
             );
             drop(state);
             self.record_metrics(metrics, inputs);
             return Err(ApiError::new(
                 429,
-                "freshness_budget_exceeded",
+                reason,
                 "projected seal visibility exceeds freshness budget",
             )
             .with_retry_after(5));
@@ -439,37 +545,25 @@ impl AdmissionController {
     }
 
     fn effective_heavy_capacity_locked(&self, state: &AdmissionState) -> usize {
-        if state.projected_visibility_seconds
-            >= self.freshness_budget_sla_seconds * FreshnessModel::HEAVY_QUERY_DEGRADE_FRACTION
-        {
-            self.heavy_query_degraded_capacity
-        } else {
-            self.heavy_query_capacity
-        }
+        effective_heavy_capacity(
+            &state.debt,
+            self.freshness_budget_sla_seconds,
+            self.heavy_query_capacity,
+            self.heavy_query_degraded_capacity,
+        )
     }
 
     fn freshness_at_risk_locked(&self, state: &AdmissionState) -> bool {
-        state.projected_visibility_seconds
-            >= self.freshness_budget_sla_seconds * FreshnessModel::HEAVY_QUERY_REJECT_FRACTION
+        heavy_freshness_at_risk(&state.debt, self.freshness_budget_sla_seconds)
     }
 
     fn update_projection_locked(&self, state: &mut AdmissionState, inputs: FreshnessBudgetInputs) {
-        let projected_bytes = inputs.inflight_bytes.saturating_add(inputs.incoming_bytes);
-        state.projected_seal_seconds =
-            projected_bytes as f64 / state.ewma_seal_bytes_per_second.max(1.0);
-        let allowed_buffer_bytes = self
-            .arrow_write_buffer_target_bytes
-            .saturating_mul(inputs.buffered_active_count);
-        let excess_buffer_bytes = inputs.buffered_bytes.saturating_sub(allowed_buffer_bytes);
-        // Buffer-size debt drains at the same observed seal rate as seal debt.
-        let buffer_size_debt_seconds =
-            excess_buffer_bytes as f64 / state.ewma_seal_bytes_per_second.max(1.0);
-        let buffer_age_debt_seconds =
-            (inputs.oldest_buffer_age_seconds - self.arrow_write_buffer_max_age_seconds).max(0.0);
-        state.projected_buffer_seconds = buffer_size_debt_seconds + buffer_age_debt_seconds;
-        state.projected_visibility_seconds = state
-            .projected_seal_seconds
-            .max(state.projected_buffer_seconds);
+        state.debt = VisibilityDebt::project(
+            inputs,
+            state.ewma_seal_bytes_per_second,
+            self.arrow_write_buffer_target_bytes,
+            self.arrow_write_buffer_max_age_seconds,
+        );
     }
 }
 
@@ -556,9 +650,9 @@ fn snapshot_locked(
         heavy_query_capacity,
         heavy_query_effective_capacity,
         ewma_seal_bytes_per_second: state.ewma_seal_bytes_per_second,
-        projected_seal_seconds: state.projected_seal_seconds,
-        projected_buffer_seconds: state.projected_buffer_seconds,
-        projected_visibility_seconds: state.projected_visibility_seconds,
+        projected_seal_seconds: state.debt.seal_seconds,
+        projected_buffer_seconds: state.debt.buffer_seconds,
+        projected_visibility_seconds: state.debt.visibility_seconds,
         observed_freshness_lag_seconds: state.observed_freshness_lag_seconds,
         freshness_budget_sla_seconds,
         heavy_query_reductions_total: state.heavy_query_reductions_total,
@@ -577,7 +671,7 @@ fn query_rejection_reason(
         QueryClass::Heavy if state.heavy_query_active >= effective_heavy_capacity => {
             "heavy_query_admission_full"
         }
-        QueryClass::Heavy if state.projected_visibility_seconds > 0.0 => "freshness_debt",
+        QueryClass::Heavy if state.debt.visibility_seconds > 0.0 => "freshness_debt",
         QueryClass::Heavy => "heavy_query_admission_full",
     }
 }
