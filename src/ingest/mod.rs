@@ -40,32 +40,7 @@ pub enum OtlpRequestKind {
 }
 
 impl OtlpRequestKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Logs => "logs",
-            Self::Traces => "traces",
-            Self::Metrics => "metrics",
-        }
-    }
-
-    pub fn raw_spool_lane(self) -> RawSpoolLane {
-        match self {
-            Self::Logs => RawSpoolLane::Logs,
-            Self::Traces => RawSpoolLane::Traces,
-            Self::Metrics => RawSpoolLane::Metrics,
-        }
-    }
-}
-
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize)]
-pub enum RawSpoolLane {
-    Logs,
-    Traces,
-    Metrics,
-}
-
-impl RawSpoolLane {
-    pub const ALL: [RawSpoolLane; 3] = [Self::Logs, Self::Traces, Self::Metrics];
+    pub const ALL: [OtlpRequestKind; 3] = [Self::Logs, Self::Traces, Self::Metrics];
 
     pub fn as_str(self) -> &'static str {
         match self {
@@ -76,7 +51,7 @@ impl RawSpoolLane {
     }
 }
 
-impl fmt::Display for RawSpoolLane {
+impl fmt::Display for OtlpRequestKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
@@ -109,8 +84,8 @@ impl fmt::Display for StorageSignal {
 pub struct Ingestor {
     runtime_memory_reserved_bytes: Arc<AtomicUsize>,
     inflight: Arc<admission::InflightBytes>,
-    raw_spools: BTreeMap<RawSpoolLane, Writer>,
-    raw_spool_seal_refs: Arc<Mutex<BTreeMap<(RawSpoolLane, RecordId), SealRef>>>,
+    raw_spools: BTreeMap<OtlpRequestKind, Writer>,
+    raw_spool_seal_refs: Arc<Mutex<BTreeMap<(OtlpRequestKind, RecordId), SealRef>>>,
     ingest_workers: Mutex<Option<IngestWorkerPool>>,
     config: Config,
 }
@@ -128,7 +103,7 @@ pub(in crate::ingest) struct SpooledIngestWork {
 impl Ingestor {
     pub fn new(config: Config) -> Result<Self> {
         let mut raw_spools = BTreeMap::new();
-        for lane in RawSpoolLane::ALL {
+        for lane in OtlpRequestKind::ALL {
             raw_spools.insert(lane, spawn_raw_spool_writer(&config, lane)?);
         }
         Ok(Self {
@@ -609,7 +584,7 @@ impl Ingestor {
                     storage_signal: signal.as_str(),
                     inflight_bytes,
                     inflight_capacity_bytes: capacity,
-                    pressure: if capacity == 0 {
+                    inflight_pressure: if capacity == 0 {
                         0.0
                     } else {
                         inflight_bytes as f64 / capacity as f64
@@ -634,12 +609,12 @@ impl Ingestor {
             metrics.gauge(
                 "canardstack_ingest_inflight_pressure",
                 &[("storage_signal", snapshot.storage_signal)],
-                snapshot.pressure,
+                snapshot.inflight_pressure,
             );
             metrics.gauge_max(
                 "canardstack_ingest_inflight_pressure_max",
                 &[("storage_signal", snapshot.storage_signal)],
-                snapshot.pressure,
+                snapshot.inflight_pressure,
             );
             metrics.gauge(
                 "canardstack_ingest_inflight_capacity_bytes",
@@ -653,7 +628,7 @@ impl Ingestor {
         metrics.gauge(
             "canardstack_ingest_worker_queue_capacity",
             &[("state", "capacity")],
-            self.config.ingest_buffer_capacity as f64,
+            self.config.ingest_worker_channel_capacity as f64,
         );
     }
 
@@ -741,7 +716,7 @@ fn transformed_rows_by_signal(transformed: &Transformed) -> Vec<(StorageSignal, 
         .collect()
 }
 
-fn spawn_raw_spool_writer(config: &Config, lane: RawSpoolLane) -> Result<Writer> {
+fn spawn_raw_spool_writer(config: &Config, lane: OtlpRequestKind) -> Result<Writer> {
     Writer::spawn(
         Options {
             dir: config.raw_spool_dir.join(lane.as_str()),

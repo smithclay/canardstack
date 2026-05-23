@@ -38,7 +38,7 @@ impl Ingestor {
         let weak = Arc::downgrade(self);
         let per_worker_capacity = self
             .config
-            .ingest_buffer_capacity
+            .ingest_worker_channel_capacity
             .div_ceil(worker_count)
             .max(1);
         let mut commands = Vec::with_capacity(worker_count);
@@ -57,8 +57,8 @@ impl Ingestor {
         tracing::info!(
             event = "ingest_workers_started",
             workers = worker_count,
-            buffer_capacity = self.config.ingest_buffer_capacity,
-            per_worker_buffer_capacity = per_worker_capacity
+            worker_channel_capacity = self.config.ingest_worker_channel_capacity,
+            per_worker_channel_capacity = per_worker_capacity
         );
         *pool = Some(IngestWorkerPool {
             commands,

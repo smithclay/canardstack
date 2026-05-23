@@ -292,7 +292,7 @@ impl Spool {
 
         // The spool directory's final component is the raw-spool lane (see
         // `spawn_raw_spool_writer`), so derive a stable label for diagnostics
-        // without threading a `RawSpoolLane` through `Options`.
+        // without threading an `OtlpRequestKind` through `Options`.
         let lane_label = options
             .dir
             .file_name()

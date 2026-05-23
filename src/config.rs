@@ -106,7 +106,7 @@ pub struct Config {
     pub raw_spool_checkpoint_fsync_records: usize,
     pub raw_spool_checkpoint_fsync_delay: Duration,
     pub ingest_workers: usize,
-    pub ingest_buffer_capacity: usize,
+    pub ingest_worker_channel_capacity: usize,
 }
 
 const DEFAULT_CONFIG_PATH: &str = "config.toml";
@@ -301,9 +301,11 @@ impl Config {
             ingest_workers: env_usize("CANARDSTACK_INGEST_WORKERS")?
                 .or(file.usize(&["ingest", "workers"])?)
                 .unwrap_or(4),
-            ingest_buffer_capacity: env_usize("CANARDSTACK_INGEST_BUFFER_CAPACITY")?
-                .or(file.usize(&["ingest", "buffer_capacity"])?)
-                .unwrap_or(1024),
+            ingest_worker_channel_capacity: env_usize(
+                "CANARDSTACK_INGEST_WORKER_CHANNEL_CAPACITY",
+            )?
+            .or(file.usize(&["ingest", "worker_channel_capacity"])?)
+            .unwrap_or(1024),
         })
     }
 
@@ -366,7 +368,7 @@ impl Config {
             raw_spool_checkpoint_fsync_records: 1024,
             raw_spool_checkpoint_fsync_delay: Duration::from_millis(1000),
             ingest_workers: 4,
-            ingest_buffer_capacity: 1024,
+            ingest_worker_channel_capacity: 1024,
         }
     }
 
@@ -472,8 +474,8 @@ impl Config {
         if self.ingest_workers == 0 {
             anyhow::bail!("CANARDSTACK_INGEST_WORKERS must be > 0");
         }
-        if self.ingest_buffer_capacity == 0 {
-            anyhow::bail!("CANARDSTACK_INGEST_BUFFER_CAPACITY must be > 0");
+        if self.ingest_worker_channel_capacity == 0 {
+            anyhow::bail!("CANARDSTACK_INGEST_WORKER_CHANNEL_CAPACITY must be > 0");
         }
         if self.raw_spool_max_record_bytes > self.raw_spool_max_total_bytes {
             anyhow::bail!(
@@ -723,7 +725,7 @@ mod tests {
         "CANARDSTACK_RAW_SPOOL_CAPACITY_BYTES",
         "CANARDSTACK_RAW_SPOOL_GROUP_COMMIT_MS",
         "CANARDSTACK_INGEST_WORKERS",
-        "CANARDSTACK_INGEST_BUFFER_CAPACITY",
+        "CANARDSTACK_INGEST_WORKER_CHANNEL_CAPACITY",
     ];
 
     fn env_lock() -> &'static Mutex<()> {
@@ -797,7 +799,7 @@ process_memory_limit_bytes = 4000000
 seal_rate_seed_bytes = 654321
 seal_rate_seed_window_secs = 11
 workers = 3
-buffer_capacity = 33
+worker_channel_capacity = 33
 
 [validation]
 accept_late_secs = 100
@@ -903,7 +905,7 @@ http_keepalive = true
             Duration::from_millis(1000)
         );
         assert_eq!(config.ingest_workers, 3);
-        assert_eq!(config.ingest_buffer_capacity, 33);
+        assert_eq!(config.ingest_worker_channel_capacity, 33);
         assert!(config.bench_http_keepalive);
     }
 

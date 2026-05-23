@@ -2,7 +2,7 @@ use canardstack::admission_control::AdmissionController;
 use canardstack::config::ServeRole;
 use canardstack::http;
 use canardstack::ingest::spool::{Options, Record, Spool};
-use canardstack::ingest::{Ingestor, OtlpRequestKind, RawSpoolLane, StorageSignal};
+use canardstack::ingest::{Ingestor, OtlpRequestKind, StorageSignal};
 use canardstack::metrics::Metrics;
 use canardstack::storage::Storage;
 use canardstack::validation;
@@ -726,7 +726,7 @@ fn unhealthy_raw_spool_writer_makes_readiness_not_ready() {
     // Wedge one raw-spool lane writer (mirrors a fatal append/fsync failure).
     state
         .ingestor
-        .force_raw_spool_unhealthy(RawSpoolLane::Logs, "injected fatal for test")
+        .force_raw_spool_unhealthy(OtlpRequestKind::Logs, "injected fatal for test")
         .unwrap();
 
     // /healthz must now report NOT ready and name the wedged raw-spool lane.
@@ -1150,7 +1150,7 @@ fn ingest_workers_return_202_after_raw_spool_and_handoff() {
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
     config.local_storage_dir = dir.path().join("storage");
     config.ingest_workers = 1;
-    config.ingest_buffer_capacity = 4;
+    config.ingest_worker_channel_capacity = 4;
     let state = AppState::new(config).unwrap();
     let body = log_fixture(Utc::now().timestamp_nanos_opt().unwrap()).to_string();
     let response = http::route(
@@ -1188,7 +1188,7 @@ fn ingest_workers_buffer_storage_rows_and_checkpoint_spool() {
     config.local_storage_dir = dir.path().join("storage");
     config.raw_spool_dir = dir.path().join("raw-spool");
     config.ingest_workers = 1;
-    config.ingest_buffer_capacity = 4;
+    config.ingest_worker_channel_capacity = 4;
     let state = AppState::new(config).unwrap();
     let body = log_fixture(Utc::now().timestamp_nanos_opt().unwrap()).to_string();
     let response = http::route(
@@ -1333,7 +1333,7 @@ fn raw_spool_replays_pending_request_on_startup() {
     let body = log_fixture(Utc::now().timestamp_nanos_opt().unwrap()).to_string();
     {
         let mut spool = Spool::open(Options {
-            dir: config.raw_spool_dir.join(RawSpoolLane::Logs.as_str()),
+            dir: config.raw_spool_dir.join(OtlpRequestKind::Logs.as_str()),
             max_segment_bytes: config.raw_spool_max_segment_bytes as u64,
             max_record_bytes: config.raw_spool_max_record_bytes as u64,
             max_total_bytes: config.raw_spool_max_total_bytes as u64,
@@ -1392,7 +1392,7 @@ fn raw_spool_replays_one_metrics_request_into_gauge_and_sum_tables() {
     let body = metric_fixture(Utc::now().timestamp_nanos_opt().unwrap()).to_string();
     {
         let mut spool = Spool::open(Options {
-            dir: config.raw_spool_dir.join(RawSpoolLane::Metrics.as_str()),
+            dir: config.raw_spool_dir.join(OtlpRequestKind::Metrics.as_str()),
             max_segment_bytes: config.raw_spool_max_segment_bytes as u64,
             max_record_bytes: config.raw_spool_max_record_bytes as u64,
             max_total_bytes: config.raw_spool_max_total_bytes as u64,
@@ -1440,7 +1440,7 @@ fn raw_spool_replay_failure_does_not_abort_boot() {
     let body = log_fixture(Utc::now().timestamp_nanos_opt().unwrap()).to_string();
     {
         let mut spool = Spool::open(Options {
-            dir: config.raw_spool_dir.join(RawSpoolLane::Logs.as_str()),
+            dir: config.raw_spool_dir.join(OtlpRequestKind::Logs.as_str()),
             max_segment_bytes: config.raw_spool_max_segment_bytes as u64,
             max_record_bytes: config.raw_spool_max_record_bytes as u64,
             max_total_bytes: config.raw_spool_max_total_bytes as u64,
@@ -3372,8 +3372,10 @@ fn config_validate_rejects_invalid_ingest_workers_capacities() {
         "baseline test config must validate"
     );
 
-    let mutations: [fn(&mut Config); 2] =
-        [|c| c.ingest_workers = 0, |c| c.ingest_buffer_capacity = 0];
+    let mutations: [fn(&mut Config); 2] = [
+        |c| c.ingest_workers = 0,
+        |c| c.ingest_worker_channel_capacity = 0,
+    ];
     for mutate in mutations {
         let mut config = Config::test(path.clone());
         mutate(&mut config);

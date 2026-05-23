@@ -1,6 +1,6 @@
 use super::{full_info, AppendBatchStats, CheckpointBatchStats, Record, RecordId, Writer};
 use crate::admission_control::AdmissionController;
-use crate::ingest::{Ingestor, OtlpRequestKind, RawSpoolLane};
+use crate::ingest::{Ingestor, OtlpRequestKind};
 use crate::metrics::Metrics;
 use crate::storage::{ArrowFlushOutcome, Storage, TimingPhase};
 use crate::validation::{self, ApiError, ApiResult};
@@ -17,7 +17,7 @@ pub(in crate::ingest) struct SealRef {
 
 #[derive(Clone, Copy, Debug)]
 pub(in crate::ingest) struct AppendRef {
-    pub(in crate::ingest) spool: RawSpoolLane,
+    pub(in crate::ingest) spool: OtlpRequestKind,
     pub(in crate::ingest) id: RecordId,
 }
 
@@ -36,7 +36,7 @@ impl Ingestor {
         metrics: Arc<Metrics>,
     ) -> Result<usize> {
         let mut replayed = 0usize;
-        for lane in RawSpoolLane::ALL {
+        for lane in OtlpRequestKind::ALL {
             let pending = self
                 .raw_spool_for(lane)?
                 .recover_pending()
@@ -251,7 +251,7 @@ impl Ingestor {
         compressed_body: Vec<u8>,
         metrics: &Metrics,
     ) -> ApiResult<(AppendRef, Vec<u8>)> {
-        let spool = route.raw_spool_lane();
+        let spool = route;
         let content_type = headers.get("content-type").cloned().unwrap_or_default();
         let content_encoding = headers.get("content-encoding").cloned();
         let compressed_body_len = compressed_body.len();
@@ -325,7 +325,7 @@ impl Ingestor {
 
     fn record_raw_spool_append_batch_metrics(
         metrics: &Metrics,
-        lane: RawSpoolLane,
+        lane: OtlpRequestKind,
         stats: AppendBatchStats,
     ) {
         metrics.inc(
@@ -398,7 +398,7 @@ impl Ingestor {
 
     fn record_raw_spool_checkpoint_batch_metrics(
         metrics: &Metrics,
-        lane: RawSpoolLane,
+        lane: OtlpRequestKind,
         stats: CheckpointBatchStats,
     ) {
         if stats.records == 0 {
@@ -494,7 +494,7 @@ impl Ingestor {
             return Ok(());
         }
         let started = Instant::now();
-        let mut by_lane_ids = BTreeMap::<RawSpoolLane, Vec<RecordId>>::new();
+        let mut by_lane_ids = BTreeMap::<OtlpRequestKind, Vec<RecordId>>::new();
         for (_, raw_spool_ref) in records {
             by_lane_ids
                 .entry(raw_spool_ref.spool)
@@ -536,7 +536,7 @@ impl Ingestor {
             healthy: true,
             ..Default::default()
         };
-        for lane in RawSpoolLane::ALL {
+        for lane in OtlpRequestKind::ALL {
             let stats = self
                 .raw_spool_for(lane)?
                 .stats()
@@ -548,7 +548,7 @@ impl Ingestor {
 
     pub fn raw_spool_stats_by_lane(&self) -> Result<BTreeMap<&'static str, super::Stats>> {
         let mut stats_by_lane = BTreeMap::new();
-        for lane in RawSpoolLane::ALL {
+        for lane in OtlpRequestKind::ALL {
             stats_by_lane.insert(
                 lane.as_str(),
                 self.raw_spool_for(lane)?
@@ -563,7 +563,7 @@ impl Ingestor {
     /// that cannot read its stats (thread stopped/poisoned) or is in the fatal
     /// append/fsync latch counts as unhealthy so readiness reports NOT ready.
     pub fn raw_spool_healthy(&self) -> bool {
-        RawSpoolLane::ALL.into_iter().all(|lane| {
+        OtlpRequestKind::ALL.into_iter().all(|lane| {
             self.raw_spool_for(lane)
                 .and_then(|spool| spool.stats())
                 .map(|stats| stats.healthy)
@@ -577,7 +577,7 @@ impl Ingestor {
     #[doc(hidden)]
     pub fn force_raw_spool_unhealthy(
         &self,
-        lane: RawSpoolLane,
+        lane: OtlpRequestKind,
         message: impl Into<String>,
     ) -> Result<()> {
         self.raw_spool_for(lane)?.inject_fatal(message)
@@ -587,7 +587,7 @@ impl Ingestor {
     /// any unhealthy lane so the health JSON can show which lane is wedged.
     pub fn raw_spool_health_by_lane(&self) -> BTreeMap<&'static str, (bool, Option<String>)> {
         let mut health = BTreeMap::new();
-        for lane in RawSpoolLane::ALL {
+        for lane in OtlpRequestKind::ALL {
             let entry = match self.raw_spool_for(lane).and_then(|spool| spool.stats()) {
                 Ok(stats) => (stats.healthy, stats.error),
                 Err(err) => (false, Some(err.to_string())),
@@ -661,7 +661,7 @@ impl Ingestor {
                 stats.append_sync_seconds_total,
             );
         }
-        for lane in RawSpoolLane::ALL {
+        for lane in OtlpRequestKind::ALL {
             let Ok(stats) = self.raw_spool_for(lane).and_then(|spool| spool.stats()) else {
                 continue;
             };
@@ -732,7 +732,7 @@ impl Ingestor {
         }
     }
 
-    fn raw_spool_for(&self, lane: RawSpoolLane) -> Result<&Writer> {
+    fn raw_spool_for(&self, lane: OtlpRequestKind) -> Result<&Writer> {
         self.raw_spools
             .get(&lane)
             .with_context(|| format!("raw spool writer for {lane} is unavailable"))

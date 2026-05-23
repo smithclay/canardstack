@@ -185,8 +185,8 @@ Memory and worker-buffer guardrails:
 - `CANARDSTACK_INGEST_MEMORY_BYTES`, default 2 GiB. The per-signal in-flight
   ceiling derives from this total budget.
 - `CANARDSTACK_INGEST_WORKERS`, default 4 ingest workers.
-- `CANARDSTACK_INGEST_BUFFER_CAPACITY`, default 1024 in-flight handoffs, split
-  across workers.
+- `CANARDSTACK_INGEST_WORKER_CHANNEL_CAPACITY`, default 1024 in-flight handoffs,
+  split across workers.
 - Optional `CANARDSTACK_PROCESS_MEMORY_LIMIT_BYTES`.
 
 Seal triggers:

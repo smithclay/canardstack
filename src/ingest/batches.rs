@@ -12,14 +12,15 @@ pub(super) struct PendingBatch {
 
 /// Per-signal view of ingest in-flight pressure: bytes that have been admitted
 /// (durably spooled, handed to a worker) but not yet appended to the Arrow
-/// write buffer. There is no separate in-memory queue, so this is the only "queue"
-/// depth ingest exposes; freshness/visibility debt lives in the admission snapshot.
+/// write buffer, as a fraction of the per-signal in-flight capacity. There is no
+/// separate in-memory queue; freshness/visibility debt lives in the admission
+/// snapshot.
 #[derive(Debug, Serialize)]
 pub struct IngestSnapshot {
     pub storage_signal: &'static str,
     pub inflight_bytes: usize,
     pub inflight_capacity_bytes: usize,
-    pub pressure: f64,
+    pub inflight_pressure: f64,
 }
 
 pub(super) fn pending_batches(transformed: Transformed) -> Vec<PendingBatch> {

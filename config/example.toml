@@ -32,7 +32,7 @@ seal_rate_seed_bytes = 4194304
 seal_rate_seed_window_secs = 10
 # Parallel transform across OS threads; the scheduler is the single seal driver.
 # workers = 4
-# buffer_capacity = 1024
+# worker_channel_capacity = 1024
 
 [validation]
 accept_late_secs = 86400

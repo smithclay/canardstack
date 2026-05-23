@@ -13,7 +13,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 const SCHEDULER_METADATA_REFRESH_BUCKET_LIMIT: usize = 1;
-const METADATA_REFRESH_QUEUE_PRESSURE_YIELD: f64 = 0.70;
+const METADATA_REFRESH_INFLIGHT_PRESSURE_YIELD: f64 = 0.70;
 
 #[derive(Clone, Debug)]
 struct FailureRecord {
@@ -262,7 +262,7 @@ fn scheduler_loop(state: Arc<AppState>, stop: Arc<AtomicBool>) {
                     return Ok(json!({
                         "status": "skipped",
                         "reason": "ingest_pressure",
-                        "max_queue_pressure": max_queue_pressure(&snapshots)
+                        "max_inflight_pressure": max_inflight_pressure(&snapshots)
                     }));
                 }
                 let buckets = s
@@ -369,13 +369,13 @@ fn next_interval(state: &AppState, job: &str, base: Duration, ok: bool) -> Durat
 }
 
 fn metadata_refresh_should_yield_to_ingest(snapshots: &[IngestSnapshot]) -> bool {
-    max_queue_pressure(snapshots) >= METADATA_REFRESH_QUEUE_PRESSURE_YIELD
+    max_inflight_pressure(snapshots) >= METADATA_REFRESH_INFLIGHT_PRESSURE_YIELD
 }
 
-fn max_queue_pressure(snapshots: &[IngestSnapshot]) -> f64 {
+fn max_inflight_pressure(snapshots: &[IngestSnapshot]) -> f64 {
     snapshots
         .iter()
-        .map(|snapshot| snapshot.pressure)
+        .map(|snapshot| snapshot.inflight_pressure)
         .fold(0.0, f64::max)
 }
 
@@ -399,25 +399,25 @@ fn classify_job_error(err: &anyhow::Error, job: &str) -> &'static str {
 mod tests {
     use super::*;
 
-    fn snapshot(signal: &'static str, pressure: f64) -> IngestSnapshot {
+    fn snapshot(signal: &'static str, inflight_pressure: f64) -> IngestSnapshot {
         IngestSnapshot {
             storage_signal: signal,
             inflight_bytes: 0,
             inflight_capacity_bytes: 0,
-            pressure,
+            inflight_pressure,
         }
     }
 
     #[test]
-    fn metadata_refresh_yields_to_high_queue_pressure() {
+    fn metadata_refresh_yields_to_high_inflight_pressure() {
         assert!(metadata_refresh_should_yield_to_ingest(&[
             snapshot("logs", 0.10),
-            snapshot("spans", METADATA_REFRESH_QUEUE_PRESSURE_YIELD),
+            snapshot("spans", METADATA_REFRESH_INFLIGHT_PRESSURE_YIELD),
         ]));
     }
 
     #[test]
-    fn metadata_refresh_runs_when_queues_are_below_pressure_threshold() {
+    fn metadata_refresh_runs_when_inflight_pressure_below_threshold() {
         assert!(!metadata_refresh_should_yield_to_ingest(&[
             snapshot("logs", 0.69),
             snapshot("spans", 0.10),
