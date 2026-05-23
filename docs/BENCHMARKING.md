@@ -9,19 +9,19 @@ pass/fail criteria that future agents should compare against.
 Use this as the reusable performance smoke for ingest-topology or scheduler
 changes when the machine can afford a 10 minute run.
 
-Current baseline, latest clean run (branch `arch-v3`, after the architecture
-decisions through the `VisibilityDebt` admission restructure):
-[report.json](/private/tmp/cs-visdebt-report/20260523T230112Z/report.json)
+Current baseline, latest clean run (branch `arch-v3`, after the full architecture
+action plan through the ingest-lifecycle collapse to coarse boundary counters):
+[report.json](/private/tmp/cs-lifecycle-report/20260523T232746Z/report.json)
 
 - Target: `400 GB/day`, `logs`, `mixed-query`, persistent connections.
 - Write path: Arrow write buffer -> DuckDB Arrow append -> DuckLake commit.
-- Actual: `4,631,121 B/s` against target `4,629,630 B/s`.
+- Actual: `4,631,113 B/s` against target `4,629,630 B/s`.
 - Statuses: `200:240`, `202:2890`, no `429`.
 - Queries: `240/240`, transport errors `0`.
-- Ingest p50/p95/p99: `11.6 / 13.2 / 16.9 ms`.
-- Query p50/p95/p99: `85.8 / 101.2 / 104.6 ms`.
-- Freshness lag final: `0.4s`; progress logs oscillated between `0.4s` and `1.0s`
-  and recovered (`0.7 -> 0.5 -> 0.4`) without sustained growth.
+- Ingest p50/p95/p99: `11.7 / 13.6 / 16.6 ms`.
+- Query p50/p95/p99: `84.1 / 99.9 / 104.2 ms`.
+- Freshness lag final: `0.8s`; progress logs oscillated between `0.4s` and `1.0s`
+  without sustained growth.
 
 Run the server in one shell with a fresh data directory and a free local port:
 
