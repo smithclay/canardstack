@@ -49,9 +49,14 @@
 //!   Entered by `append_raw_spool` succeeding. Stamped at the two
 //!   `SpooledIngestWork` construction sites: the live path in `Ingestor::ingest`
 //!   and the restart-replay path in `ingest_replayed_raw_record`.
-//! - [`IngestStage::WorkerDispatched`] — a worker thread accepted the handoff via
-//!   a successful `try_send`. Owned by `dispatch_ingest_work`. The work moves to a
-//!   worker thread, which calls `process_spooled_ingest`.
+//! - [`IngestStage::WorkerDispatched`] — the receiving worker picked up the
+//!   handoff. A successful `try_send` in `dispatch_ingest_work` moves the work into
+//!   a worker channel; the worker then advances this stage on receipt in
+//!   `run_ingest_worker` before calling `process_spooled_ingest`. The single
+//!   authoritative `work.stage` carries the hop, not a dispatcher-side mirror, so
+//!   the counter reflects work a worker has actually started (not just enqueued —
+//!   the separate `canardstack_ingest_worker_dispatch_total{outcome="queued"}`
+//!   counts the handoff).
 //! - [`IngestStage::InlineProcessed`] — every worker channel was full (or the
 //!   pool is gone), so `dispatch_ingest_work` runs `process_spooled_ingest`
 //!   inline on the connection thread (caller-runs back-pressure). The work does
@@ -106,7 +111,8 @@ pub(crate) enum IngestStage {
     /// Raw request bytes fsynced to the local raw spool (the 202 durability
     /// point).
     DurablySpooled,
-    /// A worker thread accepted the handoff via a successful `try_send`.
+    /// The receiving worker picked up the handoff (advanced on receipt in
+    /// `run_ingest_worker`).
     WorkerDispatched,
     /// Workers saturated; processed inline on the connection thread
     /// (caller-runs).
