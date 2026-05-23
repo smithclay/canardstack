@@ -62,10 +62,12 @@ pub struct QueryLimits {
 ///   deployment (endpoints, auth, catalog, retention, query limits, freshness
 ///   SLA, admission capacities, memory limits, body/connection caps, socket
 ///   timeouts).
-/// - KEPT-BUT-ADVANCED MECHANICS: still env-tunable, but internal knobs
-///   operators rarely touch (seal-rate seed, Arrow write-buffer target/age,
-///   raw-spool max sizes + append-sync + group-commit cadence, ingest worker
-///   pool sizing, scheduler intervals, bench keepalive).
+/// - KEPT-BUT-ADVANCED MECHANICS: internal knobs operators rarely touch. Some
+///   remain env-tunable (Arrow write-buffer target/age, raw-spool max sizes +
+///   append-sync + group-commit cadence, ingest worker count, scheduler
+///   intervals); others are fixed defaults whose fields exist only for test
+///   injection (seal-rate seed, ingest worker channel capacity, bench
+///   keepalive) and are no longer env/file driven.
 ///
 /// Purely internal raw-spool batching/durability mechanics with no operator
 /// meaning are NOT fields here; they live as consts in `ingest::spool`.
@@ -137,6 +139,14 @@ pub struct Config {
 const DEFAULT_CONFIG_PATH: &str = "config.toml";
 const CONFIG_PATH_ENV: &str = "CANARDSTACK_CONFIG";
 
+/// Internal seal-rate EWMA warm-up mechanics: the seed rate
+/// (`seal_rate_seed_bytes` / `seal_rate_seed_window`) only primes the estimator
+/// until measured throughput converges, so it is not an operator policy knob.
+/// Kept as `Config` fields purely for deterministic test injection (see the
+/// admission-control characterization tests).
+const DEFAULT_SEAL_RATE_SEED_BYTES: usize = 4 * 1024 * 1024;
+const DEFAULT_SEAL_RATE_SEED_WINDOW: Duration = Duration::from_secs(10);
+
 impl Config {
     pub fn from_env() -> Result<Self> {
         let file = FileConfig::load()?;
@@ -146,17 +156,6 @@ impl Config {
         let max_body_bytes = env_usize("CANARDSTACK_MAX_BODY_BYTES")?
             .or(file.usize(&["ingest", "max_body_bytes"])?)
             .unwrap_or(8 * 1024 * 1024);
-        let seal_rate_seed_bytes = env_usize("CANARDSTACK_SEAL_RATE_SEED_BYTES")?
-            .or(file.usize(&["ingest", "seal_rate_seed_bytes"])?)
-            .unwrap_or(4 * 1024 * 1024);
-        let seal_rate_seed_window = duration_ms_or_secs(
-            &file,
-            &["ingest", "seal_rate_seed_window_ms"],
-            &["ingest", "seal_rate_seed_window_secs"],
-            "CANARDSTACK_SEAL_RATE_SEED_WINDOW_MS",
-            "CANARDSTACK_SEAL_RATE_SEED_WINDOW_SECS",
-            10,
-        )?;
         let query_concurrency = env_usize("CANARDSTACK_QUERY_CONCURRENCY")?
             .or(file.usize(&["query", "concurrency"])?)
             .unwrap_or(4);
@@ -213,8 +212,10 @@ impl Config {
                 Some(value) => value,
                 None => file.usize(&["ingest", "process_memory_limit_bytes"])?,
             },
-            seal_rate_seed_bytes,
-            seal_rate_seed_window,
+            // Internal EWMA warm-up mechanics (the seal rate converges); fixed
+            // defaults, not configurable. Fields kept only for test injection.
+            seal_rate_seed_bytes: DEFAULT_SEAL_RATE_SEED_BYTES,
+            seal_rate_seed_window: DEFAULT_SEAL_RATE_SEED_WINDOW,
             duckdb_write_memory_limit: env_string("CANARDSTACK_DUCKDB_MEMORY_LIMIT")?
                 .or(file.string(&["duckdb", "memory_limit"])?)
                 .unwrap_or_else(|| "1GiB".to_string()),
@@ -294,9 +295,9 @@ impl Config {
                     .or(file.usize(&["server", "socket_write_timeout_secs"])?)
                     .unwrap_or(30) as u64,
             ),
-            bench_http_keepalive: env_bool("CANARDSTACK_BENCH_HTTP_KEEPALIVE")?
-                .or(file.bool(&["bench", "http_keepalive"])?)
-                .unwrap_or(true),
+            // Production HTTP keepalive is always on; the field exists only for
+            // test override, so it is not configurable via env/file.
+            bench_http_keepalive: true,
             raw_spool_dir: data_dir.join("raw-spool"),
             raw_spool_max_segment_bytes: (64 * 1024 * 1024).min(raw_spool_capacity_bytes),
             raw_spool_max_record_bytes: max_body_bytes,
@@ -317,11 +318,9 @@ impl Config {
             ingest_workers: env_usize("CANARDSTACK_INGEST_WORKERS")?
                 .or(file.usize(&["ingest", "workers"])?)
                 .unwrap_or(4),
-            ingest_worker_channel_capacity: env_usize(
-                "CANARDSTACK_INGEST_WORKER_CHANNEL_CAPACITY",
-            )?
-            .or(file.usize(&["ingest", "worker_channel_capacity"])?)
-            .unwrap_or(1024),
+            // Internal worker handoff sizing, not an operator policy knob; fixed
+            // default kept as a field only for test injection.
+            ingest_worker_channel_capacity: crate::ingest::INGEST_WORKER_CHANNEL_CAPACITY,
             operator_metrics_to_storage: env_bool("CANARDSTACK_OPERATOR_METRICS_TO_STORAGE")?
                 .or(file.bool(&["metrics", "operator_metrics_to_storage"])?)
                 .unwrap_or(false),
@@ -694,9 +693,6 @@ mod tests {
         "CANARDSTACK_DUCKLAKE_ATTACH_URI",
         "CANARDSTACK_MAX_BODY_BYTES",
         "CANARDSTACK_PROCESS_MEMORY_LIMIT_BYTES",
-        "CANARDSTACK_SEAL_RATE_SEED_BYTES",
-        "CANARDSTACK_SEAL_RATE_SEED_WINDOW_MS",
-        "CANARDSTACK_SEAL_RATE_SEED_WINDOW_SECS",
         "CANARDSTACK_DUCKDB_MEMORY_LIMIT",
         "CANARDSTACK_ACCEPT_LATE_SECS",
         "CANARDSTACK_ACCEPT_FUTURE_SECS",
@@ -718,11 +714,9 @@ mod tests {
         "CANARDSTACK_MAX_CONNECTIONS",
         "CANARDSTACK_SOCKET_READ_TIMEOUT_SECS",
         "CANARDSTACK_SOCKET_WRITE_TIMEOUT_SECS",
-        "CANARDSTACK_BENCH_HTTP_KEEPALIVE",
         "CANARDSTACK_RAW_SPOOL_CAPACITY_BYTES",
         "CANARDSTACK_RAW_SPOOL_GROUP_COMMIT_MS",
         "CANARDSTACK_INGEST_WORKERS",
-        "CANARDSTACK_INGEST_WORKER_CHANNEL_CAPACITY",
         "CANARDSTACK_OPERATOR_METRICS_TO_STORAGE",
     ];
 
@@ -793,10 +787,7 @@ attach_uri = "md:file"
 [ingest]
 max_body_bytes = 12345
 process_memory_limit_bytes = 4000000
-seal_rate_seed_bytes = 654321
-seal_rate_seed_window_secs = 11
 workers = 3
-worker_channel_capacity = 33
 
 [validation]
 accept_late_secs = 100
@@ -830,9 +821,6 @@ capacity_bytes = 16384
 group_commit_ms = 3
 append_sync_ms = 250
 append_sync_bytes = 8192
-
-[bench]
-http_keepalive = true
 "#,
         )
         .unwrap();
@@ -840,7 +828,6 @@ http_keepalive = true
         unsafe {
             env::set_var(CONFIG_PATH_ENV, &config_path);
             env::set_var("CANARDSTACK_BIND", "127.0.0.1:4319");
-            env::set_var("CANARDSTACK_SEAL_RATE_SEED_WINDOW_MS", "125");
             env::set_var("CANARDSTACK_DUCKLAKE_ATTACH_URI", "");
         }
 
@@ -860,8 +847,6 @@ http_keepalive = true
         assert_eq!(config.ducklake_attach_uri, None);
         assert_eq!(config.max_body_bytes, 12345);
         assert_eq!(config.runtime_memory_limit_bytes, Some(4_000_000));
-        assert_eq!(config.seal_rate_seed_bytes, 654_321);
-        assert_eq!(config.seal_rate_seed_window, Duration::from_millis(125));
         assert_eq!(config.duckdb_write_memory_limit, "2GiB");
         assert_eq!(config.arrow_write_buffer_target_bytes, 777);
         assert_eq!(config.arrow_write_buffer_max_age, Duration::from_secs(12));
@@ -895,7 +880,14 @@ http_keepalive = true
         );
         assert_eq!(config.raw_spool_append_sync_bytes, 8192);
         assert_eq!(config.ingest_workers, 3);
-        assert_eq!(config.ingest_worker_channel_capacity, 33);
+        // Internal mechanics are no longer file/env driven; they stay at their
+        // fixed defaults regardless of any (now-ignored) file keys above.
+        assert_eq!(
+            config.ingest_worker_channel_capacity,
+            crate::ingest::INGEST_WORKER_CHANNEL_CAPACITY
+        );
+        assert_eq!(config.seal_rate_seed_bytes, DEFAULT_SEAL_RATE_SEED_BYTES);
+        assert_eq!(config.seal_rate_seed_window, DEFAULT_SEAL_RATE_SEED_WINDOW);
         assert!(config.bench_http_keepalive);
     }
 

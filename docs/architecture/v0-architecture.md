@@ -225,14 +225,14 @@ Memory and worker-buffer guardrails:
 - There is no per-signal ingest memory budget knob; the freshness projection
   (and the optional process RSS limit) are the only memory backstops.
 - `CANARDSTACK_INGEST_WORKERS`, default 4 ingest workers.
-- `CANARDSTACK_INGEST_WORKER_CHANNEL_CAPACITY`, default 1024 in-flight handoffs,
-  split across workers.
+- The worker-handoff channel capacity is a fixed internal mechanic (1024
+  in-flight handoffs, split across workers), not a config knob.
 - Optional `CANARDSTACK_PROCESS_MEMORY_LIMIT_BYTES`.
 
 Seal triggers:
 
-- `CANARDSTACK_SEAL_RATE_SEED_BYTES`, default 4 MiB.
-- `CANARDSTACK_SEAL_RATE_SEED_WINDOW_SECS` or `_MS`, default 10 seconds.
+- The seal-rate EWMA seed (4 MiB over 10 seconds) is a fixed internal warm-up
+  mechanic, not a config knob; the estimator converges to measured throughput.
 
 A single scheduler-driven seal driver is the only seal path. It flushes on a
 frequent cadence (`CANARDSTACK_SEAL_INTERVAL_MS`, default 1s) or earlier when a
@@ -294,10 +294,9 @@ RSS hard cap is opt-in and OFF by default. Because admit_ingest rejects when
 projected seal visibility exceeds ~0.95x the SLA, it transitively bounds
 in-flight bytes at roughly
 `0.95 x freshness_budget_sla_seconds x ewma_seal_bytes_per_second`. During EWMA
-warm-up that bound rides on the configured seal-rate seed
-(`CANARDSTACK_SEAL_RATE_SEED_BYTES` / `_WINDOW`). Operators who want an explicit
-RSS hard cap must set `CANARDSTACK_PROCESS_MEMORY_LIMIT_BYTES` /
-`runtime_memory_limit_bytes`.
+warm-up that bound rides on the fixed internal seal-rate seed (4 MiB over 10
+seconds), which is not configurable. Operators who want an explicit RSS hard cap
+must set `CANARDSTACK_PROCESS_MEMORY_LIMIT_BYTES` / `runtime_memory_limit_bytes`.
 
 Heavy range/search/trace queries consume only the remaining query capacity after
 the seal and cheap-query reservations. When projected visibility debt reaches

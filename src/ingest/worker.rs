@@ -7,6 +7,12 @@ use std::sync::{Arc, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
+/// Fixed in-flight worker-handoff capacity for the ingest worker pool. Internal
+/// mechanic (not an operator policy knob); kept here next to the pool it sizes.
+/// `Config::ingest_worker_channel_capacity` defaults from this and exists only
+/// for deterministic test injection.
+pub(crate) const INGEST_WORKER_CHANNEL_CAPACITY: usize = 1024;
+
 /// Parallel ingest across OS threads: a fixed pool of worker threads that turn
 /// durably-spooled requests into buffered Arrow rows. Each worker appends into
 /// the storage Arrow write buffer; the scheduler is the single seal driver (see

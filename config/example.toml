@@ -27,11 +27,8 @@ memory_limit = "1GiB"
 [ingest]
 max_body_bytes = 8388608
 # process_memory_limit_bytes = 3221225472
-seal_rate_seed_bytes = 4194304
-seal_rate_seed_window_secs = 10
 # Parallel transform across OS threads; the scheduler is the single seal driver.
 # workers = 4
-# worker_channel_capacity = 1024
 
 [validation]
 accept_late_secs = 86400
@@ -77,6 +74,3 @@ maintenance_interval_secs = 30
 # are a compile-time opt-in, not a config knob: build with
 # `cargo build --features detailed-metrics` to emit them. The coarse phases are
 # always on.
-
-[bench]
-http_keepalive = true

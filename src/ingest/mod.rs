@@ -26,6 +26,7 @@ mod worker;
 pub use batches::IngestSnapshot;
 pub(in crate::ingest) use lifecycle::IngestStage;
 use worker::IngestWorkerPool;
+pub(crate) use worker::INGEST_WORKER_CHANNEL_CAPACITY;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize)]
 pub enum OtlpRequestKind {
