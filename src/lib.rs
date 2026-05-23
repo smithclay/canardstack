@@ -13,6 +13,7 @@ pub mod metrics;
 pub mod otlp;
 pub mod query;
 mod runtime;
+pub mod seal;
 pub mod storage;
 pub mod validation;
 

@@ -229,7 +229,7 @@ fn route_inner(
         ("POST", "/api/admin/maintenance/seal") => admin(headers, state, || {
             ensure_maintenance_allowed(state)?;
             let started = Instant::now();
-            let result = run_seal_with_admission(state);
+            let result = crate::seal::run(state);
             record_maintenance_metrics(state, "seal", &result, started);
             result
         }),
@@ -305,16 +305,6 @@ fn run_maintenance_job(
     let started = Instant::now();
     let result = run().map_err(storage_error);
     record_maintenance_metrics(state, job, &result, started);
-    result
-}
-
-fn run_seal_with_admission(state: &AppState) -> Result<Value, ApiError> {
-    let guard = state.admission.reserve_seal(&state.metrics)?;
-    let result = state
-        .maintenance
-        .run_seal(&state.ingestor, &state.storage, &state.metrics)
-        .map_err(storage_error);
-    guard.finish(&state.metrics);
     result
 }
 

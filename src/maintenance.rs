@@ -1,7 +1,6 @@
 use crate::app::AppState;
 use crate::config::Config;
-use crate::ingest::{IngestSnapshot, Ingestor};
-use crate::metrics::Metrics;
+use crate::ingest::IngestSnapshot;
 use crate::storage::{RetentionPolicy, Storage};
 use crate::LockExt;
 use anyhow::Result;
@@ -101,20 +100,11 @@ impl Maintenance {
         })
     }
 
-    pub fn run_seal(
-        &self,
-        ingestor: &Ingestor,
-        storage: &Storage,
-        metrics: &Metrics,
-    ) -> Result<Value> {
-        let started = Instant::now();
-        let arrow_flush = ingestor.seal_committed_to_storage(storage, metrics)?;
+    /// Record a successful seal run. The seal operation itself lives in
+    /// [`crate::seal::run`]; this exposes the private run bookkeeping so that
+    /// single entry point can mark the `seal` job as having succeeded.
+    pub(crate) fn record_seal_run(&self) {
         self.record_run("seal");
-        Ok(json!({
-            "status": "ok",
-            "arrow_flush": arrow_flush.to_json(),
-            "duration_ms": started.elapsed().as_millis()
-        }))
     }
 
     pub fn retention(&self, storage: &Storage, dry_run: bool) -> Result<Value> {
@@ -336,20 +326,7 @@ fn scheduler_loop(state: Arc<AppState>, stop: Arc<AtomicBool>) {
 
 fn run_seal_tick(state: &AppState) -> bool {
     run_job(state, "seal", |s| {
-        let pending_bytes: usize = s
-            .storage
-            .arrow_write_buffer_metrics()
-            .iter()
-            .map(|metric| metric.bytes)
-            .sum();
-        let mut guard = s
-            .admission
-            .reserve_seal(&s.metrics)
-            .map_err(|err| anyhow::anyhow!(err.message.clone()))?;
-        guard.record_bytes(pending_bytes);
-        let result = s.maintenance.run_seal(&s.ingestor, &s.storage, &s.metrics);
-        guard.finish(&s.metrics);
-        result
+        crate::seal::run(s).map_err(|err| anyhow::anyhow!(err.message.clone()))
     })
 }
 
