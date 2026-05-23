@@ -28,7 +28,7 @@ impl QueryClass {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct FreshnessInputs {
+pub struct FreshnessBudgetInputs {
     pub inflight_bytes: usize,
     pub incoming_bytes: usize,
     pub oldest_queue_age_seconds: f64,
@@ -38,7 +38,7 @@ pub struct FreshnessInputs {
 }
 
 #[derive(Clone, Debug, Serialize)]
-pub struct LaneSnapshot {
+pub struct AdmissionSnapshot {
     pub seal_active: usize,
     pub seal_capacity: usize,
     pub cheap_query_active: usize,
@@ -51,26 +51,26 @@ pub struct LaneSnapshot {
     pub projected_buffer_seconds: f64,
     pub projected_visibility_seconds: f64,
     pub observed_freshness_lag_seconds: f64,
-    pub freshness_sla_seconds: f64,
+    pub freshness_budget_sla_seconds: f64,
     pub heavy_query_reductions_total: u64,
     pub query_rejections_total: u64,
     pub ingest_freshness_rejections_total: u64,
 }
 
-pub struct LaneController {
-    inner: Mutex<LaneState>,
+pub struct AdmissionController {
+    inner: Mutex<AdmissionState>,
     seal_capacity: usize,
     cheap_query_capacity: usize,
     heavy_query_capacity: usize,
     heavy_query_degraded_capacity: usize,
-    freshness_sla_seconds: f64,
+    freshness_budget_sla_seconds: f64,
     visibility_buffer_target_bytes: usize,
     visibility_buffer_max_age_seconds: f64,
     visibility_seal_bytes_per_second: f64,
 }
 
 #[derive(Debug)]
-struct LaneState {
+struct AdmissionState {
     seal_active: usize,
     cheap_query_active: usize,
     heavy_query_active: usize,
@@ -84,11 +84,11 @@ struct LaneState {
     ingest_freshness_rejections_total: u64,
 }
 
-impl LaneController {
+impl AdmissionController {
     pub fn new(config: &Config) -> Self {
-        let seal_capacity = config.lane_seal_capacity.max(1);
+        let seal_capacity = config.seal_admission_capacity.max(1);
         let cheap_query_capacity = config
-            .lane_cheap_query_capacity
+            .cheap_query_admission_capacity
             .min(config.query_interactive.concurrency)
             .max(1);
         let reserved_query_capacity = seal_capacity.saturating_add(cheap_query_capacity);
@@ -98,7 +98,7 @@ impl LaneController {
             .saturating_sub(reserved_query_capacity)
             .max(1);
         let heavy_query_degraded_capacity = config
-            .lane_heavy_query_degraded_capacity
+            .heavy_query_degraded_capacity
             .min(heavy_query_capacity)
             .max(1);
         let initial_seal_bytes_per_second = config.seal_rate_seed_bytes as f64
@@ -106,7 +106,7 @@ impl LaneController {
         let visibility_seal_bytes_per_second = config.immutable_segment_target_bytes as f64
             / config.immutable_segment_max_age.as_secs_f64().max(0.001);
         Self {
-            inner: Mutex::new(LaneState {
+            inner: Mutex::new(AdmissionState {
                 seal_active: 0,
                 cheap_query_active: 0,
                 heavy_query_active: 0,
@@ -123,31 +123,33 @@ impl LaneController {
             cheap_query_capacity,
             heavy_query_capacity,
             heavy_query_degraded_capacity,
-            freshness_sla_seconds: config.lane_freshness_sla.as_secs_f64(),
+            freshness_budget_sla_seconds: config.freshness_budget_sla.as_secs_f64(),
             visibility_buffer_target_bytes: config.immutable_segment_target_bytes.max(1),
             visibility_buffer_max_age_seconds: config.immutable_segment_max_age.as_secs_f64(),
             visibility_seal_bytes_per_second: visibility_seal_bytes_per_second.max(1.0),
         }
     }
 
-    pub fn reserve_seal(&self, metrics: &Metrics) -> ApiResult<SealLaneGuard<'_>> {
+    pub fn reserve_seal(&self, metrics: &Metrics) -> ApiResult<SealAdmissionGuard<'_>> {
         let mut state = self.inner.lock_or_poisoned();
         if state.seal_active >= self.seal_capacity {
             metrics.inc(
-                "canardstack_lane_rejections_total",
-                &[("lane", "seal"), ("reason", "seal_lane_full")],
+                "canardstack_admission_rejections_total",
+                &[("admission", "seal"), ("reason", "seal_admission_full")],
                 1,
             );
-            return Err(
-                ApiError::new(503, "seal_lane_full", "seal lane capacity is exhausted")
-                    .with_retry_after(1),
-            );
+            return Err(ApiError::new(
+                503,
+                "seal_admission_full",
+                "seal admission capacity is exhausted",
+            )
+            .with_retry_after(1));
         }
         state.seal_active += 1;
         drop(state);
-        self.record_metrics(metrics, FreshnessInputs::default());
-        Ok(SealLaneGuard {
-            lanes: self,
+        self.record_metrics(metrics, FreshnessBudgetInputs::default());
+        Ok(SealAdmissionGuard {
+            admission: self,
             started: Instant::now(),
             bytes: 0,
             released: false,
@@ -157,9 +159,9 @@ impl LaneController {
     pub fn reserve_query(
         &self,
         class: QueryClass,
-        inputs: FreshnessInputs,
+        inputs: FreshnessBudgetInputs,
         metrics: &Metrics,
-    ) -> ApiResult<QueryLaneGuard<'_>> {
+    ) -> ApiResult<QueryAdmissionGuard<'_>> {
         let mut state = self.inner.lock_or_poisoned();
         self.update_projection_locked(&mut state, inputs);
         let effective_heavy = self.effective_heavy_capacity_locked(&state);
@@ -190,8 +192,8 @@ impl LaneController {
         if !accepted {
             state.query_rejections_total += 1;
             metrics.inc(
-                "canardstack_lane_rejections_total",
-                &[("lane", "query"), ("reason", rejection_reason)],
+                "canardstack_admission_rejections_total",
+                &[("admission", "query"), ("reason", rejection_reason)],
                 1,
             );
             drop(state);
@@ -203,10 +205,13 @@ impl LaneController {
         }
         drop(state);
         self.record_metrics(metrics, inputs);
-        Ok(QueryLaneGuard { lanes: self, class })
+        Ok(QueryAdmissionGuard {
+            admission: self,
+            class,
+        })
     }
 
-    pub fn admit_ingest(&self, inputs: FreshnessInputs, metrics: &Metrics) -> ApiResult<()> {
+    pub fn admit_ingest(&self, inputs: FreshnessBudgetInputs, metrics: &Metrics) -> ApiResult<()> {
         let mut state = self.inner.lock_or_poisoned();
         self.update_projection_locked(&mut state, inputs);
         let budget_fraction = if state.heavy_query_active > 0 {
@@ -214,21 +219,24 @@ impl LaneController {
         } else {
             INGEST_FRESHNESS_BUDGET_FRACTION
         };
-        let budget = self.freshness_sla_seconds * budget_fraction;
+        let budget = self.freshness_budget_sla_seconds * budget_fraction;
         if state.projected_visibility_seconds > budget {
             state.ingest_freshness_rejections_total += 1;
             metrics.inc(
                 "canardstack_ingest_rejections_total",
                 &[
-                    ("signal", "all"),
+                    ("request_kind", "all"),
                     ("status", "429"),
                     ("reason", "freshness_budget_exceeded"),
                 ],
                 1,
             );
             metrics.inc(
-                "canardstack_lane_rejections_total",
-                &[("lane", "ingest"), ("reason", "freshness_budget_exceeded")],
+                "canardstack_admission_rejections_total",
+                &[
+                    ("admission", "freshness_budget"),
+                    ("reason", "freshness_budget_exceeded"),
+                ],
                 1,
             );
             drop(state);
@@ -249,12 +257,12 @@ impl LaneController {
         let mut state = self.inner.lock_or_poisoned();
         state.observed_freshness_lag_seconds = lag_seconds.max(0.0);
         drop(state);
-        self.record_metrics(metrics, FreshnessInputs::default());
+        self.record_metrics(metrics, FreshnessBudgetInputs::default());
     }
 
     pub fn record_seal_bytes(&self, bytes: usize, seconds: f64, metrics: &Metrics) {
         if bytes == 0 || seconds <= 0.0 {
-            self.record_metrics(metrics, FreshnessInputs::default());
+            self.record_metrics(metrics, FreshnessBudgetInputs::default());
             return;
         }
         let observed = bytes as f64 / seconds.max(0.001);
@@ -262,10 +270,10 @@ impl LaneController {
         state.ewma_seal_bytes_per_second =
             EWMA_ALPHA * observed + (1.0 - EWMA_ALPHA) * state.ewma_seal_bytes_per_second;
         drop(state);
-        self.record_metrics(metrics, FreshnessInputs::default());
+        self.record_metrics(metrics, FreshnessBudgetInputs::default());
     }
 
-    pub fn snapshot_for(&self, inputs: FreshnessInputs) -> LaneSnapshot {
+    pub fn snapshot_for(&self, inputs: FreshnessBudgetInputs) -> AdmissionSnapshot {
         let mut state = self.inner.lock_or_poisoned();
         self.update_projection_locked(&mut state, inputs);
         let heavy_query_effective_capacity = self.effective_heavy_capacity_locked(&state);
@@ -275,40 +283,40 @@ impl LaneController {
             self.cheap_query_capacity,
             self.heavy_query_capacity,
             heavy_query_effective_capacity,
-            self.freshness_sla_seconds,
+            self.freshness_budget_sla_seconds,
         )
     }
 
-    pub fn record_metrics(&self, metrics: &Metrics, inputs: FreshnessInputs) {
+    pub fn record_metrics(&self, metrics: &Metrics, inputs: FreshnessBudgetInputs) {
         let snapshot = self.snapshot_for(inputs);
         metrics.gauge(
-            "canardstack_lane_capacity",
-            &[("lane", "seal")],
+            "canardstack_admission_capacity",
+            &[("admission", "seal")],
             snapshot.seal_capacity as f64,
         );
         metrics.gauge(
-            "canardstack_lane_in_use",
-            &[("lane", "seal")],
+            "canardstack_admission_in_use",
+            &[("admission", "seal")],
             snapshot.seal_active as f64,
         );
         metrics.gauge(
-            "canardstack_lane_capacity",
-            &[("lane", "query_cheap")],
+            "canardstack_admission_capacity",
+            &[("admission", "query_cheap")],
             snapshot.cheap_query_capacity as f64,
         );
         metrics.gauge(
-            "canardstack_lane_in_use",
-            &[("lane", "query_cheap")],
+            "canardstack_admission_in_use",
+            &[("admission", "query_cheap")],
             snapshot.cheap_query_active as f64,
         );
         metrics.gauge(
-            "canardstack_lane_capacity",
-            &[("lane", "query_heavy")],
+            "canardstack_admission_capacity",
+            &[("admission", "query_heavy")],
             snapshot.heavy_query_effective_capacity as f64,
         );
         metrics.gauge(
-            "canardstack_lane_in_use",
-            &[("lane", "query_heavy")],
+            "canardstack_admission_in_use",
+            &[("admission", "query_heavy")],
             snapshot.heavy_query_active as f64,
         );
         metrics.gauge(
@@ -337,12 +345,12 @@ impl LaneController {
             snapshot.observed_freshness_lag_seconds,
         );
         metrics.set_counter(
-            "canardstack_query_lane_reductions_total",
+            "canardstack_query_admission_reductions_total",
             &[],
             snapshot.heavy_query_reductions_total,
         );
         metrics.set_counter(
-            "canardstack_query_lane_rejections_total",
+            "canardstack_query_admission_rejections_total",
             &[],
             snapshot.query_rejections_total,
         );
@@ -353,9 +361,9 @@ impl LaneController {
         );
     }
 
-    fn effective_heavy_capacity_locked(&self, state: &LaneState) -> usize {
+    fn effective_heavy_capacity_locked(&self, state: &AdmissionState) -> usize {
         if state.projected_visibility_seconds
-            >= self.freshness_sla_seconds * HEAVY_QUERY_DEGRADE_FRACTION
+            >= self.freshness_budget_sla_seconds * HEAVY_QUERY_DEGRADE_FRACTION
         {
             self.heavy_query_degraded_capacity
         } else {
@@ -363,12 +371,12 @@ impl LaneController {
         }
     }
 
-    fn freshness_at_risk_locked(&self, state: &LaneState) -> bool {
+    fn freshness_at_risk_locked(&self, state: &AdmissionState) -> bool {
         state.projected_visibility_seconds
-            >= self.freshness_sla_seconds * HEAVY_QUERY_REJECT_FRACTION
+            >= self.freshness_budget_sla_seconds * HEAVY_QUERY_REJECT_FRACTION
     }
 
-    fn update_projection_locked(&self, state: &mut LaneState, inputs: FreshnessInputs) {
+    fn update_projection_locked(&self, state: &mut AdmissionState, inputs: FreshnessBudgetInputs) {
         let projected_bytes = inputs.inflight_bytes.saturating_add(inputs.incoming_bytes);
         state.projected_seal_seconds =
             projected_bytes as f64 / state.ewma_seal_bytes_per_second.max(1.0);
@@ -389,7 +397,7 @@ impl LaneController {
     }
 }
 
-impl Default for FreshnessInputs {
+impl Default for FreshnessBudgetInputs {
     fn default() -> Self {
         Self {
             inflight_bytes: 0,
@@ -402,14 +410,14 @@ impl Default for FreshnessInputs {
     }
 }
 
-pub struct SealLaneGuard<'a> {
-    lanes: &'a LaneController,
+pub struct SealAdmissionGuard<'a> {
+    admission: &'a AdmissionController,
     started: Instant,
     bytes: usize,
     released: bool,
 }
 
-impl SealLaneGuard<'_> {
+impl SealAdmissionGuard<'_> {
     pub fn record_bytes(&mut self, bytes: usize) {
         self.bytes = self.bytes.saturating_add(bytes);
     }
@@ -418,33 +426,33 @@ impl SealLaneGuard<'_> {
         let bytes = self.bytes;
         let seconds = self.started.elapsed().as_secs_f64();
         self.release();
-        self.lanes.record_seal_bytes(bytes, seconds, metrics);
+        self.admission.record_seal_bytes(bytes, seconds, metrics);
     }
 
     fn release(&mut self) {
         if self.released {
             return;
         }
-        let mut state = self.lanes.inner.lock_or_poisoned();
+        let mut state = self.admission.inner.lock_or_poisoned();
         state.seal_active = state.seal_active.saturating_sub(1);
         self.released = true;
     }
 }
 
-impl Drop for SealLaneGuard<'_> {
+impl Drop for SealAdmissionGuard<'_> {
     fn drop(&mut self) {
         self.release();
     }
 }
 
-pub struct QueryLaneGuard<'a> {
-    lanes: &'a LaneController,
+pub struct QueryAdmissionGuard<'a> {
+    admission: &'a AdmissionController,
     class: QueryClass,
 }
 
-impl Drop for QueryLaneGuard<'_> {
+impl Drop for QueryAdmissionGuard<'_> {
     fn drop(&mut self) {
-        let mut state = self.lanes.inner.lock_or_poisoned();
+        let mut state = self.admission.inner.lock_or_poisoned();
         match self.class {
             QueryClass::Cheap => {
                 state.cheap_query_active = state.cheap_query_active.saturating_sub(1);
@@ -457,14 +465,14 @@ impl Drop for QueryLaneGuard<'_> {
 }
 
 fn snapshot_locked(
-    state: &LaneState,
+    state: &AdmissionState,
     seal_capacity: usize,
     cheap_query_capacity: usize,
     heavy_query_capacity: usize,
     heavy_query_effective_capacity: usize,
-    freshness_sla_seconds: f64,
-) -> LaneSnapshot {
-    LaneSnapshot {
+    freshness_budget_sla_seconds: f64,
+) -> AdmissionSnapshot {
+    AdmissionSnapshot {
         seal_active: state.seal_active,
         seal_capacity,
         cheap_query_active: state.cheap_query_active,
@@ -477,7 +485,7 @@ fn snapshot_locked(
         projected_buffer_seconds: state.projected_buffer_seconds,
         projected_visibility_seconds: state.projected_visibility_seconds,
         observed_freshness_lag_seconds: state.observed_freshness_lag_seconds,
-        freshness_sla_seconds,
+        freshness_budget_sla_seconds,
         heavy_query_reductions_total: state.heavy_query_reductions_total,
         query_rejections_total: state.query_rejections_total,
         ingest_freshness_rejections_total: state.ingest_freshness_rejections_total,
@@ -486,23 +494,23 @@ fn snapshot_locked(
 
 fn query_rejection_reason(
     class: QueryClass,
-    state: &LaneState,
+    state: &AdmissionState,
     effective_heavy_capacity: usize,
 ) -> &'static str {
     match class {
-        QueryClass::Cheap => "cheap_query_lane_full",
+        QueryClass::Cheap => "cheap_query_admission_full",
         QueryClass::Heavy if state.heavy_query_active >= effective_heavy_capacity => {
-            "heavy_query_lane_full"
+            "heavy_query_admission_full"
         }
         QueryClass::Heavy if state.projected_visibility_seconds > 0.0 => "freshness_debt",
-        QueryClass::Heavy => "heavy_query_lane_full",
+        QueryClass::Heavy => "heavy_query_admission_full",
     }
 }
 
 fn query_rejection_message(class: QueryClass) -> &'static str {
     match class {
-        QueryClass::Cheap => "cheap query lane capacity is exhausted",
-        QueryClass::Heavy => "heavy query lane capacity is exhausted or freshness is at risk",
+        QueryClass::Cheap => "cheap query admission capacity is exhausted",
+        QueryClass::Heavy => "heavy query admission capacity is exhausted or freshness is at risk",
     }
 }
 
@@ -512,44 +520,44 @@ mod tests {
     use crate::config::Config;
     use tempfile::tempdir;
 
-    fn controller() -> LaneController {
+    fn controller() -> AdmissionController {
         let dir = tempdir().unwrap();
         let mut config = Config::test(dir.path().join("canardstack.duckdb"));
         config.query_interactive.concurrency = 4;
-        config.lane_freshness_sla = std::time::Duration::from_secs(10);
+        config.freshness_budget_sla = std::time::Duration::from_secs(10);
         config.seal_rate_seed_bytes = 1_000;
         config.seal_rate_seed_window = std::time::Duration::from_secs(1);
         config.immutable_segment_target_bytes = 1_000;
         config.immutable_segment_max_age = std::time::Duration::from_secs(1);
-        LaneController::new(&config)
+        AdmissionController::new(&config)
     }
 
     #[test]
-    fn flush_lane_is_independent_of_query_saturation() {
-        let lanes = controller();
+    fn seal_admission_is_independent_of_query_saturation() {
+        let admission = controller();
         let metrics = Metrics::default();
-        let inputs = FreshnessInputs::default();
-        let _heavy = lanes
+        let inputs = FreshnessBudgetInputs::default();
+        let _heavy = admission
             .reserve_query(QueryClass::Heavy, inputs, &metrics)
             .unwrap();
-        let _cheap = lanes
+        let _cheap = admission
             .reserve_query(QueryClass::Cheap, inputs, &metrics)
             .unwrap();
 
-        assert!(lanes.reserve_seal(&metrics).is_ok());
+        assert!(admission.reserve_seal(&metrics).is_ok());
     }
 
     #[test]
     fn heavy_query_rejects_when_freshness_debt_exceeds_sla() {
-        let lanes = controller();
+        let admission = controller();
         let metrics = Metrics::default();
-        let inputs = FreshnessInputs {
+        let inputs = FreshnessBudgetInputs {
             inflight_bytes: 16_000,
             incoming_bytes: 0,
             oldest_queue_age_seconds: 0.0,
-            ..FreshnessInputs::default()
+            ..FreshnessBudgetInputs::default()
         };
-        let err = match lanes.reserve_query(QueryClass::Heavy, inputs, &metrics) {
+        let err = match admission.reserve_query(QueryClass::Heavy, inputs, &metrics) {
             Ok(_) => panic!("heavy query should reject under freshness debt"),
             Err(err) => err,
         };
@@ -559,74 +567,74 @@ mod tests {
     }
 
     #[test]
-    fn cheap_query_keeps_protected_lane_under_freshness_debt() {
-        let lanes = controller();
+    fn cheap_query_keeps_protected_admission_under_freshness_debt() {
+        let admission = controller();
         let metrics = Metrics::default();
-        let inputs = FreshnessInputs {
+        let inputs = FreshnessBudgetInputs {
             inflight_bytes: 16_000,
             incoming_bytes: 0,
             oldest_queue_age_seconds: 0.0,
-            ..FreshnessInputs::default()
+            ..FreshnessBudgetInputs::default()
         };
 
-        assert!(lanes
+        assert!(admission
             .reserve_query(QueryClass::Cheap, inputs, &metrics)
             .is_ok());
     }
 
     #[test]
     fn heavy_query_keeps_full_capacity_before_late_degradation() {
-        let lanes = controller();
+        let admission = controller();
         let metrics = Metrics::default();
-        let inputs = FreshnessInputs {
+        let inputs = FreshnessBudgetInputs {
             inflight_bytes: 9_000,
             incoming_bytes: 0,
             oldest_queue_age_seconds: 0.0,
-            ..FreshnessInputs::default()
+            ..FreshnessBudgetInputs::default()
         };
 
-        let _first = lanes
+        let _first = admission
             .reserve_query(QueryClass::Heavy, inputs, &metrics)
             .unwrap();
-        assert!(lanes
+        assert!(admission
             .reserve_query(QueryClass::Heavy, inputs, &metrics)
             .is_ok());
     }
 
     #[test]
     fn heavy_query_degrades_before_hard_freshness_rejection() {
-        let lanes = controller();
+        let admission = controller();
         let metrics = Metrics::default();
-        let inputs = FreshnessInputs {
+        let inputs = FreshnessBudgetInputs {
             inflight_bytes: 12_000,
             incoming_bytes: 0,
             oldest_queue_age_seconds: 0.0,
-            ..FreshnessInputs::default()
+            ..FreshnessBudgetInputs::default()
         };
 
-        let _first = lanes
+        let _first = admission
             .reserve_query(QueryClass::Heavy, inputs, &metrics)
             .unwrap();
-        let err = match lanes.reserve_query(QueryClass::Heavy, inputs, &metrics) {
+        let err = match admission.reserve_query(QueryClass::Heavy, inputs, &metrics) {
             Ok(_) => panic!("second heavy query should hit degraded capacity"),
             Err(err) => err,
         };
 
         assert_eq!(err.status, 429);
-        assert_eq!(err.reason, "heavy_query_lane_full");
+        assert_eq!(err.reason, "heavy_query_admission_full");
     }
 
     #[test]
     fn ingest_rejects_when_projected_visibility_exceeds_budget() {
-        let lanes = controller();
+        let admission = controller();
         let metrics = Metrics::default();
-        let err = lanes
+        let err = admission
             .admit_ingest(
-                FreshnessInputs {
+                FreshnessBudgetInputs {
                     inflight_bytes: 60_000,
                     incoming_bytes: 1,
                     oldest_queue_age_seconds: 0.0,
-                    ..FreshnessInputs::default()
+                    ..FreshnessBudgetInputs::default()
                 },
                 &metrics,
             )
@@ -638,16 +646,16 @@ mod tests {
 
     #[test]
     fn ingest_rejects_when_buffer_visibility_debt_exceeds_budget() {
-        let lanes = controller();
+        let admission = controller();
         let metrics = Metrics::default();
-        let err = lanes
+        let err = admission
             .admit_ingest(
-                FreshnessInputs {
+                FreshnessBudgetInputs {
                     inflight_bytes: 0,
                     buffered_bytes: 12_000,
                     incoming_bytes: 1,
                     oldest_queue_age_seconds: 0.0,
-                    ..FreshnessInputs::default()
+                    ..FreshnessBudgetInputs::default()
                 },
                 &metrics,
             )
@@ -659,17 +667,17 @@ mod tests {
 
     #[test]
     fn cached_visible_freshness_lag_does_not_block_empty_queue_ingest() {
-        let lanes = controller();
+        let admission = controller();
         let metrics = Metrics::default();
-        lanes.record_observed_freshness_lag(12.0, &metrics);
+        admission.record_observed_freshness_lag(12.0, &metrics);
 
-        lanes
+        admission
             .admit_ingest(
-                FreshnessInputs {
+                FreshnessBudgetInputs {
                     inflight_bytes: 0,
                     incoming_bytes: 1,
                     oldest_queue_age_seconds: 0.0,
-                    ..FreshnessInputs::default()
+                    ..FreshnessBudgetInputs::default()
                 },
                 &metrics,
             )
@@ -678,17 +686,17 @@ mod tests {
 
     #[test]
     fn cached_visible_freshness_lag_does_not_latch_existing_queue_debt() {
-        let lanes = controller();
+        let admission = controller();
         let metrics = Metrics::default();
-        lanes.record_observed_freshness_lag(12.0, &metrics);
+        admission.record_observed_freshness_lag(12.0, &metrics);
 
-        lanes
+        admission
             .admit_ingest(
-                FreshnessInputs {
+                FreshnessBudgetInputs {
                     inflight_bytes: 1,
                     incoming_bytes: 1,
                     oldest_queue_age_seconds: 0.0,
-                    ..FreshnessInputs::default()
+                    ..FreshnessBudgetInputs::default()
                 },
                 &metrics,
             )

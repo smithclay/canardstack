@@ -1,6 +1,6 @@
 use super::{ArrowBatchBufferTiming, PreparedArrowBatch, TimingPhase};
 use crate::db::sql::quote as sql_quote;
-use crate::ingest::Signal;
+use crate::ingest::StorageSignal;
 use crate::storage::arrow::timestamp_column;
 use anyhow::{Context, Result};
 use arrow58::array as arrow58_array;
@@ -33,7 +33,7 @@ pub(super) struct ImmutableSealResult {
     pub(super) rows: usize,
     pub(super) files: usize,
     pub(super) timings: Vec<ArrowBatchBufferTiming>,
-    pub(super) affected: BTreeMap<Signal, BTreeSet<String>>,
+    pub(super) affected: BTreeMap<StorageSignal, BTreeSet<String>>,
 }
 
 pub struct ImmutableSealOutcome {
@@ -95,7 +95,7 @@ impl ImmutableSegmentBuffer {
             && (self.bytes >= target_bytes || now.duration_since(self.opened_at) >= max_age)
     }
 
-    pub(super) fn record_batch(&self, table: Signal) -> Result<RecordBatch> {
+    pub(super) fn record_batch(&self, table: StorageSignal) -> Result<RecordBatch> {
         match self.batches.as_slice() {
             [] => anyhow::bail!("immutable {table} buffer is empty"),
             [batch] => Ok(batch.clone()),
@@ -163,14 +163,14 @@ pub(super) fn distributed_segment_timing(
 }
 
 pub(super) struct SealedSegment {
-    pub(super) table: Signal,
+    pub(super) table: StorageSignal,
     pub(super) path: PathBuf,
     pub(super) rows: usize,
 }
 
 pub(super) fn write_immutable_segment(
     storage_dir: &Path,
-    table: Signal,
+    table: StorageSignal,
     partition: ImmutableSegmentPartition,
     batch: &RecordBatch,
 ) -> Result<ImmutableSegmentWrite> {
@@ -249,7 +249,7 @@ pub(super) fn write_immutable_segment(
 
 pub(super) fn immutable_segment_path(
     storage_dir: &Path,
-    table: Signal,
+    table: StorageSignal,
     partition: ImmutableSegmentPartition,
 ) -> Result<PathBuf> {
     let sequence = IMMUTABLE_SEGMENT_COUNTER.fetch_add(1, Ordering::SeqCst);
@@ -359,7 +359,7 @@ pub(super) fn timestamp_utc(
 pub(super) fn register_ducklake_data_file(
     conn: &Connection,
     catalog_name: &str,
-    table: Signal,
+    table: StorageSignal,
     path: &Path,
 ) -> Result<()> {
     let sql = format!(
@@ -374,7 +374,7 @@ pub(super) fn register_ducklake_data_file(
 }
 
 pub(super) fn immutable_buffer_snapshot(
-    buffers: &BTreeMap<Signal, ImmutableSegmentBuffer>,
+    buffers: &BTreeMap<StorageSignal, ImmutableSegmentBuffer>,
 ) -> Value {
     let mut map = serde_json::Map::new();
     for (table, buffer) in buffers {
@@ -438,9 +438,10 @@ mod tests {
             hour: 0,
         };
 
-        let written = write_immutable_segment(dir.path(), Signal::Logs, partition, &batch).unwrap();
+        let written =
+            write_immutable_segment(dir.path(), StorageSignal::Logs, partition, &batch).unwrap();
 
-        assert_eq!(written.segment.table, Signal::Logs);
+        assert_eq!(written.segment.table, StorageSignal::Logs);
         assert_eq!(written.segment.rows, 2);
         assert!(written.segment.path.exists());
 
@@ -461,6 +462,6 @@ mod tests {
         assert!(written
             .timings
             .iter()
-            .all(|timing| timing.table == Signal::Logs && timing.rows == 2));
+            .all(|timing| timing.table == StorageSignal::Logs && timing.rows == 2));
     }
 }

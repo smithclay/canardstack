@@ -51,11 +51,11 @@ concurrency = 4
 timeout_secs = 15
 memory_limit = "1GiB"
 
-[lanes]
+[admission]
 seal_capacity = 1
 cheap_query_capacity = 1
 heavy_query_degraded_capacity = 1
-freshness_sla_secs = 15
+freshness_budget_sla_secs = 15
 
 [retention]
 days = 14
@@ -64,7 +64,7 @@ days = 14
 enabled = true
 maintenance_interval_secs = 30
 # Seal cadence for the single seal driver. Keep well under the freshness SLA so
-# immutable-buffer age never approaches the lane reject threshold (default 1000ms).
+# immutable-buffer age never approaches the freshness-budget reject threshold (default 1000ms).
 # seal_interval_ms = 1000
 
 [bench]

@@ -15,10 +15,10 @@ The contract is:
 - `/api/admin/health/maintenance` → 503 when any job has consecutive failures
   ≥ 3 (matches `canardstack_maintenance_consecutive_failures{job} >= 3`).
 - `/api/admin/health/queries` → 503 when storage is not ready (queries depend
-  on DuckDB). Body includes lane state.
+  on DuckDB). Body includes admission state.
 - `/api/admin/health/ingest` → always 200; check queue gauges for backpressure
   and the `raw_spool` object for restart replay backlog. Body includes the
-  lane freshness projection.
+  freshness-budget projection.
 
 Where a step below says "check /api/admin/health/...", the expected paging
 status is the HTTP code, not just the body.
@@ -37,7 +37,7 @@ status is the HTTP code, not just the body.
 - `canardstack_maintenance_runs_total{job="seal",status="error"}`.
 - `canardstack_maintenance_failures_total{job="seal"}`.
 - `canardstack_maintenance_consecutive_failures{job="seal"}`.
-- `canardstack_ingest_inflight_bytes{signal}`.
+- `canardstack_ingest_inflight_bytes{storage_signal}`.
 - `canardstack_observed_freshness_lag_seconds`.
 - `canardstack_ingest_to_query_lag_seconds{table}`.
 - `canardstack_projected_visibility_seconds`.
@@ -56,8 +56,8 @@ status is the HTTP code, not just the body.
 
 - Keep existing queries available if they do not increase storage pressure.
 - Prefer `429` over accepting more data into full queues.
-- Heavy query lane admission should degrade before the seal lane is starved. If query
-  load still contends with the seal lane, lower `CANARDSTACK_QUERY_CONCURRENCY` while
+- Heavy query admission should degrade before the seal admission is starved. If query
+  load still contends with the seal admission, lower `CANARDSTACK_QUERY_CONCURRENCY` while
   preserving at least one heavy slot after seal and cheap-query reservations.
 
 ### Escalation
@@ -80,20 +80,20 @@ status is the HTTP code, not just the body.
 - `canardstack_query_requests_total{status="503"}`.
 - `canardstack_query_timeouts_total`.
 - `canardstack_query_rejections_total`.
-- `/api/admin/health/queries` for active, limit, and lane counts.
-- `canardstack_query_lane_rejections_total`.
-- `canardstack_query_lane_reductions_total`.
+- `/api/admin/health/queries` for active, limit, and admission counts.
+- `canardstack_query_admission_rejections_total`.
+- `canardstack_query_admission_reductions_total`.
 
 ### Immediate Mitigation
 
-All query lane knobs are env vars applied at boot — there is no hot-reload
+All query admission knobs are env vars applied at boot — there is no hot-reload
 endpoint. Steps 2 and 3 require an operator-driven restart.
 
 1. Restart query role if supervisor has not already done so.
 2. Lower query memory by 50%: set `CANARDSTACK_QUERY_MEMORY_LIMIT`
    (e.g. `256MiB`) and restart.
 3. Lower global query concurrency, keeping it greater than
-   `CANARDSTACK_SEAL_LANE_CAPACITY + CANARDSTACK_CHEAP_QUERY_LANE_CAPACITY`;
+   `CANARDSTACK_SEAL_ADMISSION_CAPACITY + CANARDSTACK_CHEAP_QUERY_ADMISSION_CAPACITY`;
    with defaults, use `CANARDSTACK_QUERY_CONCURRENCY=3` or higher.
 4. Lower heavy degraded capacity only if needed:
    `CANARDSTACK_HEAVY_QUERY_DEGRADED_CAPACITY=1`.
@@ -127,7 +127,7 @@ endpoint. Steps 2 and 3 require an operator-driven restart.
 - `canardstack_maintenance_failures_total`.
 - `canardstack_maintenance_consecutive_failures`.
 - `canardstack_ingest_requests_total{status="503"}`.
-- `canardstack_ingest_inflight_bytes{signal}`.
+- `canardstack_ingest_inflight_bytes{storage_signal}`.
 - `canardstack_ingest_to_query_lag_seconds{table}`.
 - `canardstack_projected_visibility_seconds`.
 
@@ -166,11 +166,11 @@ endpoint. Steps 2 and 3 require an operator-driven restart.
 - `canardstack_raw_spool_records_total{status="full"}`.
 - `canardstack_raw_spool_pending_records`.
 - `canardstack_raw_spool_pending_bytes`.
-- `canardstack_ingest_inflight_bytes{signal}`.
+- `canardstack_ingest_inflight_bytes{storage_signal}`.
 - `canardstack_observed_freshness_lag_seconds`.
 - `canardstack_ingest_freshness_budget_rejections_total`.
 - `canardstack_projected_visibility_seconds`.
-- `canardstack_ingest_records_total{signal}`.
+- `canardstack_ingest_records_total{request_kind}`.
 - `canardstack_http_connection_errors_total`.
 
 ### Immediate Mitigation
@@ -213,7 +213,7 @@ endpoint. Steps 2 and 3 require an operator-driven restart.
 - `canardstack_raw_spool_pending_bytes`.
 - `canardstack_raw_spool_replayed_records_total{status}`.
 - `canardstack_raw_spool_checkpointed_records_total{reason="storage_committed"}`.
-- `canardstack_ingest_inflight_bytes{signal}`.
+- `canardstack_ingest_inflight_bytes{storage_signal}`.
 - `canardstack_storage_logical_rows{table}`.
 
 ### Immediate Mitigation

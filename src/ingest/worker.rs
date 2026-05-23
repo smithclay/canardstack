@@ -78,38 +78,44 @@ fn run_ingest_worker(
         let Some(ingestor) = ingestor.upgrade() else {
             return;
         };
-        let signal = work.signal;
+        let route = work.route;
         let metrics = Arc::clone(&work.metrics);
         let started = Instant::now();
         match ingestor.process_spooled_ingest(work, &storage) {
             Ok(()) => {
                 metrics.inc(
                     "canardstack_ingest_worker_completed_total",
-                    &[("signal", signal.as_str()), ("status", "ok")],
+                    &[("request_kind", route.as_str()), ("status", "ok")],
                     1,
                 );
-                metrics.observe_phase_seconds(
-                    signal.as_str(),
-                    "ingest_worker",
-                    Some("ok"),
+                metrics.observe_seconds(
+                    "canardstack_phase_duration_seconds",
+                    &[
+                        ("request_kind", route.as_str()),
+                        ("phase", "ingest_worker"),
+                        ("status", "ok"),
+                    ],
                     started.elapsed().as_secs_f64(),
                 );
             }
             Err(err) => {
                 metrics.inc(
                     "canardstack_ingest_worker_completed_total",
-                    &[("signal", signal.as_str()), ("status", err.reason)],
+                    &[("request_kind", route.as_str()), ("status", err.reason)],
                     1,
                 );
-                metrics.observe_phase_seconds(
-                    signal.as_str(),
-                    "ingest_worker",
-                    Some("error"),
+                metrics.observe_seconds(
+                    "canardstack_phase_duration_seconds",
+                    &[
+                        ("request_kind", route.as_str()),
+                        ("phase", "ingest_worker"),
+                        ("status", "error"),
+                    ],
                     started.elapsed().as_secs_f64(),
                 );
                 tracing::warn!(
                     event = "ingest_worker_failed",
-                    signal = signal.as_str(),
+                    request_kind = route.as_str(),
                     status = err.status,
                     reason = err.reason,
                     message = %err.message

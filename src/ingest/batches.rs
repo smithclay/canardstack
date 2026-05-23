@@ -1,10 +1,10 @@
-use super::Signal;
+use super::StorageSignal;
 use crate::otlp::Transformed;
 use arrow58::record_batch::RecordBatch;
 use serde::Serialize;
 
 pub(super) struct PendingBatch {
-    pub(super) signal: Signal,
+    pub(super) signal: StorageSignal,
     pub(super) batch: RecordBatch,
     pub(super) source_format: &'static str,
     pub(super) approx_bytes: usize,
@@ -13,10 +13,10 @@ pub(super) struct PendingBatch {
 /// Per-signal view of ingest in-flight pressure: bytes that have been admitted
 /// (durably spooled, handed to a worker) but not yet appended to the immutable
 /// buffer. There is no separate in-memory queue, so this is the only "queue"
-/// depth ingest exposes; freshness/visibility debt lives in the lane snapshot.
+/// depth ingest exposes; freshness/visibility debt lives in the admission snapshot.
 #[derive(Debug, Serialize)]
 pub struct IngestSnapshot {
-    pub signal: &'static str,
+    pub storage_signal: &'static str,
     pub inflight_bytes: usize,
     pub inflight_capacity_bytes: usize,
     pub pressure: f64,
@@ -25,22 +25,27 @@ pub struct IngestSnapshot {
 pub(super) fn pending_batches(transformed: Transformed) -> Vec<PendingBatch> {
     let source_format = transformed.source_format;
     let mut batches = Vec::new();
-    push_pending_arrow(&mut batches, Signal::Logs, transformed.logs, source_format);
     push_pending_arrow(
         &mut batches,
-        Signal::Spans,
+        StorageSignal::Logs,
+        transformed.logs,
+        source_format,
+    );
+    push_pending_arrow(
+        &mut batches,
+        StorageSignal::Spans,
         transformed.spans,
         source_format,
     );
     push_pending_arrow(
         &mut batches,
-        Signal::MetricGauge,
+        StorageSignal::MetricGauge,
         transformed.gauge,
         source_format,
     );
     push_pending_arrow(
         &mut batches,
-        Signal::MetricSum,
+        StorageSignal::MetricSum,
         transformed.sum,
         source_format,
     );
@@ -49,7 +54,7 @@ pub(super) fn pending_batches(transformed: Transformed) -> Vec<PendingBatch> {
 
 fn push_pending_arrow(
     batches: &mut Vec<PendingBatch>,
-    signal: Signal,
+    signal: StorageSignal,
     batch: Option<RecordBatch>,
     source_format: &'static str,
 ) {

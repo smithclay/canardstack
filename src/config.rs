@@ -49,7 +49,7 @@ impl ServeRole {
 }
 
 #[derive(Clone, Debug)]
-pub struct QueryLane {
+pub struct QueryLimits {
     pub concurrency: usize,
     pub timeout_secs: u64,
     pub memory_limit: String,
@@ -77,11 +77,11 @@ pub struct Config {
     pub future_accept_secs: i64,
     pub immutable_segment_target_bytes: usize,
     pub immutable_segment_max_age: Duration,
-    pub query_interactive: QueryLane,
-    pub lane_seal_capacity: usize,
-    pub lane_cheap_query_capacity: usize,
-    pub lane_heavy_query_degraded_capacity: usize,
-    pub lane_freshness_sla: Duration,
+    pub query_interactive: QueryLimits,
+    pub seal_admission_capacity: usize,
+    pub cheap_query_admission_capacity: usize,
+    pub heavy_query_degraded_capacity: usize,
+    pub freshness_budget_sla: Duration,
     pub logs_retention_days: i64,
     pub spans_retention_days: i64,
     pub metrics_retention_days: i64,
@@ -215,28 +215,28 @@ impl Config {
                 "CANARDSTACK_SEGMENT_MAX_AGE_SECS",
                 10,
             )?,
-            query_interactive: QueryLane {
+            query_interactive: QueryLimits {
                 concurrency: query_concurrency,
                 timeout_secs: query_timeout_secs,
                 memory_limit: query_memory_limit,
             },
-            lane_seal_capacity: env_usize("CANARDSTACK_SEAL_LANE_CAPACITY")?
-                .or(file.usize(&["lanes", "seal_capacity"])?)
+            seal_admission_capacity: env_usize("CANARDSTACK_SEAL_ADMISSION_CAPACITY")?
+                .or(file.usize(&["admission", "seal_capacity"])?)
                 .unwrap_or(1),
-            lane_cheap_query_capacity: env_usize("CANARDSTACK_CHEAP_QUERY_LANE_CAPACITY")?
-                .or(file.usize(&["lanes", "cheap_query_capacity"])?)
-                .unwrap_or(1),
-            lane_heavy_query_degraded_capacity: env_usize(
-                "CANARDSTACK_HEAVY_QUERY_DEGRADED_CAPACITY",
+            cheap_query_admission_capacity: env_usize(
+                "CANARDSTACK_CHEAP_QUERY_ADMISSION_CAPACITY",
             )?
-            .or(file.usize(&["lanes", "heavy_query_degraded_capacity"])?)
+            .or(file.usize(&["admission", "cheap_query_capacity"])?)
             .unwrap_or(1),
-            lane_freshness_sla: duration_ms_or_secs(
+            heavy_query_degraded_capacity: env_usize("CANARDSTACK_HEAVY_QUERY_DEGRADED_CAPACITY")?
+                .or(file.usize(&["admission", "heavy_query_degraded_capacity"])?)
+                .unwrap_or(1),
+            freshness_budget_sla: duration_ms_or_secs(
                 &file,
-                &["lanes", "freshness_sla_ms"],
-                &["lanes", "freshness_sla_secs"],
-                "CANARDSTACK_FRESHNESS_SLA_MS",
-                "CANARDSTACK_FRESHNESS_SLA_SECS",
+                &["admission", "freshness_budget_sla_ms"],
+                &["admission", "freshness_budget_sla_secs"],
+                "CANARDSTACK_FRESHNESS_BUDGET_SLA_MS",
+                "CANARDSTACK_FRESHNESS_BUDGET_SLA_SECS",
                 15,
             )?,
             logs_retention_days: retention_days,
@@ -246,8 +246,8 @@ impl Config {
                 .or(file.bool(&["scheduler", "enabled"])?)
                 .unwrap_or(true),
             // Seal cadence for the single seal driver. Decoupled from the coarse
-            // maintenance interval: it must stay well under the freshness SLA so
-            // immutable-buffer age never approaches the lane reject threshold.
+            // maintenance interval: it must stay well under the freshness-budget SLA so
+            // immutable-buffer age never approaches the freshness-budget reject threshold.
             scheduler_seal_interval: duration_ms_or_secs(
                 &file,
                 &["scheduler", "seal_interval_ms"],
@@ -331,15 +331,15 @@ impl Config {
             future_accept_secs: 10 * 60,
             immutable_segment_target_bytes: 64 * 1024 * 1024,
             immutable_segment_max_age: Duration::from_secs(10),
-            query_interactive: QueryLane {
+            query_interactive: QueryLimits {
                 concurrency: 4,
                 timeout_secs: 15,
                 memory_limit: "512MiB".to_string(),
             },
-            lane_seal_capacity: 1,
-            lane_cheap_query_capacity: 1,
-            lane_heavy_query_degraded_capacity: 1,
-            lane_freshness_sla: Duration::from_secs(15),
+            seal_admission_capacity: 1,
+            cheap_query_admission_capacity: 1,
+            heavy_query_degraded_capacity: 1,
+            freshness_budget_sla: Duration::from_secs(15),
             logs_retention_days: 14,
             spans_retention_days: 14,
             metrics_retention_days: 30,
@@ -424,22 +424,22 @@ impl Config {
         if self.query_interactive.concurrency == 0 {
             anyhow::bail!("query concurrency limits must be > 0");
         }
-        if self.lane_seal_capacity == 0
-            || self.lane_cheap_query_capacity == 0
-            || self.lane_heavy_query_degraded_capacity == 0
+        if self.seal_admission_capacity == 0
+            || self.cheap_query_admission_capacity == 0
+            || self.heavy_query_degraded_capacity == 0
         {
-            anyhow::bail!("lane capacities must be > 0");
+            anyhow::bail!("admission capacities must be > 0");
         }
-        if self.lane_freshness_sla.is_zero() {
-            anyhow::bail!("CANARDSTACK_FRESHNESS_SLA_MS/SECS must be > 0");
+        if self.freshness_budget_sla.is_zero() {
+            anyhow::bail!("CANARDSTACK_FRESHNESS_BUDGET_SLA_MS/SECS must be > 0");
         }
         if self.query_interactive.concurrency
             <= self
-                .lane_seal_capacity
-                .saturating_add(self.lane_cheap_query_capacity)
+                .seal_admission_capacity
+                .saturating_add(self.cheap_query_admission_capacity)
         {
             anyhow::bail!(
-                "CANARDSTACK_QUERY_CONCURRENCY must leave at least one heavy query slot after seal and cheap-query lane reservations"
+                "CANARDSTACK_QUERY_CONCURRENCY must leave at least one heavy query slot after seal and cheap-query admission reservations"
             );
         }
         if self.query_interactive.timeout_secs == 0 {
@@ -705,11 +705,11 @@ mod tests {
         "CANARDSTACK_QUERY_CONCURRENCY",
         "CANARDSTACK_QUERY_TIMEOUT_SECS",
         "CANARDSTACK_QUERY_MEMORY_LIMIT",
-        "CANARDSTACK_SEAL_LANE_CAPACITY",
-        "CANARDSTACK_CHEAP_QUERY_LANE_CAPACITY",
+        "CANARDSTACK_SEAL_ADMISSION_CAPACITY",
+        "CANARDSTACK_CHEAP_QUERY_ADMISSION_CAPACITY",
         "CANARDSTACK_HEAVY_QUERY_DEGRADED_CAPACITY",
-        "CANARDSTACK_FRESHNESS_SLA_MS",
-        "CANARDSTACK_FRESHNESS_SLA_SECS",
+        "CANARDSTACK_FRESHNESS_BUDGET_SLA_MS",
+        "CANARDSTACK_FRESHNESS_BUDGET_SLA_SECS",
         "CANARDSTACK_RETENTION_DAYS",
         "CANARDSTACK_SCHEDULER_ENABLED",
         "CANARDSTACK_MAINTENANCE_INTERVAL_MS",
@@ -810,11 +810,11 @@ concurrency = 6
 timeout_secs = 7
 memory_limit = "384MiB"
 
-[lanes]
+[admission]
 seal_capacity = 1
 cheap_query_capacity = 2
 heavy_query_degraded_capacity = 1
-freshness_sla_secs = 9
+freshness_budget_sla_secs = 9
 
 [retention]
 days = 5
@@ -869,10 +869,10 @@ http_keepalive = true
         assert_eq!(config.query_interactive.concurrency, 6);
         assert_eq!(config.query_interactive.timeout_secs, 7);
         assert_eq!(config.query_interactive.memory_limit, "384MiB");
-        assert_eq!(config.lane_seal_capacity, 1);
-        assert_eq!(config.lane_cheap_query_capacity, 2);
-        assert_eq!(config.lane_heavy_query_degraded_capacity, 1);
-        assert_eq!(config.lane_freshness_sla, Duration::from_secs(9));
+        assert_eq!(config.seal_admission_capacity, 1);
+        assert_eq!(config.cheap_query_admission_capacity, 2);
+        assert_eq!(config.heavy_query_degraded_capacity, 1);
+        assert_eq!(config.freshness_budget_sla, Duration::from_secs(9));
         assert_eq!(config.logs_retention_days, 5);
         assert_eq!(config.metrics_retention_days, 5);
         assert!(!config.scheduler_enabled);

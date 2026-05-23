@@ -27,7 +27,7 @@ fn options(dir: &Path) -> Options {
 
 fn record(body: &[u8]) -> Record {
     Record {
-        signal: Signal::Logs,
+        request_kind: OtlpRequestKind::Logs,
         content_type: "application/x-protobuf".to_string(),
         content_encoding: Some("gzip".to_string()),
         accepted_at_micros: 1_234_567,
@@ -612,7 +612,7 @@ fn raw_spool_append_batch_defers_checkpoint_and_keeps_collecting_appends() {
 }
 
 #[test]
-fn raw_spool_group_commit_delay_flushes_partial_batch() {
+fn raw_spool_group_commit_delay_drains_partial_batch() {
     let (_tx, rx) = mpsc::sync_channel(4);
     let (first, _first_rx) = append_command(b"first", 1);
     let mut deferred = VecDeque::new();

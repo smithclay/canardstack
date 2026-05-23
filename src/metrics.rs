@@ -1,4 +1,4 @@
-use crate::ingest::Signal;
+use crate::ingest::StorageSignal;
 use crate::storage::Storage;
 use crate::LockExt;
 use anyhow::{Context, Result};
@@ -186,67 +186,85 @@ impl Metrics {
             .insert(sum_id, seconds);
     }
 
-    pub fn observe_phase_seconds(
-        &self,
-        signal: &str,
-        phase: &str,
-        query_class: Option<&str>,
-        seconds: f64,
-    ) {
-        if let Some(query_class) = query_class {
-            self.observe_seconds(
-                "canardstack_phase_duration_seconds",
-                &[
-                    ("signal", signal),
-                    ("phase", phase),
-                    ("query_class", query_class),
-                ],
-                seconds,
-            );
-        } else {
-            self.observe_seconds(
-                "canardstack_phase_duration_seconds",
-                &[("signal", signal), ("phase", phase)],
-                seconds,
-            );
-        }
+    pub fn observe_request_phase_seconds(&self, request_kind: &str, phase: &str, seconds: f64) {
+        self.observe_labeled_phase_seconds(&[("request_kind", request_kind)], phase, seconds);
     }
 
-    pub fn observe_phase_seconds_n(
+    pub fn observe_request_phase_seconds_n(
         &self,
-        signal: &str,
+        request_kind: &str,
         phase: &str,
-        query_class: Option<&str>,
         count: u64,
         seconds: f64,
     ) {
-        if let Some(query_class) = query_class {
-            self.observe_seconds_n(
-                "canardstack_phase_duration_seconds",
-                &[
-                    ("signal", signal),
-                    ("phase", phase),
-                    ("query_class", query_class),
-                ],
-                count,
-                seconds,
-            );
-        } else {
-            self.observe_seconds_n(
-                "canardstack_phase_duration_seconds",
-                &[("signal", signal), ("phase", phase)],
-                count,
-                seconds,
-            );
-        }
+        self.observe_labeled_phase_seconds_n(
+            &[("request_kind", request_kind)],
+            phase,
+            count,
+            seconds,
+        );
     }
 
-    pub fn ingest_request(&self, signal: &str, status: u16, reason: &str) {
+    pub fn observe_storage_signal_phase_seconds(
+        &self,
+        storage_signal: &str,
+        phase: &str,
+        seconds: f64,
+    ) {
+        self.observe_labeled_phase_seconds(&[("storage_signal", storage_signal)], phase, seconds);
+    }
+
+    pub fn observe_spool_lane_phase_seconds(&self, spool_lane: &str, phase: &str, seconds: f64) {
+        self.observe_labeled_phase_seconds(&[("spool_lane", spool_lane)], phase, seconds);
+    }
+
+    pub fn observe_spool_lane_phase_seconds_n(
+        &self,
+        spool_lane: &str,
+        phase: &str,
+        count: u64,
+        seconds: f64,
+    ) {
+        self.observe_labeled_phase_seconds_n(&[("spool_lane", spool_lane)], phase, count, seconds);
+    }
+
+    pub fn observe_query_route_phase_seconds(
+        &self,
+        route_template: &str,
+        phase: &str,
+        seconds: f64,
+    ) {
+        self.observe_labeled_phase_seconds(&[("route_template", route_template)], phase, seconds);
+    }
+
+    fn observe_labeled_phase_seconds(&self, labels: &[(&str, &str)], phase: &str, seconds: f64) {
+        self.observe_labeled_phase_seconds_n(labels, phase, 1, seconds);
+    }
+
+    fn observe_labeled_phase_seconds_n(
+        &self,
+        labels: &[(&str, &str)],
+        phase: &str,
+        count: u64,
+        seconds: f64,
+    ) {
+        let mut phase_labels = Vec::with_capacity(labels.len() + 1);
+        phase_labels.extend_from_slice(labels);
+        phase_labels.push(("phase", phase));
+        self.observe_seconds_n(
+            "canardstack_phase_duration_seconds",
+            &phase_labels,
+            count,
+            seconds,
+        );
+    }
+
+    pub fn ingest_request(&self, request_kind: &str, status: u16, reason: &str) {
         let status = status_label(status);
         self.inc(
             "canardstack_ingest_requests_total",
             &[
-                ("signal", signal),
+                ("request_kind", request_kind),
                 ("status", status.as_ref()),
                 ("reason", reason),
             ],
@@ -256,7 +274,7 @@ impl Metrics {
             self.inc(
                 "canardstack_ingest_rejections_total",
                 &[
-                    ("signal", signal),
+                    ("request_kind", request_kind),
                     ("status", status.as_ref()),
                     ("reason", reason),
                 ],
@@ -265,12 +283,12 @@ impl Metrics {
         }
     }
 
-    pub fn query_request(&self, query_class: &str, status: u16, reason: &str, seconds: f64) {
+    pub fn query_request(&self, route_template: &str, status: u16, reason: &str, seconds: f64) {
         let status = status_label(status);
         self.inc(
             "canardstack_query_requests_total",
             &[
-                ("query_class", query_class),
+                ("route_template", route_template),
                 ("status", status.as_ref()),
                 ("reason", reason),
             ],
@@ -278,20 +296,20 @@ impl Metrics {
         );
         self.observe_seconds(
             "canardstack_query_duration_seconds",
-            &[("query_class", query_class)],
+            &[("route_template", route_template)],
             seconds,
         );
         if status == "429" {
             self.inc(
                 "canardstack_query_rejections_total",
-                &[("query_class", query_class), ("reason", reason)],
+                &[("route_template", route_template), ("reason", reason)],
                 1,
             );
         }
         if reason == "query_timeout" {
             self.inc(
                 "canardstack_query_timeouts_total",
-                &[("query_class", query_class)],
+                &[("route_template", route_template)],
                 1,
             );
         }
@@ -372,17 +390,17 @@ impl Metrics {
             .collect::<Vec<_>>();
         let mut rows = 0;
         if !counters.is_empty() {
-            let batch = metric_samples_batch(&counters, Signal::MetricSum)?;
+            let batch = metric_samples_batch(&counters, StorageSignal::MetricSum)?;
             rows += storage.buffer_arrow_records(
-                Signal::MetricSum,
+                StorageSignal::MetricSum,
                 &batch,
                 "canardstack_operator_metrics",
             )?;
         }
         if !gauges.is_empty() {
-            let batch = metric_samples_batch(&gauges, Signal::MetricGauge)?;
+            let batch = metric_samples_batch(&gauges, StorageSignal::MetricGauge)?;
             rows += storage.buffer_arrow_records(
-                Signal::MetricGauge,
+                StorageSignal::MetricGauge,
                 &batch,
                 "canardstack_operator_metrics",
             )?;
@@ -440,7 +458,7 @@ fn escape_label_value(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-fn metric_samples_batch(samples: &[MetricSample], signal: Signal) -> Result<RecordBatch> {
+fn metric_samples_batch(samples: &[MetricSample], signal: StorageSignal) -> Result<RecordBatch> {
     let rows = samples.len();
     let timestamp = Utc::now().timestamp_micros();
     let resource_attributes = json!({"service.name": "canardstack"}).to_string();
@@ -505,7 +523,7 @@ fn metric_samples_batch(samples: &[MetricSample], signal: Signal) -> Result<Reco
         Arc::new(Int32Array::from(vec![None; rows])),
         Arc::new(StringArray::from(vec![None::<String>; rows])),
     ];
-    if signal == Signal::MetricSum {
+    if signal == StorageSignal::MetricSum {
         fields.push(Field::new("aggregation_temporality", DataType::Int32, true));
         fields.push(Field::new("is_monotonic", DataType::Boolean, true));
         arrays.push(Arc::new(Int32Array::from(vec![Some(2); rows])));

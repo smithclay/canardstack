@@ -1,5 +1,5 @@
+use crate::admission_control::QueryClass;
 use crate::compat;
-use crate::lanes::QueryClass;
 use crate::validation::ApiError;
 use crate::AppState;
 use serde_json::{json, Value};
@@ -10,254 +10,432 @@ use super::auth::api_auth;
 use super::parser::percent_decode;
 use super::response::HttpResponse;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum CompatRoleCategory {
+    Query,
+}
+
+impl CompatRoleCategory {
+    pub(super) fn serves_queries(self) -> bool {
+        matches!(self, Self::Query)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AuthRequirement {
+    Api,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QueryAdmission {
+    None,
+    Cheap,
+    Heavy,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RoutePattern {
+    Exact(&'static str),
+    PrefixParam {
+        prefix: &'static str,
+    },
+    PrefixSuffixParam {
+        prefix: &'static str,
+        suffix: &'static str,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CompatHandler {
+    PrometheusQuery,
+    PrometheusQueryRange,
+    PrometheusLabels,
+    PrometheusSeries,
+    PrometheusMetadata,
+    PrometheusLabelValues,
+    LokiQuery,
+    LokiQueryRange,
+    LokiLabels,
+    LokiSeries,
+    LokiLabelValues,
+    TempoSearch,
+    TempoTags,
+    TempoTrace,
+    TempoTagValues,
+    BuildInfo,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CompatRoute {
+    methods: &'static [&'static str],
+    template: &'static str,
+    pattern: RoutePattern,
+    role_category: CompatRoleCategory,
+    auth: AuthRequirement,
+    admission: QueryAdmission,
+    handler: CompatHandler,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct CompatRouteMatch<'a> {
+    route: &'static CompatRoute,
+    param: Option<&'a str>,
+}
+
+impl CompatRouteMatch<'_> {
+    pub(super) fn role_category(self) -> CompatRoleCategory {
+        self.route.role_category
+    }
+}
+
+const COMPAT_ROUTES: &[CompatRoute] = &[
+    compat_route(
+        &["GET", "POST"],
+        "/api/v1/query",
+        RoutePattern::Exact("/api/v1/query"),
+        QueryAdmission::Cheap,
+        CompatHandler::PrometheusQuery,
+    ),
+    compat_route(
+        &["GET", "POST"],
+        "/api/v1/query_range",
+        RoutePattern::Exact("/api/v1/query_range"),
+        QueryAdmission::Heavy,
+        CompatHandler::PrometheusQueryRange,
+    ),
+    compat_route(
+        &["GET"],
+        "/api/v1/labels",
+        RoutePattern::Exact("/api/v1/labels"),
+        QueryAdmission::Cheap,
+        CompatHandler::PrometheusLabels,
+    ),
+    compat_route(
+        &["GET"],
+        "/api/v1/series",
+        RoutePattern::Exact("/api/v1/series"),
+        QueryAdmission::Cheap,
+        CompatHandler::PrometheusSeries,
+    ),
+    compat_route(
+        &["GET"],
+        "/api/v1/metadata",
+        RoutePattern::Exact("/api/v1/metadata"),
+        QueryAdmission::Cheap,
+        CompatHandler::PrometheusMetadata,
+    ),
+    compat_route(
+        &["GET"],
+        "/api/v1/label/:name/values",
+        RoutePattern::PrefixSuffixParam {
+            prefix: "/api/v1/label/",
+            suffix: "/values",
+        },
+        QueryAdmission::Cheap,
+        CompatHandler::PrometheusLabelValues,
+    ),
+    compat_route(
+        &["GET"],
+        "/loki/api/v1/query",
+        RoutePattern::Exact("/loki/api/v1/query"),
+        QueryAdmission::Cheap,
+        CompatHandler::LokiQuery,
+    ),
+    compat_route(
+        &["GET"],
+        "/loki/api/v1/query_range",
+        RoutePattern::Exact("/loki/api/v1/query_range"),
+        QueryAdmission::Heavy,
+        CompatHandler::LokiQueryRange,
+    ),
+    compat_route(
+        &["GET"],
+        "/loki/api/v1/labels",
+        RoutePattern::Exact("/loki/api/v1/labels"),
+        QueryAdmission::Cheap,
+        CompatHandler::LokiLabels,
+    ),
+    compat_route(
+        &["GET"],
+        "/loki/api/v1/series",
+        RoutePattern::Exact("/loki/api/v1/series"),
+        QueryAdmission::Cheap,
+        CompatHandler::LokiSeries,
+    ),
+    compat_route(
+        &["GET"],
+        "/loki/api/v1/label/:name/values",
+        RoutePattern::PrefixSuffixParam {
+            prefix: "/loki/api/v1/label/",
+            suffix: "/values",
+        },
+        QueryAdmission::Cheap,
+        CompatHandler::LokiLabelValues,
+    ),
+    compat_route(
+        &["GET"],
+        "/api/search",
+        RoutePattern::Exact("/api/search"),
+        QueryAdmission::Heavy,
+        CompatHandler::TempoSearch,
+    ),
+    compat_route(
+        &["GET"],
+        "/api/search/tags",
+        RoutePattern::Exact("/api/search/tags"),
+        QueryAdmission::Cheap,
+        CompatHandler::TempoTags,
+    ),
+    compat_route(
+        &["GET"],
+        "/api/v2/search/tags",
+        RoutePattern::Exact("/api/v2/search/tags"),
+        QueryAdmission::Cheap,
+        CompatHandler::TempoTags,
+    ),
+    compat_route(
+        &["GET"],
+        "/api/v2/traces/:trace_id",
+        RoutePattern::PrefixParam {
+            prefix: "/api/v2/traces/",
+        },
+        QueryAdmission::Heavy,
+        CompatHandler::TempoTrace,
+    ),
+    compat_route(
+        &["GET"],
+        "/api/traces/:trace_id",
+        RoutePattern::PrefixParam {
+            prefix: "/api/traces/",
+        },
+        QueryAdmission::Heavy,
+        CompatHandler::TempoTrace,
+    ),
+    compat_route(
+        &["GET"],
+        "/api/search/tag/:tag/values",
+        RoutePattern::PrefixSuffixParam {
+            prefix: "/api/search/tag/",
+            suffix: "/values",
+        },
+        QueryAdmission::Cheap,
+        CompatHandler::TempoTagValues,
+    ),
+    compat_route(
+        &["GET"],
+        "/api/v2/search/tag/:tag/values",
+        RoutePattern::PrefixSuffixParam {
+            prefix: "/api/v2/search/tag/",
+            suffix: "/values",
+        },
+        QueryAdmission::Cheap,
+        CompatHandler::TempoTagValues,
+    ),
+    compat_route(
+        &["GET"],
+        "/api/status/buildinfo",
+        RoutePattern::Exact("/api/status/buildinfo"),
+        QueryAdmission::None,
+        CompatHandler::BuildInfo,
+    ),
+];
+
+const fn compat_route(
+    methods: &'static [&'static str],
+    template: &'static str,
+    pattern: RoutePattern,
+    admission: QueryAdmission,
+    handler: CompatHandler,
+) -> CompatRoute {
+    CompatRoute {
+        methods,
+        template,
+        pattern,
+        role_category: CompatRoleCategory::Query,
+        auth: AuthRequirement::Api,
+        admission,
+        handler,
+    }
+}
+
+pub(super) fn match_compat_route<'a>(method: &str, path: &'a str) -> Option<CompatRouteMatch<'a>> {
+    COMPAT_ROUTES.iter().find_map(|route| {
+        if !route.methods.contains(&method) {
+            return None;
+        }
+        match_route_path(route.pattern, path).map(|param| CompatRouteMatch { route, param })
+    })
+}
+
+#[cfg(test)]
+pub(super) fn compat_route_examples_for_tests() -> Vec<(String, String)> {
+    COMPAT_ROUTES
+        .iter()
+        .flat_map(|route| {
+            let path = match route.pattern {
+                RoutePattern::Exact(path) => path.to_string(),
+                RoutePattern::PrefixParam { prefix } => {
+                    format!("{prefix}11111111111111111111111111111111")
+                }
+                RoutePattern::PrefixSuffixParam { prefix, suffix } => {
+                    let param = if route.template.contains(":tag") {
+                        "service.name"
+                    } else {
+                        "service_name"
+                    };
+                    format!("{prefix}{param}{suffix}")
+                }
+            };
+            route
+                .methods
+                .iter()
+                .map(move |method| ((*method).to_string(), path.clone()))
+        })
+        .collect()
+}
+
 pub(super) fn route_compat(
-    method: &str,
-    path: &str,
+    matched: CompatRouteMatch<'_>,
     query: &HashMap<String, String>,
     headers: &HashMap<String, String>,
     body: &[u8],
     state: &AppState,
-) -> Option<HttpResponse> {
+) -> HttpResponse {
     let started = Instant::now();
     let params = request_params(query, headers, body);
-    // `query_class` must be a static route template - never the raw `path` -
-    // or the `canardstack_query_*` series cardinality explodes on every
-    // distinct trace_id / label / tag in the URL.
-    let (query_class, result) = match (method, path) {
-        ("GET", "/api/v1/query") | ("POST", "/api/v1/query") => (
-            "/api/v1/query",
-            api_auth(headers, state, || {
-                with_query_lane(state, QueryClass::Cheap, || {
-                    compat::prometheus_query(state, &params)
-                })
-            }),
-        ),
-        ("GET", "/api/v1/query_range") | ("POST", "/api/v1/query_range") => (
-            "/api/v1/query_range",
-            api_auth(headers, state, || {
-                with_query_lane(state, QueryClass::Heavy, || {
-                    compat::prometheus_query_range(state, &params)
-                })
-            }),
-        ),
-        ("GET", "/api/v1/labels") => (
-            "/api/v1/labels",
-            api_auth(headers, state, || {
-                with_query_lane(state, QueryClass::Cheap, || {
-                    compat::prometheus_labels(state, &params)
-                })
-            }),
-        ),
-        ("GET", "/api/v1/series") => (
-            "/api/v1/series",
-            api_auth(headers, state, || {
-                with_query_lane(state, QueryClass::Cheap, || {
-                    compat::prometheus_series(state, &params)
-                })
-            }),
-        ),
-        ("GET", "/api/v1/metadata") => (
-            "/api/v1/metadata",
-            api_auth(headers, state, || {
-                with_query_lane(state, QueryClass::Cheap, || {
-                    compat::prometheus_metadata(state)
-                })
-            }),
-        ),
-        ("GET", "/loki/api/v1/query") => (
-            "/loki/api/v1/query",
-            api_auth(headers, state, || {
-                with_query_lane(state, QueryClass::Cheap, || {
-                    compat::loki_query(state, &params)
-                })
-            }),
-        ),
-        ("GET", "/loki/api/v1/query_range") => (
-            "/loki/api/v1/query_range",
-            api_auth(headers, state, || {
-                with_query_lane(state, QueryClass::Heavy, || {
-                    compat::loki_query_range(state, &params)
-                })
-            }),
-        ),
-        ("GET", "/loki/api/v1/labels") => (
-            "/loki/api/v1/labels",
-            api_auth(headers, state, || {
-                with_query_lane(state, QueryClass::Cheap, || {
-                    compat::loki_labels(state, &params)
-                })
-            }),
-        ),
-        ("GET", "/loki/api/v1/series") => (
-            "/loki/api/v1/series",
-            api_auth(headers, state, || {
-                with_query_lane(state, QueryClass::Cheap, || {
-                    compat::loki_series(state, &params)
-                })
-            }),
-        ),
-        ("GET", "/api/search") => (
-            "/api/search",
-            api_auth(headers, state, || {
-                with_query_lane(state, QueryClass::Heavy, || {
-                    compat::tempo_search(state, &params)
-                })
-            }),
-        ),
-        ("GET", "/api/search/tags") => (
-            "/api/search/tags",
-            api_auth(headers, state, || {
-                with_query_lane(state, QueryClass::Cheap, || Ok(compat::tempo_tags()))
-            }),
-        ),
-        ("GET", "/api/v2/search/tags") => (
-            "/api/v2/search/tags",
-            api_auth(headers, state, || {
-                with_query_lane(state, QueryClass::Cheap, || Ok(compat::tempo_tags()))
-            }),
-        ),
-        ("GET", "/api/status/buildinfo") => (
-            "/api/status/buildinfo",
-            api_auth(headers, state, || {
-                Ok(json!({
-                    "version": env!("CARGO_PKG_VERSION"),
-                    "revision": "canardstack",
-                    "branch": "local",
-                    "buildUser": "canardstack",
-                    "buildDate": ""
-                }))
-            }),
-        ),
-        _ => {
-            if method == "GET" {
-                if let Some(name) = path
-                    .strip_prefix("/api/v1/label/")
-                    .and_then(|s| s.strip_suffix("/values"))
-                {
-                    return Some(compat_http(
-                        state,
-                        "/api/v1/label/:name/values",
-                        api_auth(headers, state, || {
-                            with_query_lane(state, QueryClass::Cheap, || {
-                                compat::prometheus_label_values(state, name, &params)
-                            })
-                        }),
-                        started,
-                    ));
-                }
-                if let Some(name) = path
-                    .strip_prefix("/loki/api/v1/label/")
-                    .and_then(|s| s.strip_suffix("/values"))
-                {
-                    return Some(compat_http(
-                        state,
-                        "/loki/api/v1/label/:name/values",
-                        api_auth(headers, state, || {
-                            with_query_lane(state, QueryClass::Cheap, || {
-                                compat::loki_label_values(state, name, &params)
-                            })
-                        }),
-                        started,
-                    ));
-                }
-                if let Some(trace_id) = path.strip_prefix("/api/v2/traces/") {
-                    return Some(tempo_trace_http(
-                        state,
-                        "/api/v2/traces/:trace_id",
-                        trace_id,
-                        headers,
-                        started,
-                    ));
-                }
-                if let Some(trace_id) = path.strip_prefix("/api/traces/") {
-                    return Some(tempo_trace_http(
-                        state,
-                        "/api/traces/:trace_id",
-                        trace_id,
-                        headers,
-                        started,
-                    ));
-                }
-                if let Some(tag) = path
-                    .strip_prefix("/api/search/tag/")
-                    .and_then(|s| s.strip_suffix("/values"))
-                {
-                    return Some(compat_http(
-                        state,
-                        "/api/search/tag/:tag/values",
-                        api_auth(headers, state, || {
-                            with_query_lane(state, QueryClass::Cheap, || {
-                                compat::tempo_tag_values(state, tag, &params)
-                            })
-                        }),
-                        started,
-                    ));
-                }
-                if let Some(tag) = path
-                    .strip_prefix("/api/v2/search/tag/")
-                    .and_then(|s| s.strip_suffix("/values"))
-                {
-                    return Some(compat_http(
-                        state,
-                        "/api/v2/search/tag/:tag/values",
-                        api_auth(headers, state, || {
-                            with_query_lane(state, QueryClass::Cheap, || {
-                                compat::tempo_tag_values(state, tag, &params)
-                            })
-                        }),
-                        started,
-                    ));
-                }
-            }
-            return None;
+    if matched.route.handler == CompatHandler::TempoTrace {
+        return tempo_trace_http(matched, headers, state, started);
+    }
+
+    let result = authorize(matched.route.auth, headers, state, || {
+        with_query_admission(state, matched.route.admission, || {
+            compat_value(matched.route.handler, matched.param, state, &params)
+        })
+    });
+    compat_http(state, matched.route.template, result, started)
+}
+
+fn match_route_path(pattern: RoutePattern, path: &str) -> Option<Option<&str>> {
+    match pattern {
+        RoutePattern::Exact(exact) => (path == exact).then_some(None),
+        RoutePattern::PrefixParam { prefix } => path
+            .strip_prefix(prefix)
+            .filter(|param| !param.is_empty() && !param.contains('/'))
+            .map(Some),
+        RoutePattern::PrefixSuffixParam { prefix, suffix } => path
+            .strip_prefix(prefix)
+            .and_then(|rest| rest.strip_suffix(suffix))
+            .filter(|param| !param.is_empty() && !param.contains('/'))
+            .map(Some),
+    }
+}
+
+fn compat_value(
+    handler: CompatHandler,
+    param: Option<&str>,
+    state: &AppState,
+    params: &HashMap<String, String>,
+) -> Result<Value, ApiError> {
+    match handler {
+        CompatHandler::PrometheusQuery => compat::prometheus_query(state, params),
+        CompatHandler::PrometheusQueryRange => compat::prometheus_query_range(state, params),
+        CompatHandler::PrometheusLabels => compat::prometheus_labels(state, params),
+        CompatHandler::PrometheusSeries => compat::prometheus_series(state, params),
+        CompatHandler::PrometheusMetadata => compat::prometheus_metadata(state),
+        CompatHandler::PrometheusLabelValues => {
+            compat::prometheus_label_values(state, param.expect("label route has param"), params)
         }
-    };
-    Some(compat_http(state, query_class, result, started))
+        CompatHandler::LokiQuery => compat::loki_query(state, params),
+        CompatHandler::LokiQueryRange => compat::loki_query_range(state, params),
+        CompatHandler::LokiLabels => compat::loki_labels(state, params),
+        CompatHandler::LokiSeries => compat::loki_series(state, params),
+        CompatHandler::LokiLabelValues => {
+            compat::loki_label_values(state, param.expect("label route has param"), params)
+        }
+        CompatHandler::TempoSearch => compat::tempo_search(state, params),
+        CompatHandler::TempoTags => Ok(compat::tempo_tags()),
+        CompatHandler::TempoTrace => {
+            compat::tempo_trace(state, param.expect("trace route has param"))
+        }
+        CompatHandler::TempoTagValues => {
+            compat::tempo_tag_values(state, param.expect("tag route has param"), params)
+        }
+        CompatHandler::BuildInfo => Ok(json!({
+            "version": env!("CARGO_PKG_VERSION"),
+            "revision": "canardstack",
+            "branch": "local",
+            "buildUser": "canardstack",
+            "buildDate": ""
+        })),
+    }
 }
 
 fn tempo_trace_http(
-    state: &AppState,
-    query_class: &'static str,
-    trace_id: &str,
+    matched: CompatRouteMatch<'_>,
     headers: &HashMap<String, String>,
+    state: &AppState,
     started: Instant,
 ) -> HttpResponse {
+    let trace_id = matched.param.expect("trace route has param");
     let wants_json = headers
         .get("accept")
         .is_some_and(|value| value.contains("application/json"));
     if wants_json {
-        return compat_http(
-            state,
-            query_class,
-            api_auth(headers, state, || {
-                with_query_lane(state, QueryClass::Heavy, || {
-                    compat::tempo_trace(state, trace_id)
-                })
-            }),
-            started,
-        );
+        let result = authorize(matched.route.auth, headers, state, || {
+            with_query_admission(state, matched.route.admission, || {
+                compat::tempo_trace(state, trace_id)
+            })
+        });
+        return compat_http(state, matched.route.template, result, started);
     }
 
-    let result = api_auth(headers, state, || {
-        with_query_lane(state, QueryClass::Heavy, || {
+    let result = authorize(matched.route.auth, headers, state, || {
+        with_query_admission(state, matched.route.admission, || {
             compat::tempo_trace_proto(state, trace_id)
         })
     });
-    record_query_metrics(state, query_class, &result, started);
+    record_query_metrics(state, matched.route.template, &result, started);
     match result {
         Ok(bytes) => HttpResponse::bytes(200, "application/protobuf", bytes),
         Err(err) => compat_error_response(err),
     }
 }
 
-fn with_query_lane<T>(
+fn authorize<T>(
+    auth: AuthRequirement,
+    headers: &HashMap<String, String>,
     state: &AppState,
-    class: QueryClass,
     run: impl FnOnce() -> Result<T, ApiError>,
 ) -> Result<T, ApiError> {
-    let inputs = state.ingestor.lane_freshness_inputs(&state.storage);
-    let _guard = state.lanes.reserve_query(class, inputs, &state.metrics)?;
-    run()
+    match auth {
+        AuthRequirement::Api => api_auth(headers, state, run),
+    }
+}
+
+fn with_query_admission<T>(
+    state: &AppState,
+    admission: QueryAdmission,
+    run: impl FnOnce() -> Result<T, ApiError>,
+) -> Result<T, ApiError> {
+    match admission {
+        QueryAdmission::None => run(),
+        QueryAdmission::Cheap => {
+            let inputs = state.ingestor.freshness_budget_inputs(&state.storage);
+            let _guard =
+                state
+                    .admission
+                    .reserve_query(QueryClass::Cheap, inputs, &state.metrics)?;
+            run()
+        }
+        QueryAdmission::Heavy => {
+            let inputs = state.ingestor.freshness_budget_inputs(&state.storage);
+            let _guard =
+                state
+                    .admission
+                    .reserve_query(QueryClass::Heavy, inputs, &state.metrics)?;
+            run()
+        }
+    }
 }
 
 fn compat_error_response(err: ApiError) -> HttpResponse {
@@ -273,11 +451,11 @@ fn compat_error_response(err: ApiError) -> HttpResponse {
 
 fn compat_http(
     state: &AppState,
-    query_class: &'static str,
+    route_template: &'static str,
     result: Result<Value, ApiError>,
     started: Instant,
 ) -> HttpResponse {
-    record_query_metrics(state, query_class, &result, started);
+    record_query_metrics(state, route_template, &result, started);
     match result {
         Ok(value) => HttpResponse::json(200, value),
         Err(err) => compat_error_response(err),
@@ -286,7 +464,7 @@ fn compat_http(
 
 fn record_query_metrics<T>(
     state: &AppState,
-    query_class: &'static str,
+    route_template: &'static str,
     result: &Result<T, ApiError>,
     started: Instant,
 ) {
@@ -294,13 +472,15 @@ fn record_query_metrics<T>(
         Ok(_) => (200, "ok"),
         Err(err) => (err.status, err.reason),
     };
-    state
-        .metrics
-        .query_request(query_class, status, reason, started.elapsed().as_secs_f64());
-    state.metrics.observe_phase_seconds(
-        "query",
+    state.metrics.query_request(
+        route_template,
+        status,
+        reason,
+        started.elapsed().as_secs_f64(),
+    );
+    state.metrics.observe_query_route_phase_seconds(
+        route_template,
         "query_execute",
-        Some(query_class),
         started.elapsed().as_secs_f64(),
     );
 }

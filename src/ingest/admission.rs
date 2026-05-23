@@ -1,5 +1,5 @@
 use super::batches::PendingBatch;
-use super::Signal;
+use super::{OtlpRequestKind, StorageSignal};
 use crate::config::Config;
 use crate::metrics::Metrics;
 use crate::runtime::memory;
@@ -40,7 +40,7 @@ impl RuntimeMemoryReservation {
     pub(super) fn reserve_at_least(
         &mut self,
         target_bytes: usize,
-        signal: Signal,
+        route: OtlpRequestKind,
         metrics: &Metrics,
     ) -> ApiResult<()> {
         let Some(limit) = self.limit else {
@@ -54,7 +54,7 @@ impl RuntimeMemoryReservation {
             let Some(rss) = memory::runtime_rss_bytes() else {
                 metrics.inc(
                     "canardstack_ingest_runtime_memory_unknown_total",
-                    &[("signal", signal.as_str())],
+                    &[("request_kind", route.as_str())],
                     1,
                 );
                 return Ok(());
@@ -101,14 +101,15 @@ impl Drop for RuntimeMemoryReservation {
 /// Per-signal accounting of bytes that have been admitted (durably spooled and
 /// handed to an ingest worker) but not yet appended to the immutable buffer.
 ///
-/// Freshness-first admission in [`crate::lanes::LaneController::admit_ingest`] is
+/// Freshness-first admission in
+/// [`crate::admission_control::AdmissionController::admit_ingest`] is
 /// the single authority that sheds ingest under projected-visibility pressure.
 /// This tracker only adds a cheap per-signal ceiling so one signal's burst
 /// cannot monopolize the in-flight window, and exposes the in-flight total the
 /// freshness projection treats as "queued" bytes. It is lock-free: the former
 /// watermark/hysteresis credit ledger collapsed into plain atomics.
 pub(super) struct InflightBytes {
-    counters: [AtomicUsize; Signal::ALL.len()],
+    counters: [AtomicUsize; StorageSignal::ALL.len()],
     per_signal_capacity_bytes: usize,
 }
 
@@ -127,7 +128,7 @@ impl InflightBytes {
             .sum()
     }
 
-    pub(super) fn signal_bytes(&self, signal: Signal) -> usize {
+    pub(super) fn signal_bytes(&self, signal: StorageSignal) -> usize {
         self.counters[signal_index(signal)].load(Ordering::Acquire)
     }
 
@@ -137,12 +138,12 @@ impl InflightBytes {
 
     pub(super) fn estimate_for_request(
         &self,
-        signal: Signal,
+        route: OtlpRequestKind,
         headers: &HashMap<String, String>,
         compressed_body_bytes: usize,
         max_body_bytes: usize,
-    ) -> BTreeMap<Signal, usize> {
-        inflight_estimate_by_signal(signal, headers, compressed_body_bytes, max_body_bytes)
+    ) -> BTreeMap<StorageSignal, usize> {
+        inflight_estimate_by_request(route, headers, compressed_body_bytes, max_body_bytes)
     }
 
     /// Reserve the per-signal estimate, rejecting with `signal_inflight_full` if a
@@ -151,7 +152,7 @@ impl InflightBytes {
     /// returns its bytes instead of leaking toward a permanent 429.
     pub(super) fn reserve(
         self: &Arc<Self>,
-        estimate: BTreeMap<Signal, usize>,
+        estimate: BTreeMap<StorageSignal, usize>,
     ) -> ApiResult<InflightReservation> {
         let estimate = normalized_bytes(estimate);
         for (&signal, &bytes) in &estimate {
@@ -189,18 +190,18 @@ impl InflightBytes {
     }
 }
 
-fn signal_index(signal: Signal) -> usize {
+fn signal_index(signal: StorageSignal) -> usize {
     match signal {
-        Signal::Logs => 0,
-        Signal::Spans => 1,
-        Signal::MetricGauge => 2,
-        Signal::MetricSum => 3,
+        StorageSignal::Logs => 0,
+        StorageSignal::Spans => 1,
+        StorageSignal::MetricGauge => 2,
+        StorageSignal::MetricSum => 3,
     }
 }
 
 pub(super) struct InflightReservation {
     tracker: Arc<InflightBytes>,
-    bytes: BTreeMap<Signal, usize>,
+    bytes: BTreeMap<StorageSignal, usize>,
 }
 
 impl InflightReservation {
@@ -209,9 +210,9 @@ impl InflightReservation {
     /// the rows wait for the worker storage buffer append. Infallible: the request is
     /// already durably spooled, so accurate accounting must not be able to
     /// reject it here.
-    pub(super) fn adjust(&mut self, exact: BTreeMap<Signal, usize>) {
+    pub(super) fn adjust(&mut self, exact: BTreeMap<StorageSignal, usize>) {
         let exact = normalized_bytes(exact);
-        for signal in Signal::ALL {
+        for signal in StorageSignal::ALL {
             let current = self.bytes.get(&signal).copied().unwrap_or(0);
             let desired = exact.get(&signal).copied().unwrap_or(0);
             if desired > current {
@@ -236,7 +237,7 @@ impl Drop for InflightReservation {
     }
 }
 
-pub(super) fn inflight_bytes_by_signal(batches: &[PendingBatch]) -> BTreeMap<Signal, usize> {
+pub(super) fn inflight_bytes_by_signal(batches: &[PendingBatch]) -> BTreeMap<StorageSignal, usize> {
     let mut bytes_by_signal = BTreeMap::new();
     for batch in batches {
         *bytes_by_signal.entry(batch.signal).or_default() += batch.approx_bytes;
@@ -278,21 +279,29 @@ fn inflight_estimate_bytes(
     }
 }
 
-fn inflight_estimate_by_signal(
-    signal: Signal,
+fn inflight_estimate_by_request(
+    route: OtlpRequestKind,
     headers: &HashMap<String, String>,
     compressed_body_bytes: usize,
     max_body_bytes: usize,
-) -> BTreeMap<Signal, usize> {
-    let bytes = if signal.is_metric() {
-        metric_inflight_estimate_bytes(headers, compressed_body_bytes, max_body_bytes)
-    } else {
-        inflight_estimate_bytes(headers, compressed_body_bytes, max_body_bytes)
-    };
-    if signal.is_metric() {
-        BTreeMap::from([(Signal::MetricGauge, bytes), (Signal::MetricSum, bytes)])
-    } else {
-        BTreeMap::from([(signal, bytes)])
+) -> BTreeMap<StorageSignal, usize> {
+    match route {
+        OtlpRequestKind::Logs => BTreeMap::from([(
+            StorageSignal::Logs,
+            inflight_estimate_bytes(headers, compressed_body_bytes, max_body_bytes),
+        )]),
+        OtlpRequestKind::Traces => BTreeMap::from([(
+            StorageSignal::Spans,
+            inflight_estimate_bytes(headers, compressed_body_bytes, max_body_bytes),
+        )]),
+        OtlpRequestKind::Metrics => {
+            let bytes =
+                metric_inflight_estimate_bytes(headers, compressed_body_bytes, max_body_bytes);
+            BTreeMap::from([
+                (StorageSignal::MetricGauge, bytes),
+                (StorageSignal::MetricSum, bytes),
+            ])
+        }
     }
 }
 
@@ -314,7 +323,9 @@ fn metric_inflight_estimate_bytes(
     }
 }
 
-fn normalized_bytes(bytes_by_signal: BTreeMap<Signal, usize>) -> BTreeMap<Signal, usize> {
+fn normalized_bytes(
+    bytes_by_signal: BTreeMap<StorageSignal, usize>,
+) -> BTreeMap<StorageSignal, usize> {
     bytes_by_signal
         .into_iter()
         .filter(|(_, bytes)| *bytes > 0)
@@ -339,18 +350,19 @@ mod tests {
     #[test]
     fn metric_inflight_estimate_reserves_both_metric_signals() {
         let estimate =
-            inflight_estimate_by_signal(Signal::MetricGauge, &HashMap::new(), 100, 1_000);
+            inflight_estimate_by_request(OtlpRequestKind::Metrics, &HashMap::new(), 100, 1_000);
 
-        assert_eq!(estimate.get(&Signal::MetricGauge), Some(&600));
-        assert_eq!(estimate.get(&Signal::MetricSum), Some(&600));
+        assert_eq!(estimate.get(&StorageSignal::MetricGauge), Some(&600));
+        assert_eq!(estimate.get(&StorageSignal::MetricSum), Some(&600));
         assert_eq!(estimate.len(), 2);
     }
 
     #[test]
     fn non_metric_inflight_estimate_reserves_request_signal_only() {
-        let estimate = inflight_estimate_by_signal(Signal::Logs, &HashMap::new(), 100, 1_000);
+        let estimate =
+            inflight_estimate_by_request(OtlpRequestKind::Logs, &HashMap::new(), 100, 1_000);
 
-        assert_eq!(estimate.get(&Signal::Logs), Some(&400));
+        assert_eq!(estimate.get(&StorageSignal::Logs), Some(&400));
         assert_eq!(estimate.len(), 1);
     }
 
@@ -362,7 +374,7 @@ mod tests {
         let config = Config::test(dir.path().join("canardstack.duckdb"));
         let tracker = Arc::new(InflightBytes::new(&config));
         let reservation = tracker
-            .reserve(BTreeMap::from([(Signal::Logs, 1_024)]))
+            .reserve(BTreeMap::from([(StorageSignal::Logs, 1_024)]))
             .unwrap();
         assert_eq!(tracker.total_bytes(), 1_024);
 
@@ -386,7 +398,7 @@ mod tests {
         config.per_signal_inflight_bytes = 16;
         let tracker = Arc::new(InflightBytes::new(&config));
 
-        let err = match tracker.reserve(BTreeMap::from([(Signal::Logs, 64)])) {
+        let err = match tracker.reserve(BTreeMap::from([(StorageSignal::Logs, 64)])) {
             Ok(_) => panic!("reservation above the per-signal ceiling must reject"),
             Err(err) => err,
         };
@@ -407,10 +419,10 @@ mod tests {
         let config = Config::test(dir.path().join("canardstack.duckdb"));
         let tracker = Arc::new(InflightBytes::new(&config));
         let mut reservation = tracker
-            .reserve(BTreeMap::from([(Signal::Logs, 1_000)]))
+            .reserve(BTreeMap::from([(StorageSignal::Logs, 1_000)]))
             .unwrap();
-        reservation.adjust(BTreeMap::from([(Signal::Logs, 250)]));
-        assert_eq!(tracker.signal_bytes(Signal::Logs), 250);
+        reservation.adjust(BTreeMap::from([(StorageSignal::Logs, 250)]));
+        assert_eq!(tracker.signal_bytes(StorageSignal::Logs), 250);
         drop(reservation);
         assert_eq!(tracker.total_bytes(), 0);
     }

@@ -848,14 +848,9 @@ fn build_report(input: BuildReportInput) -> Report {
             "measured-window stage throughput deltas unavailable from /metrics samples".to_string(),
         );
     } else {
-        let enqueued_rows = stage_throughput
-            .totals
-            .get("enqueued_rows")
-            .copied()
-            .unwrap_or(0.0);
         let buffered_rows = stage_throughput
             .totals
-            .get("flush_buffered_rows")
+            .get("buffered_rows")
             .copied()
             .unwrap_or(0.0);
         let visible_rows = stage_throughput
@@ -863,16 +858,10 @@ fn build_report(input: BuildReportInput) -> Report {
             .get("storage_visible_rows")
             .copied()
             .unwrap_or(0.0);
-        if enqueued_rows > 0.0 && buffered_rows < enqueued_rows * 0.80 {
+        if buffered_rows > 0.0 && visible_rows < buffered_rows * 0.80 {
             smell_observations.push(format!(
-                "flush buffered only {:.0}/{:.0} measured-window enqueued rows",
-                buffered_rows, enqueued_rows
-            ));
-        }
-        if enqueued_rows > 0.0 && visible_rows < enqueued_rows * 0.80 {
-            smell_observations.push(format!(
-                "storage-visible rows advanced only {:.0}/{:.0} measured-window enqueued rows",
-                visible_rows, enqueued_rows
+                "storage-visible rows advanced only {:.0}/{:.0} measured-window buffered rows",
+                visible_rows, buffered_rows
             ));
         }
     }
@@ -884,8 +873,8 @@ fn build_report(input: BuildReportInput) -> Report {
         storage,
         mut server_phase_timing,
         transform_counters,
-        flush_counters,
-        flush_gauges,
+        ingest_buffer_counters,
+        ingest_buffer_gauges,
         ducklake_maintenance_timing,
     ) = match scraped {
         Some(scraped) => (
@@ -894,8 +883,8 @@ fn build_report(input: BuildReportInput) -> Report {
             Some(scraped.storage),
             scraped.server_phase_timing,
             scraped.transform_counters,
-            scraped.flush_counters,
-            scraped.flush_gauges,
+            scraped.ingest_buffer_counters,
+            scraped.ingest_buffer_gauges,
             scraped.ducklake_maintenance_timing,
         ),
         None => (
@@ -1073,8 +1062,8 @@ fn build_report(input: BuildReportInput) -> Report {
         storage,
         server_phase_timing,
         transform_counters,
-        flush_counters,
-        flush_gauges,
+        ingest_buffer_counters,
+        ingest_buffer_gauges,
         ducklake_maintenance_timing,
         resource_samples,
         metric_snapshots,
@@ -1222,7 +1211,7 @@ fn print_summary(report: &Report, path: &Path) {
     }
     if report.stage_throughput.available {
         println!(
-            "stage_rates_per_sec accepted_decoded_bytes={:.0} transformed_rows={:.0} enqueued_rows={:.0} flush_buffered_rows={:.0} storage_visible_rows={:.0}",
+            "stage_rates_per_sec accepted_decoded_bytes={:.0} transformed_rows={:.0} buffered_rows={:.0} storage_visible_rows={:.0}",
             report
                 .stage_throughput
                 .totals_per_second
@@ -1238,13 +1227,7 @@ fn print_summary(report: &Report, path: &Path) {
             report
                 .stage_throughput
                 .totals_per_second
-                .get("enqueued_rows")
-                .copied()
-                .unwrap_or(0.0),
-            report
-                .stage_throughput
-                .totals_per_second
-                .get("flush_buffered_rows")
+                .get("buffered_rows")
                 .copied()
                 .unwrap_or(0.0),
             report
@@ -2596,8 +2579,8 @@ struct ScrapedMetrics {
     storage: StorageReport,
     server_phase_timing: BTreeMap<String, PhaseTimingReport>,
     transform_counters: BTreeMap<String, u64>,
-    flush_counters: BTreeMap<String, u64>,
-    flush_gauges: BTreeMap<String, f64>,
+    ingest_buffer_counters: BTreeMap<String, u64>,
+    ingest_buffer_gauges: BTreeMap<String, f64>,
     ducklake_maintenance_timing: BTreeMap<String, PhaseTimingReport>,
 }
 
@@ -2667,20 +2650,21 @@ fn scrape_metrics(text: &str) -> ScrapedMetrics {
                 out.transform_counters
                     .insert(labels_key(&metric.labels), metric.value as u64);
             }
-            name if name.starts_with("canardstack_ingest_flush_") && name.ends_with("_total") => {
-                out.flush_counters.insert(
+            name if name.starts_with("canardstack_ingest_buffered_")
+                && name.ends_with("_total") =>
+            {
+                out.ingest_buffer_counters.insert(
                     format!("{} {}", metric.name, labels_key(&metric.labels)),
                     metric.value as u64,
                 );
             }
-            name if name.starts_with("canardstack_ingest_flush_") => {
-                out.flush_gauges.insert(
+            name if name.starts_with("canardstack_ingest_buffered_") => {
+                out.ingest_buffer_gauges.insert(
                     format!("{} {}", metric.name, labels_key(&metric.labels)),
                     metric.value,
                 );
             }
-            "canardstack_ducklake_flush_inlined_duration_seconds_count"
-            | "canardstack_ducklake_compaction_duration_seconds_count" => {
+            "canardstack_ducklake_compaction_duration_seconds_count" => {
                 ducklake_counts.insert(
                     format!(
                         "{} {}",
@@ -2690,8 +2674,7 @@ fn scrape_metrics(text: &str) -> ScrapedMetrics {
                     metric.value,
                 );
             }
-            "canardstack_ducklake_flush_inlined_duration_seconds_sum"
-            | "canardstack_ducklake_compaction_duration_seconds_sum" => {
+            "canardstack_ducklake_compaction_duration_seconds_sum" => {
                 ducklake_sums.insert(
                     format!(
                         "{} {}",
@@ -2929,8 +2912,8 @@ struct Report {
     storage: Option<StorageReport>,
     server_phase_timing: BTreeMap<String, PhaseTimingReport>,
     transform_counters: BTreeMap<String, u64>,
-    flush_counters: BTreeMap<String, u64>,
-    flush_gauges: BTreeMap<String, f64>,
+    ingest_buffer_counters: BTreeMap<String, u64>,
+    ingest_buffer_gauges: BTreeMap<String, f64>,
     ducklake_maintenance_timing: BTreeMap<String, PhaseTimingReport>,
     resource_samples: Vec<ResourceSample>,
     metric_snapshots: Vec<MetricSnapshotReport>,
@@ -3095,19 +3078,19 @@ impl LokiProgressiveQueryReport {
     ) -> Self {
         let total_timing = server_phase_timing
             .get(
-                "phase=loki_progressive_query_execute,query_class=/loki/api/v1/query_range,signal=logs",
+                "phase=loki_progressive_query_execute,route_template=/loki/api/v1/query_range,storage_signal=logs",
             )
             .cloned()
             .unwrap_or_else(PhaseTimingReport::zero);
         let planner_timing = server_phase_timing
             .get(
-                "phase=loki_progressive_query_candidate_plan,query_class=/loki/api/v1/query_range,signal=logs",
+                "phase=loki_progressive_query_candidate_plan,route_template=/loki/api/v1/query_range,storage_signal=logs",
             )
             .cloned()
             .unwrap_or_else(PhaseTimingReport::zero);
         let candidate_execute_timing = server_phase_timing
             .get(
-                "phase=loki_progressive_query_candidate_execute,query_class=/loki/api/v1/query_range,signal=logs",
+                "phase=loki_progressive_query_candidate_execute,route_template=/loki/api/v1/query_range,storage_signal=logs",
             )
             .cloned()
             .unwrap_or_else(PhaseTimingReport::zero);
@@ -3266,97 +3249,61 @@ impl StageThroughputReport {
             StageMetric {
                 stage: "raw_spooled_records",
                 metric: "canardstack_raw_spool_records_total",
-                label: "signal",
+                label: "spool_lane",
                 kind: StageMetricKind::Counter,
             },
             StageMetric {
                 stage: "raw_spool_replayed_records",
                 metric: "canardstack_raw_spool_replayed_records_total",
-                label: "signal",
+                label: "request_kind",
                 kind: StageMetricKind::Counter,
             },
             StageMetric {
                 stage: "accepted_request_bytes",
                 metric: "canardstack_ingest_request_bytes_total",
-                label: "signal",
+                label: "request_kind",
                 kind: StageMetricKind::Counter,
             },
             StageMetric {
                 stage: "accepted_decoded_bytes",
                 metric: "canardstack_ingest_decoded_bytes_total",
-                label: "signal",
+                label: "request_kind",
                 kind: StageMetricKind::Counter,
             },
             StageMetric {
                 stage: "transformed_rows",
                 metric: "canardstack_ingest_transformed_rows_total",
-                label: "signal",
+                label: "storage_signal",
                 kind: StageMetricKind::Counter,
             },
             StageMetric {
-                stage: "enqueued_rows",
-                metric: "canardstack_ingest_enqueued_rows_total",
-                label: "signal",
+                stage: "buffered_rows",
+                metric: "canardstack_ingest_buffered_rows_total",
+                label: "storage_signal",
                 kind: StageMetricKind::Counter,
             },
             StageMetric {
-                stage: "enqueued_bytes",
-                metric: "canardstack_ingest_enqueued_bytes_total",
-                label: "signal",
-                kind: StageMetricKind::Counter,
-            },
-            StageMetric {
-                stage: "flush_drained_rows",
-                metric: "canardstack_ingest_flush_drained_rows_total",
-                label: "signal",
-                kind: StageMetricKind::Counter,
-            },
-            StageMetric {
-                stage: "flush_drained_bytes",
-                metric: "canardstack_ingest_flush_drained_bytes_total",
-                label: "signal",
-                kind: StageMetricKind::Counter,
-            },
-            StageMetric {
-                stage: "flush_coalesced_rows",
-                metric: "canardstack_ingest_flush_coalesced_rows_total",
-                label: "signal",
-                kind: StageMetricKind::Counter,
-            },
-            StageMetric {
-                stage: "flush_coalesced_bytes",
-                metric: "canardstack_ingest_flush_coalesced_bytes_total",
-                label: "signal",
-                kind: StageMetricKind::Counter,
-            },
-            StageMetric {
-                stage: "flush_buffered_rows",
-                metric: "canardstack_ingest_flush_buffered_rows_total",
-                label: "signal",
-                kind: StageMetricKind::Counter,
-            },
-            StageMetric {
-                stage: "flush_buffered_bytes",
-                metric: "canardstack_ingest_flush_buffered_bytes_total",
-                label: "signal",
+                stage: "buffered_bytes",
+                metric: "canardstack_ingest_buffered_bytes_total",
+                label: "storage_signal",
                 kind: StageMetricKind::Counter,
             },
             StageMetric {
                 stage: "immutable_sealed_rows",
                 metric: "canardstack_immutable_segments_sealed_rows_total",
-                label: "signal",
+                label: "storage_signal",
                 kind: StageMetricKind::Counter,
             },
             StageMetric {
                 stage: "immutable_sealed_files",
                 metric: "canardstack_immutable_segments_sealed_files_total",
-                label: "signal",
+                label: "storage_signal",
                 kind: StageMetricKind::Counter,
             },
             StageMetric {
                 stage: "raw_spool_checkpointed_records",
                 metric: "canardstack_raw_spool_checkpointed_records_total",
-                label: "signal",
+                label: "request_kind",
                 kind: StageMetricKind::Counter,
             },
             StageMetric {

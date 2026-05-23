@@ -11,7 +11,7 @@ The current MVP architecture is:
 ```text
 OTLP/HTTP -> cheap validation + freshness/runtime/queue admission
   -> fsynced local raw spool write -> ingest worker transform -> immutable buffer
-  -> scheduler single seal driver (protected seal lane) -> immutable Parquet segments
+  -> scheduler single seal driver (protected seal admission) -> immutable Parquet segments
   -> DuckLake registration -> logical DuckLake SQL compatibility APIs
 ```
 
@@ -27,8 +27,8 @@ Current product constraints:
   for bounded processing. It does not mean rows are committed or query-visible.
 - QueryEngine and compatibility APIs read registered logical DuckLake tables,
   not raw Parquet file paths.
-- Logical lane admission reserves seal capacity before query capacity. Cheap
-  discovery/probe/instant-ish queries retain a protected lane; heavy range/search
+- Admission control reserves seal capacity before query capacity. Cheap
+  discovery/probe/instant-ish queries retain a protected admission; heavy range/search
   queries degrade or reject first under freshness debt.
 - Metrics performance is TBD. The current MVP envelope is for logs and traces.
 
@@ -65,7 +65,7 @@ cargo clippy --all-targets --all-features --locked -- -D warnings
 
 # Focused tests
 cargo test raw_spool -- --nocapture
-cargo test raw_spool_replays_accepted_unflushed_request_after_restart -- --nocapture
+cargo test raw_spool_replays_accepted_unsealed_request_after_restart -- --nocapture
 cargo test admin_ingest_health_includes_raw_spool_backlog -- --nocapture
 cargo test loki_query_range_backward_uses_standard_log_query -- --nocapture
 
@@ -97,7 +97,7 @@ CANARDSTACK_RAW_SPOOL_GATE_WARMUP=10s
 CANARDSTACK_RAW_SPOOL_GATE_DURATION=60s
 CANARDSTACK_RAW_SPOOL_GATE_TARGET_GB_DAY=500
 CANARDSTACK_RAW_SPOOL_GATE_TRACE_TARGET_GB_DAY=500
-CANARDSTACK_RAW_SPOOL_GATE_FRESHNESS_SLA=15s
+CANARDSTACK_FRESHNESS_BUDGET_SLA=15s
 CANARDSTACK_RAW_SPOOL_GATE_BACKLOG_RECORDS=10000
 CANARDSTACK_RAW_SPOOL_GATE_BACKLOG_BYTES=134217728
 CANARDSTACK_RAW_SPOOL_GATE_MAX_RUNTIME=3m
@@ -136,7 +136,7 @@ Common options:
 - `--freshness-sla 15s`
 - `--report-dir /private/tmp/canardstack-bench`
 
-Signal-specific mixed-query pressure maps to the current compatibility surface:
+Storage-signal-specific mixed-query pressure maps to the current compatibility surface:
 
 - `logs`: Loki `GET /loki/api/v1/query_range`.
 - `spans`: Tempo `GET /api/search`.
@@ -152,9 +152,9 @@ Reports include:
 - queue trends
 - raw-spool, transform, buffer, seal, checkpoint, and storage-visible
   stage throughput
-- lane capacity/in-use, projected seal seconds, projected buffer seconds,
+- admission capacity/in-use, projected seal seconds, projected buffer seconds,
   projected visibility seconds, freshness-budget rejections, and heavy-query
-  lane reductions when emitted
+  admission reductions when emitted
 - Loki query latency for log runs
 - process CPU/RSS samples when `--server-pid` can be sampled
 
@@ -203,9 +203,9 @@ Traces:
 Metrics:
 
 - Sustained mixed-query metric performance remains exploratory. Keep the latest
-  comparable report path with any lane or query-admission change.
-- The closest pre-lane 10-minute metrics mixed-query baseline for the
-  freshness-first lane work is
+  comparable report path with any admission change.
+- The closest pre-admission 10-minute metrics mixed-query baseline for the
+  freshness-first admission work is
   `/private/tmp/canardstack-fireforget-baseline-current/report/20260521T030914Z/report.json`.
   It targeted `4000 GB/day`, `metrics`, `mixed-query`,
   `ingest_concurrency=64`, persistent connections, `30s` warmup, and `601s`
@@ -213,13 +213,13 @@ Metrics:
   `1,474,970` `429`s, `14` `503`s, had `14/144` query failures, max queue
   bytes `509,995,784`, max queue oldest age `16.91s`, and max measured
   freshness lag `4.53s`.
-- The May 21 split-debt lane tuning report is
-  `/private/tmp/canardstack-lanes-debt2-report/20260521T185804Z/report.json`.
+- The May 21 split-debt admission tuning report is
+  `/private/tmp/canardstack-admission-debt2-report/20260521T185804Z/report.json`.
   It used the same `4000 GB/day` metrics mixed-query shape, accepted
   `37.03 MB/s`, returned `3,544,056` `202`s, `882,684` `429`s, `0` `503`s,
   had `2/230` query failures, max queue oldest age `16.96s`, and max measured
   freshness lag `2.28s`. It still failed the absolute 90%-of-target and
-  zero-query-failure gates, but materially improved the lane baseline.
+  zero-query-failure gates, but materially improved the admission baseline.
 
 Recent single-node throughput scout, May 20 2026: the highest clean 10-minute
 mixed-signal run was `2000 GB/day` at ingest concurrency `64`, with
@@ -252,7 +252,7 @@ Every future benchmark entry should record:
 - ingest/query latency p50/p95/p99
 - freshness lag
 - status counts and transport errors
-- lane projected visibility, freshness-budget rejections, and query lane reductions/rejections when relevant
+- admission projected visibility, freshness-budget rejections, and query admission reductions/rejections when relevant
 
 Use `15s` as the quick validation freshness SLA and `30s` as the sustained
 multi-hour freshness SLA. Treat a clearly increasing freshness trend as a

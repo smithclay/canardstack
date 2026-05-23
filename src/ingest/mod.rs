@@ -1,5 +1,5 @@
+use crate::admission_control::{AdmissionController, FreshnessBudgetInputs};
 use crate::config::Config;
-use crate::lanes::{FreshnessInputs, LaneController};
 use crate::metrics::Metrics;
 use crate::otlp::{self, Transformed};
 use crate::storage::{ArrowBatchBuffer, ArrowBatchBufferTiming, Storage};
@@ -25,7 +25,7 @@ pub use batches::IngestSnapshot;
 use worker::IngestWorkerPool;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize)]
-pub enum Signal {
+pub enum StorageSignal {
     Logs,
     Spans,
     MetricGauge,
@@ -33,13 +33,13 @@ pub enum Signal {
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize)]
-pub enum IngestRoute {
+pub enum OtlpRequestKind {
     Logs,
     Traces,
     Metrics,
 }
 
-impl IngestRoute {
+impl OtlpRequestKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Logs => "logs",
@@ -48,49 +48,59 @@ impl IngestRoute {
         }
     }
 
-    pub fn spool_record_signal(self) -> Signal {
+    pub fn raw_spool_lane(self) -> RawSpoolLane {
         match self {
-            Self::Logs => Signal::Logs,
-            Self::Traces => Signal::Spans,
-            // Metrics requests can produce gauge and sum tables. The raw record
-            // keeps one signal for replay compatibility; metric spool sharding
-            // below chooses the actual raw-spool directory independently.
-            Self::Metrics => Signal::MetricGauge,
-        }
-    }
-
-    pub fn from_spool_record_signal(signal: Signal) -> Self {
-        match signal {
-            Signal::Logs => Self::Logs,
-            Signal::Spans => Self::Traces,
-            Signal::MetricGauge | Signal::MetricSum => Self::Metrics,
+            Self::Logs => RawSpoolLane::Logs,
+            Self::Traces => RawSpoolLane::Traces,
+            Self::Metrics => RawSpoolLane::Metrics,
         }
     }
 }
 
-impl Signal {
-    pub const ALL: [Signal; 4] = [
-        Signal::Logs,
-        Signal::Spans,
-        Signal::MetricGauge,
-        Signal::MetricSum,
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize)]
+pub enum RawSpoolLane {
+    Logs,
+    Traces,
+    Metrics,
+}
+
+impl RawSpoolLane {
+    pub const ALL: [RawSpoolLane; 3] = [Self::Logs, Self::Traces, Self::Metrics];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Logs => "logs",
+            Self::Traces => "traces",
+            Self::Metrics => "metrics",
+        }
+    }
+}
+
+impl fmt::Display for RawSpoolLane {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl StorageSignal {
+    pub const ALL: [StorageSignal; 4] = [
+        StorageSignal::Logs,
+        StorageSignal::Spans,
+        StorageSignal::MetricGauge,
+        StorageSignal::MetricSum,
     ];
 
     pub fn as_str(self) -> &'static str {
         match self {
-            Signal::Logs => "logs",
-            Signal::Spans => "spans",
-            Signal::MetricGauge => "metric_gauge",
-            Signal::MetricSum => "metric_sum",
+            StorageSignal::Logs => "logs",
+            StorageSignal::Spans => "spans",
+            StorageSignal::MetricGauge => "metric_gauge",
+            StorageSignal::MetricSum => "metric_sum",
         }
-    }
-
-    fn is_metric(self) -> bool {
-        matches!(self, Signal::MetricGauge | Signal::MetricSum)
     }
 }
 
-impl fmt::Display for Signal {
+impl fmt::Display for StorageSignal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
@@ -99,16 +109,14 @@ impl fmt::Display for Signal {
 pub struct Ingestor {
     runtime_memory_reserved_bytes: Arc<AtomicUsize>,
     inflight: Arc<admission::InflightBytes>,
-    raw_spools: BTreeMap<Signal, Writer>,
-    metric_raw_spool_next: AtomicUsize,
-    raw_spool_seal_refs: Arc<Mutex<BTreeMap<(Signal, RecordId), SealRef>>>,
+    raw_spools: BTreeMap<RawSpoolLane, Writer>,
+    raw_spool_seal_refs: Arc<Mutex<BTreeMap<(RawSpoolLane, RecordId), SealRef>>>,
     ingest_workers: Mutex<Option<IngestWorkerPool>>,
     config: Config,
 }
 
 pub(in crate::ingest) struct SpooledIngestWork {
-    pub(in crate::ingest) route: IngestRoute,
-    pub(in crate::ingest) signal: Signal,
+    pub(in crate::ingest) route: OtlpRequestKind,
     headers: HashMap<String, String>,
     compressed_body: Vec<u8>,
     raw_spool_ref: spool::AppendRef,
@@ -120,14 +128,13 @@ pub(in crate::ingest) struct SpooledIngestWork {
 impl Ingestor {
     pub fn new(config: Config) -> Result<Self> {
         let mut raw_spools = BTreeMap::new();
-        for signal in all_signals() {
-            raw_spools.insert(signal, spawn_raw_spool_writer(&config, signal)?);
+        for lane in RawSpoolLane::ALL {
+            raw_spools.insert(lane, spawn_raw_spool_writer(&config, lane)?);
         }
         Ok(Self {
             runtime_memory_reserved_bytes: Arc::new(AtomicUsize::new(0)),
             inflight: Arc::new(admission::InflightBytes::new(&config)),
             raw_spools,
-            metric_raw_spool_next: AtomicUsize::new(0),
             raw_spool_seal_refs: Arc::new(Mutex::new(BTreeMap::new())),
             ingest_workers: Mutex::new(None),
             config,
@@ -136,14 +143,13 @@ impl Ingestor {
 
     pub fn ingest(
         &self,
-        route: IngestRoute,
+        route: OtlpRequestKind,
         headers: &HashMap<String, String>,
         compressed_body: Vec<u8>,
         storage: &Storage,
-        lanes: &LaneController,
+        admission: &AdmissionController,
         metrics: Arc<Metrics>,
     ) -> ApiResult<Value> {
-        let signal = route.spool_record_signal();
         let async_metrics = Arc::clone(&metrics);
         let metrics = metrics.as_ref();
         if let Err(err) = validation::validate_body_size(compressed_body.len(), &self.config) {
@@ -164,11 +170,11 @@ impl Ingestor {
             .with_retry_after(10));
         }
         let inflight_reservation = match self.reserve_inflight(
-            signal,
+            route,
             headers,
             compressed_body.len(),
             storage,
-            lanes,
+            admission,
             metrics,
         ) {
             Ok(reservation) => reservation,
@@ -179,19 +185,19 @@ impl Ingestor {
             }
         };
         let runtime_memory_reservation =
-            match self.admit_runtime_memory(signal, headers, compressed_body.len(), metrics) {
+            match self.admit_runtime_memory(route, headers, compressed_body.len(), metrics) {
                 Ok(reservation) => reservation,
                 Err(err) => {
                     metrics.ingest_request(route.as_str(), err.status, err.reason);
                     return Err(err);
                 }
             };
-        if let Err(err) = self.ensure_ingest_workers_available(signal, metrics) {
+        if let Err(err) = self.ensure_ingest_workers_available(route, metrics) {
             metrics.ingest_request(route.as_str(), err.status, err.reason);
             return Err(err);
         }
         let (raw_spool_ref, compressed_body) =
-            match self.append_raw_spool(signal, headers, compressed_body, metrics) {
+            match self.append_raw_spool(route, headers, compressed_body, metrics) {
                 Ok(appended) => appended,
                 Err(err) => {
                     metrics.ingest_request(route.as_str(), err.status, err.reason);
@@ -200,7 +206,6 @@ impl Ingestor {
             };
         let spooled = SpooledIngestWork {
             route,
-            signal,
             headers: headers.clone(),
             compressed_body,
             raw_spool_ref,
@@ -217,7 +222,6 @@ impl Ingestor {
         storage: &Storage,
     ) -> ApiResult<()> {
         let SpooledIngestWork {
-            signal,
             route,
             headers,
             compressed_body,
@@ -231,10 +235,9 @@ impl Ingestor {
         let started = Instant::now();
         let body_result =
             otlp::decompress_if_needed(&headers, &compressed_body, self.config.max_body_bytes);
-        metrics.observe_phase_seconds(
-            signal.as_str(),
+        metrics.observe_request_phase_seconds(
+            route.as_str(),
             "decompress",
-            None,
             started.elapsed().as_secs_f64(),
         );
         let body = match body_result {
@@ -245,7 +248,7 @@ impl Ingestor {
                 } else {
                     "decode_failed"
                 };
-                self.checkpoint_raw_spool_terminal(raw_spool_ref, signal, reason, metrics)?;
+                self.checkpoint_raw_spool_terminal(raw_spool_ref, route, reason, metrics)?;
                 return Err(err);
             }
         };
@@ -254,12 +257,7 @@ impl Ingestor {
             std::borrow::Cow::Owned(bytes) => bytes.len(),
         };
         if let Err(err) = validation::validate_body_size(body.len(), &self.config) {
-            self.checkpoint_raw_spool_terminal(
-                raw_spool_ref,
-                signal,
-                "body_size_invalid",
-                metrics,
-            )?;
+            self.checkpoint_raw_spool_terminal(raw_spool_ref, route, "body_size_invalid", metrics)?;
             return Err(err);
         }
         let started = Instant::now();
@@ -267,10 +265,9 @@ impl Ingestor {
         let transformed_result = otlp::transform_observed(route, &headers, &body, metrics);
         #[cfg(not(feature = "otlp2records-observer"))]
         let transformed_result = otlp::transform(route, &headers, &body);
-        metrics.observe_phase_seconds(
-            signal.as_str(),
+        metrics.observe_request_phase_seconds(
+            route.as_str(),
             "otlp_transform",
-            None,
             started.elapsed().as_secs_f64(),
         );
         let transformed = match transformed_result {
@@ -278,7 +275,7 @@ impl Ingestor {
             Err(err) => {
                 self.checkpoint_raw_spool_terminal(
                     raw_spool_ref,
-                    signal,
+                    route,
                     "transform_failed",
                     metrics,
                 )?;
@@ -288,16 +285,15 @@ impl Ingestor {
         let unsupported_histograms = transformed.unsupported_histograms;
         let started = Instant::now();
         let skew_result = self.validate_skew(&transformed);
-        metrics.observe_phase_seconds(
-            signal.as_str(),
+        metrics.observe_request_phase_seconds(
+            route.as_str(),
             "timestamp_validation",
-            None,
             started.elapsed().as_secs_f64(),
         );
         if let Err(err) = skew_result {
             self.checkpoint_raw_spool_terminal(
                 raw_spool_ref,
-                signal,
+                route,
                 "timestamp_rejected",
                 metrics,
             )?;
@@ -308,8 +304,8 @@ impl Ingestor {
             metrics.inc(
                 "canardstack_ingest_transformed_rows_total",
                 &[
-                    ("signal", output_signal.as_str()),
-                    ("request_signal", route.as_str()),
+                    ("storage_signal", output_signal.as_str()),
+                    ("request_kind", route.as_str()),
                 ],
                 rows as u64,
             );
@@ -326,12 +322,12 @@ impl Ingestor {
         let peak_bytes = request_bytes
             .saturating_add(decoded_body_materialized_bytes)
             .saturating_add(pending_bytes);
-        if let Err(err) = runtime_memory_reservation.reserve_at_least(peak_bytes, signal, metrics) {
-            self.checkpoint_raw_spool_terminal(raw_spool_ref, signal, "memory_rejected", metrics)?;
+        if let Err(err) = runtime_memory_reservation.reserve_at_least(peak_bytes, route, metrics) {
+            self.checkpoint_raw_spool_terminal(raw_spool_ref, route, "memory_rejected", metrics)?;
             return Err(err);
         }
         if batches.is_empty() {
-            self.checkpoint_raw_spool_terminal(raw_spool_ref, signal, "transform_empty", metrics)?;
+            self.checkpoint_raw_spool_terminal(raw_spool_ref, route, "transform_empty", metrics)?;
             return Ok(());
         }
 
@@ -346,10 +342,9 @@ impl Ingestor {
             .collect::<Vec<_>>();
         let buffer_started = Instant::now();
         let buffer_result = storage.buffer_arrow_batches(&buffers);
-        metrics.observe_phase_seconds(
-            signal.as_str(),
+        metrics.observe_request_phase_seconds(
+            route.as_str(),
             "storage_buffer",
-            None,
             buffer_started.elapsed().as_secs_f64(),
         );
         let buffered = match buffer_result {
@@ -361,12 +356,12 @@ impl Ingestor {
                 // dependency error; the admission credit drops with this scope.
                 metrics.inc(
                     "canardstack_ingest_storage_insert_total",
-                    &[("signal", signal.as_str()), ("status", "error")],
+                    &[("request_kind", route.as_str()), ("status", "error")],
                     1,
                 );
                 tracing::warn!(
                     event = "ingest_storage_insert_failed",
-                    signal = signal.as_str(),
+                    request_kind = route.as_str(),
                     error = %err
                 );
                 return Err(
@@ -378,7 +373,7 @@ impl Ingestor {
         observe_storage_timings(metrics, &buffered.timings);
         metrics.inc(
             "canardstack_ingest_storage_insert_total",
-            &[("signal", signal.as_str()), ("status", "ok")],
+            &[("request_kind", route.as_str()), ("status", "ok")],
             1,
         );
 
@@ -386,7 +381,7 @@ impl Ingestor {
         // scheduler checkpoints it after the next durable seal, then release the
         // admission credit (buffer occupancy is now reflected as buffered bytes
         // for freshness, not as a held queue credit).
-        self.track_raw_spool_record(raw_spool_ref, signal);
+        self.track_raw_spool_record(raw_spool_ref, route);
         drop(inflight_reservation);
 
         let accepted = buffered_totals
@@ -403,25 +398,25 @@ impl Ingestor {
         );
         metrics.inc(
             "canardstack_ingest_records_total",
-            &[("signal", signal.as_str())],
+            &[("request_kind", route.as_str())],
             accepted as u64,
         );
         if unsupported_histograms > 0 {
             metrics.inc(
                 "canardstack_ingest_unsupported_histograms_total",
-                &[("signal", signal.as_str())],
+                &[("request_kind", route.as_str())],
                 unsupported_histograms as u64,
             );
         }
         for (output_signal, (rows, bytes)) in buffered_totals {
             metrics.inc(
                 "canardstack_ingest_buffered_rows_total",
-                &[("signal", output_signal.as_str())],
+                &[("storage_signal", output_signal.as_str())],
                 rows as u64,
             );
             metrics.inc(
                 "canardstack_ingest_buffered_bytes_total",
-                &[("signal", output_signal.as_str())],
+                &[("storage_signal", output_signal.as_str())],
                 bytes as u64,
             );
         }
@@ -435,7 +430,6 @@ impl Ingestor {
         storage: &Storage,
         metrics: &Metrics,
     ) -> ApiResult<Value> {
-        let signal = work.signal;
         let route = work.route;
         // Round-robin to the first worker with buffer space. On a successful send
         // the function returns directly from inside the loop; if every worker is
@@ -457,7 +451,7 @@ impl Ingestor {
                                 self.record_worker_queue_metrics(metrics);
                                 metrics.inc(
                                     "canardstack_ingest_requests_queued_total",
-                                    &[("signal", signal.as_str()), ("status", "queued")],
+                                    &[("request_kind", route.as_str()), ("status", "queued")],
                                     1,
                                 );
                                 return Ok(json!({
@@ -481,7 +475,10 @@ impl Ingestor {
         // natural backpressure: request latency rises under worker saturation.
         metrics.inc(
             "canardstack_ingest_requests_queued_total",
-            &[("signal", signal.as_str()), ("status", "processed_inline")],
+            &[
+                ("request_kind", route.as_str()),
+                ("status", "processed_inline"),
+            ],
             1,
         );
         let result = self.process_spooled_ingest(work, storage);
@@ -494,7 +491,7 @@ impl Ingestor {
         if let Err(err) = result {
             tracing::warn!(
                 event = "ingest_inline_process_failed",
-                signal = signal.as_str(),
+                request_kind = route.as_str(),
                 status = err.status,
                 reason = err.reason,
                 message = %err.message,
@@ -508,14 +505,18 @@ impl Ingestor {
         }))
     }
 
-    fn ensure_ingest_workers_available(&self, signal: Signal, metrics: &Metrics) -> ApiResult<()> {
+    fn ensure_ingest_workers_available(
+        &self,
+        route: OtlpRequestKind,
+        metrics: &Metrics,
+    ) -> ApiResult<()> {
         {
             let pool = self.ingest_workers.lock_or_poisoned();
             let Some(dispatcher) = pool.as_ref() else {
                 metrics.inc(
                     "canardstack_ingest_requests_queued_total",
                     &[
-                        ("signal", signal.as_str()),
+                        ("request_kind", route.as_str()),
                         ("status", "workers_unavailable"),
                     ],
                     1,
@@ -531,7 +532,7 @@ impl Ingestor {
                 metrics.inc(
                     "canardstack_ingest_requests_queued_total",
                     &[
-                        ("signal", signal.as_str()),
+                        ("request_kind", route.as_str()),
                         ("status", "workers_unavailable"),
                     ],
                     1,
@@ -547,34 +548,34 @@ impl Ingestor {
         Ok(())
     }
 
-    /// Single ingest admission gate: project visibility through the lane
-    /// controller (the freshness-first authority), then take a per-signal
+    /// Single ingest admission gate: project visibility through the freshness
+    /// budget (the freshness-first authority), then take a per-storage-signal
     /// in-flight reservation as a cheap isolation ceiling. Both run before the
     /// durable raw-spool append, so a rejection never spools.
     fn reserve_inflight(
         &self,
-        signal: Signal,
+        route: OtlpRequestKind,
         headers: &HashMap<String, String>,
         compressed_body_bytes: usize,
         storage: &Storage,
-        lanes: &LaneController,
+        admission: &AdmissionController,
         metrics: &Metrics,
     ) -> ApiResult<admission::InflightReservation> {
         let estimate = self.inflight.estimate_for_request(
-            signal,
+            route,
             headers,
             compressed_body_bytes,
             self.config.max_body_bytes,
         );
-        let mut inputs = self.lane_freshness_inputs(storage);
+        let mut inputs = self.freshness_budget_inputs(storage);
         inputs.incoming_bytes = estimate.values().sum::<usize>();
-        lanes.admit_ingest(inputs, metrics)?;
+        admission.admit_ingest(inputs, metrics)?;
         self.inflight.reserve(estimate)
     }
 
     fn admit_runtime_memory(
         &self,
-        signal: Signal,
+        route: OtlpRequestKind,
         headers: &HashMap<String, String>,
         compressed_body_bytes: usize,
         metrics: &Metrics,
@@ -592,7 +593,7 @@ impl Ingestor {
                 compressed_body_bytes,
                 self.config.max_body_bytes,
             ),
-            signal,
+            route,
             metrics,
         )?;
         Ok(reservation)
@@ -600,12 +601,12 @@ impl Ingestor {
 
     pub fn snapshots(&self) -> Vec<IngestSnapshot> {
         let capacity = self.inflight.capacity_bytes();
-        Signal::ALL
+        StorageSignal::ALL
             .into_iter()
             .map(|signal| {
                 let inflight_bytes = self.inflight.signal_bytes(signal);
                 IngestSnapshot {
-                    signal: signal.as_str(),
+                    storage_signal: signal.as_str(),
                     inflight_bytes,
                     inflight_capacity_bytes: capacity,
                     pressure: if capacity == 0 {
@@ -622,27 +623,27 @@ impl Ingestor {
         for snapshot in self.snapshots() {
             metrics.gauge(
                 "canardstack_ingest_inflight_bytes",
-                &[("signal", snapshot.signal)],
+                &[("storage_signal", snapshot.storage_signal)],
                 snapshot.inflight_bytes as f64,
             );
             metrics.gauge_max(
                 "canardstack_ingest_inflight_bytes_max",
-                &[("signal", snapshot.signal)],
+                &[("storage_signal", snapshot.storage_signal)],
                 snapshot.inflight_bytes as f64,
             );
             metrics.gauge(
                 "canardstack_ingest_inflight_pressure",
-                &[("signal", snapshot.signal)],
+                &[("storage_signal", snapshot.storage_signal)],
                 snapshot.pressure,
             );
             metrics.gauge_max(
                 "canardstack_ingest_inflight_pressure_max",
-                &[("signal", snapshot.signal)],
+                &[("storage_signal", snapshot.storage_signal)],
                 snapshot.pressure,
             );
             metrics.gauge(
                 "canardstack_ingest_inflight_capacity_bytes",
-                &[("signal", snapshot.signal)],
+                &[("storage_signal", snapshot.storage_signal)],
                 snapshot.inflight_capacity_bytes as f64,
             );
         }
@@ -656,7 +657,7 @@ impl Ingestor {
         );
     }
 
-    pub fn lane_freshness_inputs(&self, storage: &Storage) -> FreshnessInputs {
+    pub fn freshness_budget_inputs(&self, storage: &Storage) -> FreshnessBudgetInputs {
         let (buffered_bytes, buffered_active_count, oldest_buffer_age_seconds) = storage
             .immutable_buffer_metrics()
             .into_iter()
@@ -667,7 +668,7 @@ impl Ingestor {
                     age.max(metric.age_seconds),
                 )
             });
-        FreshnessInputs {
+        FreshnessBudgetInputs {
             inflight_bytes: self.inflight_bytes(),
             incoming_bytes: 0,
             // Admitted bytes move straight from the worker into the immutable
@@ -699,12 +700,12 @@ impl Ingestor {
             .unwrap_or("identity");
         metrics.inc(
             "canardstack_ingest_request_bytes_total",
-            &[("signal", route), ("encoding", encoding)],
+            &[("request_kind", route), ("encoding", encoding)],
             request_bytes as u64,
         );
         metrics.inc(
             "canardstack_ingest_decoded_bytes_total",
-            &[("signal", route), ("encoding", encoding)],
+            &[("request_kind", route), ("encoding", encoding)],
             decoded_bytes as u64,
         );
     }
@@ -721,16 +722,15 @@ impl Ingestor {
 
 fn observe_storage_timings(metrics: &Metrics, timings: &[ArrowBatchBufferTiming]) {
     for timing in timings {
-        metrics.observe_phase_seconds(
+        metrics.observe_storage_signal_phase_seconds(
             timing.table.as_str(),
             timing.phase.as_str(),
-            None,
             timing.seconds,
         );
     }
 }
 
-fn transformed_rows_by_signal(transformed: &Transformed) -> Vec<(Signal, usize)> {
+fn transformed_rows_by_signal(transformed: &Transformed) -> Vec<(StorageSignal, usize)> {
     transformed
         .signal_batches()
         .into_iter()
@@ -741,14 +741,10 @@ fn transformed_rows_by_signal(transformed: &Transformed) -> Vec<(Signal, usize)>
         .collect()
 }
 
-fn all_signals() -> [Signal; 4] {
-    Signal::ALL
-}
-
-fn spawn_raw_spool_writer(config: &Config, signal: Signal) -> Result<Writer> {
+fn spawn_raw_spool_writer(config: &Config, lane: RawSpoolLane) -> Result<Writer> {
     Writer::spawn(
         Options {
-            dir: config.raw_spool_dir.join(signal.as_str()),
+            dir: config.raw_spool_dir.join(lane.as_str()),
             max_segment_bytes: config.raw_spool_max_segment_bytes as u64,
             max_record_bytes: config.raw_spool_max_record_bytes as u64,
             max_total_bytes: config.raw_spool_max_total_bytes as u64,
@@ -761,10 +757,12 @@ fn spawn_raw_spool_writer(config: &Config, signal: Signal) -> Result<Writer> {
         config.raw_spool_group_commit_records,
         config.raw_spool_group_commit_delay,
     )
-    .with_context(|| format!("spawn {signal} raw spool writer"))
+    .with_context(|| format!("spawn {lane} raw spool writer"))
 }
 
-fn pending_batch_totals(batches: &[batches::PendingBatch]) -> BTreeMap<Signal, (usize, usize)> {
+fn pending_batch_totals(
+    batches: &[batches::PendingBatch],
+) -> BTreeMap<StorageSignal, (usize, usize)> {
     let mut totals = BTreeMap::new();
     for batch in batches {
         let (rows, bytes) = totals.entry(batch.signal).or_insert((0, 0));

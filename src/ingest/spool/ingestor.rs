@@ -1,30 +1,29 @@
 use super::{full_info, AppendBatchStats, CheckpointBatchStats, Record, RecordId, Writer};
-use crate::ingest::{all_signals, IngestRoute, Ingestor, Signal};
-use crate::lanes::LaneController;
+use crate::admission_control::AdmissionController;
+use crate::ingest::{Ingestor, OtlpRequestKind, RawSpoolLane};
 use crate::metrics::Metrics;
 use crate::storage::{ImmutableSealOutcome, Storage, TimingPhase};
 use crate::validation::{self, ApiError, ApiResult};
 use crate::LockExt;
 use anyhow::{Context, Result};
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
 
 #[derive(Clone, Copy, Debug)]
 pub(in crate::ingest) struct SealRef {
-    pub(in crate::ingest) signal: Signal,
+    pub(in crate::ingest) request_kind: OtlpRequestKind,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub(in crate::ingest) struct AppendRef {
-    pub(in crate::ingest) spool: Signal,
+    pub(in crate::ingest) spool: RawSpoolLane,
     pub(in crate::ingest) id: RecordId,
 }
 
 struct RecoveredWork {
     raw_spool_ref: AppendRef,
-    signal: Signal,
+    route: OtlpRequestKind,
     headers: HashMap<String, String>,
     compressed_body: Vec<u8>,
 }
@@ -33,15 +32,15 @@ impl Ingestor {
     pub fn replay_raw_spool(
         &self,
         storage: &Storage,
-        lanes: &LaneController,
+        admission: &AdmissionController,
         metrics: Arc<Metrics>,
     ) -> Result<usize> {
         let mut replayed = 0usize;
-        for signal in all_signals() {
+        for lane in RawSpoolLane::ALL {
             let pending = self
-                .raw_spool_for(signal)?
+                .raw_spool_for(lane)?
                 .recover_pending()
-                .with_context(|| format!("recover {signal} raw spool pending records"))?;
+                .with_context(|| format!("recover {lane} raw spool pending records"))?;
             for recovered in pending {
                 let mut headers = HashMap::new();
                 headers.insert(
@@ -54,7 +53,8 @@ impl Ingestor {
                 metrics.inc(
                     "canardstack_raw_spool_replayed_records_total",
                     &[
-                        ("signal", recovered.record.signal.as_str()),
+                        ("request_kind", recovered.record.request_kind.as_str()),
+                        ("spool_lane", lane.as_str()),
                         ("status", "attempted"),
                     ],
                     1,
@@ -62,15 +62,15 @@ impl Ingestor {
                 match self.ingest_replayed_raw_record(
                     RecoveredWork {
                         raw_spool_ref: AppendRef {
-                            spool: signal,
+                            spool: lane,
                             id: recovered.id,
                         },
-                        signal: recovered.record.signal,
+                        route: recovered.record.request_kind,
                         headers,
                         compressed_body: recovered.record.compressed_body,
                     },
                     storage,
-                    lanes,
+                    admission,
                     metrics.clone(),
                 ) {
                     Ok(()) => {
@@ -78,7 +78,8 @@ impl Ingestor {
                         metrics.inc(
                             "canardstack_raw_spool_replayed_records_total",
                             &[
-                                ("signal", recovered.record.signal.as_str()),
+                                ("request_kind", recovered.record.request_kind.as_str()),
+                                ("spool_lane", lane.as_str()),
                                 ("status", "ok"),
                             ],
                             1,
@@ -88,7 +89,8 @@ impl Ingestor {
                         metrics.inc(
                             "canardstack_raw_spool_replayed_records_total",
                             &[
-                                ("signal", recovered.record.signal.as_str()),
+                                ("request_kind", recovered.record.request_kind.as_str()),
+                                ("spool_lane", lane.as_str()),
                                 ("status", "failed"),
                             ],
                             1,
@@ -98,7 +100,8 @@ impl Ingestor {
                         // retried on a future startup, preserving at-least-once delivery.
                         tracing::warn!(
                             event = "raw_spool_replay_record_failed",
-                            signal = recovered.record.signal.as_str(),
+                            request_kind = recovered.record.request_kind.as_str(),
+                            raw_spool_lane = lane.as_str(),
                             record_segment = recovered.id.segment,
                             record_sequence = recovered.id.sequence,
                             error = %err,
@@ -117,12 +120,12 @@ impl Ingestor {
         &self,
         recovered: RecoveredWork,
         storage: &Storage,
-        lanes: &LaneController,
+        admission: &AdmissionController,
         metrics: Arc<Metrics>,
     ) -> Result<()> {
         let RecoveredWork {
             raw_spool_ref,
-            signal,
+            route,
             headers,
             compressed_body,
         } = recovered;
@@ -135,22 +138,21 @@ impl Ingestor {
         }
         let inflight_reservation = self
             .reserve_inflight(
-                signal,
+                route,
                 &headers,
                 compressed_body.len(),
                 storage,
-                lanes,
+                admission,
                 metrics.as_ref(),
             )
             .map_err(|err| anyhow::anyhow!(err.message.clone()))?;
         let runtime_memory_reservation = self
-            .admit_runtime_memory(signal, &headers, compressed_body.len(), metrics.as_ref())
+            .admit_runtime_memory(route, &headers, compressed_body.len(), metrics.as_ref())
             .map_err(|err| anyhow::anyhow!(err.message.clone()))?;
-        self.ensure_ingest_workers_available(signal, metrics.as_ref())
+        self.ensure_ingest_workers_available(route, metrics.as_ref())
             .map_err(|err| anyhow::anyhow!(err.message.clone()))?;
         let work = crate::ingest::SpooledIngestWork {
-            route: IngestRoute::from_spool_record_signal(signal),
-            signal,
+            route,
             headers: headers.clone(),
             compressed_body,
             raw_spool_ref,
@@ -170,11 +172,14 @@ impl Ingestor {
     pub(in crate::ingest) fn track_raw_spool_record(
         &self,
         raw_spool_ref: AppendRef,
-        signal: Signal,
+        route: OtlpRequestKind,
     ) {
-        self.raw_spool_seal_refs
-            .lock_or_poisoned()
-            .insert((raw_spool_ref.spool, raw_spool_ref.id), SealRef { signal });
+        self.raw_spool_seal_refs.lock_or_poisoned().insert(
+            (raw_spool_ref.spool, raw_spool_ref.id),
+            SealRef {
+                request_kind: route,
+            },
+        );
     }
 
     /// Single seal driver: capture the records to checkpoint, force-seal the
@@ -211,13 +216,13 @@ impl Ingestor {
         Ok(outcome)
     }
 
-    fn capture_committed_refs(&self) -> Vec<(Signal, AppendRef)> {
+    fn capture_committed_refs(&self) -> Vec<(OtlpRequestKind, AppendRef)> {
         let mut refs = self.raw_spool_seal_refs.lock_or_poisoned();
         let captured = refs
             .iter()
             .map(|((spool, id), seal_ref)| {
                 (
-                    seal_ref.signal,
+                    seal_ref.request_kind,
                     AppendRef {
                         spool: *spool,
                         id: *id,
@@ -229,34 +234,33 @@ impl Ingestor {
         captured
     }
 
-    fn restore_committed_refs(&self, captured: Vec<(Signal, AppendRef)>) {
+    fn restore_committed_refs(&self, captured: Vec<(OtlpRequestKind, AppendRef)>) {
         let mut refs = self.raw_spool_seal_refs.lock_or_poisoned();
-        for (signal, append_ref) in captured {
+        for (request_kind, append_ref) in captured {
             refs.entry((append_ref.spool, append_ref.id))
-                .or_insert(SealRef { signal });
+                .or_insert(SealRef { request_kind });
         }
     }
 
     pub(in crate::ingest) fn append_raw_spool(
         &self,
-        signal: Signal,
+        route: OtlpRequestKind,
         headers: &HashMap<String, String>,
         compressed_body: Vec<u8>,
         metrics: &Metrics,
     ) -> ApiResult<(AppendRef, Vec<u8>)> {
-        let spool = self.spool_for_append(signal);
+        let spool = route.raw_spool_lane();
         let content_type = headers.get("content-type").cloned().unwrap_or_default();
         let content_encoding = headers.get("content-encoding").cloned();
         let compressed_body_len = compressed_body.len();
         let started = Instant::now();
-        let record = Record::new(signal, content_type, content_encoding, compressed_body);
+        let record = Record::new(route, content_type, content_encoding, compressed_body);
         let result = self
             .raw_spool_for(spool)
             .and_then(|raw_spool| raw_spool.append(record));
-        metrics.observe_phase_seconds(
+        metrics.observe_spool_lane_phase_seconds(
             spool.as_str(),
             "raw_spool_append",
-            None,
             started.elapsed().as_secs_f64(),
         );
         match result {
@@ -266,12 +270,12 @@ impl Ingestor {
                 }
                 metrics.inc(
                     "canardstack_raw_spool_records_total",
-                    &[("signal", spool.as_str()), ("status", "spooled")],
+                    &[("spool_lane", spool.as_str()), ("status", "spooled")],
                     1,
                 );
                 metrics.inc(
                     "canardstack_raw_spool_bytes_total",
-                    &[("signal", spool.as_str())],
+                    &[("spool_lane", spool.as_str())],
                     compressed_body_len as u64,
                 );
                 Ok((AppendRef { spool, id: ack.id }, ack.compressed_body))
@@ -280,7 +284,7 @@ impl Ingestor {
                 if full_info(&err).is_some() {
                     metrics.inc(
                         "canardstack_raw_spool_records_total",
-                        &[("signal", spool.as_str()), ("status", "full")],
+                        &[("spool_lane", spool.as_str()), ("status", "full")],
                         1,
                     );
                     Err(ApiError::new(
@@ -291,7 +295,7 @@ impl Ingestor {
                 } else if err.to_string().contains("raw spool writer queue is full") {
                     metrics.inc(
                         "canardstack_raw_spool_records_total",
-                        &[("signal", spool.as_str()), ("status", "queue_full")],
+                        &[("spool_lane", spool.as_str()), ("status", "queue_full")],
                         1,
                     );
                     Err(ApiError::new(
@@ -303,7 +307,7 @@ impl Ingestor {
                 } else {
                     metrics.inc(
                         "canardstack_raw_spool_records_total",
-                        &[("signal", spool.as_str()), ("status", "error")],
+                        &[("spool_lane", spool.as_str()), ("status", "error")],
                         1,
                     );
                     Err(ApiError::new(
@@ -319,85 +323,80 @@ impl Ingestor {
 
     fn record_raw_spool_append_batch_metrics(
         metrics: &Metrics,
-        signal: Signal,
+        lane: RawSpoolLane,
         stats: AppendBatchStats,
     ) {
         metrics.inc(
             "canardstack_raw_spool_append_batches_total",
-            &[("signal", signal.as_str())],
+            &[("spool_lane", lane.as_str())],
             1,
         );
         metrics.inc(
             "canardstack_raw_spool_append_batch_records_total",
-            &[("signal", signal.as_str())],
+            &[("spool_lane", lane.as_str())],
             stats.records as u64,
         );
         metrics.inc(
             "canardstack_raw_spool_append_batch_encoded_bytes_total",
-            &[("signal", signal.as_str())],
+            &[("spool_lane", lane.as_str())],
             stats.encoded_bytes,
         );
         metrics.inc(
             "canardstack_raw_spool_append_file_fsyncs_total",
-            &[("signal", signal.as_str())],
+            &[("spool_lane", lane.as_str())],
             stats.fsync_count,
         );
         metrics.gauge(
             "canardstack_raw_spool_append_batch_records",
-            &[("signal", signal.as_str()), ("stat", "last")],
+            &[("spool_lane", lane.as_str()), ("stat", "last")],
             stats.records as f64,
         );
         metrics.gauge_max(
             "canardstack_raw_spool_append_batch_records",
-            &[("signal", signal.as_str()), ("stat", "max")],
+            &[("spool_lane", lane.as_str()), ("stat", "max")],
             stats.records as f64,
         );
         metrics.gauge(
             "canardstack_raw_spool_append_batch_encoded_bytes",
-            &[("signal", signal.as_str()), ("stat", "last")],
+            &[("spool_lane", lane.as_str()), ("stat", "last")],
             stats.encoded_bytes as f64,
         );
         metrics.gauge_max(
             "canardstack_raw_spool_append_batch_encoded_bytes",
-            &[("signal", signal.as_str()), ("stat", "max")],
+            &[("spool_lane", lane.as_str()), ("stat", "max")],
             stats.encoded_bytes as f64,
         );
-        metrics.observe_phase_seconds_n(
-            signal.as_str(),
+        metrics.observe_spool_lane_phase_seconds_n(
+            lane.as_str(),
             "raw_spool_append_queue_wait",
-            None,
             stats.records as u64,
             stats.queue_seconds,
         );
-        metrics.observe_phase_seconds(
-            signal.as_str(),
+        metrics.observe_spool_lane_phase_seconds(
+            lane.as_str(),
             "raw_spool_append_batch_wait",
-            None,
             stats.wait_seconds,
         );
-        metrics.observe_phase_seconds(
-            signal.as_str(),
+        metrics.observe_spool_lane_phase_seconds(
+            lane.as_str(),
             "raw_spool_append_encode",
-            None,
             stats.encode_seconds,
         );
-        metrics.observe_phase_seconds(
-            signal.as_str(),
+        metrics.observe_spool_lane_phase_seconds(
+            lane.as_str(),
             "raw_spool_append_write",
-            None,
             stats.write_seconds,
         );
-        metrics.observe_phase_seconds(
-            signal.as_str(),
+        metrics.observe_spool_lane_phase_seconds(
+            lane.as_str(),
             "raw_spool_append_fsync",
-            None,
             stats.fsync_seconds,
         );
     }
 
     fn record_raw_spool_checkpoint_batch_metrics(
         metrics: &Metrics,
-        signal: Signal,
+        lane: RawSpoolLane,
         stats: CheckpointBatchStats,
     ) {
         if stats.records == 0 {
@@ -405,30 +404,28 @@ impl Ingestor {
         }
         metrics.inc(
             "canardstack_raw_spool_checkpoint_batches_total",
-            &[("signal", signal.as_str())],
+            &[("spool_lane", lane.as_str())],
             1,
         );
         metrics.inc(
             "canardstack_raw_spool_checkpoint_batch_records_total",
-            &[("signal", signal.as_str())],
+            &[("spool_lane", lane.as_str())],
             stats.records as u64,
         );
         metrics.inc(
             "canardstack_raw_spool_checkpoint_batch_commands_total",
-            &[("signal", signal.as_str())],
+            &[("spool_lane", lane.as_str())],
             stats.commands as u64,
         );
-        metrics.observe_phase_seconds_n(
-            signal.as_str(),
+        metrics.observe_spool_lane_phase_seconds_n(
+            lane.as_str(),
             "raw_spool_checkpoint_queue_wait",
-            None,
             stats.records as u64,
             stats.queue_seconds,
         );
-        metrics.observe_phase_seconds(
-            signal.as_str(),
+        metrics.observe_spool_lane_phase_seconds(
+            lane.as_str(),
             "raw_spool_checkpoint_batch_wait",
-            None,
             stats.wait_seconds,
         );
     }
@@ -436,11 +433,11 @@ impl Ingestor {
     pub(in crate::ingest) fn checkpoint_raw_spool_terminal(
         &self,
         raw_spool_ref: AppendRef,
-        signal: Signal,
+        route: OtlpRequestKind,
         reason: &'static str,
         metrics: &Metrics,
     ) -> ApiResult<()> {
-        self.checkpoint_raw_spool(raw_spool_ref, signal, reason, Some(metrics))
+        self.checkpoint_raw_spool(raw_spool_ref, route, reason, Some(metrics))
             .map_err(|err| {
                 ApiError::new(
                     503,
@@ -454,7 +451,7 @@ impl Ingestor {
     fn checkpoint_raw_spool(
         &self,
         raw_spool_ref: AppendRef,
-        signal: Signal,
+        route: OtlpRequestKind,
         reason: &'static str,
         metrics: Option<&Metrics>,
     ) -> Result<()> {
@@ -469,16 +466,16 @@ impl Ingestor {
             metrics.observe_seconds(
                 "canardstack_phase_duration_seconds",
                 &[
-                    ("signal", signal.as_str()),
+                    ("request_kind", route.as_str()),
                     ("phase", "raw_spool_terminal_checkpoint"),
                     ("reason", reason),
                 ],
                 seconds,
             );
-            metrics.observe_phase_seconds(signal.as_str(), "raw_spool_checkpoint", None, seconds);
+            metrics.observe_request_phase_seconds(route.as_str(), "raw_spool_checkpoint", seconds);
             metrics.inc(
                 "canardstack_raw_spool_checkpointed_records_total",
-                &[("signal", signal.as_str()), ("reason", reason)],
+                &[("request_kind", route.as_str()), ("reason", reason)],
                 1,
             );
         }
@@ -487,7 +484,7 @@ impl Ingestor {
 
     fn checkpoint_raw_spool_batch(
         &self,
-        records: &[(Signal, AppendRef)],
+        records: &[(OtlpRequestKind, AppendRef)],
         reason: &'static str,
         metrics: Option<&Metrics>,
     ) -> Result<()> {
@@ -495,37 +492,36 @@ impl Ingestor {
             return Ok(());
         }
         let started = Instant::now();
-        let mut by_signal_ids = BTreeMap::<Signal, Vec<RecordId>>::new();
+        let mut by_lane_ids = BTreeMap::<RawSpoolLane, Vec<RecordId>>::new();
         for (_, raw_spool_ref) in records {
-            by_signal_ids
+            by_lane_ids
                 .entry(raw_spool_ref.spool)
                 .or_default()
                 .push(raw_spool_ref.id);
         }
-        for (signal, ids) in by_signal_ids {
+        for (lane, ids) in by_lane_ids {
             let stats = self
-                .raw_spool_for(signal)?
+                .raw_spool_for(lane)?
                 .mark_committed_batch(&ids)
-                .with_context(|| format!("checkpoint {signal} raw spool records"))?;
+                .with_context(|| format!("checkpoint {lane} raw spool records"))?;
             if let Some(metrics) = metrics {
-                Self::record_raw_spool_checkpoint_batch_metrics(metrics, signal, stats);
+                Self::record_raw_spool_checkpoint_batch_metrics(metrics, lane, stats);
             }
         }
         if let Some(metrics) = metrics {
-            metrics.observe_phase_seconds(
+            metrics.observe_spool_lane_phase_seconds(
                 "all",
                 "raw_spool_checkpoint",
-                None,
                 started.elapsed().as_secs_f64(),
             );
-            let mut by_signal = BTreeMap::<Signal, u64>::new();
-            for (signal, _) in records {
-                *by_signal.entry(*signal).or_default() += 1;
+            let mut by_request_kind = BTreeMap::<OtlpRequestKind, u64>::new();
+            for (request_kind, _) in records {
+                *by_request_kind.entry(*request_kind).or_default() += 1;
             }
-            for (signal, count) in by_signal {
+            for (request_kind, count) in by_request_kind {
                 metrics.inc(
                     "canardstack_raw_spool_checkpointed_records_total",
-                    &[("signal", signal.as_str()), ("reason", reason)],
+                    &[("request_kind", request_kind.as_str()), ("reason", reason)],
                     count,
                 );
             }
@@ -538,63 +534,63 @@ impl Ingestor {
             healthy: true,
             ..Default::default()
         };
-        for signal in all_signals() {
+        for lane in RawSpoolLane::ALL {
             let stats = self
-                .raw_spool_for(signal)?
+                .raw_spool_for(lane)?
                 .stats()
-                .with_context(|| format!("read {signal} raw spool stats"))?;
+                .with_context(|| format!("read {lane} raw spool stats"))?;
             merge_raw_spool_stats(&mut aggregate, &stats);
         }
         Ok(aggregate)
     }
 
-    pub fn raw_spool_stats_by_signal(&self) -> Result<BTreeMap<&'static str, super::Stats>> {
-        let mut stats_by_signal = BTreeMap::new();
-        for signal in all_signals() {
-            stats_by_signal.insert(
-                signal.as_str(),
-                self.raw_spool_for(signal)?
+    pub fn raw_spool_stats_by_lane(&self) -> Result<BTreeMap<&'static str, super::Stats>> {
+        let mut stats_by_lane = BTreeMap::new();
+        for lane in RawSpoolLane::ALL {
+            stats_by_lane.insert(
+                lane.as_str(),
+                self.raw_spool_for(lane)?
                     .stats()
-                    .with_context(|| format!("read {signal} raw spool stats"))?,
+                    .with_context(|| format!("read {lane} raw spool stats"))?,
             );
         }
-        Ok(stats_by_signal)
+        Ok(stats_by_lane)
     }
 
-    /// True only when every per-signal raw-spool writer is healthy. A writer
+    /// True only when every raw-spool lane writer is healthy. A writer
     /// that cannot read its stats (thread stopped/poisoned) or is in the fatal
     /// append/fsync latch counts as unhealthy so readiness reports NOT ready.
     pub fn raw_spool_healthy(&self) -> bool {
-        all_signals().into_iter().all(|signal| {
-            self.raw_spool_for(signal)
+        RawSpoolLane::ALL.into_iter().all(|lane| {
+            self.raw_spool_for(lane)
                 .and_then(|spool| spool.stats())
                 .map(|stats| stats.healthy)
                 .unwrap_or(false)
         })
     }
 
-    /// Force a single signal's raw-spool writer into the fatal/unhealthy latch,
+    /// Force a single raw-spool lane writer into the fatal/unhealthy latch,
     /// mirroring a real append/fsync failure. Intended for tests that exercise
     /// readiness wiring; gated to debug builds.
     #[doc(hidden)]
     pub fn force_raw_spool_unhealthy(
         &self,
-        signal: Signal,
+        lane: RawSpoolLane,
         message: impl Into<String>,
     ) -> Result<()> {
-        self.raw_spool_for(signal)?.inject_fatal(message)
+        self.raw_spool_for(lane)?.inject_fatal(message)
     }
 
-    /// Per-signal raw-spool writer health, with the latched error message for
-    /// any unhealthy signal so the health JSON can show which signal is wedged.
-    pub fn raw_spool_health_by_signal(&self) -> BTreeMap<&'static str, (bool, Option<String>)> {
+    /// Per-lane raw-spool writer health, with the latched error message for
+    /// any unhealthy lane so the health JSON can show which lane is wedged.
+    pub fn raw_spool_health_by_lane(&self) -> BTreeMap<&'static str, (bool, Option<String>)> {
         let mut health = BTreeMap::new();
-        for signal in all_signals() {
-            let entry = match self.raw_spool_for(signal).and_then(|spool| spool.stats()) {
+        for lane in RawSpoolLane::ALL {
+            let entry = match self.raw_spool_for(lane).and_then(|spool| spool.stats()) {
                 Ok(stats) => (stats.healthy, stats.error),
                 Err(err) => (false, Some(err.to_string())),
             };
-            health.insert(signal.as_str(), entry);
+            health.insert(lane.as_str(), entry);
         }
         health
     }
@@ -658,74 +654,74 @@ impl Ingestor {
             );
             metrics.set_observation(
                 "canardstack_phase_duration_seconds",
-                &[("signal", "all"), ("phase", "raw_spool_append_fsync")],
+                &[("spool_lane", "all"), ("phase", "raw_spool_append_fsync")],
                 stats.append_syncs_total,
                 stats.append_sync_seconds_total,
             );
         }
-        for signal in all_signals() {
-            let Ok(stats) = self.raw_spool_for(signal).and_then(|spool| spool.stats()) else {
+        for lane in RawSpoolLane::ALL {
+            let Ok(stats) = self.raw_spool_for(lane).and_then(|spool| spool.stats()) else {
                 continue;
             };
             metrics.gauge(
                 "canardstack_raw_spool_segment_bytes",
-                &[("signal", signal.as_str())],
+                &[("spool_lane", lane.as_str())],
                 stats.segment_bytes as f64,
             );
             metrics.gauge(
                 "canardstack_raw_spool_segments",
-                &[("signal", signal.as_str())],
+                &[("spool_lane", lane.as_str())],
                 stats.segment_count as f64,
             );
             metrics.gauge(
                 "canardstack_raw_spool_pending_records",
-                &[("signal", signal.as_str())],
+                &[("spool_lane", lane.as_str())],
                 stats.pending_records as f64,
             );
             metrics.gauge(
                 "canardstack_raw_spool_pending_bytes",
-                &[("signal", signal.as_str())],
+                &[("spool_lane", lane.as_str())],
                 stats.pending_bytes as f64,
             );
             metrics.gauge(
                 "canardstack_raw_spool_unsynced_records",
-                &[("signal", signal.as_str())],
+                &[("spool_lane", lane.as_str())],
                 stats.unsynced_records as f64,
             );
             metrics.gauge(
                 "canardstack_raw_spool_unsynced_bytes",
-                &[("signal", signal.as_str())],
+                &[("spool_lane", lane.as_str())],
                 stats.unsynced_bytes as f64,
             );
             metrics.gauge(
                 "canardstack_raw_spool_unsynced_age_seconds",
-                &[("signal", signal.as_str())],
+                &[("spool_lane", lane.as_str())],
                 stats.unsynced_age_seconds,
             );
             metrics.gauge(
                 "canardstack_raw_spool_healthy",
-                &[("signal", signal.as_str())],
+                &[("spool_lane", lane.as_str())],
                 if stats.healthy { 1.0 } else { 0.0 },
             );
             metrics.set_counter(
                 "canardstack_raw_spool_append_syncs_total",
-                &[("signal", signal.as_str())],
+                &[("spool_lane", lane.as_str())],
                 stats.append_syncs_total,
             );
             metrics.set_counter(
                 "canardstack_raw_spool_append_sync_failures_total",
-                &[("signal", signal.as_str())],
+                &[("spool_lane", lane.as_str())],
                 stats.append_sync_failures_total,
             );
             metrics.set_counter(
                 "canardstack_raw_spool_append_file_fsyncs_total",
-                &[("signal", signal.as_str())],
+                &[("spool_lane", lane.as_str())],
                 stats.append_sync_file_fsyncs_total,
             );
             metrics.set_observation(
                 "canardstack_phase_duration_seconds",
                 &[
-                    ("signal", signal.as_str()),
+                    ("spool_lane", lane.as_str()),
                     ("phase", "raw_spool_append_fsync"),
                 ],
                 stats.append_syncs_total,
@@ -734,35 +730,18 @@ impl Ingestor {
         }
     }
 
-    fn raw_spool_for(&self, signal: Signal) -> Result<&Writer> {
+    fn raw_spool_for(&self, lane: RawSpoolLane) -> Result<&Writer> {
         self.raw_spools
-            .get(&signal)
-            .with_context(|| format!("raw spool writer for {signal} is unavailable"))
-    }
-
-    fn spool_for_append(&self, signal: Signal) -> Signal {
-        if signal.is_metric() {
-            if self
-                .metric_raw_spool_next
-                .fetch_add(1, Ordering::Relaxed)
-                .is_multiple_of(2)
-            {
-                Signal::MetricGauge
-            } else {
-                Signal::MetricSum
-            }
-        } else {
-            signal
-        }
+            .get(&lane)
+            .with_context(|| format!("raw spool writer for {lane} is unavailable"))
     }
 }
 
 fn observe_immutable_seal(metrics: &Metrics, outcome: &ImmutableSealOutcome) {
     for timing in &outcome.timings {
-        metrics.observe_phase_seconds(
+        metrics.observe_storage_signal_phase_seconds(
             timing.table.as_str(),
             timing.phase.as_str(),
-            None,
             timing.seconds,
         );
     }
@@ -773,12 +752,12 @@ fn observe_immutable_seal(metrics: &Metrics, outcome: &ImmutableSealOutcome) {
         if timing.phase == TimingPhase::ParquetEncode {
             metrics.inc(
                 "canardstack_immutable_segments_sealed_files_total",
-                &[("signal", timing.table.as_str())],
+                &[("storage_signal", timing.table.as_str())],
                 1,
             );
             metrics.inc(
                 "canardstack_immutable_segments_sealed_rows_total",
-                &[("signal", timing.table.as_str())],
+                &[("storage_signal", timing.table.as_str())],
                 timing.rows as u64,
             );
         }

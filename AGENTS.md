@@ -61,14 +61,14 @@ Data flow:
 OTLP/HTTP (JSON or protobuf, optional gzip)
   -> validation (auth, content type, size, timestamp skew)
   -> local fsync raw spool
-  -> otlp2records -> Arrow RecordBatch grouped by Signal
-  -> freshness-first admission (lane projection + per-signal in-flight ceiling)
+  -> otlp2records -> Arrow RecordBatch grouped by storage signal
+  -> freshness-first admission (freshness budget + per-storage-signal in-flight ceiling)
   -> ingest worker pool inserts into the storage immutable buffer
   -> scheduler single seal driver -> immutable Parquet segment files registered with DuckLake
   -> bounded compat query adapters for Prometheus / Loki / Tempo subsets
 ```
 
-Signals are `Logs`, `Spans`, `MetricGauge`, and `MetricSum`. Histograms and exponential histograms are intentionally rejected in v0.
+Storage signals are `Logs`, `Spans`, `MetricGauge`, and `MetricSum`. Histograms and exponential histograms are intentionally rejected in v0.
 
 ## Source Map
 
@@ -82,7 +82,7 @@ Top-level modules map to pipeline stages or boundaries. Subdirectories group hel
 - `src/validation.rs` - auth, content-type, size, compression, timestamp-skew checks, `ApiError`, and error envelopes.
 - `src/otlp.rs` - OTLP JSON/protobuf decode and `Transformed` payload construction.
 - `src/ingest/` - request flow, freshness-first admission, per-signal in-flight accounting, the durable raw spool, and the ingest worker pool that inserts into the storage immutable buffer.
-- `src/lanes.rs` - minimal logical lane controller for seal reservation, freshness-budget ingest admission, and cheap/heavy query admission.
+- `src/admission_control.rs` - seal admission, freshness-budget ingest admission, and cheap/heavy query admission.
 - `src/storage/` - DuckDB lifecycle, DuckLake `ATTACH`, extension install, immutable segment writes, `StorageProbe`, retention, and maintenance SQL.
 - `src/query/` - bounded query helpers, shared query plans, and Prometheus/Loki/Tempo selector parsing.
 - `src/compat/` - Prometheus/Loki/Tempo route adapters and the v0 public query surface.
@@ -100,7 +100,7 @@ Top-level modules map to pipeline stages or boundaries. Subdirectories group hel
 - Treat ingest as at-least-once after local durable spool: a 2xx response means the raw request was fsynced to the local raw spool and accepted for bounded processing. It does not mean the rows are DuckLake-committed or query-visible yet.
 - Preserve pressure behavior: ingest admission returns 429 under pressure, and storage/dependency failures surface as 503 where appropriate.
 - Preserve freshness-first admission: request-path checks may reject with 429 before raw-spool append when projected seal visibility exceeds the configured freshness SLA.
-- Preserve seal/query lane priority: seal capacity is reserved before query capacity; cheap metadata/probe/discovery/instant-ish queries keep a protected lane, and heavy range/search queries degrade or reject first under freshness debt.
+- Preserve seal/query admission priority: seal capacity is reserved before query capacity; cheap metadata/probe/discovery/instant-ish queries keep protected admission, and heavy range/search queries degrade or reject first under freshness debt.
 - Keep query routes bounded by time range, row limit, timeout, DuckDB memory limit, and concurrency caps through `QueryEngine`.
 - Do not expose arbitrary SQL through the compatibility APIs. Direct SQL is intentionally an external DuckDB CLI / MotherDuck path.
 - Preserve the Prometheus/Loki error envelope shape: `{"status":"error","errorType":"...","error":"..."}`.

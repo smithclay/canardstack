@@ -1,3 +1,4 @@
+pub mod admission_control;
 pub mod app;
 pub mod cli;
 pub mod compat;
@@ -5,7 +6,6 @@ pub mod config;
 mod db;
 pub mod http;
 pub mod ingest;
-pub mod lanes;
 pub mod logging;
 pub mod maintenance;
 pub mod metadata;

@@ -1,4 +1,4 @@
-use super::Signal;
+use super::OtlpRequestKind;
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use serde::Serialize;
@@ -35,7 +35,7 @@ pub struct RecordId {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Record {
-    pub signal: Signal,
+    pub request_kind: OtlpRequestKind,
     pub content_type: String,
     pub content_encoding: Option<String>,
     pub accepted_at_micros: i64,
@@ -169,7 +169,7 @@ struct SegmentState {
 
 pub struct Spool {
     dir: PathBuf,
-    signal_label: String,
+    lane_label: String,
     max_segment_bytes: u64,
     max_record_bytes: u64,
     max_total_bytes: u64,
@@ -290,10 +290,10 @@ impl Spool {
             .open(&checkpoint_path)
             .with_context(|| format!("open raw spool checkpoint {}", checkpoint_path.display()))?;
 
-        // The spool directory's final component is the signal name (see
+        // The spool directory's final component is the raw-spool lane (see
         // `spawn_raw_spool_writer`), so derive a stable label for diagnostics
-        // without threading a `Signal` through `Options`.
-        let signal_label = options
+        // without threading a `RawSpoolLane` through `Options`.
+        let lane_label = options
             .dir
             .file_name()
             .and_then(|name| name.to_str())
@@ -301,7 +301,7 @@ impl Spool {
             .to_string();
         Ok(Self {
             dir: options.dir,
-            signal_label,
+            lane_label,
             max_segment_bytes,
             max_record_bytes,
             max_total_bytes,
@@ -410,7 +410,7 @@ impl Spool {
             if active_bytes > 0
                 && active_bytes.saturating_add(record.bytes.len() as u64) > self.max_segment_bytes
             {
-                self.flush_append_group(&mut group, &mut group_records, &mut write_seconds)?;
+                self.drain_append_group(&mut group, &mut group_records, &mut write_seconds)?;
                 self.rotate()?;
             }
             let id = RecordId {
@@ -426,7 +426,7 @@ impl Spool {
             });
             ids.push(id);
         }
-        self.flush_append_group(&mut group, &mut group_records, &mut write_seconds)?;
+        self.drain_append_group(&mut group, &mut group_records, &mut write_seconds)?;
         Ok(AppendBatch {
             stats: AppendBatchStats {
                 records: ids.len(),
@@ -444,7 +444,7 @@ impl Spool {
         })
     }
 
-    fn flush_append_group(
+    fn drain_append_group(
         &mut self,
         group: &mut Vec<u8>,
         records: &mut Vec<AppendedRecord>,
@@ -654,7 +654,7 @@ impl Spool {
                 if self.fatal_error.is_none() {
                     tracing::error!(
                         event = "raw_spool_writer_fatal",
-                        signal = self.signal_label.as_str(),
+                        raw_spool_lane = self.lane_label.as_str(),
                         error = %message,
                         "raw spool writer entered fatal state; appends for this signal will 503 until restart"
                     );
@@ -795,9 +795,9 @@ impl Spool {
         if self.fatal_error.is_none() {
             tracing::error!(
                 event = "raw_spool_writer_fatal",
-                signal = self.signal_label.as_str(),
+                raw_spool_lane = self.lane_label.as_str(),
                 error = %message,
-                "raw spool writer entered fatal state; appends for this signal will 503 until restart"
+                "raw spool writer entered fatal state; appends for this lane will 503 until restart"
             );
         }
         self.fatal_error = Some(message);
@@ -815,13 +815,13 @@ pub fn full_info(err: &anyhow::Error) -> Option<&Full> {
 
 impl Record {
     pub fn new(
-        signal: Signal,
+        request_kind: OtlpRequestKind,
         content_type: impl Into<String>,
         content_encoding: Option<String>,
         compressed_body: impl Into<Vec<u8>>,
     ) -> Self {
         Self {
-            signal,
+            request_kind,
             content_type: content_type.into(),
             content_encoding,
             accepted_at_micros: Utc::now().timestamp_micros(),

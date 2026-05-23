@@ -1,4 +1,4 @@
-use super::super::Signal;
+use super::super::OtlpRequestKind;
 use super::{Record, RecordId, RecoveredRecord, RECORD_HEADER_BYTES, RECORD_MAGIC};
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
@@ -25,7 +25,7 @@ pub(super) struct PreparedRecord {
 #[derive(Serialize, Deserialize)]
 struct Header {
     sequence: u64,
-    signal: String,
+    request_kind: String,
     content_type: String,
     content_encoding: Option<String>,
     accepted_at_micros: i64,
@@ -92,7 +92,7 @@ pub(super) fn encode_record(sequence: u64, record: &Record) -> Result<Vec<u8>> {
 fn encode_prepared_record(sequence: u64, prepared: &PreparedRecord) -> Result<Vec<u8>> {
     let header = Header {
         sequence,
-        signal: prepared.record.signal.as_str().to_string(),
+        request_kind: prepared.record.request_kind.as_str().to_string(),
         content_type: prepared.record.content_type.clone(),
         content_encoding: prepared.record.content_encoding.clone(),
         accepted_at_micros: prepared.record.accepted_at_micros,
@@ -230,12 +230,13 @@ fn read_record_at(
             "raw spool record checksum mismatch",
         ));
     }
-    let signal = signal_from_str(&header.signal)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid raw spool signal"))?;
+    let request_kind = request_kind_from_str(&header.request_kind).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "invalid raw spool request kind")
+    })?;
     Ok(Some((
         header.sequence,
         Record {
-            signal,
+            request_kind,
             content_type: header.content_type,
             content_encoding: header.content_encoding,
             accepted_at_micros: header.accepted_at_micros,
@@ -311,12 +312,11 @@ pub(super) fn checkpoint_path(dir: &Path) -> PathBuf {
     dir.join("checkpoint.log")
 }
 
-fn signal_from_str(value: &str) -> Option<Signal> {
+fn request_kind_from_str(value: &str) -> Option<OtlpRequestKind> {
     match value {
-        "logs" => Some(Signal::Logs),
-        "spans" => Some(Signal::Spans),
-        "metric_gauge" => Some(Signal::MetricGauge),
-        "metric_sum" => Some(Signal::MetricSum),
+        "logs" => Some(OtlpRequestKind::Logs),
+        "traces" => Some(OtlpRequestKind::Traces),
+        "metrics" => Some(OtlpRequestKind::Metrics),
         _ => None,
     }
 }

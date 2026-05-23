@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::ingest::Signal;
+use crate::ingest::StorageSignal;
 use anyhow::{Context, Result};
 use arrow58::record_batch::RecordBatch;
 use duckdb::Connection;
@@ -82,7 +82,7 @@ pub struct StorageCapabilities {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct ImmutableBufferMetric {
-    pub table: Signal,
+    pub table: StorageSignal,
     pub rows: usize,
     pub bytes: usize,
     pub age_seconds: f64,
@@ -109,17 +109,17 @@ pub struct Storage {
     ducklake_managed_maintenance: bool,
     immutable_segment_target_bytes: usize,
     immutable_segment_max_age: Duration,
-    immutable_buffers: Mutex<BTreeMap<Signal, ImmutableSegmentBuffer>>,
+    immutable_buffers: Mutex<BTreeMap<StorageSignal, ImmutableSegmentBuffer>>,
     write_memory_limit: String,
     last_error: Mutex<Option<String>>,
     /// Cache-invalidation token for discovery metadata. Bumped only after a
     /// committed `metadata_summary` change (refresh or retention); discovery
     /// caches in `Metadata` key entries on this value and drop them on a bump.
     metadata_generation: AtomicU64,
-    /// Signal/event-date buckets whose `metadata_summary` rows are stale after
+    /// StorageSignal/event-date buckets whose `metadata_summary` rows are stale after
     /// a committed insert. Drained by the `metadata_refresh` scheduler job so
     /// the day-partition re-aggregation stays off the ingest commit path.
-    dirty_metadata: Mutex<BTreeMap<Signal, BTreeSet<String>>>,
+    dirty_metadata: Mutex<BTreeMap<StorageSignal, BTreeSet<String>>>,
 }
 
 pub struct RetentionPolicy {
@@ -144,7 +144,7 @@ impl std::fmt::Display for QueryTimeoutError {
 impl std::error::Error for QueryTimeoutError {}
 
 pub struct ArrowBatchBuffer<'a> {
-    pub table: Signal,
+    pub table: StorageSignal,
     pub batch: &'a RecordBatch,
     pub source_format: &'a str,
 }
@@ -190,7 +190,7 @@ impl std::fmt::Display for TimingPhase {
 
 #[derive(Clone, Debug)]
 pub struct ArrowBatchBufferTiming {
-    pub table: Signal,
+    pub table: StorageSignal,
     pub phase: TimingPhase,
     pub rows: usize,
     pub seconds: f64,
@@ -203,7 +203,7 @@ pub struct ArrowBatchBufferResult {
 }
 
 struct PreparedArrowBatch {
-    pub(super) table: Signal,
+    pub(super) table: StorageSignal,
     pub(super) batch: RecordBatch,
     pub(super) rows: usize,
     pub(super) timestamp_days: Vec<String>,
@@ -390,10 +390,10 @@ mod tests {
     #[test]
     fn metadata_refresh_uses_one_insert_per_signal_bucket() {
         for (signal, select_count) in [
-            (Signal::Logs, 8),
-            (Signal::Spans, 6),
-            (Signal::MetricGauge, 5),
-            (Signal::MetricSum, 5),
+            (StorageSignal::Logs, 8),
+            (StorageSignal::Spans, 6),
+            (StorageSignal::MetricGauge, 5),
+            (StorageSignal::MetricSum, 5),
         ] {
             let sql = metadata_refresh_sql("canardlake.", signal, "2026-05-16").unwrap();
             assert_eq!(

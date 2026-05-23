@@ -57,9 +57,9 @@ flowchart LR
 ```
 
 Admission is freshness-first: before the durable raw-spool append, the request
-projects seal visibility through the lane controller and is shed with `429`
-when projected visibility exceeds the freshness budget. A cheap per-signal
-in-flight ceiling (`signal_inflight_full`) keeps one signal's burst from
+projects seal visibility through the admission controller and is shed with `429`
+when projected visibility exceeds the freshness budget. A cheap per-storage-signal
+in-flight ceiling (`signal_inflight_full`) keeps one storage signal's burst from
 monopolizing the accepted-but-not-yet-buffered window. There is no separate
 in-memory queue and no seal worker: ingest workers insert directly into the
 storage immutable buffer, and a single scheduler-driven seal driver is the only
@@ -115,7 +115,7 @@ Retryable failure behavior:
 The raw spool sits after cheap request validation and before decompression or
 transform. It stores exactly the accepted request unit needed for replay:
 
-- signal route
+- OTLP request kind
 - content type
 - optional content encoding
 - accepted timestamp
@@ -159,8 +159,8 @@ Main knobs:
 - `CANARDSTACK_RAW_SPOOL_APPEND_SYNC_BYTES`
 
 `CANARDSTACK_RAW_SPOOL_CAPACITY_BYTES` applies to each raw-spool lane. The
-current lanes are logs, spans, metric gauge, and metric sum, so worst-case
-aggregate raw-spool disk use can reach roughly four times the configured value.
+current lanes are logs, traces, and metrics, so worst-case aggregate raw-spool
+disk use can reach roughly three times the configured value.
 Size the local data directory for the aggregate budget, not just one lane.
 
 ## Worker Buffers And Seal
@@ -175,7 +175,7 @@ skew-rejected accepted payloads are durably terminal-checkpointed so they do
 not replay forever. The ingest worker pool is the single "parallel ingest
 across OS threads" concept; there is no separate dataflow topology or
 storage-sink stage. Worker-buffer ownership is intentionally low-cardinality:
-signal plus source encoding.
+storage signal plus source encoding.
 
 Memory and worker-buffer guardrails:
 
@@ -196,10 +196,10 @@ A single scheduler-driven seal driver is the only seal path. It seals on a frequ
 cadence (`CANARDSTACK_SEAL_INTERVAL_MS`, default 1s) or earlier when a buffered
 signal reaches its size (`CANARDSTACK_SEGMENT_TARGET_BYTES`) or age
 (`CANARDSTACK_SEGMENT_MAX_AGE_*`) threshold. The cadence must stay well under the
-freshness SLA so immutable-buffer age never approaches the lane reject threshold;
+freshness-budget SLA so immutable-buffer age never approaches the admission reject threshold;
 it is deliberately decoupled from the coarse maintenance interval. Each seal
 captures the set of pending raw-spool records, force-seals the immutable buffer
-to Parquet under the seal lane, registers the files in DuckLake, and then
+to Parquet under seal admission, registers the files in DuckLake, and then
 checkpoints exactly the captured records. Capturing before sealing is
 load-bearing for at-least-once: a record appended after the capture is
 checkpointed on a later seal, never before its rows are durable. Admin seal
@@ -213,7 +213,7 @@ uses two local debt signals:
 - visibility-buffer debt: immutable storage-buffer bytes and age beyond the
   configured segment target and max age, before files are DuckLake-registered.
 
-The lane controller estimates:
+The admission controller estimates freshness budget:
 
 ```text
 projected_seal_seconds = inflight_bytes / ewma_seal_bytes_per_sec
@@ -225,37 +225,38 @@ projected_visibility_seconds =
       projected_buffer_seconds)
 ```
 
-If the projected visibility exceeds `CANARDSTACK_FRESHNESS_SLA_SECS` or `_MS`,
-the request returns retryable `429 freshness_budget_exceeded` and does not write
-the raw spool. Queue, process-memory, and runtime-memory pressure remain bounded
-and retryable.
+If projected visibility exceeds `CANARDSTACK_FRESHNESS_BUDGET_SLA_SECS` or
+`_MS`, the request returns retryable `429 freshness_budget_exceeded` and does
+not write the raw spool. Queue, process-memory, and runtime-memory pressure
+remain bounded and retryable.
 
-## Resource Lanes
+## Admission Primitives
 
-The process has logical lanes, implemented by one small in-process controller:
+The process has one small admission controller with three distinct primitives:
 
-- ingest admission lane: checks the projected-visibility freshness budget and a
-  per-signal in-flight ceiling before durable raw-spool append.
-- seal lane: reserves capacity for the scheduled seal driver and manual seal
-  before query capacity is considered.
-- query lane: splits compatibility routes into cheap and heavy classes.
-- operator/control lane: keeps health, metrics, and admin health available in
-  every serve role.
+- freshness budget: checks projected visibility plus a per-storage-signal
+  in-flight ceiling before durable raw-spool append.
+- seal admission: reserves capacity for the scheduled seal driver and manual
+  seal before query capacity is considered.
+- query admission: splits compatibility routes into cheap and heavy classes.
+
+Operator/control routes keep health, metrics, and admin health available in
+every serve role without using query admission.
 
 Heavy range/search/trace queries consume only the remaining query capacity after
 the seal and cheap-query reservations. When projected visibility debt reaches
-the freshness SLA, heavy query capacity degrades to
+the freshness-budget SLA, heavy query capacity degrades to
 `CANARDSTACK_HEAVY_QUERY_DEGRADED_CAPACITY`. If debt keeps rising, heavy queries
 return a protocol-compatible `429 freshness_debt` envelope. Cheap metadata,
 label, probe, and instant-ish routes retain
-`CANARDSTACK_CHEAP_QUERY_LANE_CAPACITY`.
+`CANARDSTACK_CHEAP_QUERY_ADMISSION_CAPACITY`.
 
-Lane knobs:
+Admission knobs:
 
-- `CANARDSTACK_SEAL_LANE_CAPACITY`, default `1`.
-- `CANARDSTACK_CHEAP_QUERY_LANE_CAPACITY`, default `1`.
+- `CANARDSTACK_SEAL_ADMISSION_CAPACITY`, default `1`.
+- `CANARDSTACK_CHEAP_QUERY_ADMISSION_CAPACITY`, default `1`.
 - `CANARDSTACK_HEAVY_QUERY_DEGRADED_CAPACITY`, default `1`.
-- `CANARDSTACK_FRESHNESS_SLA_SECS` or `_MS`, default `15s`.
+- `CANARDSTACK_FRESHNESS_BUDGET_SLA_SECS` or `_MS`, default `15s`.
 
 ## Storage
 
@@ -292,9 +293,9 @@ All HTTP compatibility queries go through `QueryEngine`, which applies:
 
 Prometheus, Loki, and Tempo adapters execute bounded logical SQL against
 DuckLake tables. DuckDB/DuckLake owns physical file planning and reads.
-Route-level lane admission runs before `QueryEngine`: cheap discovery and
-instant-ish routes reserve the protected cheap lane, while range/search/trace
-routes reserve the heavy lane.
+Route-level query admission runs before `QueryEngine`: cheap discovery and
+instant-ish routes reserve protected cheap-query admission, while
+range/search/trace routes reserve heavy-query admission.
 
 Direct SQL is intentionally outside the normal HTTP API. Operators or users who
 need SQL should use DuckDB CLI, MotherDuck, or another SQL client against the

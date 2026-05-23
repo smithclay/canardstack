@@ -231,7 +231,7 @@ fn scheduler_loop(state: Arc<AppState>, stop: Arc<AtomicBool>) {
 
         // Single seal driver. Seal when a buffered signal reaches its size/age
         // threshold, or on the freshness cadence, keeping immutable-buffer age
-        // well under the lane SLA so ingest is never shed for freshness debt. A
+        // well under the freshness-budget SLA so ingest is never shed for freshness debt. A
         // failed seal backs off so a broken catalog cannot spin the writer.
         if now >= seal_backoff_until {
             let buffers = state.storage.immutable_buffer_metrics();
@@ -297,7 +297,7 @@ fn run_seal_tick(state: &AppState) -> bool {
             .map(|metric| metric.bytes)
             .sum();
         let mut guard = s
-            .lanes
+            .admission
             .reserve_seal(&s.metrics)
             .map_err(|err| anyhow::anyhow!(err.message.clone()))?;
         guard.record_bytes(pending_bytes);
@@ -397,7 +397,7 @@ mod tests {
 
     fn snapshot(signal: &'static str, pressure: f64) -> IngestSnapshot {
         IngestSnapshot {
-            signal,
+            storage_signal: signal,
             inflight_bytes: 0,
             inflight_capacity_bytes: 0,
             pressure,

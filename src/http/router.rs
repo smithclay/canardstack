@@ -1,4 +1,4 @@
-use crate::ingest::{IngestRoute, Signal};
+use crate::ingest::{OtlpRequestKind, StorageSignal};
 use crate::validation::{self, ApiError};
 use crate::AppState;
 use serde_json::{json, Value};
@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use super::auth::admin;
-use super::compat_routes::route_compat;
+use super::compat_routes::{match_compat_route, route_compat};
 use super::response::HttpResponse;
 
 pub fn route(
@@ -74,15 +74,15 @@ fn route_inner(
     body: RequestBody<'_>,
     state: &AppState,
 ) -> HttpResponse {
-    if is_query_route(method, path) && !state.config.serve_role.serves_queries() {
-        return HttpResponse::from_api_error(&ApiError::new(
-            404,
-            "not_found",
-            "query routes are disabled for this serve role",
-        ));
-    }
-    if let Some(response) = route_compat(method, path, query, headers, body.as_slice(), state) {
-        return response;
+    if let Some(matched) = match_compat_route(method, path) {
+        if matched.role_category().serves_queries() && !state.config.serve_role.serves_queries() {
+            return HttpResponse::from_api_error(&ApiError::new(
+                404,
+                "not_found",
+                "query routes are disabled for this serve role",
+            ));
+        }
+        return route_compat(matched, query, headers, body.as_slice(), state);
     }
 
     let result = match (method, path) {
@@ -92,10 +92,10 @@ fn route_inner(
             // the node must report NOT ready even when storage is fine.
             let unhealthy_spools: Vec<Value> = state
                 .ingestor
-                .raw_spool_health_by_signal()
+                .raw_spool_health_by_lane()
                 .into_iter()
                 .filter(|(_, (healthy, _))| !healthy)
-                .map(|(signal, (_, error))| json!({"signal": signal, "error": error}))
+                .map(|(lane, (_, error))| json!({"spool_lane": lane, "error": error}))
                 .collect();
             let raw_spool_healthy = unhealthy_spools.is_empty();
             let ok = probe.is_ready() && raw_spool_healthy;
@@ -125,7 +125,12 @@ fn route_inner(
                     "ingest routes are disabled for this serve role",
                 ));
             }
-            return ingest_response(ingest(IngestRoute::Logs, headers, body.into_vec(), state));
+            return ingest_response(ingest(
+                OtlpRequestKind::Logs,
+                headers,
+                body.into_vec(),
+                state,
+            ));
         }
         ("POST", "/v1/traces") => {
             if !state.config.serve_role.accepts_ingest() {
@@ -135,7 +140,12 @@ fn route_inner(
                     "ingest routes are disabled for this serve role",
                 ));
             }
-            return ingest_response(ingest(IngestRoute::Traces, headers, body.into_vec(), state));
+            return ingest_response(ingest(
+                OtlpRequestKind::Traces,
+                headers,
+                body.into_vec(),
+                state,
+            ));
         }
         ("POST", "/v1/metrics") => {
             if !state.config.serve_role.accepts_ingest() {
@@ -146,7 +156,7 @@ fn route_inner(
                 ));
             }
             return ingest_response(ingest(
-                IngestRoute::Metrics,
+                OtlpRequestKind::Metrics,
                 headers,
                 body.into_vec(),
                 state,
@@ -166,17 +176,17 @@ fn route_inner(
                     .raw_spool_stats()
                     .map(|stats| json!(stats))
                     .unwrap_or_else(|err| json!({"error": err.to_string()}));
-                let raw_spool_by_signal = state
+                let raw_spool_by_lane = state
                     .ingestor
-                    .raw_spool_stats_by_signal()
+                    .raw_spool_stats_by_lane()
                     .map(|stats| json!(stats))
                     .unwrap_or_else(|err| json!({"error": err.to_string()}));
                 let body = json!({
                     "raw_spool_healthy": raw_spool_healthy,
                     "queues": state.ingestor.snapshots(),
-                    "lanes": state.lanes.snapshot_for(state.ingestor.lane_freshness_inputs(&state.storage)),
+                    "admission": state.admission.snapshot_for(state.ingestor.freshness_budget_inputs(&state.storage)),
                     "raw_spool": raw_spool,
-                    "raw_spool_by_signal": raw_spool_by_signal,
+                    "raw_spool_by_lane": raw_spool_by_lane,
                     "raw_spool_config": {
                         "writer_queue_capacity": state.config.raw_spool_writer_queue_capacity,
                         "group_commit_records": state.config.raw_spool_group_commit_records,
@@ -200,9 +210,9 @@ fn route_inner(
                 // Queries are only as healthy as DuckDB; 200 here while
                 // storage is wedged would mislead the runbook step.
                 let mut health = state.queries.health();
-                health["lanes"] = json!(state
-                    .lanes
-                    .snapshot_for(state.ingestor.lane_freshness_inputs(&state.storage)));
+                health["admission"] = json!(state
+                    .admission
+                    .snapshot_for(state.ingestor.freshness_budget_inputs(&state.storage)));
                 (state.storage.probe().is_ready(), health)
             });
         }
@@ -219,7 +229,7 @@ fn route_inner(
         ("POST", "/api/admin/maintenance/seal") => admin(headers, state, || {
             ensure_maintenance_allowed(state)?;
             let started = Instant::now();
-            let result = run_seal_with_lane(state, "admin_seal");
+            let result = run_seal_with_admission(state);
             record_maintenance_metrics(state, "seal", &result, started);
             result
         }),
@@ -245,7 +255,7 @@ fn route_inner(
 }
 
 fn ingest(
-    route: IngestRoute,
+    route: OtlpRequestKind,
     headers: &HashMap<String, String>,
     body: Vec<u8>,
     state: &AppState,
@@ -256,7 +266,7 @@ fn ingest(
         headers,
         body,
         &state.storage,
-        &state.lanes,
+        &state.admission,
         state.metrics.clone(),
     )
 }
@@ -298,13 +308,12 @@ fn run_maintenance_job(
     result
 }
 
-fn run_seal_with_lane(state: &AppState, triggered_by: &'static str) -> Result<Value, ApiError> {
-    let guard = state.lanes.reserve_seal(&state.metrics)?;
+fn run_seal_with_admission(state: &AppState) -> Result<Value, ApiError> {
+    let guard = state.admission.reserve_seal(&state.metrics)?;
     let result = state
         .maintenance
         .run_seal(&state.ingestor, &state.storage, &state.metrics)
         .map_err(storage_error);
-    let _ = triggered_by;
     guard.finish(&state.metrics);
     result
 }
@@ -319,33 +328,6 @@ fn ensure_maintenance_allowed(state: &AppState) -> Result<(), ApiError> {
             "maintenance mutations are disabled for this serve role",
         ))
     }
-}
-
-fn is_query_route(method: &str, path: &str) -> bool {
-    if method != "GET" && method != "POST" {
-        return false;
-    }
-    matches!(
-        path,
-        "/api/v1/query"
-            | "/api/v1/query_range"
-            | "/api/v1/labels"
-            | "/api/v1/series"
-            | "/api/v1/metadata"
-            | "/loki/api/v1/query"
-            | "/loki/api/v1/query_range"
-            | "/loki/api/v1/labels"
-            | "/loki/api/v1/series"
-            | "/api/search"
-            | "/api/search/tags"
-            | "/api/v2/search/tags"
-            | "/api/status/buildinfo"
-    ) || path.starts_with("/api/v1/label/")
-        || path.starts_with("/loki/api/v1/label/")
-        || path.starts_with("/api/v2/traces/")
-        || path.starts_with("/api/traces/")
-        || path.starts_with("/api/search/tag/")
-        || path.starts_with("/api/v2/search/tag/")
 }
 
 fn record_maintenance_metrics(
@@ -373,10 +355,10 @@ pub(crate) fn record_operator_gauges(state: &AppState) {
         .map(|buffer| (buffer.table, buffer))
         .collect::<HashMap<_, _>>();
     for table in [
-        Signal::Logs,
-        Signal::Spans,
-        Signal::MetricGauge,
-        Signal::MetricSum,
+        StorageSignal::Logs,
+        StorageSignal::Spans,
+        StorageSignal::MetricGauge,
+        StorageSignal::MetricSum,
     ] {
         let rows = immutable_buffers
             .get(&table)
@@ -475,6 +457,38 @@ pub(crate) fn record_storage_operator_gauges(state: &AppState) {
         }
     }
     state
-        .lanes
+        .admission
         .record_observed_freshness_lag(max_freshness_lag, &state.metrics);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{Config, ServeRole};
+    use tempfile::tempdir;
+
+    #[test]
+    fn ingest_role_disables_every_registered_compat_route() {
+        let dir = tempdir().unwrap();
+        let mut config = Config::test(dir.path().join("canardstack.duckdb"));
+        config.serve_role = ServeRole::Ingest;
+        let state = AppState::new(config).unwrap();
+
+        for (method, path) in super::super::compat_routes::compat_route_examples_for_tests() {
+            let response = route(
+                &method,
+                &path,
+                &HashMap::new(),
+                &HashMap::new(),
+                &[],
+                &state,
+            );
+            assert_eq!(
+                response.status(),
+                404,
+                "{method} {path}: {}",
+                response.json_body()
+            );
+        }
+    }
 }

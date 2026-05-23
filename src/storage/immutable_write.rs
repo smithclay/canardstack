@@ -7,7 +7,7 @@ use super::immutable::{
 };
 use super::{
     ArrowBatchBuffer, ArrowBatchBufferResult, ArrowBatchBufferTiming, ImmutableBufferMetric,
-    ImmutableSegmentBuffer, PreparedArrowBatch, Signal, Storage, TimingPhase,
+    ImmutableSegmentBuffer, PreparedArrowBatch, Storage, StorageSignal, TimingPhase,
 };
 use crate::LockExt;
 use anyhow::{Context, Result};
@@ -40,7 +40,7 @@ impl Storage {
 
     pub fn buffer_arrow_records(
         &self,
-        table: Signal,
+        table: StorageSignal,
         batch: &RecordBatch,
         source_format: &str,
     ) -> Result<usize> {
@@ -59,7 +59,7 @@ impl Storage {
         let mut prepared = Vec::new();
         let mut prepare_timings = Vec::new();
         let mut attempted_rows = 0;
-        let mut grouped = BTreeMap::<(Signal, &str), Vec<&RecordBatch>>::new();
+        let mut grouped = BTreeMap::<(StorageSignal, &str), Vec<&RecordBatch>>::new();
         for batch in batches {
             if batch.batch.num_rows() == 0 {
                 continue;
@@ -121,7 +121,7 @@ impl Storage {
         let error_table = prepared
             .first()
             .map(|batch| batch.table)
-            .unwrap_or(Signal::Logs);
+            .unwrap_or(StorageSignal::Logs);
         let mut timings = prepare_timings;
 
         {
@@ -203,7 +203,7 @@ impl Storage {
 
     fn seal_immutable_buffers(
         &self,
-        buffers: &BTreeMap<Signal, ImmutableSegmentBuffer>,
+        buffers: &BTreeMap<StorageSignal, ImmutableSegmentBuffer>,
     ) -> Result<ImmutableSealResult> {
         let mut timings = Vec::new();
         let mut sealed = Vec::with_capacity(buffers.len());
@@ -214,7 +214,7 @@ impl Storage {
         // are all joined before the scope returns. The DuckLake register+commit
         // below stays serialized under the single writer lock.
         let storage_dir = self.local_storage_dir.as_path();
-        let sealed_results: Vec<(Signal, Result<SealedBuffer>)> = thread::scope(|scope| {
+        let sealed_results: Vec<(StorageSignal, Result<SealedBuffer>)> = thread::scope(|scope| {
             let handles = buffers
                 .iter()
                 .map(|(&table, buffer)| {
@@ -289,7 +289,7 @@ impl Storage {
         })
     }
 
-    fn restore_immutable_buffers(&self, detached: BTreeMap<Signal, ImmutableSegmentBuffer>) {
+    fn restore_immutable_buffers(&self, detached: BTreeMap<StorageSignal, ImmutableSegmentBuffer>) {
         let mut buffers = self.immutable_buffers.lock_or_poisoned();
         for (table, mut detached_buffer) in detached {
             if let Some(current) = buffers.remove(&table) {
@@ -300,7 +300,7 @@ impl Storage {
     }
 }
 
-fn coalesce_storage_batches(table: Signal, batches: &[&RecordBatch]) -> Result<RecordBatch> {
+fn coalesce_storage_batches(table: StorageSignal, batches: &[&RecordBatch]) -> Result<RecordBatch> {
     match batches {
         [] => anyhow::bail!("cannot coalesce empty {table} storage batch group"),
         [batch] => Ok((*batch).clone()),
@@ -314,7 +314,7 @@ fn coalesce_storage_batches(table: Signal, batches: &[&RecordBatch]) -> Result<R
 
 fn seal_immutable_buffer(
     storage_dir: &Path,
-    table: Signal,
+    table: StorageSignal,
     buffer: &ImmutableSegmentBuffer,
 ) -> Result<SealedBuffer> {
     let coalesce_started = Instant::now();
@@ -367,7 +367,8 @@ mod tests {
         let second =
             RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![3]))]).unwrap();
 
-        let coalesced = coalesce_storage_batches(Signal::MetricGauge, &[&first, &second]).unwrap();
+        let coalesced =
+            coalesce_storage_batches(StorageSignal::MetricGauge, &[&first, &second]).unwrap();
 
         assert_eq!(coalesced.num_rows(), 3);
     }
@@ -393,16 +394,17 @@ mod tests {
         .unwrap();
         let mut buffer = ImmutableSegmentBuffer::new(Instant::now());
         buffer.push(PreparedArrowBatch {
-            table: Signal::MetricGauge,
+            table: StorageSignal::MetricGauge,
             batch,
             rows: 2,
             timestamp_days: vec!["1970-01-01".to_string()],
         });
 
-        let sealed = seal_immutable_buffer(dir.path(), Signal::MetricGauge, &buffer).unwrap();
+        let sealed =
+            seal_immutable_buffer(dir.path(), StorageSignal::MetricGauge, &buffer).unwrap();
 
         assert_eq!(sealed.segments.len(), 1);
-        assert_eq!(sealed.segments[0].table, Signal::MetricGauge);
+        assert_eq!(sealed.segments[0].table, StorageSignal::MetricGauge);
         assert_eq!(sealed.segments[0].rows, 2);
         assert!(sealed.segments[0].path.exists());
         assert!(sealed.affected_days.contains("1970-01-01"));

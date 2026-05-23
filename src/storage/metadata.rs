@@ -1,6 +1,6 @@
 use super::ducklake::configure_write_connection;
 use super::metadata_refresh::{merge_dirty_metadata, refresh_metadata_summaries_on};
-use super::{Signal, Storage};
+use super::{Storage, StorageSignal};
 use crate::LockExt;
 use anyhow::Result;
 use std::collections::{BTreeMap, BTreeSet};
@@ -11,7 +11,7 @@ impl Storage {
         self.metadata_generation.load(Ordering::SeqCst)
     }
 
-    pub(super) fn mark_metadata_dirty(&self, affected: BTreeMap<Signal, BTreeSet<String>>) {
+    pub(super) fn mark_metadata_dirty(&self, affected: BTreeMap<StorageSignal, BTreeSet<String>>) {
         merge_dirty_metadata(&mut self.dirty_metadata.lock_or_poisoned(), affected);
     }
 
@@ -47,10 +47,10 @@ impl Storage {
 }
 
 fn take_dirty_metadata_batch(
-    dirty: &mut BTreeMap<Signal, BTreeSet<String>>,
+    dirty: &mut BTreeMap<StorageSignal, BTreeSet<String>>,
     max_buckets: usize,
-) -> BTreeMap<Signal, BTreeSet<String>> {
-    let mut selected = BTreeMap::<Signal, BTreeSet<String>>::new();
+) -> BTreeMap<StorageSignal, BTreeSet<String>> {
+    let mut selected = BTreeMap::<StorageSignal, BTreeSet<String>>::new();
     let mut remaining = max_buckets;
     if remaining == 0 {
         return selected;
@@ -85,7 +85,7 @@ fn take_dirty_metadata_batch(
 mod tests {
     use super::*;
 
-    fn dirty(signals: &[(Signal, &[&str])]) -> BTreeMap<Signal, BTreeSet<String>> {
+    fn dirty(signals: &[(StorageSignal, &[&str])]) -> BTreeMap<StorageSignal, BTreeSet<String>> {
         signals
             .iter()
             .map(|(signal, dates)| (*signal, dates.iter().map(|date| date.to_string()).collect()))
@@ -95,33 +95,33 @@ mod tests {
     #[test]
     fn metadata_batch_limit_preserves_unselected_dirty_buckets() {
         let mut pending = dirty(&[
-            (Signal::Logs, &["2026-05-18", "2026-05-19"]),
-            (Signal::Spans, &["2026-05-19"]),
-            (Signal::MetricGauge, &["2026-05-19"]),
+            (StorageSignal::Logs, &["2026-05-18", "2026-05-19"]),
+            (StorageSignal::Spans, &["2026-05-19"]),
+            (StorageSignal::MetricGauge, &["2026-05-19"]),
         ]);
 
         let selected = take_dirty_metadata_batch(&mut pending, 2);
 
         assert_eq!(
             selected,
-            dirty(&[(Signal::Logs, &["2026-05-18", "2026-05-19"])])
+            dirty(&[(StorageSignal::Logs, &["2026-05-18", "2026-05-19"])])
         );
         assert_eq!(
             pending,
             dirty(&[
-                (Signal::Spans, &["2026-05-19"]),
-                (Signal::MetricGauge, &["2026-05-19"]),
+                (StorageSignal::Spans, &["2026-05-19"]),
+                (StorageSignal::MetricGauge, &["2026-05-19"]),
             ])
         );
     }
 
     #[test]
     fn metadata_batch_limit_zero_does_not_drain_dirty_buckets() {
-        let mut pending = dirty(&[(Signal::Logs, &["2026-05-19"])]);
+        let mut pending = dirty(&[(StorageSignal::Logs, &["2026-05-19"])]);
 
         let selected = take_dirty_metadata_batch(&mut pending, 0);
 
         assert!(selected.is_empty());
-        assert_eq!(pending, dirty(&[(Signal::Logs, &["2026-05-19"])]));
+        assert_eq!(pending, dirty(&[(StorageSignal::Logs, &["2026-05-19"])]));
     }
 }

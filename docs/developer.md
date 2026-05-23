@@ -20,9 +20,10 @@ canardstack is currently shaped as:
 - `otlp2records` for OTLP logs, traces, gauge metrics, and sum metrics.
 - Local raw spool for the `202` acceptance boundary, with append fsync completed
   before acknowledgement.
-- Bounded per-signal in-memory queues with row, byte, age, and pressure checks.
-- Logical lanes for freshness-budget ingest admission, protected seal, cheap
-  query, heavy query, and operator/control traffic.
+- Bounded per-storage-signal in-memory accounting with row, byte, age, and
+  pressure checks.
+- Admission primitives for freshness-budget ingest admission, protected seal,
+  cheap query, and heavy query traffic.
 - DuckDB through `duckdb-rs`.
 - DuckLake through DuckDB's official `ducklake` extension SQL surface. The
   default local mode is a local DuckLake catalog and local immutable data files.
@@ -48,7 +49,7 @@ file. If `CANARDSTACK_CONFIG` is unset, `./config.toml` is loaded when it
 exists; otherwise the defaults are used.
 
 Start from `config/example.toml` for a full structured config grouped by
-operator concern: server, auth, paths, DuckDB, DuckLake, ingest, query, lanes,
+operator concern: server, auth, paths, DuckDB, DuckLake, ingest, query, admission,
 retention, scheduler, and raw spool. Every public TOML setting has a matching
 `CANARDSTACK_*` environment variable, and env vars always win. Empty env vars
 clear optional string/path settings such as
@@ -339,22 +340,22 @@ Set `scheduler.enabled = false` or `CANARDSTACK_SCHEDULER_ENABLED=false` to
 fall back to operator-triggered maintenance only. The scheduler shuts down
 cleanly when `serve` exits.
 
-## Lane Controller
+## Admission Controller
 
-`src/lanes.rs` owns the logical lane counters and queue-seal throughput EWMA.
-It is intentionally not a generic scheduler. The request path asks it one
-direct question before raw-spool append: will the process queue debt plus
-immutable-buffer visibility debt stay within `CANARDSTACK_FRESHNESS_SLA_SECS`
-or `_MS`?
+`src/admission_control.rs` owns seal admission, query admission, and freshness
+budget projection. It is intentionally not a generic scheduler. The request path
+asks it one direct question before raw-spool append: will the process queue debt
+plus immutable-buffer visibility debt stay within
+`CANARDSTACK_FRESHNESS_BUDGET_SLA_SECS` or `_MS`?
 
-Seal jobs reserve the seal lane before doing DuckDB/DuckLake work and record
+Seal jobs reserve seal admission before doing DuckDB/DuckLake work and record
 successful queue-byte drain into the EWMA. Compatibility routes reserve either
-the cheap lane (labels, metadata, probe, instant-ish queries) or the heavy lane
-(range/search/trace lookups). Heavy query capacity is reduced first under
-freshness debt and then rejected with the normal protocol error envelope when
-freshness is at risk. The controller records cached query-visible freshness lag
-from operator gauge refreshes as telemetry; ingest request threads never query
-DuckDB for admission.
+cheap query admission (labels, metadata, probe, instant-ish queries) or heavy
+query admission (range/search/trace lookups). Heavy query capacity is reduced
+first under freshness debt and then rejected with the normal protocol error
+envelope when freshness is at risk. The controller records cached query-visible
+freshness lag from operator gauge refreshes as telemetry; ingest request threads
+never query DuckDB for admission.
 
 ## V0 Gaps
 
