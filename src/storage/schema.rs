@@ -1,4 +1,4 @@
-use crate::ingest::StorageSignal;
+use crate::signal::StorageSignal;
 use anyhow::{Context, Result};
 use duckdb::Connection;
 

@@ -1,5 +1,5 @@
-use super::StorageSignal;
 use crate::otlp::Transformed;
+use crate::signal::StorageSignal;
 use arrow58::record_batch::RecordBatch;
 use serde::Serialize;
 

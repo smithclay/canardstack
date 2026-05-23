@@ -1,8 +1,9 @@
 use super::batches::PendingBatch;
-use super::{OtlpRequestKind, StorageSignal};
+use super::OtlpRequestKind;
 use crate::config::Config;
 use crate::metrics::Metrics;
 use crate::runtime::memory;
+use crate::signal::StorageSignal;
 use crate::validation::{ApiError, ApiResult};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicUsize, Ordering};

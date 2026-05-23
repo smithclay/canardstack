@@ -1,6 +1,7 @@
-use crate::ingest::{OtlpRequestKind, StorageSignal};
+use crate::ingest::OtlpRequestKind;
 #[cfg(feature = "otlp2records-observer")]
 use crate::metrics::Metrics;
+use crate::signal::StorageSignal;
 use crate::validation::{ApiError, ApiResult};
 use arrow58::record_batch::RecordBatch;
 use flate2::read::GzDecoder;

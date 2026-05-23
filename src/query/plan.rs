@@ -1,3 +1,4 @@
+use crate::signal::StorageSignal;
 use crate::validation::{ApiError, ApiResult};
 use chrono::{DateTime, Utc};
 use std::collections::BTreeMap;
@@ -89,11 +90,15 @@ impl MetricSignal {
         }
     }
 
-    pub fn table(self) -> &'static str {
+    pub fn storage_signal(self) -> StorageSignal {
         match self {
-            Self::Gauge => "metric_gauge",
-            Self::Sum => "metric_sum",
+            Self::Gauge => StorageSignal::MetricGauge,
+            Self::Sum => StorageSignal::MetricSum,
         }
+    }
+
+    pub fn table(self) -> &'static str {
+        self.storage_signal().as_str()
     }
 }
 

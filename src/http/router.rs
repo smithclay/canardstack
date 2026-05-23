@@ -1,4 +1,5 @@
-use crate::ingest::{OtlpRequestKind, StorageSignal};
+use crate::ingest::OtlpRequestKind;
+use crate::signal::StorageSignal;
 use crate::validation::{self, ApiError};
 use crate::AppState;
 use serde_json::{json, Value};

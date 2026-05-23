@@ -2,6 +2,7 @@ use crate::admission_control::{AdmissionController, FreshnessBudgetInputs};
 use crate::config::Config;
 use crate::metrics::Metrics;
 use crate::otlp::{self, Transformed};
+use crate::signal::StorageSignal;
 use crate::storage::{ArrowBatchBuffer, ArrowBatchBufferTiming, Storage};
 use crate::validation::{self, ApiError, ApiResult};
 use crate::LockExt;
@@ -23,14 +24,6 @@ mod worker;
 
 pub use batches::IngestSnapshot;
 use worker::IngestWorkerPool;
-
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize)]
-pub enum StorageSignal {
-    Logs,
-    Spans,
-    MetricGauge,
-    MetricSum,
-}
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize)]
 pub enum OtlpRequestKind {
@@ -62,30 +55,6 @@ impl OtlpRequestKind {
 }
 
 impl fmt::Display for OtlpRequestKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl StorageSignal {
-    pub const ALL: [StorageSignal; 4] = [
-        StorageSignal::Logs,
-        StorageSignal::Spans,
-        StorageSignal::MetricGauge,
-        StorageSignal::MetricSum,
-    ];
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            StorageSignal::Logs => "logs",
-            StorageSignal::Spans => "spans",
-            StorageSignal::MetricGauge => "metric_gauge",
-            StorageSignal::MetricSum => "metric_sum",
-        }
-    }
-}
-
-impl fmt::Display for StorageSignal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }

@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::ingest::StorageSignal;
+use crate::signal::StorageSignal;
 use anyhow::{Context, Result};
 use arrow58::record_batch::RecordBatch;
 use duckdb::Connection;

@@ -1,6 +1,6 @@
 use super::arrow_write::timestamp_day;
 use super::schema::table_columns;
-use crate::ingest::StorageSignal;
+use crate::signal::StorageSignal;
 use anyhow::{Context, Result};
 use arrow58::array as arrow58_array;
 use arrow58::array::Array as _;

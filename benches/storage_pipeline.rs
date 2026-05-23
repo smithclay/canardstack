@@ -5,7 +5,7 @@ use arrow58::array::{
 use arrow58::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow58::record_batch::RecordBatch;
 use canardstack::config::Config;
-use canardstack::ingest::StorageSignal;
+use canardstack::signal::StorageSignal;
 use canardstack::storage::{ArrowBatchBuffer, ArrowBatchBufferTiming, Storage};
 use chrono::Utc;
 use std::collections::BTreeMap;

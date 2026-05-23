@@ -1,4 +1,4 @@
-use crate::ingest::StorageSignal;
+use crate::signal::StorageSignal;
 use crate::storage::Storage;
 use crate::LockExt;
 use anyhow::{Context, Result};

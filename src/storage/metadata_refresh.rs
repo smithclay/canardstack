@@ -2,7 +2,7 @@ use crate::db::sql::{
     logs_deployment_environment_expr, logs_http_method_expr, logs_http_route_expr,
     metrics_deployment_environment_expr, quote as sql_quote, spans_http_route_expr,
 };
-use crate::ingest::StorageSignal;
+use crate::signal::StorageSignal;
 use anyhow::{Context, Result};
 use chrono::NaiveDate;
 use duckdb::Connection;

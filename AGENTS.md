@@ -81,7 +81,8 @@ Top-level modules map to pipeline stages or boundaries. Subdirectories group hel
 - `src/http.rs` - hand-rolled std-library HTTP/1.1 server with bounded per-connection threads and non-blocking accept shutdown.
 - `src/validation.rs` - auth, content-type, size, compression, timestamp-skew checks, `ApiError`, and error envelopes.
 - `src/otlp.rs` - OTLP JSON/protobuf decode and `Transformed` payload construction.
-- `src/ingest/` - request flow, freshness-first admission, per-signal in-flight accounting, the durable raw spool, and the ingest worker pool that inserts into the Arrow write buffer.
+- `src/signal.rs` - shared `StorageSignal` physical signal/table vocabulary (one variant per DuckLake table) used across ingest, storage, query, metrics, validation, and metadata.
+- `src/ingest/` - request flow (`OtlpRequestKind`), freshness-first admission, per-signal in-flight accounting, the durable raw spool, and the ingest worker pool that inserts into the Arrow write buffer.
 - `src/admission_control.rs` - seal admission, freshness-budget ingest admission, and cheap/heavy query admission.
 - `src/storage/` - DuckDB lifecycle, DuckLake `ATTACH`, extension install, immutable segment writes, `StorageProbe`, retention, and maintenance SQL.
 - `src/query/` - bounded query helpers, shared query plans, and Prometheus/Loki/Tempo selector parsing.

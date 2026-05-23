@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::ingest::StorageSignal;
+use crate::signal::StorageSignal;
 use arrow58::array::{Array, TimestampMicrosecondArray};
 use arrow58::record_batch::RecordBatch;
 use chrono::{DateTime, Utc};
