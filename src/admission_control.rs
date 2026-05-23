@@ -702,4 +702,374 @@ mod tests {
             )
             .unwrap();
     }
+
+    // ---------------------------------------------------------------------
+    // Golden characterization of admission behavior BEFORE A-refactor.
+    //
+    // A1 removes the (already-zero) queue term; A2 unifies the buffer-drain
+    // rate to the EWMA -- under A2 the buffer-SIZE-debt scenarios will change
+    // and these expected values must be updated deliberately, with a comment
+    // per change.
+    //
+    // The whole point of this grid is to pin the *current* numeric outputs so
+    // the next phase reveals its behavior delta as explicit, reviewed
+    // expected-value edits rather than as a silent shift.
+    // ---------------------------------------------------------------------
+    mod characterization {
+        use super::*;
+
+        const EPSILON: f64 = 1e-6;
+
+        /// A characterization controller wired with DIVERGENT byte-rate
+        /// estimates so the upcoming A2 rate-unification is observable:
+        ///
+        /// - EWMA seal rate = `seal_rate_seed_bytes / seal_rate_seed_window` =
+        ///   2000 / 1s = 2000 B/s (drives `projected_seal`).
+        /// - static buffer rate = `arrow_write_buffer_target_bytes / max_age` =
+        ///   1000 / 1s = 1000 B/s (drives buffer-SIZE debt).
+        ///
+        /// These rates intentionally DIFFER (2000 vs 1000). Buffer-size debt
+        /// today divides by the static 1000 B/s rate; A2 will make it divide by
+        /// the observed 2000 B/s EWMA instead. The buffer-SIZE-debt scenarios
+        /// below therefore characterize exactly the term A2 changes, while the
+        /// seal-debt and buffer-AGE-debt scenarios characterize terms A2 must
+        /// leave alone.
+        ///
+        /// Capacity math for this config (concurrency=4, seal=1, cheap=1,
+        /// degraded=1): heavy full capacity = 4 - (1 + 1) = 2, heavy degraded
+        /// capacity = 1. So `heavy_query_effective_capacity` is 2 (full) or 1
+        /// (degraded).
+        fn characterization_controller() -> AdmissionController {
+            let dir = tempdir().unwrap();
+            let mut config = Config::test(dir.path().join("canardstack.duckdb"));
+            config.query_interactive.concurrency = 4;
+            config.freshness_budget_sla = std::time::Duration::from_secs(10);
+            // EWMA seal rate = 2000 / 1s = 2000 B/s.
+            config.seal_rate_seed_bytes = 2_000;
+            config.seal_rate_seed_window = std::time::Duration::from_secs(1);
+            // Static buffer-drain rate = 1000 / 1s = 1000 B/s (diverges from EWMA).
+            config.arrow_write_buffer_target_bytes = 1_000;
+            config.arrow_write_buffer_max_age = std::time::Duration::from_secs(1);
+            AdmissionController::new(&config)
+        }
+
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        enum IngestOutcome {
+            Accept,
+            RejectFreshnessBudget,
+        }
+
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        enum HeavyOutcome {
+            AcceptFull,
+            AcceptDegraded,
+            RejectFreshnessDebt,
+        }
+
+        struct Scenario {
+            label: &'static str,
+            // Inputs. `oldest_queue_age_seconds` is intentionally pinned at the
+            // Default (0.0): A1 removes that field and this grid must stay valid
+            // through it, so it is never set here.
+            inflight_bytes: usize,
+            incoming_bytes: usize,
+            buffered_bytes: usize,
+            buffered_active_count: usize,
+            oldest_buffer_age_seconds: f64,
+            // Expected current outputs (empirically locked from this build).
+            expected_ingest: IngestOutcome,
+            expected_heavy: HeavyOutcome,
+            expected_projected_seal_seconds: f64,
+            expected_projected_buffer_seconds: f64,
+            expected_projected_visibility_seconds: f64,
+        }
+
+        impl Scenario {
+            fn inputs(&self) -> FreshnessBudgetInputs {
+                FreshnessBudgetInputs {
+                    inflight_bytes: self.inflight_bytes,
+                    incoming_bytes: self.incoming_bytes,
+                    buffered_bytes: self.buffered_bytes,
+                    buffered_active_count: self.buffered_active_count,
+                    oldest_buffer_age_seconds: self.oldest_buffer_age_seconds,
+                    // Pinned at Default; never varied (see struct comment / A1).
+                    ..FreshnessBudgetInputs::default()
+                }
+            }
+        }
+
+        fn approx_eq(actual: f64, expected: f64, label: &str, field: &str) {
+            assert!(
+                (actual - expected).abs() <= EPSILON,
+                "[{label}] {field}: expected {expected}, got {actual}",
+            );
+        }
+
+        /// Classify the heavy-query decision on a FRESH controller (each call is
+        /// independent). AcceptFull vs AcceptDegraded is distinguished via
+        /// `snapshot_for(..).heavy_query_effective_capacity` (2 = full, 1 =
+        /// degraded for this config) on its own fresh controller.
+        fn classify_heavy(scenario: &Scenario) -> HeavyOutcome {
+            let inputs = scenario.inputs();
+
+            let admission = characterization_controller();
+            let metrics = Metrics::default();
+            let reservation = admission.reserve_query(QueryClass::Heavy, inputs, &metrics);
+            let outcome = match &reservation {
+                Err(err) => {
+                    assert_eq!(
+                        err.status, 429,
+                        "[{}] heavy rejection should be 429",
+                        scenario.label
+                    );
+                    assert_eq!(
+                        err.reason, "freshness_debt",
+                        "[{}] heavy rejection reason",
+                        scenario.label
+                    );
+                    HeavyOutcome::RejectFreshnessDebt
+                }
+                Ok(_guard) => {
+                    let probe = characterization_controller();
+                    let effective = probe.snapshot_for(inputs).heavy_query_effective_capacity;
+                    match effective {
+                        2 => HeavyOutcome::AcceptFull,
+                        1 => HeavyOutcome::AcceptDegraded,
+                        other => panic!(
+                            "[{}] unexpected effective heavy capacity {other}",
+                            scenario.label
+                        ),
+                    }
+                }
+            };
+            // Drop the reservation (and its guard, if any) before the
+            // controller it borrows from goes out of scope.
+            drop(reservation);
+            outcome
+        }
+
+        fn classify_ingest(scenario: &Scenario) -> IngestOutcome {
+            let admission = characterization_controller();
+            let metrics = Metrics::default();
+            match admission.admit_ingest(scenario.inputs(), &metrics) {
+                Ok(()) => IngestOutcome::Accept,
+                Err(err) => {
+                    assert_eq!(
+                        err.status, 429,
+                        "[{}] ingest rejection should be 429",
+                        scenario.label
+                    );
+                    assert_eq!(
+                        err.reason, "freshness_budget_exceeded",
+                        "[{}] ingest rejection reason",
+                        scenario.label
+                    );
+                    IngestOutcome::RejectFreshnessBudget
+                }
+            }
+        }
+
+        // Each row is independent: a fresh controller is built per assertion so
+        // accumulated counters / EWMA drift cannot leak between rows.
+        //
+        // FLIP-UNDER-A2 marker: rows whose projected_buffer is driven by SIZE
+        // debt (excess bytes / drain rate) will change once A2 swaps the 1000
+        // B/s static rate for the 2000 B/s EWMA. Rows driven by seal debt or
+        // buffer-AGE debt must stay fixed.
+        fn scenarios() -> Vec<Scenario> {
+            vec![
+                // idle: everything ~0. Stays fixed under A2.
+                Scenario {
+                    label: "idle",
+                    inflight_bytes: 0,
+                    incoming_bytes: 0,
+                    buffered_bytes: 0,
+                    buffered_active_count: 0,
+                    oldest_buffer_age_seconds: 0.0,
+                    expected_ingest: IngestOutcome::Accept,
+                    expected_heavy: HeavyOutcome::AcceptFull,
+                    expected_projected_seal_seconds: 0.0,
+                    expected_projected_buffer_seconds: 0.0,
+                    expected_projected_visibility_seconds: 0.0,
+                },
+                // seal-debt dominated: large inflight, no buffer pressure.
+                // projected_seal = 4000 / 2000 = 2.0s. Stays fixed under A2
+                // (already uses the EWMA).
+                Scenario {
+                    label: "seal_debt_dominated",
+                    inflight_bytes: 4_000,
+                    incoming_bytes: 0,
+                    buffered_bytes: 0,
+                    buffered_active_count: 0,
+                    oldest_buffer_age_seconds: 0.0,
+                    expected_ingest: IngestOutcome::Accept,
+                    expected_heavy: HeavyOutcome::AcceptFull,
+                    expected_projected_seal_seconds: 2.0,
+                    expected_projected_buffer_seconds: 0.0,
+                    expected_projected_visibility_seconds: 2.0,
+                },
+                // buffer-SIZE-debt dominated (age small): buffered 5000 with 1
+                // active slot -> allowed = 1000, excess = 4000.
+                // buffer_size_debt = 4000 / 1000 (STATIC) = 4.0s today.
+                // FLIP-UNDER-A2: A2 divides by 2000 -> 2.0s. visibility flips too.
+                Scenario {
+                    label: "buffer_size_debt_dominated",
+                    inflight_bytes: 0,
+                    incoming_bytes: 0,
+                    buffered_bytes: 5_000,
+                    buffered_active_count: 1,
+                    oldest_buffer_age_seconds: 0.0,
+                    expected_ingest: IngestOutcome::Accept,
+                    expected_heavy: HeavyOutcome::AcceptFull,
+                    expected_projected_seal_seconds: 0.0,
+                    expected_projected_buffer_seconds: 4.0,
+                    expected_projected_visibility_seconds: 4.0,
+                },
+                // buffer-AGE-debt dominated (small bytes, large age): bytes within
+                // allowance so size debt = 0; age 6s - max_age 1s = 5.0s.
+                // Stays fixed under A2 (age term untouched).
+                Scenario {
+                    label: "buffer_age_debt_dominated",
+                    inflight_bytes: 0,
+                    incoming_bytes: 0,
+                    buffered_bytes: 500,
+                    buffered_active_count: 1,
+                    oldest_buffer_age_seconds: 6.0,
+                    expected_ingest: IngestOutcome::Accept,
+                    expected_heavy: HeavyOutcome::AcceptFull,
+                    expected_projected_seal_seconds: 0.0,
+                    expected_projected_buffer_seconds: 5.0,
+                    expected_projected_visibility_seconds: 5.0,
+                },
+                // ingest-budget boundary, just UNDER 0.95*sla = 9.5s.
+                // inflight 18999 + incoming 0 -> seal = 18999/2000 = 9.4995s < 9.5.
+                // Stays fixed under A2 (seal-driven).
+                Scenario {
+                    label: "ingest_budget_just_under",
+                    inflight_bytes: 18_999,
+                    incoming_bytes: 0,
+                    buffered_bytes: 0,
+                    buffered_active_count: 0,
+                    oldest_buffer_age_seconds: 0.0,
+                    expected_ingest: IngestOutcome::Accept,
+                    expected_heavy: HeavyOutcome::AcceptFull,
+                    expected_projected_seal_seconds: 9.4995,
+                    expected_projected_buffer_seconds: 0.0,
+                    expected_projected_visibility_seconds: 9.4995,
+                },
+                // ingest-budget boundary, just OVER 0.95*sla = 9.5s.
+                // inflight 19001 -> seal = 9.5005s > 9.5 -> reject. Still below
+                // 1.0*sla=10 so heavy is full. Stays fixed under A2 (seal-driven).
+                Scenario {
+                    label: "ingest_budget_just_over",
+                    inflight_bytes: 19_001,
+                    incoming_bytes: 0,
+                    buffered_bytes: 0,
+                    buffered_active_count: 0,
+                    oldest_buffer_age_seconds: 0.0,
+                    expected_ingest: IngestOutcome::RejectFreshnessBudget,
+                    expected_heavy: HeavyOutcome::AcceptFull,
+                    expected_projected_seal_seconds: 9.5005,
+                    expected_projected_buffer_seconds: 0.0,
+                    expected_projected_visibility_seconds: 9.5005,
+                },
+                // heavy-degrade band: >= 1.0*sla (10s), < 1.5*sla (15s).
+                // inflight 24000 -> seal = 12.0s. Ingest rejects (over 9.5),
+                // heavy accepts but degraded (effective capacity = 1).
+                // Stays fixed under A2 (seal-driven).
+                Scenario {
+                    label: "heavy_degrade_band",
+                    inflight_bytes: 24_000,
+                    incoming_bytes: 0,
+                    buffered_bytes: 0,
+                    buffered_active_count: 0,
+                    oldest_buffer_age_seconds: 0.0,
+                    expected_ingest: IngestOutcome::RejectFreshnessBudget,
+                    expected_heavy: HeavyOutcome::AcceptDegraded,
+                    expected_projected_seal_seconds: 12.0,
+                    expected_projected_buffer_seconds: 0.0,
+                    expected_projected_visibility_seconds: 12.0,
+                },
+                // heavy-reject band: >= 1.5*sla (15s).
+                // inflight 32000 -> seal = 16.0s. Ingest rejects, heavy rejects
+                // with freshness_debt. Stays fixed under A2 (seal-driven).
+                Scenario {
+                    label: "heavy_reject_band",
+                    inflight_bytes: 32_000,
+                    incoming_bytes: 0,
+                    buffered_bytes: 0,
+                    buffered_active_count: 0,
+                    oldest_buffer_age_seconds: 0.0,
+                    expected_ingest: IngestOutcome::RejectFreshnessBudget,
+                    expected_heavy: HeavyOutcome::RejectFreshnessDebt,
+                    expected_projected_seal_seconds: 16.0,
+                    expected_projected_buffer_seconds: 0.0,
+                    expected_projected_visibility_seconds: 16.0,
+                },
+                // buffer-SIZE-debt pushed into the heavy-reject band via the
+                // STATIC drain rate. buffered 17000 over 1 slot -> excess 16000,
+                // size debt = 16000 / 1000 = 16.0s -> heavy rejects today.
+                // FLIP-UNDER-A2: A2 divides by 2000 -> 8.0s, which is below
+                // 1.0*sla, so heavy would accept FULL and ingest would accept.
+                // This row is the sharpest A2 signal.
+                Scenario {
+                    label: "buffer_size_debt_into_reject_band",
+                    inflight_bytes: 0,
+                    incoming_bytes: 0,
+                    buffered_bytes: 17_000,
+                    buffered_active_count: 1,
+                    oldest_buffer_age_seconds: 0.0,
+                    expected_ingest: IngestOutcome::RejectFreshnessBudget,
+                    expected_heavy: HeavyOutcome::RejectFreshnessDebt,
+                    expected_projected_seal_seconds: 0.0,
+                    expected_projected_buffer_seconds: 16.0,
+                    expected_projected_visibility_seconds: 16.0,
+                },
+            ]
+        }
+
+        #[test]
+        fn admission_decisions_match_golden_grid() {
+            for scenario in scenarios() {
+                let label = scenario.label;
+                let inputs = scenario.inputs();
+
+                // Projection triple from a fresh controller.
+                let admission = characterization_controller();
+                let snapshot = admission.snapshot_for(inputs);
+                approx_eq(
+                    snapshot.projected_seal_seconds,
+                    scenario.expected_projected_seal_seconds,
+                    label,
+                    "projected_seal_seconds",
+                );
+                approx_eq(
+                    snapshot.projected_buffer_seconds,
+                    scenario.expected_projected_buffer_seconds,
+                    label,
+                    "projected_buffer_seconds",
+                );
+                approx_eq(
+                    snapshot.projected_visibility_seconds,
+                    scenario.expected_projected_visibility_seconds,
+                    label,
+                    "projected_visibility_seconds",
+                );
+
+                // Ingest decision on a fresh controller.
+                assert_eq!(
+                    classify_ingest(&scenario),
+                    scenario.expected_ingest,
+                    "[{label}] ingest outcome",
+                );
+
+                // Heavy-query decision on a fresh controller.
+                assert_eq!(
+                    classify_heavy(&scenario),
+                    scenario.expected_heavy,
+                    "[{label}] heavy outcome",
+                );
+            }
+        }
+    }
 }
