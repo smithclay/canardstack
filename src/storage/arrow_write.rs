@@ -21,14 +21,6 @@ pub(super) struct ArrowWriteBuffer {
     pub(super) opened_at: Instant,
 }
 
-pub(super) struct ArrowFlushResult {
-    pub(super) rows: usize,
-    pub(super) buffers: usize,
-    pub(super) timings: Vec<ArrowBatchBufferTiming>,
-    pub(super) affected: BTreeMap<StorageSignal, BTreeSet<String>>,
-    pub(super) committed_replay_refs: CommittedReplayRefs,
-}
-
 /// Result record of a durable Arrow write-buffer commit
 /// ([`super::Storage::commit_arrow_write_buffer`]). The `flushed_*` field names
 /// (and the matching `flushed_rows`/`flushed_buffers` JSON keys plus the

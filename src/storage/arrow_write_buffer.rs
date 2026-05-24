@@ -1,7 +1,6 @@
 use super::arrow::{batch_timestamp_days, storage_duckdb_batch};
 use super::arrow_write::{
-    arrow_write_buffer_snapshot, size_or_age_due, ArrowFlushOutcome, ArrowFlushResult,
-    ArrowWriteBuffer,
+    arrow_write_buffer_snapshot, size_or_age_due, ArrowFlushOutcome, ArrowWriteBuffer,
 };
 use super::ducklake::configure_write_connection;
 use super::{
@@ -9,6 +8,7 @@ use super::{
     ArrowWriteBufferMetric, CommittedReplayRefs, InternalTelemetryCommitResult, PreparedArrowBatch,
     ReplayBackedArrowBatch, Storage, StorageSignal, TimingPhase,
 };
+use crate::ingest::ReplayBackedRecordRef;
 use crate::LockExt;
 use anyhow::{Context, Result};
 use arrow58::compute::concat_batches;
@@ -16,6 +16,54 @@ use arrow58::record_batch::RecordBatch;
 use duckdb::Connection;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant;
+
+/// Delivery provenance of a DuckLake signal-data commit, and the single switch
+/// that decides whether a [`CommittedReplayRefs`] token is minted.
+///
+/// Every signal-data write funnels through [`Storage::commit_signal_batches`],
+/// and that chokepoint mints the replay token ONLY from `ReplayBacked`. Internal
+/// self-telemetry has no raw-spool record to checkpoint, so it carries `Internal`
+/// and yields an empty token — without forging a sentinel ref. A new data
+/// producer cannot reach the COMMIT without choosing one of these variants.
+enum WriteProvenance {
+    /// External OTLP ingest: each committed row is backed by a durable raw-spool
+    /// record whose ref must be checkpointed after the COMMIT.
+    ReplayBacked(Vec<ReplayBackedRecordRef>),
+    /// Sanctioned internal self-telemetry (operator metrics): no raw-spool
+    /// record, so nothing to checkpoint and no token is minted.
+    Internal,
+}
+
+impl WriteProvenance {
+    /// Mint the committed-replay-refs token. The ONLY place a non-empty token is
+    /// produced: `ReplayBacked` carries exactly the refs to checkpoint, `Internal`
+    /// yields an empty token. Pinned by
+    /// [`write_provenance_mints_token_only_for_replay_backed`](tests::write_provenance_mints_token_only_for_replay_backed).
+    fn into_committed_replay_refs(self) -> CommittedReplayRefs {
+        match self {
+            WriteProvenance::ReplayBacked(refs) => CommittedReplayRefs::new(refs),
+            WriteProvenance::Internal => CommittedReplayRefs::empty(),
+        }
+    }
+}
+
+/// One already-prepared, already-coalesced signal batch ready to append + COMMIT.
+/// The unit the single commit chokepoint consumes; both the ingest seal and
+/// internal telemetry build these before handing off.
+struct SignalCommitBatch {
+    storage_signal: StorageSignal,
+    batch: RecordBatch,
+    rows: usize,
+    timestamp_days: BTreeSet<String>,
+}
+
+/// Outcome of the single commit chokepoint ([`Storage::commit_signal_batches`]).
+struct SignalCommitOutcome {
+    rows: usize,
+    signals: usize,
+    timings: Vec<ArrowBatchBufferTiming>,
+    committed_replay_refs: CommittedReplayRefs,
+}
 
 impl Storage {
     /// The single size/age flush-threshold predicate, exposed so the
@@ -50,9 +98,10 @@ impl Storage {
     /// Commit a sanctioned internal operator-metrics batch directly to DuckLake.
     ///
     /// This is deliberately not an Arrow write-buffer entry point: external OTLP
-    /// ingest reaches the buffer only through replay-backed batches, while internal
-    /// self-telemetry has no raw-spool record to checkpoint and commits on its own
-    /// clearly named path.
+    /// ingest reaches the buffer only through replay-backed batches. Internal
+    /// self-telemetry has no raw-spool record to checkpoint, so it commits
+    /// immediately (unbuffered) through the shared [`Storage::commit_signal_batches`]
+    /// chokepoint with `Internal` provenance, minting no replay token.
     pub(crate) fn commit_operator_metrics_snapshot(
         &self,
         storage_signal: StorageSignal,
@@ -162,48 +211,19 @@ impl Storage {
             seconds: prepare_started.elapsed().as_secs_f64(),
         }];
 
-        let writer_lock_wait_started = Instant::now();
-        let conn = self.writer.lock_or_poisoned();
-        timings.push(ArrowBatchBufferTiming {
-            storage_signal,
-            phase: TimingPhase::WriterLockWait,
-            rows,
-            seconds: writer_lock_wait_started.elapsed().as_secs_f64(),
-        });
-        configure_write_connection(&conn, &self.write_memory_limit)?;
-
-        conn.execute_batch("BEGIN TRANSACTION;")?;
-        let result = (|| -> Result<()> {
-            let append_started = Instant::now();
-            append_record_batch_to_ducklake(&conn, &self.catalog_name, storage_signal, prepared)?;
-            timings.push(ArrowBatchBufferTiming {
+        // Internal self-telemetry has no raw-spool record, so it commits through
+        // the single chokepoint with `Internal` provenance: it mints no token and
+        // checkpoints nothing, and it never enters the ingest write buffer.
+        let outcome = self.commit_signal_batches(
+            vec![SignalCommitBatch {
                 storage_signal,
-                phase: TimingPhase::DuckdbArrowAppend,
+                batch: prepared,
                 rows,
-                seconds: append_started.elapsed().as_secs_f64(),
-            });
-
-            let commit_started = Instant::now();
-            conn.execute_batch("COMMIT;")?;
-            timings.push(ArrowBatchBufferTiming {
-                storage_signal,
-                phase: TimingPhase::DucklakeCommit,
-                rows,
-                seconds: commit_started.elapsed().as_secs_f64(),
-            });
-            Ok(())
-        })();
-
-        if let Err(err) = result {
-            let _ = conn.execute_batch("ROLLBACK;");
-            return Err(err);
-        }
-
-        *self.last_error.lock_or_poisoned() = None;
-        self.mark_metadata_dirty(BTreeMap::from([(
-            storage_signal,
-            timestamp_days.into_iter().collect(),
-        )]));
+                timestamp_days: timestamp_days.into_iter().collect(),
+            }],
+            WriteProvenance::Internal,
+        )?;
+        timings.extend(outcome.timings);
         Ok(InternalTelemetryCommitResult { rows, timings })
     }
 
@@ -268,8 +288,22 @@ impl Storage {
             }
             std::mem::take(&mut *buffers)
         };
-        let commit_result = match self.commit_arrow_write_buffers(&to_commit) {
-            Ok(result) => result,
+        // Coalesce each signal's buffered batches into one prepared batch (pure
+        // in-memory concat, done before the writer lock is taken) and gather the
+        // replay refs. A coalesce failure restores the detached buffers.
+        let (prepared, replay_refs, mut timings) = match prepare_buffer_commit(&to_commit) {
+            Ok(prepared) => prepared,
+            Err(err) => {
+                self.restore_arrow_write_buffers(to_commit);
+                return Err(err);
+            }
+        };
+        // The single commit chokepoint: ingest carries `ReplayBacked` provenance,
+        // so the seal gets back exactly the token of refs to checkpoint.
+        let outcome = match self
+            .commit_signal_batches(prepared, WriteProvenance::ReplayBacked(replay_refs))
+        {
+            Ok(outcome) => outcome,
             Err(err) => {
                 self.restore_arrow_write_buffers(to_commit);
                 return Err(err);
@@ -277,34 +311,66 @@ impl Storage {
         };
         let active_write_buffers =
             arrow_write_buffer_snapshot(&self.arrow_write_buffers.lock_or_poisoned());
-        *self.last_error.lock_or_poisoned() = None;
-        self.mark_metadata_dirty(commit_result.affected);
+        timings.extend(outcome.timings);
 
         Ok(ArrowFlushOutcome {
-            flushed_rows: commit_result.rows,
-            flushed_buffers: commit_result.buffers,
-            timings: commit_result.timings,
+            flushed_rows: outcome.rows,
+            flushed_buffers: outcome.signals,
+            timings,
             active_write_buffers,
-            replay_backed_records: commit_result.committed_replay_refs.len(),
-            committed_replay_refs: commit_result.committed_replay_refs,
+            replay_backed_records: outcome.committed_replay_refs.len(),
+            committed_replay_refs: outcome.committed_replay_refs,
         })
     }
 
-    fn commit_arrow_write_buffers(
+    /// THE single chokepoint that appends signal rows to DuckLake and COMMITs
+    /// them. Every external-ingest seal and internal-telemetry write funnels
+    /// through here, so it is the one place a signal-data COMMIT is issued and the
+    /// one place a [`CommittedReplayRefs`] token is minted (from the
+    /// [`WriteProvenance`]). A new data producer cannot create a second commit
+    /// path: it must hand prepared batches to this method and pick a provenance.
+    ///
+    /// Batches must arrive already prepared (`storage_duckdb_batch`) and coalesced
+    /// to one per signal; this method owns only the writer lock, the transaction,
+    /// the `last_error` / dirty-metadata bookkeeping, and the token mint. The
+    /// COMMIT here — not the in-transaction appender drain — is what makes the rows
+    /// durable and (for `ReplayBacked`) raw-spool checkpointing legal.
+    fn commit_signal_batches(
         &self,
-        buffers: &BTreeMap<StorageSignal, ArrowWriteBuffer>,
-    ) -> Result<ArrowFlushResult> {
-        let rows = buffers.values().map(|buffer| buffer.rows).sum();
-        let replay_refs = buffers
-            .values()
-            .flat_map(|buffer| buffer.replay_refs.iter().copied())
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        let affected = buffers
+        batches: Vec<SignalCommitBatch>,
+        provenance: WriteProvenance,
+    ) -> Result<SignalCommitOutcome> {
+        let committed_replay_refs = provenance.into_committed_replay_refs();
+        if batches.is_empty() {
+            // No rows to commit: a non-empty replay token here would checkpoint
+            // records that were never committed, so callers must not pass refs
+            // without batches.
+            debug_assert!(
+                committed_replay_refs.as_slice().is_empty(),
+                "replay refs supplied with no batches to commit"
+            );
+            return Ok(SignalCommitOutcome {
+                rows: 0,
+                signals: 0,
+                timings: Vec::new(),
+                committed_replay_refs: CommittedReplayRefs::empty(),
+            });
+        }
+
+        let total_rows = batches.iter().map(|batch| batch.rows).sum();
+        let signals = batches.len();
+        let rows_by_signal = batches
             .iter()
-            .map(|(&storage_signal, buffer)| (storage_signal, buffer.timestamp_days.clone()))
-            .collect::<BTreeMap<_, _>>();
+            .map(|batch| (batch.storage_signal, batch.rows))
+            .collect::<Vec<_>>();
+        let mut affected = BTreeMap::<StorageSignal, BTreeSet<String>>::new();
+        for batch in &batches {
+            affected
+                .entry(batch.storage_signal)
+                .or_default()
+                .extend(batch.timestamp_days.iter().cloned());
+        }
+
         // Time the wait to acquire the single writer connection so writer
         // contention (seal vs. metadata-refresh on the same lock) is visible.
         let writer_lock_wait_started = Instant::now();
@@ -312,21 +378,57 @@ impl Storage {
         let writer_lock_wait_seconds = writer_lock_wait_started.elapsed().as_secs_f64();
         configure_write_connection(&conn, &self.write_memory_limit)?;
 
-        let mut timings = distributed_buffer_timing(
+        let mut timings = distributed_signal_timing(
             TimingPhase::WriterLockWait,
-            buffers,
+            &rows_by_signal,
             writer_lock_wait_seconds,
         );
-        append_buffers_to_ducklake(&conn, &self.catalog_name, buffers, &mut timings).with_context(
-            || "DuckDB Arrow appender flush failed; no fallback write path is enabled",
-        )?;
 
-        Ok(ArrowFlushResult {
-            rows,
-            buffers: buffers.len(),
+        conn.execute_batch("BEGIN TRANSACTION;")?;
+        let result = (|| -> Result<()> {
+            for batch in &batches {
+                let append_started = Instant::now();
+                append_record_batch_to_ducklake(
+                    &conn,
+                    &self.catalog_name,
+                    batch.storage_signal,
+                    batch.batch.clone(),
+                )
+                .with_context(|| {
+                    "DuckDB Arrow appender flush failed; no fallback write path is enabled"
+                })?;
+                timings.push(ArrowBatchBufferTiming {
+                    storage_signal: batch.storage_signal,
+                    phase: TimingPhase::DuckdbArrowAppend,
+                    rows: batch.rows,
+                    seconds: append_started.elapsed().as_secs_f64(),
+                });
+            }
+
+            let commit_started = Instant::now();
+            conn.execute_batch("COMMIT;")?;
+            timings.extend(distributed_signal_timing(
+                TimingPhase::DucklakeCommit,
+                &rows_by_signal,
+                commit_started.elapsed().as_secs_f64(),
+            ));
+            Ok(())
+        })();
+
+        if let Err(err) = result {
+            let _ = conn.execute_batch("ROLLBACK;");
+            return Err(err);
+        }
+        drop(conn);
+
+        *self.last_error.lock_or_poisoned() = None;
+        self.mark_metadata_dirty(affected);
+
+        Ok(SignalCommitOutcome {
+            rows: total_rows,
+            signals,
             timings,
-            affected,
-            committed_replay_refs: CommittedReplayRefs::new(replay_refs),
+            committed_replay_refs,
         })
     }
 
@@ -341,50 +443,39 @@ impl Storage {
     }
 }
 
-fn append_buffers_to_ducklake(
-    conn: &Connection,
-    catalog_name: &str,
+/// Coalesce each signal's buffered batches into one prepared [`SignalCommitBatch`]
+/// and gather the union of replay refs across all buffers. Pure in-memory work
+/// (no DB, no writer lock), so the seal does it before
+/// [`Storage::commit_signal_batches`] takes the writer connection. Returns the
+/// per-signal `ArrowWriteCoalesce` timings alongside the prepared batches.
+fn prepare_buffer_commit(
     buffers: &BTreeMap<StorageSignal, ArrowWriteBuffer>,
-    timings: &mut Vec<ArrowBatchBufferTiming>,
-) -> Result<()> {
-    conn.execute_batch("BEGIN TRANSACTION;")?;
-    let result = (|| -> Result<()> {
-        for (&storage_signal, buffer) in buffers {
-            let coalesce_started = Instant::now();
-            let batch = buffer.record_batch(storage_signal)?;
-            timings.push(ArrowBatchBufferTiming {
-                storage_signal,
-                phase: TimingPhase::ArrowWriteCoalesce,
-                rows: buffer.rows,
-                seconds: coalesce_started.elapsed().as_secs_f64(),
-            });
-
-            let append_started = Instant::now();
-            append_record_batch_to_ducklake(conn, catalog_name, storage_signal, batch)?;
-            timings.push(ArrowBatchBufferTiming {
-                storage_signal,
-                phase: TimingPhase::DuckdbArrowAppend,
-                rows: buffer.rows,
-                seconds: append_started.elapsed().as_secs_f64(),
-            });
-        }
-
-        let commit_started = Instant::now();
-        conn.execute_batch("COMMIT;")?;
-        let commit_seconds = commit_started.elapsed().as_secs_f64();
-        timings.extend(distributed_buffer_timing(
-            TimingPhase::DucklakeCommit,
-            buffers,
-            commit_seconds,
-        ));
-        Ok(())
-    })();
-
-    if let Err(err) = result {
-        let _ = conn.execute_batch("ROLLBACK;");
-        return Err(err);
+) -> Result<(
+    Vec<SignalCommitBatch>,
+    Vec<ReplayBackedRecordRef>,
+    Vec<ArrowBatchBufferTiming>,
+)> {
+    let mut prepared = Vec::with_capacity(buffers.len());
+    let mut timings = Vec::with_capacity(buffers.len());
+    let mut replay_refs = BTreeSet::new();
+    for (&storage_signal, buffer) in buffers {
+        let coalesce_started = Instant::now();
+        let batch = buffer.record_batch(storage_signal)?;
+        timings.push(ArrowBatchBufferTiming {
+            storage_signal,
+            phase: TimingPhase::ArrowWriteCoalesce,
+            rows: buffer.rows,
+            seconds: coalesce_started.elapsed().as_secs_f64(),
+        });
+        replay_refs.extend(buffer.replay_refs.iter().copied());
+        prepared.push(SignalCommitBatch {
+            storage_signal,
+            batch,
+            rows: buffer.rows,
+            timestamp_days: buffer.timestamp_days.clone(),
+        });
     }
-    Ok(())
+    Ok((prepared, replay_refs.into_iter().collect(), timings))
 }
 
 fn append_record_batch_to_ducklake(
@@ -402,36 +493,40 @@ fn append_record_batch_to_ducklake(
         format!("append Arrow RecordBatch to {catalog_name}.main.{storage_signal}")
     })?;
     // In-memory appender drain into the OPEN transaction — NOT the durable commit.
-    // The COMMIT in `append_buffers_to_ducklake` is what makes the rows durable and
-    // raw-spool checkpointing legal; this only flushes the appender's buffer.
+    // The COMMIT in `Storage::commit_signal_batches` is what makes the rows durable
+    // and raw-spool checkpointing legal; this only flushes the appender's buffer.
     appender.flush().with_context(|| {
         format!("drain DuckDB Arrow appender for {catalog_name}.main.{storage_signal}")
     })?;
     Ok(())
 }
 
-fn distributed_buffer_timing(
+/// Apportion a single whole-commit duration (writer-lock wait, COMMIT) across the
+/// signals in the commit, weighted by row count, so per-signal phase metrics stay
+/// comparable to the per-signal append timings. Equal split when the commit has
+/// zero rows.
+fn distributed_signal_timing(
     phase: TimingPhase,
-    buffers: &BTreeMap<StorageSignal, ArrowWriteBuffer>,
+    rows_by_signal: &[(StorageSignal, usize)],
     seconds: f64,
 ) -> Vec<ArrowBatchBufferTiming> {
-    if buffers.is_empty() {
+    if rows_by_signal.is_empty() {
         return Vec::new();
     }
-    let total_rows = buffers.values().map(|buffer| buffer.rows).sum::<usize>();
-    buffers
+    let total_rows = rows_by_signal.iter().map(|(_, rows)| *rows).sum::<usize>();
+    rows_by_signal
         .iter()
-        .map(|(&storage_signal, buffer)| {
-            let buffer_seconds = if total_rows == 0 {
-                seconds / buffers.len() as f64
+        .map(|&(storage_signal, rows)| {
+            let signal_seconds = if total_rows == 0 {
+                seconds / rows_by_signal.len() as f64
             } else {
-                seconds * buffer.rows as f64 / total_rows as f64
+                seconds * rows as f64 / total_rows as f64
             };
             ArrowBatchBufferTiming {
                 storage_signal,
                 phase,
-                rows: buffer.rows,
-                seconds: buffer_seconds,
+                rows,
+                seconds: signal_seconds,
             }
         })
         .collect()
@@ -554,5 +649,44 @@ mod tests {
             coalesce_storage_batches(StorageSignal::MetricGauge, &[&first, &second]).unwrap();
 
         assert_eq!(coalesced.num_rows(), 3);
+    }
+
+    /// Pins the W1 invariant: a `CommittedReplayRefs` token is minted ONLY from
+    /// `ReplayBacked` provenance, and `Internal` self-telemetry yields an empty
+    /// token without forging a sentinel ref. `commit_signal_batches` is the sole
+    /// caller of `into_committed_replay_refs`, so this guards the only mint path.
+    #[test]
+    fn write_provenance_mints_token_only_for_replay_backed() {
+        use crate::ingest::spool::RecordId;
+        use crate::ingest::{OtlpRequestKind, ReplayBackedRecordRef};
+
+        // Internal self-telemetry has no raw-spool record to checkpoint: empty
+        // token, and no sentinel ref forged to satisfy the type.
+        assert!(WriteProvenance::Internal
+            .into_committed_replay_refs()
+            .as_slice()
+            .is_empty());
+
+        // Replay-backed ingest mints a token of exactly the supplied refs — the
+        // only way a non-empty committed-replay-refs token comes into existence.
+        let refs = vec![
+            ReplayBackedRecordRef {
+                request_kind: OtlpRequestKind::Logs,
+                raw_record_id: RecordId {
+                    segment: 1,
+                    sequence: 2,
+                },
+            },
+            ReplayBackedRecordRef {
+                request_kind: OtlpRequestKind::Metrics,
+                raw_record_id: RecordId {
+                    segment: 3,
+                    sequence: 4,
+                },
+            },
+        ];
+        let token = WriteProvenance::ReplayBacked(refs.clone()).into_committed_replay_refs();
+        assert_eq!(token.len(), refs.len());
+        assert_eq!(token.as_slice(), refs.as_slice());
     }
 }
