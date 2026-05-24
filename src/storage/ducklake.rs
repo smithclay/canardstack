@@ -10,7 +10,7 @@ const DUCKDB_THREADS: usize = 1;
 pub fn install_ducklake_extension(extension_dir: Option<&Path>) -> Result<()> {
     let conn = Connection::open_in_memory()?;
     configure_extension_directory(&conn, extension_dir)?;
-    conn.execute_batch("INSTALL ducklake; LOAD ducklake;")?;
+    conn.execute_batch("INSTALL ducklake; LOAD ducklake; INSTALL json; LOAD json;")?;
     Ok(())
 }
 pub(super) fn sql_path(path: &Path) -> String {
