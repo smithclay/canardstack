@@ -6,7 +6,7 @@ use super::arrow_write::{
 use super::ducklake::configure_write_connection;
 use super::{
     ArrowBatchBufferResult, ArrowBatchBufferTiming, ArrowWriteBufferFreshness,
-    ArrowWriteBufferMetric, InternalTelemetryCommitResult, PreparedArrowBatch,
+    ArrowWriteBufferMetric, CommittedReplayRefs, InternalTelemetryCommitResult, PreparedArrowBatch,
     ReplayBackedArrowBatch, Storage, StorageSignal, TimingPhase,
 };
 use crate::LockExt;
@@ -249,11 +249,11 @@ impl Storage {
     /// the COMMIT here is what makes raw-spool checkpointing legal, distinct from
     /// the in-memory `appender.flush()` drain that runs inside the transaction
     /// before it (see [`append_record_batch_to_ducklake`]). The returned
-    /// [`ArrowFlushOutcome`] carries the committed snapshot's replay refs so the
-    /// caller ([`crate::seal`]) can checkpoint exactly those raw-spool records
-    /// afterward. Deciding *when* a commit is due is the `SealDriver`'s job
-    /// ([`crate::seal`]); this method always commits everything currently buffered.
-    pub fn commit_arrow_write_buffer(&self) -> Result<ArrowFlushOutcome> {
+    /// [`ArrowFlushOutcome`] carries the committed snapshot's replay refs as a
+    /// capability token so the caller ([`crate::seal`]) can checkpoint exactly
+    /// those raw-spool records afterward. SealDriver owns when; this method
+    /// commits what is buffered now.
+    pub(crate) fn commit_arrow_write_buffer(&self) -> Result<ArrowFlushOutcome> {
         let to_commit = {
             let mut buffers = self.arrow_write_buffers.lock_or_poisoned();
             if buffers.is_empty() {
@@ -262,7 +262,8 @@ impl Storage {
                     flushed_buffers: 0,
                     timings: Vec::new(),
                     active_write_buffers: arrow_write_buffer_snapshot(&buffers),
-                    replay_refs: Vec::new(),
+                    replay_backed_records: 0,
+                    committed_replay_refs: CommittedReplayRefs::empty(),
                 });
             }
             std::mem::take(&mut *buffers)
@@ -284,7 +285,8 @@ impl Storage {
             flushed_buffers: commit_result.buffers,
             timings: commit_result.timings,
             active_write_buffers,
-            replay_refs: commit_result.replay_refs,
+            replay_backed_records: commit_result.committed_replay_refs.len(),
+            committed_replay_refs: commit_result.committed_replay_refs,
         })
     }
 
@@ -324,7 +326,7 @@ impl Storage {
             buffers: buffers.len(),
             timings,
             affected,
-            replay_refs,
+            committed_replay_refs: CommittedReplayRefs::new(replay_refs),
         })
     }
 

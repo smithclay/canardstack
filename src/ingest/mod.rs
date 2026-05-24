@@ -5,7 +5,8 @@ use crate::metrics::{MetricName, Metrics};
 use crate::otlp::{self, Transformed};
 use crate::signal::StorageSignal;
 use crate::storage::{
-    ArrowBatchBufferResult, ArrowBatchBufferTiming, ReplayBackedArrowBatch, Storage,
+    ArrowBatchBufferResult, ArrowBatchBufferTiming, CommittedReplayRefs, ReplayBackedArrowBatch,
+    Storage,
 };
 use crate::validation::{self, ApiError, ApiResult};
 use crate::LockExt;
@@ -236,7 +237,7 @@ impl Ingestor {
 
     pub(crate) fn checkpoint_replay_backed_records(
         &self,
-        records: &[ReplayBackedRecordRef],
+        records: CommittedReplayRefs,
         reason: &'static str,
         metrics: Option<&Metrics>,
     ) -> Result<()> {
@@ -311,7 +312,7 @@ impl IngestPipeline {
 
     fn checkpoint_replay_backed_records(
         &self,
-        records: &[ReplayBackedRecordRef],
+        records: CommittedReplayRefs,
         reason: &'static str,
         metrics: Option<&Metrics>,
     ) -> Result<()> {
@@ -665,16 +666,16 @@ impl IngestPipeline {
     /// made on the worker path.
     fn dispose_terminal(
         &self,
-        raw_spool_ref: RawSpoolAppendRef,
-        route: OtlpRequestKind,
+        context: SpooledRequestContext<'_>,
         reason: &'static str,
         err: ApiError,
-        metrics: &Metrics,
     ) -> SpooledIngestError {
-        match self
-            .raw_spool
-            .checkpoint_terminal(raw_spool_ref, route, reason, metrics)
-        {
+        match self.raw_spool.checkpoint_terminal(
+            context.raw_spool_ref,
+            context.route,
+            reason,
+            context.metrics,
+        ) {
             Ok(()) => SpooledIngestError::terminal(err),
             Err(checkpoint_err) => SpooledIngestError::pending_replay(checkpoint_err),
         }
@@ -706,22 +707,10 @@ impl IngestPipeline {
             } else {
                 "decode_failed"
             };
-            self.dispose_terminal(
-                context.raw_spool_ref,
-                context.route,
-                reason,
-                err,
-                context.metrics,
-            )
+            self.dispose_terminal(context, reason, err)
         })?;
         if let Err(err) = validation::validate_body_size(body.len(), &self.config) {
-            return Err(self.dispose_terminal(
-                context.raw_spool_ref,
-                context.route,
-                "body_size_invalid",
-                err,
-                context.metrics,
-            ));
+            return Err(self.dispose_terminal(context, "body_size_invalid", err));
         }
         Ok(body)
     }
@@ -745,15 +734,7 @@ impl IngestPipeline {
             "otlp_transform",
             started.elapsed().as_secs_f64(),
         );
-        transformed_result.map_err(|err| {
-            self.dispose_terminal(
-                context.raw_spool_ref,
-                context.route,
-                "transform_failed",
-                err,
-                context.metrics,
-            )
-        })
+        transformed_result.map_err(|err| self.dispose_terminal(context, "transform_failed", err))
     }
 
     /// Timestamp-validation phase: reject batches whose timestamps fall outside
@@ -770,15 +751,7 @@ impl IngestPipeline {
             "timestamp_validation",
             started.elapsed().as_secs_f64(),
         );
-        skew_result.map_err(|err| {
-            self.dispose_terminal(
-                context.raw_spool_ref,
-                context.route,
-                "timestamp_rejected",
-                err,
-                context.metrics,
-            )
-        })
+        skew_result.map_err(|err| self.dispose_terminal(context, "timestamp_rejected", err))
     }
 
     /// Exact-accounting phase: correct the in-flight reservation to the real
@@ -801,15 +774,7 @@ impl IngestPipeline {
             .saturating_add(pending_bytes);
         runtime_memory_reservation
             .reserve_at_least(peak_bytes, context.route, context.metrics)
-            .map_err(|err| {
-                self.dispose_terminal(
-                    context.raw_spool_ref,
-                    context.route,
-                    "memory_rejected",
-                    err,
-                    context.metrics,
-                )
-            })
+            .map_err(|err| self.dispose_terminal(context, "memory_rejected", err))
     }
 
     /// Buffer phase: append the transformed rows to the storage Arrow write

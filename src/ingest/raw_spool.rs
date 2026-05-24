@@ -4,6 +4,7 @@ use crate::ingest::spool::{
 };
 use crate::ingest::OtlpRequestKind;
 use crate::metrics::{MetricName, Metrics};
+use crate::storage::CommittedReplayRefs;
 use crate::validation::{ApiError, ApiResult};
 use anyhow::{Context, Result};
 use std::collections::{BTreeMap, HashMap};
@@ -310,10 +311,12 @@ impl RawSpool {
 
     /// Terminal disposition for a payload that can never succeed: checkpoint the
     /// raw-spool record so it will not replay; the caller returns the rejection
-    /// afterward. (Retryable storage faults do NOT take this path — they leave the
-    /// record pending so it replays on restart.) A terminally-rejected request is
-    /// dropped from the lifecycle funnel and stays covered by
-    /// `canardstack_raw_spool_checkpointed_records_total{reason}` and
+    /// afterward. This is intentionally separate from committed replay-backed
+    /// checkpoints: terminal never-buffered payloads do not have, and must not
+    /// require, a storage commit token. (Retryable storage faults do NOT take this
+    /// path — they leave the record pending so it replays on restart.) A
+    /// terminally-rejected request is dropped from the lifecycle funnel and stays
+    /// covered by `canardstack_raw_spool_checkpointed_records_total{reason}` and
     /// `canardstack_ingest_requests_total{reason}`; no stage counter is emitted.
     pub(crate) fn checkpoint_terminal(
         &self,
@@ -382,10 +385,11 @@ impl RawSpool {
 
     pub(crate) fn checkpoint_replay_backed_records(
         &self,
-        records: &[ReplayBackedRecordRef],
+        records: CommittedReplayRefs,
         reason: &'static str,
         metrics: Option<&Metrics>,
     ) -> Result<()> {
+        let records = records.as_slice();
         if records.is_empty() {
             return Ok(());
         }

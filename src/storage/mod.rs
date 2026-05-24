@@ -57,6 +57,26 @@ pub struct StorageProbe {
     pub last_error: Option<String>,
 }
 
+pub(crate) struct CommittedReplayRefs(Vec<ReplayBackedRecordRef>);
+
+impl CommittedReplayRefs {
+    pub(crate) fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub(crate) fn as_slice(&self) -> &[ReplayBackedRecordRef] {
+        &self.0
+    }
+
+    pub(super) fn new(replay_refs: Vec<ReplayBackedRecordRef>) -> Self {
+        Self(replay_refs)
+    }
+
+    pub(super) fn empty() -> Self {
+        Self(Vec::new())
+    }
+}
+
 impl StorageProbe {
     pub fn is_ready(&self) -> bool {
         self.healthy

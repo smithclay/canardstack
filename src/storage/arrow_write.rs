@@ -1,4 +1,4 @@
-use super::{ArrowBatchBufferTiming, PreparedArrowBatch};
+use super::{ArrowBatchBufferTiming, CommittedReplayRefs, PreparedArrowBatch};
 use crate::ingest::ReplayBackedRecordRef;
 use crate::signal::StorageSignal;
 use anyhow::{Context, Result};
@@ -26,7 +26,7 @@ pub(super) struct ArrowFlushResult {
     pub(super) buffers: usize,
     pub(super) timings: Vec<ArrowBatchBufferTiming>,
     pub(super) affected: BTreeMap<StorageSignal, BTreeSet<String>>,
-    pub(super) replay_refs: Vec<ReplayBackedRecordRef>,
+    pub(super) committed_replay_refs: CommittedReplayRefs,
 }
 
 /// Result record of a durable Arrow write-buffer commit
@@ -39,12 +39,16 @@ pub struct ArrowFlushOutcome {
     pub flushed_buffers: usize,
     pub timings: Vec<ArrowBatchBufferTiming>,
     pub active_write_buffers: Value,
-    pub(crate) replay_refs: Vec<ReplayBackedRecordRef>,
+    pub(super) replay_backed_records: usize,
+    pub(super) committed_replay_refs: CommittedReplayRefs,
 }
 
 impl ArrowFlushOutcome {
-    pub(crate) fn replay_refs(&self) -> Vec<ReplayBackedRecordRef> {
-        self.replay_refs.clone()
+    pub(crate) fn take_committed_replay_refs(&mut self) -> CommittedReplayRefs {
+        std::mem::replace(
+            &mut self.committed_replay_refs,
+            CommittedReplayRefs::empty(),
+        )
     }
 
     pub fn to_json(&self) -> Value {
@@ -52,7 +56,7 @@ impl ArrowFlushOutcome {
             "supported": true,
             "flushed_rows": self.flushed_rows,
             "flushed_buffers": self.flushed_buffers,
-            "replay_backed_records": self.replay_refs.len(),
+            "replay_backed_records": self.replay_backed_records,
             "timings": arrow_write_timing_snapshot(&self.timings),
             "active_write_buffers": self.active_write_buffers,
         })
