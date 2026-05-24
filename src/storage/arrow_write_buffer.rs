@@ -216,6 +216,15 @@ impl Storage {
         })
     }
 
+    /// Commit buffered rows to DuckLake. For each storage signal whose Arrow
+    /// write buffer is due (`force`, or size/age per [`size_or_age_due`]), this
+    /// detaches the buffer, coalesces it into one `RecordBatch`, appends it
+    /// through the DuckDB Arrow appender, and COMMITs the DuckLake transaction.
+    /// "Flush" here means a durable DuckLake commit, not an in-memory drain. The
+    /// returned [`ArrowFlushOutcome`] carries the committed snapshot's replay refs
+    /// so the caller ([`crate::seal`]) can checkpoint exactly those raw-spool
+    /// records afterward. Production always calls this with `force = true` via the
+    /// single seal path.
     pub fn flush_arrow_write_buffer(&self, force: bool) -> Result<ArrowFlushOutcome> {
         let mut to_flush = BTreeMap::new();
         {

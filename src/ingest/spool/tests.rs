@@ -263,7 +263,7 @@ fn raw_spool_checkpoint_skips_committed_records() {
     let mut spool = Spool::open(options(dir.path())).unwrap();
     let first = spool.append(record(b"first")).unwrap();
     let second = spool.append(record(b"second")).unwrap();
-    spool.mark_committed(first).unwrap();
+    spool.checkpoint_record(first).unwrap();
     drop(spool);
 
     let spool = Spool::open(options(dir.path())).unwrap();
@@ -283,10 +283,10 @@ fn raw_spool_checkpoint_fsync_can_be_delayed_until_record_threshold() {
     let first = spool.append(record(b"first")).unwrap();
     let second = spool.append(record(b"second")).unwrap();
 
-    spool.mark_committed(first).unwrap();
+    spool.checkpoint_record(first).unwrap();
     assert_eq!(spool.checkpoint_dirty_records, 1);
 
-    spool.mark_committed(second).unwrap();
+    spool.checkpoint_record(second).unwrap();
     assert_eq!(spool.checkpoint_dirty_records, 0);
 }
 
@@ -299,7 +299,7 @@ fn raw_spool_checkpoint_fsync_can_be_forced_on_shutdown() {
     let mut spool = Spool::open(opts).unwrap();
     let first = spool.append(record(b"first")).unwrap();
 
-    spool.mark_committed(first).unwrap();
+    spool.checkpoint_record(first).unwrap();
     assert_eq!(spool.checkpoint_dirty_records, 1);
 
     spool.sync_checkpoint_if_due(true).unwrap();
@@ -443,7 +443,7 @@ fn raw_spool_reclaims_fully_committed_closed_segments() {
     let second = spool.append(record(b"second-payload")).unwrap();
     assert_ne!(first.segment, second.segment);
 
-    spool.mark_committed(first).unwrap();
+    spool.checkpoint_record(first).unwrap();
     let removed = spool.reclaim_committed_segments().unwrap();
     assert_eq!(removed, 1);
     assert!(!spool.segment_path(first.segment).exists());
@@ -464,7 +464,7 @@ fn raw_spool_reclaims_committed_closed_segments_before_full() {
 
     for _ in 0..5 {
         let id = spool.append(record(b"committed-payload")).unwrap();
-        spool.mark_committed(id).unwrap();
+        spool.checkpoint_record(id).unwrap();
     }
 
     assert_eq!(spool.recover_pending().unwrap().len(), 0);
@@ -484,8 +484,8 @@ fn raw_spool_compacts_checkpoint_on_reclaim() {
     let first = spool.append(record(b"first-payload")).unwrap();
     let second = spool.append(record(b"second-payload")).unwrap();
     assert_ne!(first.segment, second.segment);
-    spool.mark_committed(first).unwrap();
-    spool.mark_committed(second).unwrap();
+    spool.checkpoint_record(first).unwrap();
+    spool.checkpoint_record(second).unwrap();
     assert_eq!(spool.completed.len(), 2);
 
     let removed = spool.reclaim_committed_segments().unwrap();
@@ -523,7 +523,7 @@ fn raw_spool_stats_track_pending_incrementally() {
         b"first".len() as u64 + b"second".len() as u64
     );
 
-    spool.mark_committed(first).unwrap();
+    spool.checkpoint_record(first).unwrap();
     let stats = spool.stats().unwrap();
     assert_eq!(stats.pending_records, 1);
     assert_eq!(stats.pending_bytes, b"second".len() as u64);

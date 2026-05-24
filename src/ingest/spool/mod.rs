@@ -514,11 +514,16 @@ impl Spool {
         Ok(pending)
     }
 
-    pub fn mark_committed(&mut self, id: RecordId) -> Result<()> {
-        self.mark_committed_batch(vec![id])
+    pub fn checkpoint_record(&mut self, id: RecordId) -> Result<()> {
+        self.checkpoint_records(vec![id])
     }
 
-    pub fn mark_committed_batch(&mut self, ids: Vec<RecordId>) -> Result<()> {
+    /// The raw-spool checkpoint write primitive: durably mark these record
+    /// sequences as committed by appending them to the checkpoint log (fsynced per
+    /// the checkpoint batching policy) and dropping them from the pending set, so
+    /// they will not replay on a future restart. "Checkpoint" in the ingest
+    /// lifecycle vocabulary means exactly this operation.
+    pub fn checkpoint_records(&mut self, ids: Vec<RecordId>) -> Result<()> {
         self.ensure_healthy()?;
         for id in ids {
             if !self.completed.insert(id.sequence) {

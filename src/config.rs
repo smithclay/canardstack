@@ -123,6 +123,11 @@ pub struct Mechanics {
     pub raw_spool_dir: PathBuf,
     pub raw_spool_max_segment_bytes: usize,
     pub raw_spool_max_record_bytes: usize,
+    /// Durable raw-spool byte capacity applied **per request kind**: each of the
+    /// three raw-spool writers (logs/traces/metrics) enforces this cap on its own
+    /// segment files independently, so the aggregate worst-case raw-spool
+    /// footprint is up to `3 * raw_spool_max_total_bytes`. Set via
+    /// `CANARDSTACK_RAW_SPOOL_CAPACITY_BYTES` / `[raw_spool] capacity_bytes`.
     pub raw_spool_max_total_bytes: usize,
     pub raw_spool_group_commit_delay: Duration,
     pub ingest_workers: usize,

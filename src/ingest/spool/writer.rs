@@ -88,11 +88,19 @@ impl Writer {
         rx.recv().context("receive raw spool append result")?
     }
 
-    pub fn mark_committed(&self, id: RecordId) -> Result<CheckpointBatchStats> {
-        self.mark_committed_batch(&[id])
+    /// Checkpoint a single durably-spooled record: durably mark its sequence
+    /// committed so it will not replay on restart. Convenience wrapper over
+    /// [`Writer::checkpoint_records`].
+    pub fn checkpoint_record(&self, id: RecordId) -> Result<CheckpointBatchStats> {
+        self.checkpoint_records(&[id])
     }
 
-    pub fn mark_committed_batch(&self, ids: &[RecordId]) -> Result<CheckpointBatchStats> {
+    /// Checkpoint a batch of durably-spooled records: durably mark their
+    /// sequences committed (append to the checkpoint log + fsync per the writer's
+    /// batching policy) so they will not replay on restart. This is the raw-spool
+    /// "checkpoint" primitive in the ingest lifecycle vocabulary; the seal path
+    /// calls it after a successful DuckLake commit.
+    pub fn checkpoint_records(&self, ids: &[RecordId]) -> Result<CheckpointBatchStats> {
         if ids.is_empty() {
             return Ok(CheckpointBatchStats::default());
         }
@@ -388,7 +396,7 @@ pub(super) fn handle_checkpoint_batch(
         wait_seconds: collect_started.elapsed().as_secs_f64(),
         deferred_append_commands,
     };
-    match spool.mark_committed_batch(ids) {
+    match spool.checkpoint_records(ids) {
         Ok(()) => {
             let mut stats = Some(stats);
             for command in batch {

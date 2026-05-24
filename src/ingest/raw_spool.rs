@@ -42,6 +42,19 @@ pub(crate) struct PendingRawRecord {
     pub(crate) compressed_body: Vec<u8>,
 }
 
+/// One independent durable raw-spool writer per [`OtlpRequestKind`]
+/// (logs / traces / metrics), each owning its own directory, segment files, and
+/// checkpoint log.
+///
+/// Capacity is **per request kind, not a global aggregate.** The configured
+/// `raw_spool_max_total_bytes` (env `CANARDSTACK_RAW_SPOOL_CAPACITY_BYTES`,
+/// file `[raw_spool] capacity_bytes`) is applied independently to each of the
+/// three writers, so the worst-case on-disk raw-spool footprint is up to
+/// `3 * raw_spool_max_total_bytes`. A `raw_spool_full` 429 therefore means ONE
+/// request kind hit its own byte cap, not that the aggregate limit was reached.
+/// (Whether per-kind or aggregate accounting is the right operator model is a
+/// deliberate open decision; do not add a future storage signal's writer assuming
+/// one global limit without revisiting this.)
 pub(crate) struct RawSpool {
     writers: BTreeMap<OtlpRequestKind, Writer>,
 }
@@ -322,7 +335,7 @@ impl RawSpool {
         let started = Instant::now();
         let stats = self
             .raw_spool_for(raw_spool_ref.request_kind)?
-            .mark_committed(raw_spool_ref.record_id)
+            .checkpoint_record(raw_spool_ref.record_id)
             .context("checkpoint raw spool record")?;
         if let Some(metrics) = metrics {
             let seconds = started.elapsed().as_secs_f64();
@@ -374,7 +387,7 @@ impl RawSpool {
         for (request_kind, ids) in by_request_kind_ids {
             let stats = self
                 .raw_spool_for(request_kind)?
-                .mark_committed_batch(&ids)
+                .checkpoint_records(&ids)
                 .with_context(|| format!("checkpoint {request_kind} raw spool records"))?;
             if let Some(metrics) = metrics {
                 Self::record_raw_spool_checkpoint_batch_metrics(metrics, request_kind, stats);
@@ -596,6 +609,8 @@ fn spawn_raw_spool_writer(config: &Config, request_kind: OtlpRequestKind) -> Res
             dir: config.mechanics.raw_spool_dir.join(request_kind.as_str()),
             max_segment_bytes: config.mechanics.raw_spool_max_segment_bytes as u64,
             max_record_bytes: config.mechanics.raw_spool_max_record_bytes as u64,
+            // Per-request-kind cap: every writer gets the same configured value,
+            // so the aggregate footprint is up to 3x this. See `RawSpool` docs.
             max_total_bytes: config.mechanics.raw_spool_max_total_bytes as u64,
             checkpoint_fsync_records: spool::RAW_SPOOL_CHECKPOINT_FSYNC_RECORDS,
             checkpoint_fsync_delay: spool::RAW_SPOOL_CHECKPOINT_FSYNC_DELAY,

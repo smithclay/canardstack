@@ -83,10 +83,13 @@ impl SealDriver {
     }
 }
 
-/// The whole seal, in one place: reserve seal capacity, flush+commit+checkpoint
-/// the Arrow write buffer to DuckLake, feed the observed throughput back into the
-/// admission EWMA, and record the run. The single named entry point for "perform
-/// a seal", used by both the scheduler tick and the admin maintenance route.
+/// The whole seal, in one place. In order: reserve seal capacity; COMMIT the
+/// Arrow write buffer to DuckLake (the "flush" — append buffered rows and commit
+/// the transaction so they become query-visible); checkpoint the now-durable
+/// raw-spool records (mark them committed so they will not replay); feed the
+/// observed throughput back into the admission EWMA; and record the run. The
+/// single named entry point for "perform a seal", used by both the scheduler tick
+/// and the admin maintenance route.
 ///
 /// Delivery semantics: the raw-spool checkpoint happens AFTER the DuckLake COMMIT
 /// (capture before flush, checkpoint after commit). This ordering is deliberate
