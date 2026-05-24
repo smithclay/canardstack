@@ -3075,6 +3075,76 @@ fn retention_run_deletes_whole_day_eligible_rows() {
 }
 
 #[test]
+fn retention_dry_run_reports_checkpoint_skipped() {
+    let (_dir, state) = app();
+
+    let response = http::route(
+        "POST",
+        "/api/admin/maintenance/retention/dry-run",
+        &HashMap::new(),
+        &admin_headers(&state),
+        &[],
+        &state,
+    );
+
+    assert_eq!(response.status(), 200, "{}", response.json_body());
+    assert_eq!(response.json_body()["dry_run"], json!(true));
+    assert_eq!(
+        response.json_body()["ducklake_checkpoint"]["status"],
+        json!("skipped")
+    );
+    assert_eq!(
+        response.json_body()["ducklake_checkpoint"]["reason"],
+        json!("dry_run")
+    );
+    assert_eq!(
+        response.json_body()["ducklake_checkpoint"]["ran"],
+        json!(false)
+    );
+}
+
+#[test]
+fn disabled_ducklake_maintenance_skips_checkpoint_but_keeps_retention() {
+    let dir = tempdir().unwrap();
+    let mut config = Config::test(dir.path().join("canardstack.duckdb"));
+    config.operator.local_storage_dir = dir.path().join("storage");
+    config.operator.ducklake_maintenance.enabled = false;
+    config.operator.ducklake_maintenance.data_inlining_row_limit = 0;
+    config.operator.logs_retention_days = 1;
+    let state = AppState::new(config).unwrap();
+    let old_ms = (Utc::now() - Duration::days(3)).timestamp_millis();
+    append_log_rows(
+        &state,
+        &[(old_ms, "old retained log", "legacy")],
+        "otlp_json",
+    );
+
+    let response = http::route(
+        "POST",
+        "/api/admin/maintenance/retention/run",
+        &HashMap::new(),
+        &admin_headers(&state),
+        &[],
+        &state,
+    );
+
+    assert_eq!(response.status(), 200, "{}", response.json_body());
+    assert_eq!(
+        response.json_body()["ducklake_checkpoint"]["status"],
+        json!("skipped")
+    );
+    assert_eq!(
+        response.json_body()["ducklake_checkpoint"]["reason"],
+        json!("ducklake_maintenance_disabled")
+    );
+    assert_eq!(
+        response.json_body()["ducklake_checkpoint"]["ran"],
+        json!(false)
+    );
+    assert_eq!(log_rows(&state), 0);
+}
+
+#[test]
 fn malicious_label_values_do_not_inject_sql() {
     // Hostile inputs flow through compat label/tag/value lookups that build
     // SQL via sql_quote. None should cause a 5xx (which would indicate the

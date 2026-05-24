@@ -243,13 +243,17 @@ fn route_inner(
         ("POST", "/api/admin/maintenance/retention/dry-run") => admin(headers, state, || {
             ensure_maintenance_allowed(state)?;
             run_maintenance_job(state, "retention", || {
-                state.maintenance.retention(&state.storage, true)
+                state
+                    .maintenance
+                    .retention(&state.storage, true, &state.metrics)
             })
         }),
         ("POST", "/api/admin/maintenance/retention/run") => admin(headers, state, || {
             ensure_maintenance_allowed(state)?;
             run_maintenance_job(state, "retention", || {
-                state.maintenance.retention(&state.storage, false)
+                state
+                    .maintenance
+                    .retention(&state.storage, false, &state.metrics)
             })
         }),
         _ => Err(ApiError::new(404, "not_found", "route not found")),
@@ -407,10 +411,28 @@ pub(crate) fn record_operator_gauges(state: &AppState) {
         &[],
         if paused { 1.0 } else { 0.0 },
     );
+    state.metrics.gauge(
+        MetricName::DucklakeMaintenanceEnabled,
+        &[],
+        if state.config.operator.ducklake_maintenance.enabled {
+            1.0
+        } else {
+            0.0
+        },
+    );
 }
 
 pub(crate) fn record_storage_operator_gauges(state: &AppState) {
     let storage = state.storage.health();
+    state.metrics.gauge(
+        MetricName::DucklakeCheckpointSupported,
+        &[],
+        if storage.capabilities.ducklake_checkpoint_maintenance {
+            1.0
+        } else {
+            0.0
+        },
+    );
     storage_signal_gauge(
         &state.metrics,
         MetricName::StoragePhysicalBytes,

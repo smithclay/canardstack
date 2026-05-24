@@ -7,32 +7,67 @@ use serde_json::{json, Value};
 use std::sync::atomic::Ordering;
 
 impl Storage {
-    pub fn cleanup_old_files(&self, dry_run: bool) -> Result<Value> {
-        if !self.ducklake_managed_maintenance {
-            return Ok(
-                json!({"supported": false, "reason": "ducklake maintenance is not managed by this process"}),
-            );
+    pub fn checkpoint_maintenance(&self, dry_run: bool) -> Result<Value> {
+        let checkpoint_supported = self.ducklake_checkpoint_supported.load(Ordering::SeqCst);
+        if dry_run {
+            return Ok(json!({
+                "supported": checkpoint_supported,
+                "enabled": self.ducklake_maintenance_enabled,
+                "ran": false,
+                "status": "skipped",
+                "reason": "dry_run"
+            }));
         }
-        self.writer.lock_or_poisoned().execute_batch(&format!(
-            "SELECT * FROM ducklake_cleanup_old_files('{}', dry_run => {})",
-            self.catalog_name, dry_run
-        ))?;
-        Ok(json!({"supported": true, "status": "ok", "dry_run": dry_run}))
-    }
+        if !self.ducklake_maintenance_enabled {
+            return Ok(json!({
+                "supported": checkpoint_supported,
+                "enabled": false,
+                "ran": false,
+                "status": "skipped",
+                "reason": "ducklake_maintenance_disabled"
+            }));
+        }
+        if !checkpoint_supported {
+            return Ok(json!({
+                "supported": false,
+                "enabled": true,
+                "ran": false,
+                "status": "skipped",
+                "reason": "unsupported",
+                "details": self.ducklake_maintenance_capability_reason.lock_or_poisoned().clone()
+            }));
+        }
 
-    pub fn expire_snapshots(&self, older_than_days: i64) -> Result<Value> {
-        if !self.ducklake_managed_maintenance {
-            return Ok(
-                json!({"supported": false, "reason": "ducklake maintenance is not managed by this process"}),
-            );
+        let result = self.writer.lock_or_poisoned().execute_batch("CHECKPOINT;");
+        match result {
+            Ok(()) => Ok(json!({
+                "supported": true,
+                "enabled": true,
+                "ran": true,
+                "status": "ok"
+            })),
+            Err(err)
+                if super::ducklake::is_unsupported_ducklake_maintenance_error(&err.to_string()) =>
+            {
+                let reason = err.to_string();
+                self.ducklake_checkpoint_supported
+                    .store(false, Ordering::SeqCst);
+                *self
+                    .ducklake_maintenance_capability_reason
+                    .lock_or_poisoned() = Some(reason.clone());
+                Ok(json!({
+                    "supported": false,
+                    "enabled": true,
+                    "ran": false,
+                    "status": "skipped",
+                    "reason": "unsupported",
+                    "details": reason
+                }))
+            }
+            Err(err) => {
+                Err(anyhow::Error::from(err).context("run DuckLake CHECKPOINT maintenance"))
+            }
         }
-        let older_than = (Utc::now() - chrono::Duration::days(older_than_days)).to_rfc3339();
-        self.writer.lock_or_poisoned().execute_batch(&format!(
-            "SELECT * FROM ducklake_expire_snapshots('{}', older_than => TIMESTAMPTZ '{}')",
-            self.catalog_name,
-            older_than.replace('\'', "''")
-        ))?;
-        Ok(json!({"supported": true, "status": "ok", "older_than": older_than}))
     }
 
     pub fn enforce_retention(&self, policy: &RetentionPolicy, dry_run: bool) -> Result<Value> {

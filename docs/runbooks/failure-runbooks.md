@@ -126,6 +126,8 @@ endpoint. Steps 2 and 3 require an operator-driven restart.
 
 - `canardstack_maintenance_failures_total`.
 - `canardstack_maintenance_consecutive_failures`.
+- `canardstack_ducklake_checkpoint_runs_total{status="error"}`.
+- `canardstack_ducklake_checkpoint_supported`.
 - `canardstack_ingest_requests_total{status="503"}`.
 - `canardstack_ingest_inflight_bytes{storage_signal}`.
 - `canardstack_ingest_to_query_lag_seconds{table}`.

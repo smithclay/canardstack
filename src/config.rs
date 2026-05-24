@@ -90,6 +90,7 @@ pub struct OperatorConfig {
     pub duckdb_extension_dir: Option<PathBuf>,
     pub postgres_dsn: Option<String>,
     pub ducklake_attach_uri: Option<String>,
+    pub ducklake_maintenance: DuckLakeMaintenanceConfig,
     pub max_body_bytes: usize,
     pub runtime_memory_limit_bytes: Option<usize>,
     pub duckdb_write_memory_limit: String,
@@ -107,6 +108,14 @@ pub struct OperatorConfig {
     pub socket_read_timeout: Duration,
     pub socket_write_timeout: Duration,
     pub scheduler_enabled: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct DuckLakeMaintenanceConfig {
+    pub enabled: bool,
+    pub data_inlining_row_limit: usize,
+    pub expire_older_than_days: i64,
+    pub delete_older_than_secs: u64,
 }
 
 /// Advanced mechanics operators may tune, plus derived mechanics from operator
@@ -244,6 +253,10 @@ impl OperatorConfig {
         let retention_days = env_i64("CANARDSTACK_RETENTION_DAYS")?
             .or(file.i64(&["retention", "days"])?)
             .unwrap_or(14);
+        let ducklake_maintenance_enabled = env_bool("CANARDSTACK_DUCKLAKE_MAINTENANCE_ENABLED")?
+            .or(file.bool(&["ducklake", "maintenance_enabled"])?)
+            .unwrap_or(true);
+        let default_data_inlining_row_limit = if ducklake_maintenance_enabled { 10 } else { 0 };
 
         Ok(Self {
             serve_role: ServeRole::All,
@@ -269,6 +282,18 @@ impl OperatorConfig {
             ducklake_attach_uri: match env_optional_string("CANARDSTACK_DUCKLAKE_ATTACH_URI")? {
                 Some(value) => value,
                 None => file.optional_string(&["ducklake", "attach_uri"])?,
+            },
+            ducklake_maintenance: DuckLakeMaintenanceConfig {
+                enabled: ducklake_maintenance_enabled,
+                data_inlining_row_limit: env_usize("CANARDSTACK_DUCKLAKE_DATA_INLINING_ROW_LIMIT")?
+                    .or(file.usize(&["ducklake", "data_inlining_row_limit"])?)
+                    .unwrap_or(default_data_inlining_row_limit),
+                expire_older_than_days: env_i64("CANARDSTACK_DUCKLAKE_EXPIRE_OLDER_THAN_DAYS")?
+                    .or(file.i64(&["ducklake", "expire_older_than_days"])?)
+                    .unwrap_or(retention_days),
+                delete_older_than_secs: env_usize("CANARDSTACK_DUCKLAKE_DELETE_OLDER_THAN_SECS")?
+                    .or(file.usize(&["ducklake", "delete_older_than_secs"])?)
+                    .unwrap_or(24 * 60 * 60) as u64,
             },
             max_body_bytes,
             runtime_memory_limit_bytes: match env_optional_usize(
@@ -343,6 +368,12 @@ impl OperatorConfig {
             duckdb_extension_dir: None,
             postgres_dsn: None,
             ducklake_attach_uri: None,
+            ducklake_maintenance: DuckLakeMaintenanceConfig {
+                enabled: true,
+                data_inlining_row_limit: 10,
+                expire_older_than_days: 30,
+                delete_older_than_secs: 24 * 60 * 60,
+            },
             max_body_bytes: 8 * 1024 * 1024,
             runtime_memory_limit_bytes: None,
             duckdb_write_memory_limit: "512MiB".to_string(),
@@ -388,6 +419,12 @@ impl OperatorConfig {
         }
         if self.duckdb_write_memory_limit.trim().is_empty() {
             anyhow::bail!("CANARDSTACK_DUCKDB_MEMORY_LIMIT must not be empty");
+        }
+        if self.ducklake_maintenance.expire_older_than_days <= 0 {
+            anyhow::bail!("CANARDSTACK_DUCKLAKE_EXPIRE_OLDER_THAN_DAYS must be > 0");
+        }
+        if self.ducklake_maintenance.delete_older_than_secs == 0 {
+            anyhow::bail!("CANARDSTACK_DUCKLAKE_DELETE_OLDER_THAN_SECS must be > 0");
         }
         if self.logs_retention_days <= 0
             || self.spans_retention_days <= 0
@@ -766,6 +803,10 @@ mod tests {
         "CANARDSTACK_DUCKDB_EXTENSION_DIR",
         "CANARDSTACK_POSTGRES_DSN",
         "CANARDSTACK_DUCKLAKE_ATTACH_URI",
+        "CANARDSTACK_DUCKLAKE_MAINTENANCE_ENABLED",
+        "CANARDSTACK_DUCKLAKE_DATA_INLINING_ROW_LIMIT",
+        "CANARDSTACK_DUCKLAKE_EXPIRE_OLDER_THAN_DAYS",
+        "CANARDSTACK_DUCKLAKE_DELETE_OLDER_THAN_SECS",
         "CANARDSTACK_MAX_BODY_BYTES",
         "CANARDSTACK_PROCESS_MEMORY_LIMIT_BYTES",
         "CANARDSTACK_DUCKDB_MEMORY_LIMIT",
@@ -858,6 +899,10 @@ memory_limit = "2GiB"
 
 [ducklake]
 attach_uri = "md:file"
+maintenance_enabled = false
+data_inlining_row_limit = 0
+expire_older_than_days = 7
+delete_older_than_secs = 7200
 
 [ingest]
 max_body_bytes = 12345
@@ -921,6 +966,19 @@ group_commit_ms = 3
             Some(PathBuf::from("/opt/duckdb/extensions"))
         );
         assert_eq!(config.operator.ducklake_attach_uri, None);
+        assert!(!config.operator.ducklake_maintenance.enabled);
+        assert_eq!(
+            config.operator.ducklake_maintenance.data_inlining_row_limit,
+            0
+        );
+        assert_eq!(
+            config.operator.ducklake_maintenance.expire_older_than_days,
+            7
+        );
+        assert_eq!(
+            config.operator.ducklake_maintenance.delete_older_than_secs,
+            7200
+        );
         assert_eq!(config.operator.max_body_bytes, 12345);
         assert_eq!(config.operator.runtime_memory_limit_bytes, Some(4_000_000));
         assert_eq!(config.operator.duckdb_write_memory_limit, "2GiB");
@@ -1006,6 +1064,24 @@ group_commit_ms = 3
         assert_eq!(
             config.mechanics.arrow_write_buffer_max_age,
             Duration::from_secs(10)
+        );
+    }
+
+    #[test]
+    fn disabled_ducklake_maintenance_defaults_data_inlining_off() {
+        let _guard = env_lock().lock_or_poisoned();
+        let _snapshot = EnvSnapshot::capture_and_clear();
+
+        unsafe {
+            env::set_var("CANARDSTACK_DUCKLAKE_MAINTENANCE_ENABLED", "false");
+        }
+
+        let config = Config::from_env().unwrap();
+
+        assert!(!config.operator.ducklake_maintenance.enabled);
+        assert_eq!(
+            config.operator.ducklake_maintenance.data_inlining_row_limit,
+            0
         );
     }
 

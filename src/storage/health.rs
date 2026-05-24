@@ -6,7 +6,6 @@ use chrono::Utc;
 use duckdb::Connection;
 use serde_json::{json, Value};
 use std::fs;
-#[cfg(debug_assertions)]
 use std::sync::atomic::Ordering;
 
 impl Storage {
@@ -50,8 +49,11 @@ impl Storage {
             capabilities: StorageCapabilities {
                 insert: true,
                 query: true,
-                snapshot_expiration: self.ducklake_managed_maintenance,
-                cleanup_old_files: self.ducklake_managed_maintenance,
+                ducklake_maintenance_enabled: self.ducklake_maintenance_enabled,
+                ducklake_checkpoint_maintenance: self
+                    .ducklake_checkpoint_supported
+                    .load(Ordering::SeqCst),
+                ducklake_maintenance_options: self.ducklake_maintenance_options_supported,
                 whole_day_retention: true,
             },
             freshness_watermarks: self

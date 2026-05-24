@@ -30,11 +30,10 @@ current sustained MVP performance envelope is only claimed for logs and traces.
 These are deliberate v0 non-goals, called out so they are not mistaken for
 oversights. Each is documented in full in its own section below.
 
-- Physical file compaction — disabled until proven stable. DuckLake
-  `ducklake_merge_adjacent_files` is intentionally not called; v0 tolerates many
-  small Parquet segment files, with the Arrow write buffer's size/age coalescing
-  as the only file-count mitigation. See [Compaction & small files — roadmap /
-  when to revisit](#compaction--small-files--roadmap--when-to-revisit).
+- Physical file maintenance planner — canardstack does not maintain physical
+  file membership, manifests, or a custom compactor. DuckDB/DuckLake owns
+  inlining flush, small-file merge, rewrite, snapshot expiration, cleanup, and
+  orphan deletion through configured DuckLake options plus `CHECKPOINT`.
 - Online schema evolution — the storage schema is static. Columns are fixed
   const lists created with `CREATE TABLE IF NOT EXISTS`; there is no migration
   tool or `ALTER ... ADD COLUMN` path. Changing columns requires a coordinated
@@ -419,8 +418,8 @@ Scheduler jobs:
   the freshness cadence, then checkpoints the raw spool after DuckLake commit)
 - metadata refresh
 - operator metric snapshot
-- retention
-- snapshot expiration and cleanup when supported by DuckLake
+- retention followed by DuckDB/DuckLake `CHECKPOINT` when
+  `CANARDSTACK_DUCKLAKE_MAINTENANCE_ENABLED=true`
 
 Maintenance can be paused and resumed through admin endpoints. There is no
 Postgres-backed maintenance lease yet, so assume one in-process scheduler and
@@ -451,38 +450,21 @@ the previous all-in-one behavior.
 Retention is whole-day oriented and bounded by `CANARDSTACK_RETENTION_DAYS`,
 default 14.
 
-The current implementation uses bounded table deletes plus DuckLake snapshot
-expiration/cleanup hooks where available. Physical file compaction is not
-enabled until DuckLake `ducklake_merge_adjacent_files` is proven stable for this
-write pattern. Physical day-table layouts are not part of the current MVP.
+The current implementation uses bounded table deletes for canardstack-owned
+telemetry timestamp retention, then lets DuckDB/DuckLake run the physical
+maintenance sequence with `CHECKPOINT`: inlined-data flush, snapshot expiration,
+adjacent-file merge, delete-file rewrite, cleanup, and orphan deletion. The
+configured DuckLake defaults are `data_inlining_row_limit = 10`,
+`auto_compact = true`, `expire_older_than` aligned with telemetry retention, and
+`delete_older_than = 1 day`. `rewrite_delete_threshold` and `target_file_size`
+are left to DuckLake defaults unless benchmark evidence says canardstack needs a
+different streaming-ingest policy.
 
-### Compaction & small files — roadmap / when to revisit
-
-Small-batch streaming ingest produces many small Parquet segment files, which is
-the opposite of what columnar storage prefers; merging them back into larger
-files is real but deliberately deferred. This is the central deferred difficulty
-of this write pattern, so it is tracked here as an explicit roadmap entry rather
-than left as an inline "disabled" flag.
-
-- **What is punted.** Physical Parquet file compaction stays disabled: DuckLake
-  `ducklake_merge_adjacent_files` is intentionally not called, and v0 tolerates
-  many small segment files. The only current mitigation is the Arrow write
-  buffer's size/age coalescing, which keeps one seal producing one segment per
-  storage signal — there is no second pass that rewrites already-sealed files.
-- **Why.** Compaction is unproven-stable for this append/seal write pattern, and
-  rewriting sealed files introduces write amplification (re-reading and
-  re-writing data already on disk) that competes with the seal path for the
-  single writer.
-- **When to revisit.** Treat this as triggered when the small-file ratio or
-  per-signal segment count grows unbounded under steady ingest, or when query
-  latency degrades from physical-file fan-out (too many files scanned per range).
-  Those are the signals that the no-compaction tolerance has stopped paying off.
-- **What it will touch when implemented.** Compaction must reuse the single seal
-  owner / single DuckDB writer rather than adding a parallel write path. Expect
-  to coordinate the seal path (`src/seal.rs`), retention (`src/maintenance.rs`
-  and `src/storage/maintenance.rs`), the single writer lock (`src/storage`), and
-  metadata refresh so compacted membership stays consistent. The inline non-goal
-  flag lives in `Maintenance::retention` (`src/maintenance.rs`).
+Setting `CANARDSTACK_DUCKLAKE_MAINTENANCE_ENABLED=false` keeps row-level
+telemetry retention but skips `CHECKPOINT` and sets DuckLake `auto_compact=false`
+with data inlining off by default, approximating the old no-physical-maintenance
+behavior. Manual dry-runs also skip `CHECKPOINT` because DuckLake `CHECKPOINT`
+has no dry-run mode; the JSON response reports that explicitly.
 
 Online schema evolution under continuous arrival is a separate but related v0
 punt (the storage schema is static); a catalog `schema_version` guard

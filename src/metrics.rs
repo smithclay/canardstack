@@ -138,6 +138,9 @@ pub enum MetricName {
     DuckdbArrowAppendsTotal,
     DucklakeActiveDataFileRows,
     DucklakeActiveDataFiles,
+    DucklakeCheckpointRunsTotal,
+    DucklakeCheckpointSupported,
+    DucklakeMaintenanceEnabled,
     FreshnessWatermarkTimestamp,
     HttpConnectionClosesTotal,
     HttpConnectionErrorsTotal,
@@ -218,6 +221,9 @@ impl MetricName {
         Self::DuckdbArrowAppendsTotal,
         Self::DucklakeActiveDataFileRows,
         Self::DucklakeActiveDataFiles,
+        Self::DucklakeCheckpointRunsTotal,
+        Self::DucklakeCheckpointSupported,
+        Self::DucklakeMaintenanceEnabled,
         Self::FreshnessWatermarkTimestamp,
         Self::HttpConnectionClosesTotal,
         Self::HttpConnectionErrorsTotal,
@@ -297,6 +303,9 @@ impl MetricName {
             Self::DuckdbArrowAppendsTotal => "canardstack_duckdb_arrow_appends_total",
             Self::DucklakeActiveDataFileRows => "canardstack_ducklake_active_data_file_rows",
             Self::DucklakeActiveDataFiles => "canardstack_ducklake_active_data_files",
+            Self::DucklakeCheckpointRunsTotal => "canardstack_ducklake_checkpoint_runs_total",
+            Self::DucklakeCheckpointSupported => "canardstack_ducklake_checkpoint_supported",
+            Self::DucklakeMaintenanceEnabled => "canardstack_ducklake_maintenance_enabled",
             Self::FreshnessWatermarkTimestamp => "canardstack_freshness_watermark_timestamp",
             Self::HttpConnectionClosesTotal => "canardstack_http_connection_closes_total",
             Self::HttpConnectionErrorsTotal => "canardstack_http_connection_errors_total",
@@ -393,6 +402,8 @@ impl MetricName {
             | Self::ArrowWriteBufferRows
             | Self::DucklakeActiveDataFileRows
             | Self::DucklakeActiveDataFiles
+            | Self::DucklakeCheckpointSupported
+            | Self::DucklakeMaintenanceEnabled
             | Self::FreshnessWatermarkTimestamp
             | Self::IngestInflightBytes
             | Self::IngestInflightMemoryBoundBytes
@@ -483,6 +494,7 @@ impl MetricName {
             Self::MaintenanceDurationSeconds => &["job", "storage_signal"],
             Self::MaintenanceFailuresTotal => &["job", "reason"],
             Self::MaintenanceRunsTotal => &["job", "status", "reason"],
+            Self::DucklakeCheckpointRunsTotal => &["status", "reason"],
             Self::Otlp2recordsTransformEventsTotal => &["request_kind", "event"],
             Self::PhaseDurationSeconds => &[
                 "request_kind",
@@ -502,6 +514,8 @@ impl MetricName {
             Self::AdmissionReductionsTotal
             | Self::IngestInflightMemoryBoundBytes
             | Self::MaintenancePaused
+            | Self::DucklakeCheckpointSupported
+            | Self::DucklakeMaintenanceEnabled
             | Self::ObservedFreshnessLagSeconds
             | Self::ProjectedBufferSeconds
             | Self::ProjectedSealSeconds

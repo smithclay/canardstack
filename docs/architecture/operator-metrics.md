@@ -118,6 +118,7 @@ scans.
 | `canardstack_storage_physical_bytes` | Gauge | `storage_signal=all` (`table=all` legacy alias) | Local storage directory size on disk. |
 | `canardstack_ducklake_active_data_files` | Gauge | `storage_signal` (`table` legacy alias) | Active DuckLake data files per storage signal. |
 | `canardstack_ducklake_active_data_file_rows` | Gauge | `storage_signal` (`table` legacy alias) | Active rows stored in DuckLake data files per storage signal. |
+| `canardstack_ducklake_checkpoint_supported` | Gauge | none | `1` when the attached DuckLake supports canardstack-triggered `CHECKPOINT` maintenance. |
 
 The shared phase metric `canardstack_phase_duration_seconds` also records
 storage proof phases with `storage_signal` and `phase` labels:
@@ -181,6 +182,8 @@ because accepted requests are fsynced before acknowledgement.
 | `canardstack_maintenance_failures_total` | Counter | `job`, `reason` | Failures only, broken out by classified reason. Bounded reason set: `disk_full`, `seal_failed`, `metadata_refresh_failed`, `metrics_snapshot_failed`, `retention_failed`, `scheduler_job_failed`. Reasons derive from the job name where possible (so dependency wording changes do not silently re-route alerts); only `disk_full` substring-matches OS / DuckDB errors. |
 | `canardstack_maintenance_consecutive_failures` | Gauge | `job` | Consecutive failure count; resets to 0 on success. Drives exponential backoff. |
 | `canardstack_maintenance_paused` | Gauge | none | `1` when scheduled maintenance is paused. |
+| `canardstack_ducklake_maintenance_enabled` | Gauge | none | `1` when canardstack is configured to run DuckLake `CHECKPOINT` after retention. |
+| `canardstack_ducklake_checkpoint_runs_total` | Counter | `status`, `reason` | CHECKPOINT outcomes. Bounded reasons are `ok`, `dry_run`, `disabled`, `unsupported`, `other`, and `checkpoint_failed`. |
 
 ## Freshness Metrics
 
