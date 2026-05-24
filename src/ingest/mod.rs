@@ -916,6 +916,15 @@ impl IngestPipeline {
         }))
     }
 
+    /// Fail-fast worker-availability gate, run on the request path BEFORE the
+    /// durable raw-spool append: if the ingest worker pool is absent or empty
+    /// (e.g. a query-only role, or every worker stopped), shed with 503 rather
+    /// than spool the request and silently process it inline on the connection
+    /// thread. This is deliberately a separate, earlier check from the re-lock in
+    /// [`Self::dispatch_ingest_work`]; the window between the two is benign
+    /// because the only state transition there is pool teardown at shutdown,
+    /// which the dispatch caller-runs fallback already absorbs (it processes the
+    /// already-spooled work inline instead of dropping it).
     fn ensure_ingest_workers_available(
         &self,
         route: OtlpRequestKind,

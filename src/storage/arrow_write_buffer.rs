@@ -77,11 +77,30 @@ impl Storage {
             .collect()
     }
 
-    /// Buffer sanctioned internal telemetry that bypasses the raw spool. Honor the
-    /// invariant on [`BestEffortArrowBatch`]: external ingest must NOT use this
+    /// The single sanctioned production entry to the best-effort write path:
+    /// buffer the operator metrics snapshot (the sole in-tree caller is
+    /// `crate::metrics::Metrics::write_snapshot_to_storage`). Operator
+    /// self-telemetry is queryable when enabled but carries no raw-spool replay
+    /// record, so it can never be checkpointed or replayed — see the invariant on
+    /// [`BestEffortArrowBatch`]. Production routes through this `pub(crate)` seam so
+    /// it never depends on the `#[doc(hidden)]` best-effort entry points below,
+    /// which exist only for in-repo benches/tests.
+    pub(crate) fn buffer_operator_metrics_snapshot(
+        &self,
+        storage_signal: StorageSignal,
+        batch: &RecordBatch,
+        source_format: &str,
+    ) -> Result<usize> {
+        self.buffer_best_effort_arrow_records(storage_signal, batch, source_format)
+    }
+
+    /// Buffer best-effort rows, bypassing the raw spool. Not part of the supported
+    /// public API (`#[doc(hidden)]`): in production the sole best-effort caller is
+    /// [`Storage::buffer_operator_metrics_snapshot`]; this entry is `pub` only so
+    /// in-repo benches/tests (separate crates) can drive the path directly. Honor
+    /// the invariant on [`BestEffortArrowBatch`]: external ingest MUST NOT use this
     /// path (no replay ref, cannot be checkpointed) — it goes through
-    /// [`Storage::buffer_replay_backed_arrow_batches`]. `pub`/`#[doc(hidden)]` only
-    /// so in-repo benches/tests can reach it.
+    /// [`Storage::buffer_replay_backed_arrow_batches`].
     #[doc(hidden)]
     pub fn buffer_best_effort_arrow_records(
         &self,
@@ -97,10 +116,12 @@ impl Storage {
         Ok(result.rows)
     }
 
-    /// Buffer one best-effort batch. See the invariant on [`BestEffortArrowBatch`]:
-    /// sanctioned internal telemetry only; external ingest uses
-    /// [`Storage::buffer_replay_backed_arrow_batches`]. `pub`/`#[doc(hidden)]` only
-    /// so in-repo benches/tests can reach it.
+    /// Buffer one best-effort batch. Not part of the supported public API
+    /// (`#[doc(hidden)]`): in production the sole best-effort caller is
+    /// [`Storage::buffer_operator_metrics_snapshot`]; this entry is `pub` only so
+    /// in-repo benches/tests can reach it. See the invariant on
+    /// [`BestEffortArrowBatch`]: external ingest uses
+    /// [`Storage::buffer_replay_backed_arrow_batches`].
     #[doc(hidden)]
     pub fn buffer_best_effort_arrow_batch(
         &self,

@@ -1,6 +1,9 @@
 /target/
 /.canardstack/
 /.canardstack-test-storage/
+site/.astro/
+site/dist/
+site/node_modules/
 *.duckdb
 *.duckdb.wal
 *.ducklake
