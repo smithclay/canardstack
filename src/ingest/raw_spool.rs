@@ -16,18 +16,20 @@ pub(crate) struct RawSpoolAppendRef {
 }
 
 /// Raw-spool record to checkpoint after its associated buffered rows commit.
+///
+/// `request_kind` is both the record's request kind and the raw-spool writer it
+/// lives in; they were always equal, so a single field drives checkpoint routing
+/// and the `request_kind` metric label.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub(crate) struct ReplayBackedRecordRef {
     pub(crate) request_kind: OtlpRequestKind,
-    pub(crate) raw_spool_request_kind: OtlpRequestKind,
     pub(crate) raw_record_id: RecordId,
 }
 
 impl ReplayBackedRecordRef {
-    pub(crate) fn new(request_kind: OtlpRequestKind, append_ref: RawSpoolAppendRef) -> Self {
+    pub(crate) fn new(append_ref: RawSpoolAppendRef) -> Self {
         Self {
-            request_kind,
-            raw_spool_request_kind: append_ref.request_kind,
+            request_kind: append_ref.request_kind,
             raw_record_id: append_ref.record_id,
         }
     }
@@ -365,7 +367,7 @@ impl RawSpool {
         let mut by_request_kind_ids = BTreeMap::<OtlpRequestKind, Vec<RecordId>>::new();
         for replay_ref in records {
             by_request_kind_ids
-                .entry(replay_ref.raw_spool_request_kind)
+                .entry(replay_ref.request_kind)
                 .or_default()
                 .push(replay_ref.raw_record_id);
         }

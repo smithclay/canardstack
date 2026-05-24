@@ -618,7 +618,7 @@ impl IngestPipeline {
             return Ok(SpooledIngestDisposition::TerminallyDisposed);
         }
 
-        let replay_ref = ReplayBackedRecordRef::new(route, raw_spool_ref);
+        let replay_ref = ReplayBackedRecordRef::new(raw_spool_ref);
         let buffers = batches
             .iter()
             .filter(|batch| batch.batch.num_rows() > 0)
