@@ -75,7 +75,6 @@ impl fmt::Display for OtlpRequestKind {
 }
 
 pub struct Ingestor {
-    raw_spool: Arc<RawSpool>,
     pipeline: Arc<IngestPipeline>,
 }
 
@@ -99,6 +98,13 @@ pub(in crate::ingest) struct SpooledIngestWork {
     inflight_reservation: admission::InflightReservation,
     runtime_memory_reservation: admission::RuntimeMemoryReservation,
     pub(in crate::ingest) metrics: Arc<Metrics>,
+}
+
+#[derive(Clone, Copy)]
+struct SpooledRequestContext<'a> {
+    route: OtlpRequestKind,
+    raw_spool_ref: RawSpoolAppendRef,
+    metrics: &'a Metrics,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -170,11 +176,8 @@ impl SpooledIngestError {
 impl Ingestor {
     pub fn new(config: Config) -> Result<Self> {
         let raw_spool = Arc::new(RawSpool::open(&config)?);
-        let pipeline = Arc::new(IngestPipeline::new(config, Arc::clone(&raw_spool)));
-        Ok(Self {
-            raw_spool,
-            pipeline,
-        })
+        let pipeline = Arc::new(IngestPipeline::new(config, raw_spool));
+        Ok(Self { pipeline })
     }
 
     pub fn ingest(
@@ -200,15 +203,15 @@ impl Ingestor {
     }
 
     pub fn raw_spool_stats(&self) -> Result<spool::Stats> {
-        self.raw_spool.stats()
+        self.pipeline.raw_spool_stats()
     }
 
     pub fn raw_spool_stats_by_request_kind(&self) -> Result<BTreeMap<&'static str, spool::Stats>> {
-        self.raw_spool.stats_by_request_kind()
+        self.pipeline.raw_spool_stats_by_request_kind()
     }
 
     pub fn raw_spool_healthy(&self) -> bool {
-        self.raw_spool.healthy()
+        self.pipeline.raw_spool_healthy()
     }
 
     #[doc(hidden)]
@@ -217,17 +220,18 @@ impl Ingestor {
         request_kind: OtlpRequestKind,
         message: impl Into<String>,
     ) -> Result<()> {
-        self.raw_spool.force_unhealthy(request_kind, message)
+        self.pipeline
+            .force_raw_spool_unhealthy(request_kind, message)
     }
 
     pub fn raw_spool_health_by_request_kind(
         &self,
     ) -> BTreeMap<&'static str, (bool, Option<String>)> {
-        self.raw_spool.health_by_request_kind()
+        self.pipeline.raw_spool_health_by_request_kind()
     }
 
     pub fn record_raw_spool_metrics(&self, metrics: &Metrics) {
-        self.raw_spool.record_metrics(metrics);
+        self.pipeline.record_raw_spool_metrics(metrics);
     }
 
     pub(crate) fn checkpoint_replay_backed_records(
@@ -236,7 +240,7 @@ impl Ingestor {
         reason: &'static str,
         metrics: Option<&Metrics>,
     ) -> Result<()> {
-        self.raw_spool
+        self.pipeline
             .checkpoint_replay_backed_records(records, reason, metrics)
     }
 
@@ -275,6 +279,44 @@ impl IngestPipeline {
             worker_pool_saturated: AtomicBool::new(false),
             config,
         }
+    }
+
+    fn raw_spool_stats(&self) -> Result<spool::Stats> {
+        self.raw_spool.stats()
+    }
+
+    fn raw_spool_stats_by_request_kind(&self) -> Result<BTreeMap<&'static str, spool::Stats>> {
+        self.raw_spool.stats_by_request_kind()
+    }
+
+    fn raw_spool_healthy(&self) -> bool {
+        self.raw_spool.healthy()
+    }
+
+    fn force_raw_spool_unhealthy(
+        &self,
+        request_kind: OtlpRequestKind,
+        message: impl Into<String>,
+    ) -> Result<()> {
+        self.raw_spool.force_unhealthy(request_kind, message)
+    }
+
+    fn raw_spool_health_by_request_kind(&self) -> BTreeMap<&'static str, (bool, Option<String>)> {
+        self.raw_spool.health_by_request_kind()
+    }
+
+    fn record_raw_spool_metrics(&self, metrics: &Metrics) {
+        self.raw_spool.record_metrics(metrics);
+    }
+
+    fn checkpoint_replay_backed_records(
+        &self,
+        records: &[ReplayBackedRecordRef],
+        reason: &'static str,
+        metrics: Option<&Metrics>,
+    ) -> Result<()> {
+        self.raw_spool
+            .checkpoint_replay_backed_records(records, reason, metrics)
     }
 
     pub(crate) fn replay_raw_spool(
@@ -402,7 +444,7 @@ impl IngestPipeline {
         admission: &AdmissionController,
         metrics: Arc<Metrics>,
     ) -> ApiResult<Value> {
-        let async_metrics = Arc::clone(&metrics);
+        let worker_metrics = Arc::clone(&metrics);
         let metrics = metrics.as_ref();
         if let Err(err) = validation::validate_body_size(compressed_body.len(), &self.config) {
             metrics.ingest_request(route.as_str(), err.status, err.reason);
@@ -471,7 +513,7 @@ impl IngestPipeline {
             raw_spool_ref,
             inflight_reservation,
             runtime_memory_reservation,
-            metrics: async_metrics,
+            metrics: worker_metrics,
         };
         self.dispatch_ingest_work(spooled, storage, metrics)
     }
@@ -499,6 +541,11 @@ impl IngestPipeline {
         } = work;
         let metrics_arc = metrics;
         let metrics = metrics_arc.as_ref();
+        let request_context = SpooledRequestContext {
+            route,
+            raw_spool_ref,
+            metrics,
+        };
         tracing::trace!(
             event = "ingest_processing_started",
             request_kind = route.as_str(),
@@ -540,9 +587,7 @@ impl IngestPipeline {
             decoded_body_materialized_bytes,
             &mut inflight_reservation,
             &mut runtime_memory_reservation,
-            raw_spool_ref,
-            route,
-            metrics,
+            request_context,
         )?;
         if batches.is_empty() {
             // Nothing to buffer (e.g. all rows were unsupported): terminally
@@ -730,7 +775,6 @@ impl IngestPipeline {
     /// buffered Arrow byte size (infallible — the request is already spooled) and
     /// reserve the peak runtime memory the buffer will demand. Only the optional
     /// runtime-memory cap can reject, as a terminal disposition.
-    #[allow(clippy::too_many_arguments)]
     fn account_buffer_demand(
         &self,
         batches: &[batches::PendingBatch],
@@ -738,9 +782,7 @@ impl IngestPipeline {
         decoded_body_materialized_bytes: usize,
         inflight_reservation: &mut admission::InflightReservation,
         runtime_memory_reservation: &mut admission::RuntimeMemoryReservation,
-        raw_spool_ref: RawSpoolAppendRef,
-        route: OtlpRequestKind,
-        metrics: &Metrics,
+        context: SpooledRequestContext<'_>,
     ) -> std::result::Result<(), SpooledIngestError> {
         inflight_reservation.adjust(admission::inflight_bytes_by_signal(batches));
         let pending_bytes = batches.iter().map(|b| b.approx_bytes).sum::<usize>();
@@ -748,9 +790,15 @@ impl IngestPipeline {
             .saturating_add(decoded_body_materialized_bytes)
             .saturating_add(pending_bytes);
         runtime_memory_reservation
-            .reserve_at_least(peak_bytes, route, metrics)
+            .reserve_at_least(peak_bytes, context.route, context.metrics)
             .map_err(|err| {
-                self.dispose_terminal(raw_spool_ref, route, "memory_rejected", err, metrics)
+                self.dispose_terminal(
+                    context.raw_spool_ref,
+                    context.route,
+                    "memory_rejected",
+                    err,
+                    context.metrics,
+                )
             })
     }
 

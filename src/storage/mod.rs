@@ -31,7 +31,7 @@ use arrow_write::ArrowWriteBuffer;
 pub use ducklake::install_ducklake_extension;
 use ducklake::{
     attach_ducklake_connection, configure_base_connection, configure_write_connection,
-    ducklake_attach_plan,
+    ducklake_attach_plan, DUCKLAKE_CATALOG_NAME, DUCKLAKE_TARGET_PREFIX,
 };
 pub use metadata::MetadataRefreshOutcome;
 use schema::{create_tables_on, enforce_schema_version_on};
@@ -41,8 +41,6 @@ pub struct StorageHealth {
     pub healthy: bool,
     pub mode: String,
     pub ducklake_catalog: String,
-    pub ducklake_available: bool,
-    pub ducklake_required: bool,
     pub postgres_catalog_configured: bool,
     pub last_error: Option<String>,
     pub capabilities: StorageCapabilities,
@@ -56,20 +54,18 @@ pub struct StorageHealth {
 pub struct StorageProbe {
     pub healthy: bool,
     pub mode: String,
-    pub ducklake_available: bool,
-    pub ducklake_required: bool,
     pub last_error: Option<String>,
 }
 
 impl StorageProbe {
     pub fn is_ready(&self) -> bool {
-        self.healthy && (!self.ducklake_required || self.ducklake_available)
+        self.healthy
     }
 }
 
 impl StorageHealth {
     pub fn is_ready(&self) -> bool {
-        self.healthy && (!self.ducklake_required || self.ducklake_available)
+        self.healthy
     }
 }
 
@@ -113,12 +109,10 @@ pub struct Storage {
     target_prefix: String,
     mode: String,
     catalog_name: String,
-    ducklake_available: bool,
     #[cfg(debug_assertions)]
     force_dependency_unhealthy: AtomicBool,
     postgres_catalog_configured: bool,
     local_storage_dir: PathBuf,
-    ducklake_required: bool,
     ducklake_managed_maintenance: bool,
     arrow_write_buffers: Mutex<BTreeMap<StorageSignal, ArrowWriteBuffer>>,
     write_memory_limit: String,
@@ -244,7 +238,7 @@ impl Storage {
         .context(
             "DuckLake attach failed. Fix the catalog config (URI, token, network, or extension path) and restart.",
         )?;
-        let target_prefix = "canardlake.".to_string();
+        let target_prefix = DUCKLAKE_TARGET_PREFIX.to_string();
         let plan = ducklake_attach_plan(config)?;
         let mode = format!("{}_arrow_append", plan.mode);
         let ducklake_managed_maintenance = plan.managed_maintenance;
@@ -266,13 +260,11 @@ impl Storage {
             reader: Mutex::new(reader),
             target_prefix,
             mode,
-            catalog_name: "canardlake".to_string(),
-            ducklake_available: true,
+            catalog_name: DUCKLAKE_CATALOG_NAME.to_string(),
             #[cfg(debug_assertions)]
             force_dependency_unhealthy: AtomicBool::new(false),
             postgres_catalog_configured: config.operator.postgres_dsn.is_some(),
             local_storage_dir: config.operator.local_storage_dir.clone(),
-            ducklake_required: true,
             ducklake_managed_maintenance,
             arrow_write_buffers: Mutex::new(BTreeMap::new()),
             write_memory_limit: config.operator.duckdb_write_memory_limit.clone(),

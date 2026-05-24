@@ -111,6 +111,407 @@ pub enum MetricKind {
     Gauge,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MetricShape {
+    Counter,
+    Gauge,
+    Observation,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub enum MetricName {
+    AdmissionCapacity,
+    AdmissionInUse,
+    AdmissionReductionsTotal,
+    AdmissionRejectionsTotal,
+    ArrowFlushRowsTotal,
+    ArrowFlushesTotal,
+    ArrowWriteBufferAgeSeconds,
+    ArrowWriteBufferBytes,
+    ArrowWriteBufferRows,
+    DuckdbArrowAppendedRowsTotal,
+    DuckdbArrowAppendsTotal,
+    DucklakeActiveDataFileRows,
+    DucklakeActiveDataFiles,
+    FreshnessWatermarkTimestamp,
+    HttpConnectionClosesTotal,
+    HttpConnectionErrorsTotal,
+    HttpConnectionRequestsTotal,
+    IngestBufferedBytesTotal,
+    IngestBufferedRowsTotal,
+    IngestDecodedBytesTotal,
+    IngestInflightBytes,
+    IngestInflightMemoryBoundBytes,
+    IngestRecordsTotal,
+    IngestRequestBytesTotal,
+    IngestRequestsTotal,
+    IngestRuntimeMemoryUnknownTotal,
+    IngestSealStageTotal,
+    IngestStageTotal,
+    IngestStorageInsertTotal,
+    IngestToQueryLagSeconds,
+    IngestTransformedRowsTotal,
+    IngestUnsupportedHistogramsTotal,
+    IngestWorkerCompletedTotal,
+    IngestWorkerDispatchTotal,
+    IngestWorkerQueueCapacity,
+    MaintenanceConsecutiveFailures,
+    MaintenanceDurationSeconds,
+    MaintenanceFailuresTotal,
+    MaintenancePaused,
+    MaintenanceRunsTotal,
+    ObservedFreshnessLagSeconds,
+    Otlp2recordsTransformEventsTotal,
+    PhaseDurationSeconds,
+    ProjectedBufferSeconds,
+    ProjectedSealSeconds,
+    ProjectedVisibilitySeconds,
+    QueryDurationSeconds,
+    QueryRequestsTotal,
+    QueryTimeoutsTotal,
+    RawSpoolAppendBatchEncodedBytesTotal,
+    RawSpoolAppendBatchRecordsTotal,
+    RawSpoolAppendBatchesTotal,
+    RawSpoolAppendFileFsyncsTotal,
+    RawSpoolAppendSyncFailuresTotal,
+    RawSpoolAppendSyncsTotal,
+    RawSpoolBytesTotal,
+    RawSpoolCheckpointBatchCommandsTotal,
+    RawSpoolCheckpointBatchRecordsTotal,
+    RawSpoolCheckpointBatchesTotal,
+    RawSpoolCheckpointedRecordsTotal,
+    RawSpoolHealthy,
+    RawSpoolPendingBytes,
+    RawSpoolPendingRecords,
+    RawSpoolRecordsTotal,
+    RawSpoolReplayedRecordsTotal,
+    RawSpoolSegmentBytes,
+    RawSpoolSegments,
+    RawSpoolUnsyncedAgeSeconds,
+    RawSpoolUnsyncedBytes,
+    RawSpoolUnsyncedRecords,
+    RuntimeMemoryLimitBytes,
+    RuntimeRssBytes,
+    SealEwmaBytesPerSecond,
+    StorageLogicalRows,
+    StoragePhysicalBytes,
+}
+
+impl MetricName {
+    const ALL: &'static [Self] = &[
+        Self::AdmissionCapacity,
+        Self::AdmissionInUse,
+        Self::AdmissionReductionsTotal,
+        Self::AdmissionRejectionsTotal,
+        Self::ArrowFlushRowsTotal,
+        Self::ArrowFlushesTotal,
+        Self::ArrowWriteBufferAgeSeconds,
+        Self::ArrowWriteBufferBytes,
+        Self::ArrowWriteBufferRows,
+        Self::DuckdbArrowAppendedRowsTotal,
+        Self::DuckdbArrowAppendsTotal,
+        Self::DucklakeActiveDataFileRows,
+        Self::DucklakeActiveDataFiles,
+        Self::FreshnessWatermarkTimestamp,
+        Self::HttpConnectionClosesTotal,
+        Self::HttpConnectionErrorsTotal,
+        Self::HttpConnectionRequestsTotal,
+        Self::IngestBufferedBytesTotal,
+        Self::IngestBufferedRowsTotal,
+        Self::IngestDecodedBytesTotal,
+        Self::IngestInflightBytes,
+        Self::IngestInflightMemoryBoundBytes,
+        Self::IngestRecordsTotal,
+        Self::IngestRequestBytesTotal,
+        Self::IngestRequestsTotal,
+        Self::IngestRuntimeMemoryUnknownTotal,
+        Self::IngestSealStageTotal,
+        Self::IngestStageTotal,
+        Self::IngestStorageInsertTotal,
+        Self::IngestToQueryLagSeconds,
+        Self::IngestTransformedRowsTotal,
+        Self::IngestUnsupportedHistogramsTotal,
+        Self::IngestWorkerCompletedTotal,
+        Self::IngestWorkerDispatchTotal,
+        Self::IngestWorkerQueueCapacity,
+        Self::MaintenanceConsecutiveFailures,
+        Self::MaintenanceDurationSeconds,
+        Self::MaintenanceFailuresTotal,
+        Self::MaintenancePaused,
+        Self::MaintenanceRunsTotal,
+        Self::ObservedFreshnessLagSeconds,
+        Self::Otlp2recordsTransformEventsTotal,
+        Self::PhaseDurationSeconds,
+        Self::ProjectedBufferSeconds,
+        Self::ProjectedSealSeconds,
+        Self::ProjectedVisibilitySeconds,
+        Self::QueryDurationSeconds,
+        Self::QueryRequestsTotal,
+        Self::QueryTimeoutsTotal,
+        Self::RawSpoolAppendBatchEncodedBytesTotal,
+        Self::RawSpoolAppendBatchRecordsTotal,
+        Self::RawSpoolAppendBatchesTotal,
+        Self::RawSpoolAppendFileFsyncsTotal,
+        Self::RawSpoolAppendSyncFailuresTotal,
+        Self::RawSpoolAppendSyncsTotal,
+        Self::RawSpoolBytesTotal,
+        Self::RawSpoolCheckpointBatchCommandsTotal,
+        Self::RawSpoolCheckpointBatchRecordsTotal,
+        Self::RawSpoolCheckpointBatchesTotal,
+        Self::RawSpoolCheckpointedRecordsTotal,
+        Self::RawSpoolHealthy,
+        Self::RawSpoolPendingBytes,
+        Self::RawSpoolPendingRecords,
+        Self::RawSpoolRecordsTotal,
+        Self::RawSpoolReplayedRecordsTotal,
+        Self::RawSpoolSegmentBytes,
+        Self::RawSpoolSegments,
+        Self::RawSpoolUnsyncedAgeSeconds,
+        Self::RawSpoolUnsyncedBytes,
+        Self::RawSpoolUnsyncedRecords,
+        Self::RuntimeMemoryLimitBytes,
+        Self::RuntimeRssBytes,
+        Self::SealEwmaBytesPerSecond,
+        Self::StorageLogicalRows,
+        Self::StoragePhysicalBytes,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AdmissionCapacity => "canardstack_admission_capacity",
+            Self::AdmissionInUse => "canardstack_admission_in_use",
+            Self::AdmissionReductionsTotal => "canardstack_admission_reductions_total",
+            Self::AdmissionRejectionsTotal => "canardstack_admission_rejections_total",
+            Self::ArrowFlushRowsTotal => "canardstack_arrow_flush_rows_total",
+            Self::ArrowFlushesTotal => "canardstack_arrow_flushes_total",
+            Self::ArrowWriteBufferAgeSeconds => "canardstack_arrow_write_buffer_age_seconds",
+            Self::ArrowWriteBufferBytes => "canardstack_arrow_write_buffer_bytes",
+            Self::ArrowWriteBufferRows => "canardstack_arrow_write_buffer_rows",
+            Self::DuckdbArrowAppendedRowsTotal => "canardstack_duckdb_arrow_appended_rows_total",
+            Self::DuckdbArrowAppendsTotal => "canardstack_duckdb_arrow_appends_total",
+            Self::DucklakeActiveDataFileRows => "canardstack_ducklake_active_data_file_rows",
+            Self::DucklakeActiveDataFiles => "canardstack_ducklake_active_data_files",
+            Self::FreshnessWatermarkTimestamp => "canardstack_freshness_watermark_timestamp",
+            Self::HttpConnectionClosesTotal => "canardstack_http_connection_closes_total",
+            Self::HttpConnectionErrorsTotal => "canardstack_http_connection_errors_total",
+            Self::HttpConnectionRequestsTotal => "canardstack_http_connection_requests_total",
+            Self::IngestBufferedBytesTotal => "canardstack_ingest_buffered_bytes_total",
+            Self::IngestBufferedRowsTotal => "canardstack_ingest_buffered_rows_total",
+            Self::IngestDecodedBytesTotal => "canardstack_ingest_decoded_bytes_total",
+            Self::IngestInflightBytes => "canardstack_ingest_inflight_bytes",
+            Self::IngestInflightMemoryBoundBytes => {
+                "canardstack_ingest_inflight_memory_bound_bytes"
+            }
+            Self::IngestRecordsTotal => "canardstack_ingest_records_total",
+            Self::IngestRequestBytesTotal => "canardstack_ingest_request_bytes_total",
+            Self::IngestRequestsTotal => "canardstack_ingest_requests_total",
+            Self::IngestRuntimeMemoryUnknownTotal => {
+                "canardstack_ingest_runtime_memory_unknown_total"
+            }
+            Self::IngestSealStageTotal => "canardstack_ingest_seal_stage_total",
+            Self::IngestStageTotal => "canardstack_ingest_stage_total",
+            Self::IngestStorageInsertTotal => "canardstack_ingest_storage_insert_total",
+            Self::IngestToQueryLagSeconds => "canardstack_ingest_to_query_lag_seconds",
+            Self::IngestTransformedRowsTotal => "canardstack_ingest_transformed_rows_total",
+            Self::IngestUnsupportedHistogramsTotal => {
+                "canardstack_ingest_unsupported_histograms_total"
+            }
+            Self::IngestWorkerCompletedTotal => "canardstack_ingest_worker_completed_total",
+            Self::IngestWorkerDispatchTotal => "canardstack_ingest_worker_dispatch_total",
+            Self::IngestWorkerQueueCapacity => "canardstack_ingest_worker_queue_capacity",
+            Self::MaintenanceConsecutiveFailures => "canardstack_maintenance_consecutive_failures",
+            Self::MaintenanceDurationSeconds => "canardstack_maintenance_duration_seconds",
+            Self::MaintenanceFailuresTotal => "canardstack_maintenance_failures_total",
+            Self::MaintenancePaused => "canardstack_maintenance_paused",
+            Self::MaintenanceRunsTotal => "canardstack_maintenance_runs_total",
+            Self::ObservedFreshnessLagSeconds => "canardstack_observed_freshness_lag_seconds",
+            Self::Otlp2recordsTransformEventsTotal => {
+                "canardstack_otlp2records_transform_events_total"
+            }
+            Self::PhaseDurationSeconds => "canardstack_phase_duration_seconds",
+            Self::ProjectedBufferSeconds => "canardstack_projected_buffer_seconds",
+            Self::ProjectedSealSeconds => "canardstack_projected_seal_seconds",
+            Self::ProjectedVisibilitySeconds => "canardstack_projected_visibility_seconds",
+            Self::QueryDurationSeconds => "canardstack_query_duration_seconds",
+            Self::QueryRequestsTotal => "canardstack_query_requests_total",
+            Self::QueryTimeoutsTotal => "canardstack_query_timeouts_total",
+            Self::RawSpoolAppendBatchEncodedBytesTotal => {
+                "canardstack_raw_spool_append_batch_encoded_bytes_total"
+            }
+            Self::RawSpoolAppendBatchRecordsTotal => {
+                "canardstack_raw_spool_append_batch_records_total"
+            }
+            Self::RawSpoolAppendBatchesTotal => "canardstack_raw_spool_append_batches_total",
+            Self::RawSpoolAppendFileFsyncsTotal => "canardstack_raw_spool_append_file_fsyncs_total",
+            Self::RawSpoolAppendSyncFailuresTotal => {
+                "canardstack_raw_spool_append_sync_failures_total"
+            }
+            Self::RawSpoolAppendSyncsTotal => "canardstack_raw_spool_append_syncs_total",
+            Self::RawSpoolBytesTotal => "canardstack_raw_spool_bytes_total",
+            Self::RawSpoolCheckpointBatchCommandsTotal => {
+                "canardstack_raw_spool_checkpoint_batch_commands_total"
+            }
+            Self::RawSpoolCheckpointBatchRecordsTotal => {
+                "canardstack_raw_spool_checkpoint_batch_records_total"
+            }
+            Self::RawSpoolCheckpointBatchesTotal => {
+                "canardstack_raw_spool_checkpoint_batches_total"
+            }
+            Self::RawSpoolCheckpointedRecordsTotal => {
+                "canardstack_raw_spool_checkpointed_records_total"
+            }
+            Self::RawSpoolHealthy => "canardstack_raw_spool_healthy",
+            Self::RawSpoolPendingBytes => "canardstack_raw_spool_pending_bytes",
+            Self::RawSpoolPendingRecords => "canardstack_raw_spool_pending_records",
+            Self::RawSpoolRecordsTotal => "canardstack_raw_spool_records_total",
+            Self::RawSpoolReplayedRecordsTotal => "canardstack_raw_spool_replayed_records_total",
+            Self::RawSpoolSegmentBytes => "canardstack_raw_spool_segment_bytes",
+            Self::RawSpoolSegments => "canardstack_raw_spool_segments",
+            Self::RawSpoolUnsyncedAgeSeconds => "canardstack_raw_spool_unsynced_age_seconds",
+            Self::RawSpoolUnsyncedBytes => "canardstack_raw_spool_unsynced_bytes",
+            Self::RawSpoolUnsyncedRecords => "canardstack_raw_spool_unsynced_records",
+            Self::RuntimeMemoryLimitBytes => "canardstack_runtime_memory_limit_bytes",
+            Self::RuntimeRssBytes => "canardstack_runtime_rss_bytes",
+            Self::SealEwmaBytesPerSecond => "canardstack_seal_ewma_bytes_per_second",
+            Self::StorageLogicalRows => "canardstack_storage_logical_rows",
+            Self::StoragePhysicalBytes => "canardstack_storage_physical_bytes",
+        }
+    }
+
+    fn shape(self) -> MetricShape {
+        match self {
+            Self::AdmissionCapacity
+            | Self::AdmissionInUse
+            | Self::ArrowWriteBufferAgeSeconds
+            | Self::ArrowWriteBufferBytes
+            | Self::ArrowWriteBufferRows
+            | Self::DucklakeActiveDataFileRows
+            | Self::DucklakeActiveDataFiles
+            | Self::FreshnessWatermarkTimestamp
+            | Self::IngestInflightBytes
+            | Self::IngestInflightMemoryBoundBytes
+            | Self::IngestToQueryLagSeconds
+            | Self::IngestWorkerQueueCapacity
+            | Self::MaintenanceConsecutiveFailures
+            | Self::MaintenancePaused
+            | Self::ObservedFreshnessLagSeconds
+            | Self::ProjectedBufferSeconds
+            | Self::ProjectedSealSeconds
+            | Self::ProjectedVisibilitySeconds
+            | Self::RawSpoolHealthy
+            | Self::RawSpoolPendingBytes
+            | Self::RawSpoolPendingRecords
+            | Self::RawSpoolSegmentBytes
+            | Self::RawSpoolSegments
+            | Self::RawSpoolUnsyncedAgeSeconds
+            | Self::RawSpoolUnsyncedBytes
+            | Self::RawSpoolUnsyncedRecords
+            | Self::RuntimeMemoryLimitBytes
+            | Self::RuntimeRssBytes
+            | Self::SealEwmaBytesPerSecond
+            | Self::StorageLogicalRows
+            | Self::StoragePhysicalBytes => MetricShape::Gauge,
+            Self::MaintenanceDurationSeconds
+            | Self::PhaseDurationSeconds
+            | Self::QueryDurationSeconds => MetricShape::Observation,
+            _ => MetricShape::Counter,
+        }
+    }
+
+    fn allowed_label_keys(self) -> &'static [&'static str] {
+        match self {
+            Self::AdmissionCapacity | Self::AdmissionInUse => &["admission"],
+            Self::AdmissionRejectionsTotal => &["admission", "reason"],
+            Self::ArrowFlushRowsTotal
+            | Self::ArrowFlushesTotal
+            | Self::ArrowWriteBufferAgeSeconds
+            | Self::ArrowWriteBufferBytes
+            | Self::ArrowWriteBufferRows
+            | Self::DuckdbArrowAppendedRowsTotal
+            | Self::DuckdbArrowAppendsTotal
+            | Self::IngestBufferedBytesTotal
+            | Self::IngestBufferedRowsTotal
+            | Self::IngestInflightBytes => &["storage_signal"],
+            Self::DucklakeActiveDataFileRows
+            | Self::DucklakeActiveDataFiles
+            | Self::FreshnessWatermarkTimestamp
+            | Self::IngestToQueryLagSeconds
+            | Self::StorageLogicalRows
+            | Self::StoragePhysicalBytes => &["storage_signal"],
+            Self::HttpConnectionClosesTotal | Self::HttpConnectionErrorsTotal => &["reason"],
+            Self::HttpConnectionRequestsTotal => &["mode"],
+            Self::IngestDecodedBytesTotal | Self::IngestRequestBytesTotal => {
+                &["request_kind", "encoding"]
+            }
+            Self::IngestRecordsTotal
+            | Self::IngestRuntimeMemoryUnknownTotal
+            | Self::IngestUnsupportedHistogramsTotal
+            | Self::RawSpoolAppendBatchEncodedBytesTotal
+            | Self::RawSpoolAppendBatchRecordsTotal
+            | Self::RawSpoolAppendBatchesTotal
+            | Self::RawSpoolAppendFileFsyncsTotal
+            | Self::RawSpoolAppendSyncFailuresTotal
+            | Self::RawSpoolAppendSyncsTotal
+            | Self::RawSpoolBytesTotal
+            | Self::RawSpoolCheckpointBatchCommandsTotal
+            | Self::RawSpoolCheckpointBatchRecordsTotal
+            | Self::RawSpoolCheckpointBatchesTotal
+            | Self::RawSpoolHealthy
+            | Self::RawSpoolPendingBytes
+            | Self::RawSpoolPendingRecords
+            | Self::RawSpoolSegmentBytes
+            | Self::RawSpoolSegments
+            | Self::RawSpoolUnsyncedAgeSeconds
+            | Self::RawSpoolUnsyncedBytes
+            | Self::RawSpoolUnsyncedRecords => &["request_kind"],
+            Self::IngestRequestsTotal => &["request_kind", "status", "reason"],
+            Self::IngestSealStageTotal => &["stage"],
+            Self::IngestStageTotal => &["request_kind", "stage"],
+            Self::IngestStorageInsertTotal | Self::IngestWorkerCompletedTotal => {
+                &["request_kind", "status"]
+            }
+            Self::IngestTransformedRowsTotal => &["storage_signal", "request_kind"],
+            Self::IngestWorkerDispatchTotal => &["request_kind", "outcome"],
+            Self::IngestWorkerQueueCapacity => &["state"],
+            Self::MaintenanceConsecutiveFailures => &["job"],
+            Self::MaintenanceDurationSeconds => &["job", "storage_signal"],
+            Self::MaintenanceFailuresTotal => &["job", "reason"],
+            Self::MaintenanceRunsTotal => &["job", "status", "reason"],
+            Self::Otlp2recordsTransformEventsTotal => &["request_kind", "event"],
+            Self::PhaseDurationSeconds => &[
+                "request_kind",
+                "route_template",
+                "storage_signal",
+                "phase",
+                "reason",
+            ],
+            Self::QueryDurationSeconds | Self::QueryTimeoutsTotal => &["route_template"],
+            Self::QueryRequestsTotal => &["route_template", "status", "reason"],
+            Self::RawSpoolCheckpointedRecordsTotal => &["request_kind", "reason"],
+            Self::RawSpoolRecordsTotal | Self::RawSpoolReplayedRecordsTotal => {
+                &["request_kind", "status"]
+            }
+            Self::AdmissionReductionsTotal
+            | Self::IngestInflightMemoryBoundBytes
+            | Self::MaintenancePaused
+            | Self::ObservedFreshnessLagSeconds
+            | Self::ProjectedBufferSeconds
+            | Self::ProjectedSealSeconds
+            | Self::ProjectedVisibilitySeconds
+            | Self::RuntimeMemoryLimitBytes
+            | Self::RuntimeRssBytes
+            | Self::SealEwmaBytesPerSecond => &[],
+        }
+    }
+
+    fn from_str(name: &str) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|metric| metric.as_str() == name)
+    }
+}
+
 impl Metrics {
     /// Select the lock shard for a metric id. A given id always maps
     /// to the same shard, so read-modify-write counters/gauges remain correct
@@ -125,22 +526,55 @@ impl Metrics {
         &self.shards[(hash as usize) & (METRICS_SHARDS - 1)]
     }
 
+    pub fn inc_metric(&self, name: MetricName, labels: &[(&str, &str)], by: u64) {
+        assert_eq!(name.shape(), MetricShape::Counter);
+        self.inc_registered(name, labels, by);
+    }
+
     pub fn inc(&self, name: &str, labels: &[(&str, &str)], by: u64) {
-        let metric_id = MetricId::new(name, labels);
+        let name = registered_metric_name(name, MetricShape::Counter, labels);
+        self.inc_registered(name, labels, by);
+    }
+
+    fn inc_registered(&self, name: MetricName, labels: &[(&str, &str)], by: u64) {
+        validate_metric_labels(name, labels);
+        let metric_id = MetricId::new(name.as_str(), labels);
         let mut inner = self.shard_for(&metric_id).lock_or_poisoned();
         *inner.counters.entry(metric_id).or_default() += by;
     }
 
+    pub fn set_counter_metric(&self, name: MetricName, labels: &[(&str, &str)], value: u64) {
+        assert_eq!(name.shape(), MetricShape::Counter);
+        self.set_counter_registered(name, labels, value);
+    }
+
     pub fn set_counter(&self, name: &str, labels: &[(&str, &str)], value: u64) {
-        let metric_id = MetricId::new(name, labels);
+        let name = registered_metric_name(name, MetricShape::Counter, labels);
+        self.set_counter_registered(name, labels, value);
+    }
+
+    fn set_counter_registered(&self, name: MetricName, labels: &[(&str, &str)], value: u64) {
+        validate_metric_labels(name, labels);
+        let metric_id = MetricId::new(name.as_str(), labels);
         self.shard_for(&metric_id)
             .lock_or_poisoned()
             .counters
             .insert(metric_id, value);
     }
 
+    pub fn gauge_metric(&self, name: MetricName, labels: &[(&str, &str)], value: f64) {
+        assert_eq!(name.shape(), MetricShape::Gauge);
+        self.gauge_registered(name, labels, value);
+    }
+
     pub fn gauge(&self, name: &str, labels: &[(&str, &str)], value: f64) {
-        let metric_id = MetricId::new(name, labels);
+        let name = registered_metric_name(name, MetricShape::Gauge, labels);
+        self.gauge_registered(name, labels, value);
+    }
+
+    fn gauge_registered(&self, name: MetricName, labels: &[(&str, &str)], value: f64) {
+        validate_metric_labels(name, labels);
+        let metric_id = MetricId::new(name.as_str(), labels);
         self.shard_for(&metric_id)
             .lock_or_poisoned()
             .gauges
@@ -151,12 +585,39 @@ impl Metrics {
         self.observe_seconds_n(name, labels, 1, seconds);
     }
 
+    pub fn observe_seconds_metric(&self, name: MetricName, labels: &[(&str, &str)], seconds: f64) {
+        self.observe_seconds_n_metric(name, labels, 1, seconds);
+    }
+
+    pub fn observe_seconds_n_metric(
+        &self,
+        name: MetricName,
+        labels: &[(&str, &str)],
+        count: u64,
+        seconds: f64,
+    ) {
+        assert_eq!(name.shape(), MetricShape::Observation);
+        self.observe_seconds_n_registered(name, labels, count, seconds);
+    }
+
     pub fn observe_seconds_n(&self, name: &str, labels: &[(&str, &str)], count: u64, seconds: f64) {
+        let name = registered_metric_name(name, MetricShape::Observation, labels);
+        self.observe_seconds_n_registered(name, labels, count, seconds);
+    }
+
+    fn observe_seconds_n_registered(
+        &self,
+        name: MetricName,
+        labels: &[(&str, &str)],
+        count: u64,
+        seconds: f64,
+    ) {
+        validate_metric_labels(name, labels);
         if count == 0 {
             return;
         }
-        let count_id = MetricId::new(&format!("{name}_count"), labels);
-        let sum_id = MetricId::new(&format!("{name}_sum"), labels);
+        let count_id = MetricId::new(&format!("{}_count", name.as_str()), labels);
+        let sum_id = MetricId::new(&format!("{}_sum", name.as_str()), labels);
         {
             let mut inner = self.shard_for(&count_id).lock_or_poisoned();
             *inner.counters.entry(count_id).or_default() += count;
@@ -167,8 +628,10 @@ impl Metrics {
     }
 
     pub fn set_observation(&self, name: &str, labels: &[(&str, &str)], count: u64, seconds: f64) {
-        let count_id = MetricId::new(&format!("{name}_count"), labels);
-        let sum_id = MetricId::new(&format!("{name}_sum"), labels);
+        let name = registered_metric_name(name, MetricShape::Observation, labels);
+        validate_metric_labels(name, labels);
+        let count_id = MetricId::new(&format!("{}_count", name.as_str()), labels);
+        let sum_id = MetricId::new(&format!("{}_sum", name.as_str()), labels);
         self.shard_for(&count_id)
             .lock_or_poisoned()
             .counters
@@ -285,11 +748,6 @@ impl Metrics {
         self.observe_seconds(
             "canardstack_maintenance_duration_seconds",
             &[("job", job), ("storage_signal", "all")],
-            seconds,
-        );
-        self.observe_seconds(
-            "canardstack_maintenance_duration_seconds",
-            &[("job", job), ("table", "all")],
             seconds,
         );
     }
@@ -411,6 +869,44 @@ fn status_label(status: u16) -> Cow<'static, str> {
         500 => Cow::Borrowed("500"),
         503 => Cow::Borrowed("503"),
         other => Cow::Owned(other.to_string()),
+    }
+}
+
+fn registered_metric_name(
+    name: &str,
+    expected_shape: MetricShape,
+    labels: &[(&str, &str)],
+) -> MetricName {
+    let metric = MetricName::from_str(name)
+        .unwrap_or_else(|| panic!("metric `{name}` is not registered in MetricName"));
+    assert_eq!(
+        metric.shape(),
+        expected_shape,
+        "metric `{name}` was emitted as {expected_shape:?}, but registry defines it as {:?}",
+        metric.shape()
+    );
+    validate_metric_labels(metric, labels);
+    metric
+}
+
+fn validate_metric_labels(name: MetricName, labels: &[(&str, &str)]) {
+    let allowed = name.allowed_label_keys();
+    for (key, _) in labels {
+        assert!(
+            allowed.contains(key),
+            "metric `{}` emitted unsupported label key `{key}`; allowed keys: {allowed:?}",
+            name.as_str()
+        );
+    }
+    for index in 0..labels.len() {
+        assert!(
+            !labels[index + 1..]
+                .iter()
+                .any(|(key, _)| *key == labels[index].0),
+            "metric `{}` emitted duplicate label key `{}`",
+            name.as_str(),
+            labels[index].0
+        );
     }
 }
 
@@ -849,18 +1345,8 @@ mod snapshot_tests {
             0.0,
         );
         metrics.gauge(
-            "canardstack_storage_physical_bytes",
-            &[("table", "all")],
-            0.0,
-        );
-        metrics.gauge(
             "canardstack_storage_logical_rows",
             &[("storage_signal", "logs")],
-            0.0,
-        );
-        metrics.gauge(
-            "canardstack_storage_logical_rows",
-            &[("table", "logs")],
             0.0,
         );
         metrics.gauge(
@@ -869,18 +1355,8 @@ mod snapshot_tests {
             0.0,
         );
         metrics.gauge(
-            "canardstack_ducklake_active_data_files",
-            &[("table", "logs")],
-            0.0,
-        );
-        metrics.gauge(
             "canardstack_ducklake_active_data_file_rows",
             &[("storage_signal", "logs")],
-            0.0,
-        );
-        metrics.gauge(
-            "canardstack_ducklake_active_data_file_rows",
-            &[("table", "logs")],
             0.0,
         );
         metrics.gauge(
@@ -889,18 +1365,8 @@ mod snapshot_tests {
             0.0,
         );
         metrics.gauge(
-            "canardstack_freshness_watermark_timestamp",
-            &[("table", "logs")],
-            0.0,
-        );
-        metrics.gauge(
             "canardstack_ingest_to_query_lag_seconds",
             &[("storage_signal", "logs")],
-            0.0,
-        );
-        metrics.gauge(
-            "canardstack_ingest_to_query_lag_seconds",
-            &[("table", "logs")],
             0.0,
         );
 
@@ -1112,6 +1578,33 @@ mod snapshot_tests {
             assert!(
                 rendered.contains(phase),
                 "fine phase {phase} must be present with detailed-metrics"
+            );
+        }
+    }
+
+    #[test]
+    fn metric_registry_names_are_unique() {
+        let names = MetricName::ALL
+            .iter()
+            .map(|metric| metric.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            names.len(),
+            MetricName::ALL.len(),
+            "metric registry contains duplicate Prometheus names"
+        );
+    }
+
+    #[test]
+    fn pinned_lean_surface_is_registered() {
+        let registered = MetricName::ALL
+            .iter()
+            .map(|metric| metric.as_str().to_string())
+            .collect::<BTreeSet<_>>();
+        for expected in expected_lean_surface() {
+            assert!(
+                registered.contains(&expected),
+                "pinned metric `{expected}` is missing from MetricName"
             );
         }
     }

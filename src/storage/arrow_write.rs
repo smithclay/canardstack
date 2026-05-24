@@ -142,7 +142,6 @@ pub(super) fn arrow_write_timing_snapshot(timings: &[ArrowBatchBufferTiming]) ->
             .map(|timing| {
                 json!({
                     "storage_signal": timing.storage_signal.as_str(),
-                    "table": timing.storage_signal.as_str(),
                     "phase": timing.phase.as_str(),
                     "rows": timing.rows,
                     "seconds": timing.seconds,

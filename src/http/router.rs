@@ -349,9 +349,6 @@ fn record_maintenance_metrics(
 
 fn storage_signal_gauge(metrics: &Metrics, name: &'static str, storage_signal: &str, value: f64) {
     metrics.gauge(name, &[("storage_signal", storage_signal)], value);
-    // Deprecation window for the pre-glossary label. Keep dual emission until
-    // dashboards have migrated to `storage_signal`.
-    metrics.gauge(name, &[("table", storage_signal)], value);
 }
 
 pub(crate) fn record_operator_gauges(state: &AppState) {

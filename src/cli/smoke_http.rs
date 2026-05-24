@@ -80,9 +80,6 @@ fn ensure_ducklake_attached(client: &Client, admin_key: &str) -> Result<()> {
     let response = client.get("/api/admin/health/storage", Some(admin_key))?;
     ensure_status(&response, 200, "storage health")?;
     let body = parse_json(&response, "storage health")?;
-    if body.get("ducklake_available").and_then(Value::as_bool) != Some(true) {
-        bail!("DuckLake is not attached; storage health was {body}");
-    }
     let mode = body.get("mode").and_then(Value::as_str).unwrap_or_default();
     if !mode.starts_with("ducklake_") {
         bail!("expected a DuckLake-backed storage mode, got storage health {body}");

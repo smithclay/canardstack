@@ -100,7 +100,7 @@ impl Maintenance {
                 "spans": self.retention.spans_days,
                 "metrics": self.retention.metrics_days
             },
-            "scheduler_jobs": ["metadata_refresh", "metrics_snapshot", "retention"]
+            "scheduler_jobs": ["seal", "metadata_refresh", "metrics_snapshot", "retention"]
         })
     }
 

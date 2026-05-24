@@ -2813,7 +2813,6 @@ fn remote_ducklake_attach_uri_smoke() {
     let state = AppState::new(config).unwrap();
     let health = state.storage.health();
     assert!(health.mode.ends_with("_arrow_append"));
-    assert!(health.ducklake_available);
     assert!(health.capabilities.insert);
 
     let now = Utc::now();
@@ -2927,7 +2926,7 @@ fn scheduler_health_excludes_ingest_visibility_jobs() {
     );
     assert_eq!(
         maintenance_health.json_body()["scheduler_jobs"],
-        json!(["metadata_refresh", "metrics_snapshot", "retention"])
+        json!(["seal", "metadata_refresh", "metrics_snapshot", "retention"])
     );
 }
 

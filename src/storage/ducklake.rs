@@ -6,6 +6,8 @@ use std::fs;
 use std::path::Path;
 
 const DUCKDB_THREADS: usize = 1;
+pub(super) const DUCKLAKE_CATALOG_NAME: &str = "canardlake";
+pub(super) const DUCKLAKE_TARGET_PREFIX: &str = "canardlake.";
 
 pub fn install_ducklake_extension(extension_dir: Option<&Path>) -> Result<()> {
     let conn = Connection::open_in_memory()?;
@@ -92,7 +94,7 @@ pub(super) fn build_ducklake_attach_plan(
         }
         return Ok(DuckLakeAttachPlan {
             sql: format!(
-                "ATTACH '{}' AS canardlake; USE canardlake;",
+                "ATTACH '{}' AS {DUCKLAKE_CATALOG_NAME}; USE {DUCKLAKE_CATALOG_NAME};",
                 uri.replace('\'', "''"),
             ),
             mode: if is_motherduck {
@@ -111,7 +113,7 @@ pub(super) fn build_ducklake_attach_plan(
     if let Some(dsn) = postgres_dsn {
         return Ok(DuckLakeAttachPlan {
             sql: format!(
-                "ATTACH 'ducklake:postgres:{}' AS canardlake (DATA_PATH '{}'); USE canardlake;",
+                "ATTACH 'ducklake:postgres:{}' AS {DUCKLAKE_CATALOG_NAME} (DATA_PATH '{}'); USE {DUCKLAKE_CATALOG_NAME};",
                 dsn.replace('\'', "''"),
                 data_path,
             ),
@@ -129,7 +131,7 @@ pub(super) fn build_ducklake_attach_plan(
         .join("canardstack.ducklake");
     Ok(DuckLakeAttachPlan {
         sql: format!(
-            "ATTACH 'ducklake:{}' AS canardlake (DATA_PATH '{}'); USE canardlake;",
+            "ATTACH 'ducklake:{}' AS {DUCKLAKE_CATALOG_NAME} (DATA_PATH '{}'); USE {DUCKLAKE_CATALOG_NAME};",
             sql_path(&metadata),
             data_path,
         ),

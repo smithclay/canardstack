@@ -144,9 +144,6 @@ impl Storage {
         batch: &RecordBatch,
         source_format: &str,
     ) -> Result<InternalTelemetryCommitResult> {
-        if !self.ducklake_available {
-            anyhow::bail!("internal telemetry commit requires DuckLake storage");
-        }
         if batch.num_rows() == 0 {
             return Ok(InternalTelemetryCommitResult {
                 rows: 0,
@@ -216,10 +213,6 @@ impl Storage {
         prepare_timings: Vec<ArrowBatchBufferTiming>,
         attempted_rows: usize,
     ) -> Result<ArrowBatchBufferResult> {
-        if !self.ducklake_available {
-            anyhow::bail!("Arrow write buffer ingest requires DuckLake storage");
-        }
-
         let error_table = prepared
             .first()
             .map(|batch| batch.storage_signal)
