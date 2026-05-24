@@ -143,7 +143,12 @@ impl ArrowWriteBuffer {
         now: Instant,
     ) -> bool {
         self.rows > 0
-            && (self.bytes >= target_bytes || now.duration_since(self.opened_at) >= max_age)
+            && size_or_age_due(
+                self.bytes,
+                now.duration_since(self.opened_at).as_secs_f64(),
+                target_bytes,
+                max_age.as_secs_f64(),
+            )
     }
 
     pub(super) fn record_batch(&self, storage_signal: StorageSignal) -> Result<RecordBatch> {
@@ -158,6 +163,21 @@ impl ArrowWriteBuffer {
             }
         }
     }
+}
+
+/// Single source of truth for the Arrow write-buffer size/age flush threshold:
+/// a buffer is due when its byte size reaches `target_bytes` or its age reaches
+/// `max_age_seconds`. Both `ArrowWriteBuffer::should_flush` and the
+/// `SealDriver` seal-cadence decision delegate here so the two cannot diverge.
+/// Production always seals via `flush_arrow_write_buffer(force = true)`, so in
+/// practice this predicate also drives the `SealDriver` "should I seal now?" check.
+pub(crate) fn size_or_age_due(
+    bytes: usize,
+    age_seconds: f64,
+    target_bytes: usize,
+    max_age_seconds: f64,
+) -> bool {
+    bytes >= target_bytes || age_seconds >= max_age_seconds
 }
 
 pub(super) fn arrow_write_buffer_snapshot(

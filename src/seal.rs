@@ -57,8 +57,12 @@ impl SealDriver {
 
         let buffered = buffers.iter().any(|metric| metric.bytes > 0);
         let threshold_due = buffers.iter().any(|metric| {
-            metric.bytes >= self.buffer_target_bytes
-                || metric.age_seconds >= self.buffer_max_age_seconds
+            Storage::size_or_age_due(
+                metric.bytes,
+                metric.age_seconds,
+                self.buffer_target_bytes,
+                self.buffer_max_age_seconds,
+            )
         });
         if buffered && (threshold_due || now >= self.next_seal) {
             let ok = run_seal(state);

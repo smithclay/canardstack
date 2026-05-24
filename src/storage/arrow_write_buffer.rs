@@ -1,7 +1,7 @@
 use super::arrow::{batch_timestamp_days, storage_duckdb_batch};
 use super::arrow_write::{
-    arrow_write_buffer_snapshot, ArrowFlushOutcome, ArrowFlushResult, ArrowWriteBuffer,
-    BufferDurability,
+    arrow_write_buffer_snapshot, size_or_age_due, ArrowFlushOutcome, ArrowFlushResult,
+    ArrowWriteBuffer, BufferDurability,
 };
 use super::ducklake::configure_write_connection;
 use super::{
@@ -52,6 +52,18 @@ impl<'a> ArrowBatchInput<'a> {
 }
 
 impl Storage {
+    /// The single size/age flush-threshold predicate, exposed so the
+    /// `SealDriver` seal-cadence decision and `ArrowWriteBuffer::should_flush`
+    /// share one definition. See [`size_or_age_due`].
+    pub(crate) fn size_or_age_due(
+        bytes: usize,
+        age_seconds: f64,
+        target_bytes: usize,
+        max_age_seconds: f64,
+    ) -> bool {
+        size_or_age_due(bytes, age_seconds, target_bytes, max_age_seconds)
+    }
+
     pub fn arrow_write_buffer_metrics(&self) -> Vec<ArrowWriteBufferMetric> {
         let buffers = self.arrow_write_buffers.lock_or_poisoned();
         buffers
