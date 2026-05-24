@@ -284,6 +284,11 @@ impl Metrics {
         );
         self.observe_seconds(
             "canardstack_maintenance_duration_seconds",
+            &[("job", job), ("storage_signal", "all")],
+            seconds,
+        );
+        self.observe_seconds(
+            "canardstack_maintenance_duration_seconds",
             &[("job", job), ("table", "all")],
             seconds,
         );
@@ -339,6 +344,8 @@ impl Metrics {
         if samples.is_empty() {
             return Ok(0);
         }
+        // Sanctioned best-effort producer: operator self-telemetry is queryable
+        // when enabled, but it has no raw-spool replay record.
         let counters = samples
             .iter()
             .filter(|sample| sample.kind() == MetricKind::Counter)
@@ -549,7 +556,7 @@ mod snapshot_tests {
         );
         metrics.inc(
             "canardstack_ingest_worker_completed_total",
-            &[("request_kind", "logs"), ("status", "ok")],
+            &[("request_kind", "logs"), ("status", "buffered")],
             1,
         );
         metrics.inc(
@@ -833,7 +840,17 @@ mod snapshot_tests {
         // Storage / freshness operator gauges.
         metrics.gauge(
             "canardstack_storage_physical_bytes",
+            &[("storage_signal", "all")],
+            0.0,
+        );
+        metrics.gauge(
+            "canardstack_storage_physical_bytes",
             &[("table", "all")],
+            0.0,
+        );
+        metrics.gauge(
+            "canardstack_storage_logical_rows",
+            &[("storage_signal", "logs")],
             0.0,
         );
         metrics.gauge(
@@ -843,7 +860,17 @@ mod snapshot_tests {
         );
         metrics.gauge(
             "canardstack_ducklake_active_data_files",
+            &[("storage_signal", "logs")],
+            0.0,
+        );
+        metrics.gauge(
+            "canardstack_ducklake_active_data_files",
             &[("table", "logs")],
+            0.0,
+        );
+        metrics.gauge(
+            "canardstack_ducklake_active_data_file_rows",
+            &[("storage_signal", "logs")],
             0.0,
         );
         metrics.gauge(
@@ -853,7 +880,17 @@ mod snapshot_tests {
         );
         metrics.gauge(
             "canardstack_freshness_watermark_timestamp",
+            &[("storage_signal", "logs")],
+            0.0,
+        );
+        metrics.gauge(
+            "canardstack_freshness_watermark_timestamp",
             &[("table", "logs")],
+            0.0,
+        );
+        metrics.gauge(
+            "canardstack_ingest_to_query_lag_seconds",
+            &[("storage_signal", "logs")],
             0.0,
         );
         metrics.gauge(

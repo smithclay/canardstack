@@ -24,9 +24,11 @@ persist a snapshot into the `metric_gauge` / `metric_sum` storage tables. Set
 `[metrics] operator_metrics_to_storage = true`) to enable the write; the job then
 writes the current samples with `service_name="canardstack"` (counters land in
 `metric_sum`, gauges land in `metric_gauge`) so canardstack's own metrics are
-queryable through the compat query path. With the flag off the job reports
-`rows: 0` / `"operator_metrics_to_storage": false` and `/metrics` still serves
-the live surface.
+queryable through the compat query path. These rows are a sanctioned best-effort
+write-buffer producer: they do not have raw-spool replay refs and are not
+replayed after a crash. With the flag off the job reports `rows: 0` /
+`"operator_metrics_to_storage": false` and `/metrics` still serves the live
+surface.
 
 ### Fine phase timings (`detailed-metrics` feature, opt-in)
 
@@ -45,7 +47,8 @@ Labels stay low-cardinality:
   label name for the ingest/raw-spool surface (the former `spool_lane` label was
   retired in the metrics diet).
 - `storage_signal`: `logs`, `spans`, `metric_gauge`, `metric_sum`.
-- `table`: `logs`, `spans`, `metric_gauge`, `metric_sum`, or `all`.
+- `table`: legacy alias for `storage_signal` on storage/operator gauges during
+  the deprecation window; new dashboards should use `storage_signal`.
 - `status`: HTTP status code or grouped class.
 - `outcome`: worker-channel handoff outcome (`queued`, `processed_inline`, `workers_unavailable`).
 - `reason`: bounded rejection or failure reason.
@@ -89,7 +92,7 @@ Do not label metrics by `service_name`, trace id, query text, API key, or arbitr
 | `canardstack_ingest_worker_queue_capacity` | Gauge | `state=capacity` | Configured bounded worker channel capacity. |
 | `canardstack_ingest_worker_dispatch_total` | Counter | `request_kind`, `outcome` | Worker-channel handoff outcomes: `queued`, `processed_inline`, or `workers_unavailable`. A rising `outcome="processed_inline"` rate signals worker-pool saturation: every worker channel was full, so the request was processed inline on the connection thread (back-pressure via latency). The first transition into each saturation episode also emits the `ingest_worker_pool_saturated` log event (logged once per episode, cleared on the next successful queued dispatch). |
 | `canardstack_ingest_storage_insert_total` | Counter | `request_kind`, `status` | Worker appends of Arrow batches into the Arrow write buffer. |
-| `canardstack_ingest_worker_completed_total` | Counter | `request_kind`, `status` | Ingest worker tasks completed, by outcome. |
+| `canardstack_ingest_worker_completed_total` | Counter | `request_kind`, `status` | Ingest worker tasks completed, by post-spool durability disposition (`buffered`, `terminally_disposed`, or `left_pending_for_replay`). |
 | `canardstack_duckdb_arrow_appends_total` | Counter | `storage_signal` | DuckDB Arrow appender calls per flushed storage signal. |
 | `canardstack_duckdb_arrow_appended_rows_total` | Counter | `storage_signal` | Rows handed to DuckDB through the Arrow appender. |
 | `canardstack_arrow_flushes_total` | Counter | `storage_signal` | Arrow write-buffer flushes that reached DuckLake commit. |
@@ -110,10 +113,10 @@ scans.
 
 | Metric | Type | Labels | Purpose |
 | --- | --- | --- | --- |
-| `canardstack_storage_logical_rows` | Gauge | `table` | Row count per table from DuckDB. |
-| `canardstack_storage_physical_bytes` | Gauge | `table=all` | Local storage directory size on disk. |
-| `canardstack_ducklake_active_data_files` | Gauge | `table` | Active DuckLake data files per table. |
-| `canardstack_ducklake_active_data_file_rows` | Gauge | `table` | Active rows stored in DuckLake data files per table. |
+| `canardstack_storage_logical_rows` | Gauge | `storage_signal` (`table` legacy alias) | Row count per storage signal from DuckDB. |
+| `canardstack_storage_physical_bytes` | Gauge | `storage_signal=all` (`table=all` legacy alias) | Local storage directory size on disk. |
+| `canardstack_ducklake_active_data_files` | Gauge | `storage_signal` (`table` legacy alias) | Active DuckLake data files per storage signal. |
+| `canardstack_ducklake_active_data_file_rows` | Gauge | `storage_signal` (`table` legacy alias) | Active rows stored in DuckLake data files per storage signal. |
 
 The shared phase metric `canardstack_phase_duration_seconds` also records
 storage proof phases with `storage_signal` and `phase` labels:
@@ -123,6 +126,9 @@ storage proof phases with `storage_signal` and `phase` labels:
 waiting to acquire the single write connection lock, on the flush path
 (`request_kind`, `phase=writer_lock_wait`) and the metadata-refresh path
 (`phase=writer_lock_wait`, `path=metadata_refresh`).
+
+Admin flush/seal JSON timings also include `storage_signal`; the legacy `table`
+key is included during the same deprecation window.
 
 `/api/admin/health/ingest` returns queue snapshots, raw-spool stats
 (`segment_count`, `segment_bytes`, `pending_records`, `pending_bytes`,
@@ -170,7 +176,7 @@ because accepted requests are fsynced before acknowledgement.
 | Metric | Type | Labels | Purpose |
 | --- | --- | --- | --- |
 | `canardstack_maintenance_runs_total` | Counter | `job`, `status`, `reason` | Job outcomes (`status=ok` or `status=error`). |
-| `canardstack_maintenance_duration_seconds` | Histogram (`_count` / `_sum`) | `job`, `table=all` | Job runtime. |
+| `canardstack_maintenance_duration_seconds` | Histogram (`_count` / `_sum`) | `job`, `storage_signal=all` (`table=all` legacy alias) | Job runtime. |
 | `canardstack_maintenance_failures_total` | Counter | `job`, `reason` | Failures only, broken out by classified reason. Bounded reason set: `disk_full`, `seal_failed`, `metadata_refresh_failed`, `metrics_snapshot_failed`, `retention_failed`, `scheduler_job_failed`. Reasons derive from the job name where possible (so dependency wording changes do not silently re-route alerts); only `disk_full` substring-matches OS / DuckDB errors. |
 | `canardstack_maintenance_consecutive_failures` | Gauge | `job` | Consecutive failure count; resets to 0 on success. Drives exponential backoff. |
 | `canardstack_maintenance_paused` | Gauge | none | `1` when scheduled maintenance is paused. |
@@ -179,8 +185,8 @@ because accepted requests are fsynced before acknowledgement.
 
 | Metric | Type | Labels | Purpose |
 | --- | --- | --- | --- |
-| `canardstack_freshness_watermark_timestamp` | Gauge | `table` | Newest query-visible event time (epoch seconds). |
-| `canardstack_ingest_to_query_lag_seconds` | Gauge | `table` | Now minus visible watermark, clamped at 0. |
+| `canardstack_freshness_watermark_timestamp` | Gauge | `storage_signal` (`table` legacy alias) | Newest query-visible event time (epoch seconds). |
+| `canardstack_ingest_to_query_lag_seconds` | Gauge | `storage_signal` (`table` legacy alias) | Now minus visible watermark, clamped at 0. |
 
 ## Initial Alerts
 

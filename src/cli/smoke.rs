@@ -54,9 +54,7 @@ pub fn run() -> anyhow::Result<()> {
     while Instant::now() < deadline && state.ingestor.inflight_bytes() > 0 {
         thread::sleep(StdDuration::from_millis(20));
     }
-    state
-        .ingestor
-        .seal_committed_to_storage(&state.storage, &state.metrics)?;
+    crate::seal::commit_buffered_rows(&state)?;
 
     let mut admin_headers = HashMap::new();
     admin_headers.insert(

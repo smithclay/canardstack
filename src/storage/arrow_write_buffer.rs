@@ -7,6 +7,7 @@ use super::{
     ArrowBatchBuffer, ArrowBatchBufferResult, ArrowBatchBufferTiming, ArrowWriteBufferMetric,
     PreparedArrowBatch, Storage, StorageSignal, TimingPhase,
 };
+use crate::seal::BufferDurability;
 use crate::LockExt;
 use anyhow::{Context, Result};
 use arrow58::compute::concat_batches;
@@ -20,8 +21,8 @@ impl Storage {
         let buffers = self.arrow_write_buffers.lock_or_poisoned();
         buffers
             .iter()
-            .map(|(table, buffer)| ArrowWriteBufferMetric {
-                table: *table,
+            .map(|(storage_signal, buffer)| ArrowWriteBufferMetric {
+                storage_signal: *storage_signal,
                 rows: buffer.rows,
                 bytes: buffer.bytes,
                 age_seconds: buffer.opened_at.elapsed().as_secs_f64(),
@@ -31,14 +32,15 @@ impl Storage {
 
     pub fn buffer_arrow_records(
         &self,
-        table: StorageSignal,
+        storage_signal: StorageSignal,
         batch: &RecordBatch,
         source_format: &str,
     ) -> Result<usize> {
         let result = self.buffer_arrow_batches(&[ArrowBatchBuffer {
-            table,
+            storage_signal,
             batch,
             source_format,
+            durability: BufferDurability::best_effort(),
         }])?;
         Ok(result.rows)
     }
@@ -50,39 +52,53 @@ impl Storage {
         let mut prepared = Vec::new();
         let mut prepare_timings = Vec::new();
         let mut attempted_rows = 0;
-        let mut grouped = BTreeMap::<(StorageSignal, &str), Vec<&RecordBatch>>::new();
+        let mut grouped =
+            BTreeMap::<(StorageSignal, &str), (Vec<&RecordBatch>, BufferDurability, usize)>::new();
         for batch in batches {
             if batch.batch.num_rows() == 0 {
                 continue;
             }
-            attempted_rows += batch.batch.num_rows();
-            grouped
-                .entry((batch.table, batch.source_format))
-                .or_default()
-                .push(batch.batch);
+            if !batch.durability.is_declared() {
+                anyhow::bail!(
+                    "Arrow write buffer producer for {} did not declare durability",
+                    batch.storage_signal
+                );
+            }
+            let rows = batch.batch.num_rows();
+            attempted_rows += rows;
+            let (batch_refs, durability, best_effort_rows) = grouped
+                .entry((batch.storage_signal, batch.source_format))
+                .or_insert_with(|| (Vec::new(), BufferDurability::empty(), 0));
+            durability.merge(batch.durability.clone());
+            if batch.durability.has_best_effort() {
+                *best_effort_rows += rows;
+            }
+            batch_refs.push(batch.batch);
         }
-        for ((table, source_format), batches) in grouped {
+        for ((storage_signal, source_format), (batches, durability, best_effort_rows)) in grouped {
             let rows = batches.iter().map(|batch| batch.num_rows()).sum();
             let coalesce_started = Instant::now();
-            let batch = coalesce_storage_batches(table, &batches)?;
+            let batch = coalesce_storage_batches(storage_signal, &batches)?;
             prepare_timings.push(ArrowBatchBufferTiming {
-                table,
+                storage_signal,
                 phase: TimingPhase::Coalesce,
                 rows,
                 seconds: coalesce_started.elapsed().as_secs_f64(),
             });
             let prepare_started = Instant::now();
-            let prepared_batch = storage_duckdb_batch(table, &batch, source_format)?;
+            let prepared_batch = storage_duckdb_batch(storage_signal, &batch, source_format)?;
             let timestamp_days = batch_timestamp_days(&prepared_batch)?;
             let prepare_seconds = prepare_started.elapsed().as_secs_f64();
             prepared.push(PreparedArrowBatch {
-                table,
+                storage_signal,
                 batch: prepared_batch,
                 rows,
                 timestamp_days,
+                durability,
+                best_effort_rows,
             });
             prepare_timings.push(ArrowBatchBufferTiming {
-                table,
+                storage_signal,
                 phase: TimingPhase::Prepare,
                 rows,
                 seconds: prepare_seconds,
@@ -111,7 +127,7 @@ impl Storage {
 
         let error_table = prepared
             .first()
-            .map(|batch| batch.table)
+            .map(|batch| batch.storage_signal)
             .unwrap_or(StorageSignal::Logs);
         let mut timings = prepare_timings;
 
@@ -120,12 +136,12 @@ impl Storage {
             let started = Instant::now();
             for batch in prepared {
                 buffers
-                    .entry(batch.table)
+                    .entry(batch.storage_signal)
                     .or_insert_with(|| ArrowWriteBuffer::new(started))
                     .push(batch);
             }
             timings.push(ArrowBatchBufferTiming {
-                table: error_table,
+                storage_signal: error_table,
                 phase: TimingPhase::ArrowWriteBuffer,
                 rows: attempted_rows,
                 seconds: started.elapsed().as_secs_f64(),
@@ -163,6 +179,8 @@ impl Storage {
                     flushed_buffers: 0,
                     timings: Vec::new(),
                     active_write_buffers: arrow_write_buffer_snapshot(&buffers),
+                    replay_refs: Vec::new(),
+                    best_effort_rows: 0,
                 });
             }
 
@@ -190,6 +208,8 @@ impl Storage {
             flushed_buffers: flush_result.buffers,
             timings: flush_result.timings,
             active_write_buffers,
+            replay_refs: flush_result.replay_refs,
+            best_effort_rows: flush_result.best_effort_rows,
         })
     }
 
@@ -198,9 +218,19 @@ impl Storage {
         buffers: &BTreeMap<StorageSignal, ArrowWriteBuffer>,
     ) -> Result<ArrowFlushResult> {
         let rows = buffers.values().map(|buffer| buffer.rows).sum();
+        let replay_refs = buffers
+            .values()
+            .flat_map(|buffer| buffer.durability.replay_refs())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let best_effort_rows = buffers
+            .values()
+            .map(|buffer| buffer.best_effort_rows)
+            .sum::<usize>();
         let affected = buffers
             .iter()
-            .map(|(&table, buffer)| (table, buffer.timestamp_days.clone()))
+            .map(|(&storage_signal, buffer)| (storage_signal, buffer.timestamp_days.clone()))
             .collect::<BTreeMap<_, _>>();
         // Time the wait to acquire the single writer connection so writer
         // contention (seal vs. metadata-refresh on the same lock) is visible.
@@ -223,16 +253,18 @@ impl Storage {
             buffers: buffers.len(),
             timings,
             affected,
+            replay_refs,
+            best_effort_rows,
         })
     }
 
     fn restore_arrow_write_buffers(&self, detached: BTreeMap<StorageSignal, ArrowWriteBuffer>) {
         let mut buffers = self.arrow_write_buffers.lock_or_poisoned();
-        for (table, mut detached_buffer) in detached {
-            if let Some(current) = buffers.remove(&table) {
+        for (storage_signal, mut detached_buffer) in detached {
+            if let Some(current) = buffers.remove(&storage_signal) {
                 detached_buffer.append_buffer(current);
             }
-            buffers.insert(table, detached_buffer);
+            buffers.insert(storage_signal, detached_buffer);
         }
     }
 }
@@ -245,20 +277,20 @@ fn append_buffers_to_ducklake(
 ) -> Result<()> {
     conn.execute_batch("BEGIN TRANSACTION;")?;
     let result = (|| -> Result<()> {
-        for (&table, buffer) in buffers {
+        for (&storage_signal, buffer) in buffers {
             let coalesce_started = Instant::now();
-            let batch = buffer.record_batch(table)?;
+            let batch = buffer.record_batch(storage_signal)?;
             timings.push(ArrowBatchBufferTiming {
-                table,
+                storage_signal,
                 phase: TimingPhase::ArrowWriteCoalesce,
                 rows: buffer.rows,
                 seconds: coalesce_started.elapsed().as_secs_f64(),
             });
 
             let append_started = Instant::now();
-            append_record_batch_to_ducklake(conn, catalog_name, table, batch)?;
+            append_record_batch_to_ducklake(conn, catalog_name, storage_signal, batch)?;
             timings.push(ArrowBatchBufferTiming {
-                table,
+                storage_signal,
                 phase: TimingPhase::DuckdbArrowAppend,
                 rows: buffer.rows,
                 seconds: append_started.elapsed().as_secs_f64(),
@@ -286,18 +318,20 @@ fn append_buffers_to_ducklake(
 fn append_record_batch_to_ducklake(
     conn: &Connection,
     catalog_name: &str,
-    table: StorageSignal,
+    storage_signal: StorageSignal,
     batch: RecordBatch,
 ) -> Result<()> {
     let mut appender = conn
-        .appender_to_catalog_and_db(table.as_str(), catalog_name, "main")
-        .with_context(|| format!("open DuckDB Arrow appender for {catalog_name}.main.{table}"))?;
-    appender
-        .append_record_batch(batch)
-        .with_context(|| format!("append Arrow RecordBatch to {catalog_name}.main.{table}"))?;
-    appender
-        .flush()
-        .with_context(|| format!("flush DuckDB Arrow appender for {catalog_name}.main.{table}"))?;
+        .appender_to_catalog_and_db(storage_signal.as_str(), catalog_name, "main")
+        .with_context(|| {
+            format!("open DuckDB Arrow appender for {catalog_name}.main.{storage_signal}")
+        })?;
+    appender.append_record_batch(batch).with_context(|| {
+        format!("append Arrow RecordBatch to {catalog_name}.main.{storage_signal}")
+    })?;
+    appender.flush().with_context(|| {
+        format!("flush DuckDB Arrow appender for {catalog_name}.main.{storage_signal}")
+    })?;
     Ok(())
 }
 
@@ -312,14 +346,14 @@ fn distributed_buffer_timing(
     let total_rows = buffers.values().map(|buffer| buffer.rows).sum::<usize>();
     buffers
         .iter()
-        .map(|(&table, buffer)| {
+        .map(|(&storage_signal, buffer)| {
             let buffer_seconds = if total_rows == 0 {
                 seconds / buffers.len() as f64
             } else {
                 seconds * buffer.rows as f64 / total_rows as f64
             };
             ArrowBatchBufferTiming {
-                table,
+                storage_signal,
                 phase,
                 rows: buffer.rows,
                 seconds: buffer_seconds,
@@ -328,14 +362,17 @@ fn distributed_buffer_timing(
         .collect()
 }
 
-fn coalesce_storage_batches(table: StorageSignal, batches: &[&RecordBatch]) -> Result<RecordBatch> {
+fn coalesce_storage_batches(
+    storage_signal: StorageSignal,
+    batches: &[&RecordBatch],
+) -> Result<RecordBatch> {
     match batches {
-        [] => anyhow::bail!("cannot coalesce empty {table} storage batch group"),
+        [] => anyhow::bail!("cannot coalesce empty {storage_signal} storage batch group"),
         [batch] => Ok((*batch).clone()),
         [first, ..] => {
             let schema = first.schema();
             concat_batches(&schema, batches.iter().copied())
-                .with_context(|| format!("coalesce {table} storage batches"))
+                .with_context(|| format!("coalesce {storage_signal} storage batches"))
         }
     }
 }

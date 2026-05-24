@@ -276,9 +276,9 @@ impl AdmissionController {
         // rate and the target/max-age drain rate, so the buffer-size debt (which
         // also divides by this EWMA, see update_projection_locked) starts no
         // slower than the static drain target.
-        let seal_rate_seed_rate = config.mechanics.seal_rate_seed_bytes as f64
+        let seal_rate_seed_rate = config.test_overrides.seal_rate_seed_bytes as f64
             / config
-                .mechanics
+                .test_overrides
                 .seal_rate_seed_window
                 .as_secs_f64()
                 .max(0.001);
@@ -694,8 +694,8 @@ mod tests {
         let mut config = Config::test(dir.path().join("canardstack.duckdb"));
         config.operator.query_interactive.concurrency = 4;
         config.operator.freshness_budget_sla = std::time::Duration::from_secs(10);
-        config.mechanics.seal_rate_seed_bytes = 1_000;
-        config.mechanics.seal_rate_seed_window = std::time::Duration::from_secs(1);
+        config.test_overrides.seal_rate_seed_bytes = 1_000;
+        config.test_overrides.seal_rate_seed_window = std::time::Duration::from_secs(1);
         config.mechanics.arrow_write_buffer_target_bytes = 1_000;
         config.mechanics.arrow_write_buffer_max_age = std::time::Duration::from_secs(1);
         AdmissionController::new(&config)
@@ -909,8 +909,8 @@ mod tests {
             config.operator.freshness_budget_sla = std::time::Duration::from_secs(10);
             // Seed seal rate = 2000 / 1s = 2000 B/s; post-A2 this is the single
             // observed rate (seeded from max(2000, target/max-age=1000)).
-            config.mechanics.seal_rate_seed_bytes = 2_000;
-            config.mechanics.seal_rate_seed_window = std::time::Duration::from_secs(1);
+            config.test_overrides.seal_rate_seed_bytes = 2_000;
+            config.test_overrides.seal_rate_seed_window = std::time::Duration::from_secs(1);
             // target/max-age = 1000 / 1s = 1000 B/s; pre-A2 this drove buffer
             // size debt, post-A2 it only floors the EWMA seed (max wins -> 2000).
             config.mechanics.arrow_write_buffer_target_bytes = 1_000;

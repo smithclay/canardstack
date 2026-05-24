@@ -1,4 +1,5 @@
 use crate::ingest::OtlpRequestKind;
+use crate::metrics::Metrics;
 use crate::signal::StorageSignal;
 use crate::validation::{self, ApiError};
 use crate::AppState;
@@ -343,6 +344,13 @@ fn record_maintenance_metrics(
         .maintenance_run(job, status, reason, started.elapsed().as_secs_f64());
 }
 
+fn storage_signal_gauge(metrics: &Metrics, name: &'static str, storage_signal: &str, value: f64) {
+    metrics.gauge(name, &[("storage_signal", storage_signal)], value);
+    // Deprecation window for the pre-glossary label. Keep dual emission until
+    // dashboards have migrated to `storage_signal`.
+    metrics.gauge(name, &[("table", storage_signal)], value);
+}
+
 pub(crate) fn record_operator_gauges(state: &AppState) {
     state.ingestor.record_inflight_metrics(&state.metrics);
     state.ingestor.record_raw_spool_metrics(&state.metrics);
@@ -350,39 +358,42 @@ pub(crate) fn record_operator_gauges(state: &AppState) {
         .storage
         .arrow_write_buffer_metrics()
         .into_iter()
-        .map(|buffer| (buffer.table, buffer))
+        .map(|buffer| (buffer.storage_signal, buffer))
         .collect::<HashMap<_, _>>();
-    for table in [
+    for storage_signal in [
         StorageSignal::Logs,
         StorageSignal::Spans,
         StorageSignal::MetricGauge,
         StorageSignal::MetricSum,
     ] {
         let rows = arrow_write_buffers
-            .get(&table)
+            .get(&storage_signal)
             .map(|buffer| buffer.rows)
             .unwrap_or(0);
         let bytes = arrow_write_buffers
-            .get(&table)
+            .get(&storage_signal)
             .map(|buffer| buffer.bytes)
             .unwrap_or(0);
         let age_seconds = arrow_write_buffers
-            .get(&table)
+            .get(&storage_signal)
             .map(|buffer| buffer.age_seconds)
             .unwrap_or(0.0);
-        state.metrics.gauge(
+        storage_signal_gauge(
+            &state.metrics,
             "canardstack_arrow_write_buffer_rows",
-            &[("table", table.as_str())],
+            storage_signal.as_str(),
             rows as f64,
         );
-        state.metrics.gauge(
+        storage_signal_gauge(
+            &state.metrics,
             "canardstack_arrow_write_buffer_bytes",
-            &[("table", table.as_str())],
+            storage_signal.as_str(),
             bytes as f64,
         );
-        state.metrics.gauge(
+        storage_signal_gauge(
+            &state.metrics,
             "canardstack_arrow_write_buffer_age_seconds",
-            &[("table", table.as_str())],
+            storage_signal.as_str(),
             age_seconds,
         );
     }
@@ -400,17 +411,19 @@ pub(crate) fn record_operator_gauges(state: &AppState) {
 
 pub(crate) fn record_storage_operator_gauges(state: &AppState) {
     let storage = state.storage.health();
-    state.metrics.gauge(
+    storage_signal_gauge(
+        &state.metrics,
         "canardstack_storage_physical_bytes",
-        &[("table", "all")],
+        "all",
         storage.physical_bytes as f64,
     );
     if let Some(rows) = storage.logical_rows.as_object() {
         for (table, value) in rows {
             if let Some(count) = value.as_i64() {
-                state.metrics.gauge(
+                storage_signal_gauge(
+                    &state.metrics,
                     "canardstack_storage_logical_rows",
-                    &[("table", table.as_str())],
+                    table.as_str(),
                     count as f64,
                 );
             }
@@ -433,9 +446,7 @@ pub(crate) fn record_storage_operator_gauges(state: &AppState) {
                 ),
             ] {
                 if let Some(count) = value.get(field).and_then(Value::as_i64) {
-                    state
-                        .metrics
-                        .gauge(metric, &[("table", table.as_str())], count as f64);
+                    storage_signal_gauge(&state.metrics, metric, table.as_str(), count as f64);
                 }
             }
         }
@@ -444,17 +455,19 @@ pub(crate) fn record_storage_operator_gauges(state: &AppState) {
     if let Some(watermarks) = storage.freshness_watermarks.as_object() {
         for (table, value) in watermarks {
             if let Some(epoch) = value.get("epoch_seconds").and_then(Value::as_f64) {
-                state.metrics.gauge(
+                storage_signal_gauge(
+                    &state.metrics,
                     "canardstack_freshness_watermark_timestamp",
-                    &[("table", table.as_str())],
+                    table.as_str(),
                     epoch,
                 );
             }
             if let Some(lag) = value.get("lag_seconds").and_then(Value::as_f64) {
                 max_freshness_lag = max_freshness_lag.max(lag.max(0.0));
-                state.metrics.gauge(
+                storage_signal_gauge(
+                    &state.metrics,
                     "canardstack_ingest_to_query_lag_seconds",
-                    &[("table", table.as_str())],
+                    table.as_str(),
                     lag.max(0.0),
                 );
             }

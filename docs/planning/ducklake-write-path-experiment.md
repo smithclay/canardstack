@@ -100,11 +100,10 @@ The HTTP runs used `--no-queries`, so they measure request latency only. They we
 
 Correctness notes:
 
-- The raw-spool checkpoint order remains unchanged:
-  `Ingestor::seal_committed_to_storage` captures pending refs, calls
-  `storage.flush_arrow_write_buffer(true)`, observes the committed outcome, then
-  checkpoints the captured raw-spool records. The checkpoint regression test
-  still passes.
+- The raw-spool checkpoint order remains unchanged: `seal::commit_buffered_rows`
+  snapshots typed buffered rows, calls `storage.flush_arrow_write_buffer(true)`,
+  observes the committed outcome, then checkpoints the replay-backed refs from
+  that committed snapshot. The checkpoint regression test still passes.
 - The temporary write-path and merge-adjacent flags have been removed.
 - The direct appender path writes the existing prepared Arrow `RecordBatch` values into `canardlake.main.<table>` inside an explicit DuckDB transaction and records append timing separately from DuckLake commit timing.
 

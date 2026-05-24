@@ -9,14 +9,13 @@ use std::time::Instant;
 
 /// Fixed in-flight worker-handoff capacity for the ingest worker pool. Internal
 /// mechanic (not an operator policy knob); kept here next to the pool it sizes.
-/// `Config::ingest_worker_channel_capacity` defaults from this and exists only
-/// for deterministic test injection.
+/// `Config::test_overrides.ingest_worker_channel_capacity` defaults from this
+/// and exists only for deterministic test injection.
 pub(crate) const INGEST_WORKER_CHANNEL_CAPACITY: usize = 1024;
 
 /// Parallel ingest across OS threads: a fixed pool of worker threads that turn
 /// durably-spooled requests into buffered Arrow rows. Each worker appends into
-/// the storage Arrow write buffer; the scheduler is the single seal driver (see
-/// `Ingestor::seal_committed_to_storage`).
+/// the storage Arrow write buffer; `crate::seal` is the single seal owner.
 pub(super) struct IngestWorkerPool {
     pub(super) commands: Vec<SyncSender<SpooledIngestWork>>,
     pub(super) handles: Vec<JoinHandle<()>>,
@@ -44,7 +43,7 @@ impl Ingestor {
         let weak = Arc::downgrade(self);
         let per_worker_capacity = self
             .config
-            .mechanics
+            .test_overrides
             .ingest_worker_channel_capacity
             .div_ceil(worker_count)
             .max(1);
@@ -64,7 +63,7 @@ impl Ingestor {
         tracing::info!(
             event = "ingest_workers_started",
             workers = worker_count,
-            worker_channel_capacity = self.config.mechanics.ingest_worker_channel_capacity,
+            worker_channel_capacity = self.config.test_overrides.ingest_worker_channel_capacity,
             per_worker_channel_capacity = per_worker_capacity
         );
         *pool = Some(IngestWorkerPool {
@@ -90,10 +89,13 @@ fn run_ingest_worker(
         // `process_spooled_ingest` emits the per-request boundary counters itself.
         let started = Instant::now();
         match ingestor.process_spooled_ingest(work, &storage) {
-            Ok(()) => {
+            Ok(disposition) => {
                 metrics.inc(
                     "canardstack_ingest_worker_completed_total",
-                    &[("request_kind", route.as_str()), ("status", "ok")],
+                    &[
+                        ("request_kind", route.as_str()),
+                        ("status", disposition.as_str()),
+                    ],
                     1,
                 );
                 metrics.observe_seconds(
@@ -109,7 +111,10 @@ fn run_ingest_worker(
             Err(err) => {
                 metrics.inc(
                     "canardstack_ingest_worker_completed_total",
-                    &[("request_kind", route.as_str()), ("status", err.reason)],
+                    &[
+                        ("request_kind", route.as_str()),
+                        ("status", err.disposition.as_str()),
+                    ],
                     1,
                 );
                 metrics.observe_seconds(
@@ -124,9 +129,10 @@ fn run_ingest_worker(
                 tracing::warn!(
                     event = "ingest_worker_failed",
                     request_kind = route.as_str(),
-                    status = err.status,
-                    reason = err.reason,
-                    message = %err.message
+                    status = err.error.status,
+                    reason = err.error.reason,
+                    disposition = err.disposition.as_str(),
+                    message = %err.error.message
                 );
             }
         }

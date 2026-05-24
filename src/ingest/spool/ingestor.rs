@@ -1,24 +1,19 @@
 use super::{full_info, AppendBatchStats, CheckpointBatchStats, Record, RecordId, Writer};
 use crate::admission_control::AdmissionController;
-use crate::ingest::{lifecycle, IngestStage, Ingestor, OtlpRequestKind, SealStage};
+use crate::ingest::{lifecycle, IngestStage, Ingestor, OtlpRequestKind};
 use crate::metrics::Metrics;
+use crate::seal::ReplayRef;
 use crate::storage::{ArrowFlushOutcome, Storage, TimingPhase};
 use crate::validation::{self, ApiError, ApiResult};
-use crate::LockExt;
 use anyhow::{Context, Result};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Instant;
 
 #[derive(Clone, Copy, Debug)]
-pub(in crate::ingest) struct SealRef {
-    pub(in crate::ingest) request_kind: OtlpRequestKind,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub(in crate::ingest) struct AppendRef {
-    pub(in crate::ingest) spool: OtlpRequestKind,
-    pub(in crate::ingest) id: RecordId,
+pub(crate) struct AppendRef {
+    pub(crate) spool: OtlpRequestKind,
+    pub(crate) id: RecordId,
 }
 
 struct RecoveredWork {
@@ -162,122 +157,6 @@ impl Ingestor {
         self.dispatch_ingest_work(work, storage, metrics.as_ref())
             .map(|_| ())
             .map_err(|err| anyhow::anyhow!(err.message.clone()))
-    }
-
-    /// Record that a durably-spooled request's rows are now in the Arrow write
-    /// buffer (the [`IngestStage::Buffered`] boundary in
-    /// [`crate::ingest::lifecycle`]). The scheduler checkpoints the record after
-    /// the next durable DuckLake commit (see
-    /// [`Ingestor::seal_committed_to_storage`]). Called only after a successful
-    /// buffer append so a tracked ref always implies buffered rows.
-    pub(in crate::ingest) fn track_raw_spool_record(
-        &self,
-        raw_spool_ref: AppendRef,
-        route: OtlpRequestKind,
-    ) {
-        self.raw_spool_seal_refs.lock_or_poisoned().insert(
-            (raw_spool_ref.spool, raw_spool_ref.id),
-            SealRef {
-                request_kind: route,
-            },
-        );
-    }
-
-    /// Single seal driver, emitting the seal-phase boundaries in
-    /// [`crate::ingest::lifecycle`]: capture the records to checkpoint, force-flush
-    /// the whole Arrow write buffer to durable DuckLake storage
-    /// ([`SealStage::Committed`]), then checkpoint exactly the captured records
-    /// ([`SealStage::Checkpointed`]), or mark [`SealStage::DuplicateRisk`] if the
-    /// checkpoint fails after the commit. Capturing before flushing is
-    /// load-bearing for at-least-once: a record appended after the capture is not
-    /// checkpointed until a later seal, so we never checkpoint rows that were not
-    /// storage-committed.
-    pub fn seal_committed_to_storage(
-        &self,
-        storage: &Storage,
-        metrics: &Metrics,
-    ) -> Result<ArrowFlushOutcome> {
-        let captured = self.capture_committed_refs();
-        // The seal counters are guarded on a non-empty capture so the periodic
-        // scheduler seal that finds nothing buffered does not inflate the funnel:
-        // an idle seal still flushes/commits an empty buffer but checkpoints no
-        // records.
-        let seal_records = !captured.is_empty();
-        tracing::debug!(
-            event = "seal_captured_refs",
-            captured_records = captured.len(),
-        );
-        let outcome = match storage.flush_arrow_write_buffer(true) {
-            Ok(outcome) => outcome,
-            Err(err) => {
-                self.restore_committed_refs(captured);
-                return Err(err);
-            }
-        };
-        tracing::debug!(
-            event = "seal_ducklake_committed",
-            flushed_rows = outcome.flushed_rows,
-        );
-        if seal_records {
-            lifecycle::record_seal(metrics, SealStage::Committed);
-        }
-        observe_arrow_flush(metrics, &outcome);
-        match self.checkpoint_raw_spool_batch(&captured, "storage_committed", Some(metrics)) {
-            Ok(()) => {
-                tracing::debug!(
-                    event = "seal_raw_spool_checkpointed",
-                    checkpointed_records = captured.len(),
-                );
-                if seal_records {
-                    lifecycle::record_seal(metrics, SealStage::Checkpointed);
-                }
-            }
-            Err(err) => {
-                // Rows are durably committed; only the raw-spool checkpoint
-                // failed. The records stay pending and replay as duplicate ROWS in
-                // storage on a future restart. The checkpoint deliberately
-                // follows the DuckLake COMMIT (capture before flush, checkpoint
-                // after commit), so any crash or checkpoint failure between commit
-                // and checkpoint re-ingests already-committed records. v0 does NOT
-                // dedup, so those duplicate rows are surfaced verbatim to queries
-                // after crash-replay. This branch only runs for a non-empty
-                // capture (an empty checkpoint batch returns Ok), so it is always a
-                // real per-seal duplicate-risk event. See `crate::ingest::lifecycle`.
-                tracing::error!(
-                    event = "raw_spool_checkpoint_failed",
-                    error = %err,
-                    "Arrow flush committed but raw spool checkpoint failed; records left pending"
-                );
-                lifecycle::record_seal(metrics, SealStage::DuplicateRisk);
-            }
-        }
-        Ok(outcome)
-    }
-
-    fn capture_committed_refs(&self) -> Vec<(OtlpRequestKind, AppendRef)> {
-        let mut refs = self.raw_spool_seal_refs.lock_or_poisoned();
-        let captured = refs
-            .iter()
-            .map(|((spool, id), seal_ref)| {
-                (
-                    seal_ref.request_kind,
-                    AppendRef {
-                        spool: *spool,
-                        id: *id,
-                    },
-                )
-            })
-            .collect::<Vec<_>>();
-        refs.clear();
-        captured
-    }
-
-    fn restore_committed_refs(&self, captured: Vec<(OtlpRequestKind, AppendRef)>) {
-        let mut refs = self.raw_spool_seal_refs.lock_or_poisoned();
-        for (request_kind, append_ref) in captured {
-            refs.entry((append_ref.spool, append_ref.id))
-                .or_insert(SealRef { request_kind });
-        }
     }
 
     pub(in crate::ingest) fn append_raw_spool(
@@ -523,9 +402,9 @@ impl Ingestor {
         Ok(())
     }
 
-    fn checkpoint_raw_spool_batch(
+    pub(crate) fn checkpoint_replay_refs(
         &self,
-        records: &[(OtlpRequestKind, AppendRef)],
+        records: &[ReplayRef],
         reason: &'static str,
         metrics: Option<&Metrics>,
     ) -> Result<()> {
@@ -534,11 +413,11 @@ impl Ingestor {
         }
         let started = Instant::now();
         let mut by_request_kind_ids = BTreeMap::<OtlpRequestKind, Vec<RecordId>>::new();
-        for (_, raw_spool_ref) in records {
+        for replay_ref in records {
             by_request_kind_ids
-                .entry(raw_spool_ref.spool)
+                .entry(replay_ref.spool)
                 .or_default()
-                .push(raw_spool_ref.id);
+                .push(replay_ref.id);
         }
         for (request_kind, ids) in by_request_kind_ids {
             let stats = self
@@ -556,8 +435,8 @@ impl Ingestor {
                 started.elapsed().as_secs_f64(),
             );
             let mut by_request_kind = BTreeMap::<OtlpRequestKind, u64>::new();
-            for (request_kind, _) in records {
-                *by_request_kind.entry(*request_kind).or_default() += 1;
+            for replay_ref in records {
+                *by_request_kind.entry(replay_ref.request_kind).or_default() += 1;
             }
             for (request_kind, count) in by_request_kind {
                 metrics.inc(
@@ -723,48 +602,48 @@ impl Ingestor {
         }
     }
 
+    pub(crate) fn observe_arrow_flush(&self, metrics: &Metrics, outcome: &ArrowFlushOutcome) {
+        for timing in &outcome.timings {
+            metrics.observe_storage_signal_phase_seconds(
+                timing.storage_signal.as_str(),
+                timing.phase.as_str(),
+                timing.seconds,
+            );
+        }
+        if outcome.flushed_rows == 0 {
+            return;
+        }
+        for timing in &outcome.timings {
+            if timing.phase == TimingPhase::DuckdbArrowAppend {
+                metrics.inc(
+                    "canardstack_duckdb_arrow_appends_total",
+                    &[("storage_signal", timing.storage_signal.as_str())],
+                    1,
+                );
+                metrics.inc(
+                    "canardstack_duckdb_arrow_appended_rows_total",
+                    &[("storage_signal", timing.storage_signal.as_str())],
+                    timing.rows as u64,
+                );
+            } else if timing.phase == TimingPhase::DucklakeCommit {
+                metrics.inc(
+                    "canardstack_arrow_flush_rows_total",
+                    &[("storage_signal", timing.storage_signal.as_str())],
+                    timing.rows as u64,
+                );
+                metrics.inc(
+                    "canardstack_arrow_flushes_total",
+                    &[("storage_signal", timing.storage_signal.as_str())],
+                    1,
+                );
+            }
+        }
+    }
+
     fn raw_spool_for(&self, request_kind: OtlpRequestKind) -> Result<&Writer> {
         self.raw_spools
             .get(&request_kind)
             .with_context(|| format!("raw spool writer for {request_kind} is unavailable"))
-    }
-}
-
-fn observe_arrow_flush(metrics: &Metrics, outcome: &ArrowFlushOutcome) {
-    for timing in &outcome.timings {
-        metrics.observe_storage_signal_phase_seconds(
-            timing.table.as_str(),
-            timing.phase.as_str(),
-            timing.seconds,
-        );
-    }
-    if outcome.flushed_rows == 0 {
-        return;
-    }
-    for timing in &outcome.timings {
-        if timing.phase == TimingPhase::DuckdbArrowAppend {
-            metrics.inc(
-                "canardstack_duckdb_arrow_appends_total",
-                &[("storage_signal", timing.table.as_str())],
-                1,
-            );
-            metrics.inc(
-                "canardstack_duckdb_arrow_appended_rows_total",
-                &[("storage_signal", timing.table.as_str())],
-                timing.rows as u64,
-            );
-        } else if timing.phase == TimingPhase::DucklakeCommit {
-            metrics.inc(
-                "canardstack_arrow_flush_rows_total",
-                &[("storage_signal", timing.table.as_str())],
-                timing.rows as u64,
-            );
-            metrics.inc(
-                "canardstack_arrow_flushes_total",
-                &[("storage_signal", timing.table.as_str())],
-                1,
-            );
-        }
     }
 }
 

@@ -55,18 +55,18 @@ pub struct QueryLimits {
     pub memory_limit: String,
 }
 
-/// Process configuration, split by responsibility into two sub-structs:
+/// Process configuration, split by responsibility:
 ///
 /// - [`OperatorConfig`] — the public, supported deployment surface operators
 ///   set to run a deployment (endpoints, auth, catalog, retention, query
 ///   limits, freshness SLA, admission capacities, memory limits,
 ///   body/connection caps, socket timeouts, scheduler on/off).
-/// - [`Mechanics`] — advanced/internal knobs operators rarely touch. Some
-///   remain env-tunable (Arrow write-buffer target/age, raw-spool max sizes +
-///   append-sync + group-commit cadence, ingest worker count, scheduler
-///   intervals); others are fixed defaults whose fields exist only for test
-///   injection (seal-rate seed, ingest worker channel capacity, bench
-///   keepalive) and are no longer env/file driven.
+/// - [`Mechanics`] — advanced mechanics that are either env/file-tunable or
+///   derived from an operator setting (Arrow write-buffer target/age, raw-spool
+///   max sizes + append-sync + group-commit cadence, ingest worker count,
+///   scheduler intervals).
+/// - [`TestOverrides`] — fixed production defaults exposed only so tests can
+///   exercise edge cases deterministically. Operators cannot configure these.
 ///
 /// Purely internal raw-spool batching/durability mechanics with no operator
 /// meaning are NOT fields here; they live as consts in `ingest::spool`.
@@ -74,6 +74,7 @@ pub struct QueryLimits {
 pub struct Config {
     pub operator: OperatorConfig,
     pub mechanics: Mechanics,
+    pub test_overrides: TestOverrides,
 }
 
 /// The public, supported deployment surface: settings operators set to run a
@@ -108,20 +109,17 @@ pub struct OperatorConfig {
     pub scheduler_enabled: bool,
 }
 
-/// Advanced/internal knobs and test-injection fields. Some remain env/file
-/// tunable; others are fixed defaults whose fields exist only for test
-/// injection and are no longer env/file driven.
+/// Advanced mechanics operators may tune, plus derived mechanics from operator
+/// settings. Fixed production defaults used only for tests live in
+/// [`TestOverrides`], not here.
 #[derive(Clone, Debug)]
 pub struct Mechanics {
-    pub seal_rate_seed_bytes: usize,
-    pub seal_rate_seed_window: Duration,
     pub arrow_write_buffer_target_bytes: usize,
     pub arrow_write_buffer_max_age: Duration,
     pub scheduler_seal_interval: Duration,
     pub scheduler_metadata_interval: Duration,
     pub scheduler_metrics_interval: Duration,
     pub scheduler_retention_interval: Duration,
-    pub bench_http_keepalive: bool,
     pub raw_spool_dir: PathBuf,
     pub raw_spool_max_segment_bytes: usize,
     pub raw_spool_max_record_bytes: usize,
@@ -130,13 +128,21 @@ pub struct Mechanics {
     pub raw_spool_append_sync_interval: Duration,
     pub raw_spool_append_sync_bytes: usize,
     pub ingest_workers: usize,
-    pub ingest_worker_channel_capacity: usize,
     /// When true, the scheduler's metrics-snapshot job writes a snapshot of the
     /// current operator metrics into the `metric_gauge` / `metric_sum` storage
     /// tables (queryable via the Prometheus-compatible path). Off by default to
     /// avoid the extra write load and the `canardstack_operator_metrics` rows;
     /// the operator gauges still refresh and `/metrics` still serves them.
     pub operator_metrics_to_storage: bool,
+}
+
+/// Fixed-default hooks that production code reads but only tests mutate.
+#[derive(Clone, Debug)]
+pub struct TestOverrides {
+    pub seal_rate_seed_bytes: usize,
+    pub seal_rate_seed_window: Duration,
+    pub bench_http_keepalive: bool,
+    pub ingest_worker_channel_capacity: usize,
 }
 
 const DEFAULT_CONFIG_PATH: &str = "config.toml";
@@ -186,6 +192,7 @@ impl Config {
         Ok(Self {
             operator,
             mechanics,
+            test_overrides: TestOverrides::production(),
         })
     }
 
@@ -197,6 +204,7 @@ impl Config {
         Self {
             operator: OperatorConfig::test(duckdb_path, local_storage_dir.clone()),
             mechanics: Mechanics::test(local_storage_dir),
+            test_overrides: TestOverrides::test(),
         }
     }
 
@@ -204,6 +212,7 @@ impl Config {
     pub fn validate(&self) -> anyhow::Result<()> {
         self.operator.validate()?;
         self.mechanics.validate()?;
+        self.test_overrides.validate()?;
         // Cross-field check spanning both sub-structs: the raw-spool max record
         // size derives from operator.max_body_bytes and must fit the mechanics
         // raw-spool total capacity.
@@ -424,10 +433,6 @@ impl Mechanics {
         maintenance_interval: Duration,
     ) -> Result<Self> {
         Ok(Self {
-            // Internal EWMA warm-up mechanics (the seal rate converges); fixed
-            // defaults, not configurable. Fields kept only for test injection.
-            seal_rate_seed_bytes: DEFAULT_SEAL_RATE_SEED_BYTES,
-            seal_rate_seed_window: DEFAULT_SEAL_RATE_SEED_WINDOW,
             arrow_write_buffer_target_bytes: env_usize(
                 "CANARDSTACK_ARROW_WRITE_BUFFER_TARGET_BYTES",
             )?
@@ -455,9 +460,6 @@ impl Mechanics {
             scheduler_metadata_interval: maintenance_interval,
             scheduler_metrics_interval: maintenance_interval.saturating_mul(2),
             scheduler_retention_interval: maintenance_interval.saturating_mul(120),
-            // Production HTTP keepalive is always on; the field exists only for
-            // test override, so it is not configurable via env/file.
-            bench_http_keepalive: true,
             raw_spool_dir: data_dir.join("raw-spool"),
             raw_spool_max_segment_bytes: (64 * 1024 * 1024).min(raw_spool_capacity_bytes),
             raw_spool_max_record_bytes: max_body_bytes,
@@ -478,9 +480,6 @@ impl Mechanics {
             ingest_workers: env_usize("CANARDSTACK_INGEST_WORKERS")?
                 .or(file.usize(&["ingest", "workers"])?)
                 .unwrap_or(4),
-            // Internal worker handoff sizing, not an operator policy knob; fixed
-            // default kept as a field only for test injection.
-            ingest_worker_channel_capacity: crate::ingest::INGEST_WORKER_CHANNEL_CAPACITY,
             operator_metrics_to_storage: env_bool("CANARDSTACK_OPERATOR_METRICS_TO_STORAGE")?
                 .or(file.bool(&["metrics", "operator_metrics_to_storage"])?)
                 .unwrap_or(false),
@@ -489,15 +488,12 @@ impl Mechanics {
 
     fn test(local_storage_dir: PathBuf) -> Self {
         Self {
-            seal_rate_seed_bytes: 256 * 1024,
-            seal_rate_seed_window: Duration::from_millis(50),
             arrow_write_buffer_target_bytes: 64 * 1024 * 1024,
             arrow_write_buffer_max_age: Duration::from_secs(10),
             scheduler_seal_interval: Duration::from_millis(200),
             scheduler_metadata_interval: Duration::from_millis(200),
             scheduler_metrics_interval: Duration::from_millis(200),
             scheduler_retention_interval: Duration::from_secs(3_600),
-            bench_http_keepalive: false,
             raw_spool_dir: local_storage_dir.join("raw-spool"),
             raw_spool_max_segment_bytes: 64 * 1024 * 1024,
             raw_spool_max_record_bytes: 8 * 1024 * 1024,
@@ -506,19 +502,12 @@ impl Mechanics {
             raw_spool_append_sync_interval: Duration::from_millis(500),
             raw_spool_append_sync_bytes: 16 * 1024 * 1024,
             ingest_workers: 4,
-            ingest_worker_channel_capacity: 1024,
             operator_metrics_to_storage: false,
         }
     }
 
     /// Validate advanced/internal mechanics knobs.
     fn validate(&self) -> anyhow::Result<()> {
-        if self.seal_rate_seed_bytes == 0 {
-            anyhow::bail!("seal-rate seed bytes must be > 0");
-        }
-        if self.seal_rate_seed_window.is_zero() {
-            anyhow::bail!("seal-rate seed window must be > 0");
-        }
         if self.arrow_write_buffer_target_bytes == 0 {
             anyhow::bail!("CANARDSTACK_ARROW_WRITE_BUFFER_TARGET_BYTES must be > 0");
         }
@@ -541,15 +530,45 @@ impl Mechanics {
         if self.ingest_workers == 0 {
             anyhow::bail!("CANARDSTACK_INGEST_WORKERS must be > 0");
         }
-        if self.ingest_worker_channel_capacity == 0 {
-            anyhow::bail!("ingest worker channel capacity must be > 0");
-        }
         if self.scheduler_seal_interval.is_zero()
             || self.scheduler_metadata_interval.is_zero()
             || self.scheduler_metrics_interval.is_zero()
             || self.scheduler_retention_interval.is_zero()
         {
             anyhow::bail!("scheduler intervals must be > 0");
+        }
+        Ok(())
+    }
+}
+
+impl TestOverrides {
+    fn production() -> Self {
+        Self {
+            seal_rate_seed_bytes: DEFAULT_SEAL_RATE_SEED_BYTES,
+            seal_rate_seed_window: DEFAULT_SEAL_RATE_SEED_WINDOW,
+            bench_http_keepalive: true,
+            ingest_worker_channel_capacity: crate::ingest::INGEST_WORKER_CHANNEL_CAPACITY,
+        }
+    }
+
+    fn test() -> Self {
+        Self {
+            seal_rate_seed_bytes: 256 * 1024,
+            seal_rate_seed_window: Duration::from_millis(50),
+            bench_http_keepalive: false,
+            ingest_worker_channel_capacity: 1024,
+        }
+    }
+
+    fn validate(&self) -> anyhow::Result<()> {
+        if self.seal_rate_seed_bytes == 0 {
+            anyhow::bail!("seal-rate seed bytes must be > 0");
+        }
+        if self.seal_rate_seed_window.is_zero() {
+            anyhow::bail!("seal-rate seed window must be > 0");
+        }
+        if self.ingest_worker_channel_capacity == 0 {
+            anyhow::bail!("ingest worker channel capacity must be > 0");
         }
         Ok(())
     }
@@ -963,18 +982,18 @@ append_sync_bytes = 8192
         // Internal mechanics are no longer file/env driven; they stay at their
         // fixed defaults regardless of any (now-ignored) file keys above.
         assert_eq!(
-            config.mechanics.ingest_worker_channel_capacity,
+            config.test_overrides.ingest_worker_channel_capacity,
             crate::ingest::INGEST_WORKER_CHANNEL_CAPACITY
         );
         assert_eq!(
-            config.mechanics.seal_rate_seed_bytes,
+            config.test_overrides.seal_rate_seed_bytes,
             DEFAULT_SEAL_RATE_SEED_BYTES
         );
         assert_eq!(
-            config.mechanics.seal_rate_seed_window,
+            config.test_overrides.seal_rate_seed_window,
             DEFAULT_SEAL_RATE_SEED_WINDOW
         );
-        assert!(config.mechanics.bench_http_keepalive);
+        assert!(config.test_overrides.bench_http_keepalive);
     }
 
     #[test]
@@ -984,7 +1003,7 @@ append_sync_bytes = 8192
 
         let config = Config::from_env().unwrap();
 
-        assert!(config.mechanics.bench_http_keepalive);
+        assert!(config.test_overrides.bench_http_keepalive);
     }
 
     #[test]

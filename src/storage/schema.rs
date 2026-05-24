@@ -170,8 +170,10 @@ pub(super) const METADATA_SUMMARY_COLUMNS: &[(&str, &str)] = &[
     ("last_seen", "TIMESTAMP"),
 ];
 
-pub(super) fn table_columns(table: StorageSignal) -> &'static [(&'static str, &'static str)] {
-    match table {
+pub(super) fn table_columns(
+    storage_signal: StorageSignal,
+) -> &'static [(&'static str, &'static str)] {
+    match storage_signal {
         StorageSignal::Logs => LOGS_COLUMNS,
         StorageSignal::Spans => SPANS_COLUMNS,
         StorageSignal::MetricGauge => METRIC_GAUGE_COLUMNS,

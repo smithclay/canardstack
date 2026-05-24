@@ -81,10 +81,7 @@ fn seal_all(state: &AppState) -> usize {
         }
         thread::sleep(StdDuration::from_millis(10));
     }
-    state
-        .ingestor
-        .seal_committed_to_storage(&state.storage, &state.metrics)
-        .unwrap();
+    canardstack::seal::commit_buffered_rows(state).unwrap();
     state
         .storage
         .logical_rows()
@@ -957,8 +954,8 @@ fn ingest_pressure_returns_429_and_holds_no_inflight() {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
     config.operator.freshness_budget_sla = StdDuration::from_millis(1);
-    config.mechanics.seal_rate_seed_window = StdDuration::from_secs(1);
-    config.mechanics.seal_rate_seed_bytes = 1_000;
+    config.test_overrides.seal_rate_seed_window = StdDuration::from_secs(1);
+    config.test_overrides.seal_rate_seed_bytes = 1_000;
     config.mechanics.arrow_write_buffer_target_bytes = 1_000;
     config.mechanics.arrow_write_buffer_max_age = StdDuration::from_secs(1);
     let state = AppState::new(config).unwrap();
@@ -995,8 +992,8 @@ fn freshness_budget_rejects_before_raw_spool_append() {
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
     config.mechanics.raw_spool_dir = dir.path().join("raw-spool");
     config.operator.freshness_budget_sla = StdDuration::from_millis(1);
-    config.mechanics.seal_rate_seed_window = StdDuration::from_secs(1);
-    config.mechanics.seal_rate_seed_bytes = 1_000;
+    config.test_overrides.seal_rate_seed_window = StdDuration::from_secs(1);
+    config.test_overrides.seal_rate_seed_bytes = 1_000;
     // The observed seal-rate EWMA is seeded from max(seal-rate seed,
     // target/max-age); pin the buffer drain rate to the same 1000 B/s so the
     // tiny incoming log still projects over the 1ms freshness budget.
@@ -1196,7 +1193,7 @@ fn ingest_workers_return_202_after_raw_spool_and_handoff() {
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
     config.operator.local_storage_dir = dir.path().join("storage");
     config.mechanics.ingest_workers = 1;
-    config.mechanics.ingest_worker_channel_capacity = 4;
+    config.test_overrides.ingest_worker_channel_capacity = 4;
     let state = AppState::new(config).unwrap();
     let body = log_fixture(Utc::now().timestamp_nanos_opt().unwrap()).to_string();
     let response = http::route(
@@ -1221,7 +1218,7 @@ fn ingest_workers_return_202_after_raw_spool_and_handoff() {
     );
     assert!(
         metrics.contains(
-            "canardstack_ingest_worker_completed_total{request_kind=\"logs\",status=\"ok\"} 1"
+            "canardstack_ingest_worker_completed_total{request_kind=\"logs\",status=\"buffered\"} 1"
         ),
         "{metrics}"
     );
@@ -1234,7 +1231,7 @@ fn ingest_workers_buffer_storage_rows_and_checkpoint_spool() {
     config.operator.local_storage_dir = dir.path().join("storage");
     config.mechanics.raw_spool_dir = dir.path().join("raw-spool");
     config.mechanics.ingest_workers = 1;
-    config.mechanics.ingest_worker_channel_capacity = 4;
+    config.test_overrides.ingest_worker_channel_capacity = 4;
     let state = AppState::new(config).unwrap();
     let body = log_fixture(Utc::now().timestamp_nanos_opt().unwrap()).to_string();
     let response = http::route(
@@ -1951,7 +1948,7 @@ fn metric_seal_drains_oversized_batch_and_preserves_queue_accounting() {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
     config.operator.local_storage_dir = dir.path().join("storage");
-    config.mechanics.seal_rate_seed_bytes = 10 * 1024 * 1024;
+    config.test_overrides.seal_rate_seed_bytes = 10 * 1024 * 1024;
     let state = AppState::new(config).unwrap();
     let body = gauge_payload(Utc::now().timestamp_nanos_opt().unwrap(), 5).to_string();
 
@@ -1976,7 +1973,7 @@ fn metric_due_seal_preserves_gauge_sum_pairing() {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
     config.operator.local_storage_dir = dir.path().join("storage");
-    config.mechanics.seal_rate_seed_bytes = 10_000_000;
+    config.test_overrides.seal_rate_seed_bytes = 10_000_000;
     let state = AppState::new(config).unwrap();
     let body = metric_fixture(Utc::now().timestamp_nanos_opt().unwrap()).to_string();
 
@@ -2943,8 +2940,8 @@ fn disabled_scheduler_requires_manual_seal_for_visibility() {
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
     config.operator.local_storage_dir = dir.path().join("storage");
     config.operator.scheduler_enabled = false;
-    config.mechanics.seal_rate_seed_window = StdDuration::from_secs(60);
-    config.mechanics.seal_rate_seed_bytes = 10_000_000;
+    config.test_overrides.seal_rate_seed_window = StdDuration::from_secs(60);
+    config.test_overrides.seal_rate_seed_bytes = 10_000_000;
 
     let state = AppState::new(config).unwrap();
     let body = log_fixture(Utc::now().timestamp_nanos_opt().unwrap()).to_string();
@@ -3377,7 +3374,7 @@ fn config_validate_rejects_zero_seal_freshness_ages() {
     );
 
     let mutations: [fn(&mut Config); 2] = [
-        |c| c.mechanics.seal_rate_seed_window = std::time::Duration::ZERO,
+        |c| c.test_overrides.seal_rate_seed_window = std::time::Duration::ZERO,
         |c| c.mechanics.arrow_write_buffer_max_age = std::time::Duration::ZERO,
     ];
     for mutate in mutations {
@@ -3429,7 +3426,7 @@ fn config_validate_rejects_invalid_ingest_workers_capacities() {
 
     let mutations: [fn(&mut Config); 2] = [
         |c| c.mechanics.ingest_workers = 0,
-        |c| c.mechanics.ingest_worker_channel_capacity = 0,
+        |c| c.test_overrides.ingest_worker_channel_capacity = 0,
     ];
     for mutate in mutations {
         let mut config = Config::test(path.clone());

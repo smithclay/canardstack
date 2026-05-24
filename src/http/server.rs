@@ -168,7 +168,7 @@ fn is_socket_timeout(err: &anyhow::Error) -> bool {
 
 fn handle_stream(mut stream: TcpStream, state: Arc<AppState>) -> anyhow::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
-    let keepalive_enabled = state.config.mechanics.bench_http_keepalive;
+    let keepalive_enabled = state.config.test_overrides.bench_http_keepalive;
     let mut requests = 0usize;
     loop {
         let mut first = String::new();
@@ -317,7 +317,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut config = Config::test(dir.path().join("canardstack.duckdb"));
         config.operator.local_storage_dir = dir.path().join("storage");
-        config.mechanics.bench_http_keepalive = true;
+        config.test_overrides.bench_http_keepalive = true;
         let state = Arc::new(AppState::new(config).unwrap());
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();

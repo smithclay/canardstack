@@ -19,7 +19,7 @@ compatibility query surface uses), where that distinction applies.
 | --- | --- |
 | raw record (`spool::Record`, `src/ingest/spool/mod.rs`) | The durably-spooled raw OTLP request: exactly what the client sent, fsynced to the local raw spool before any transform. At-least-once delivery is anchored on this record. |
 | Arrow row batch (`RecordBatch`, a "batch") | The transformed columnar unit produced by `otlp2records`, grouped by storage signal. The columnar form of a chunk of rows. |
-| write buffer (`ArrowWriteBuffer`, `src/storage/arrow_write_buffer.rs`) | The in-memory, per-signal accumulator that coalesces batches before a seal flushes them. |
+| write buffer (`ArrowWriteBuffer`, `src/storage/arrow_write_buffer.rs`) | The in-memory, per-storage-signal accumulator that coalesces batches before a seal flushes them. Each buffered unit carries a durability disposition: replay-backed raw-spool refs for normal ingest, or best-effort for sanctioned internal rows. |
 | row | A single logical record inside a batch or DuckLake table (one log line, one span, one metric data point). |
 
 ## Operations
@@ -27,7 +27,7 @@ compatibility query surface uses), where that distinction applies.
 | Term | Definition |
 | --- | --- |
 | flush | Moving the write buffer's accumulated batches into DuckDB via the Arrow appender. |
-| seal | The scheduler operation in `seal::run` (`src/seal.rs`): capture the pending raw-spool record refs, then flush the write buffer and commit to DuckLake, then checkpoint exactly the captured raw-spool records. Capturing before flushing is load-bearing for at-least-once. |
+| seal | The scheduler operation in `seal::run` (`src/seal.rs`): snapshot typed buffered rows, flush and commit them to DuckLake, then checkpoint exactly the replay-backed raw-spool refs from that committed snapshot. Snapshot-before-flush is load-bearing for at-least-once. |
 | checkpoint | Disposing of a raw-spool record — after a successful DuckLake commit, or after a terminal rejection — so it will not replay on restart. |
 
 ## Reserved term

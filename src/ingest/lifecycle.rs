@@ -32,7 +32,7 @@ pub(in crate::ingest) enum IngestStage {
 /// Seal durable-boundary stage. Emitted as the `stage` label on
 /// `canardstack_ingest_seal_stage_total{stage}` via [`record_seal`].
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub(in crate::ingest) enum SealStage {
+pub(crate) enum SealStage {
     /// Arrow write buffer flushed and committed to durable DuckLake storage.
     Committed,
     /// Captured raw-spool refs checkpointed after the commit (will not replay).
@@ -45,7 +45,7 @@ pub(in crate::ingest) enum SealStage {
 impl IngestStage {
     /// Stable snake_case label value. Operators key dashboards off these, so the
     /// [`as_str_is_stable`](tests::as_str_is_stable) test pins them.
-    pub(in crate::ingest) fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Accepted => "accepted",
             Self::Spooled => "spooled",
@@ -86,7 +86,7 @@ pub(in crate::ingest) fn record(
 
 /// Increment `canardstack_ingest_seal_stage_total{stage}`. The single place this
 /// counter is emitted.
-pub(in crate::ingest) fn record_seal(metrics: &Metrics, stage: SealStage) {
+pub(crate) fn record_seal(metrics: &Metrics, stage: SealStage) {
     metrics.inc(
         "canardstack_ingest_seal_stage_total",
         &[("stage", stage.as_str())],

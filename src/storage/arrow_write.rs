@@ -1,4 +1,5 @@
 use super::{ArrowBatchBufferTiming, PreparedArrowBatch};
+use crate::seal::{BufferDurability, ReplayRef};
 use crate::signal::StorageSignal;
 use anyhow::{Context, Result};
 use arrow58::array as arrow58_array;
@@ -16,6 +17,8 @@ pub(super) struct ArrowWriteBuffer {
     pub(super) rows: usize,
     pub(super) bytes: usize,
     pub(super) timestamp_days: BTreeSet<String>,
+    pub(super) durability: BufferDurability,
+    pub(super) best_effort_rows: usize,
     pub(super) opened_at: Instant,
 }
 
@@ -24,6 +27,8 @@ pub(super) struct ArrowFlushResult {
     pub(super) buffers: usize,
     pub(super) timings: Vec<ArrowBatchBufferTiming>,
     pub(super) affected: BTreeMap<StorageSignal, BTreeSet<String>>,
+    pub(super) replay_refs: Vec<ReplayRef>,
+    pub(super) best_effort_rows: usize,
 }
 
 pub struct ArrowFlushOutcome {
@@ -32,15 +37,27 @@ pub struct ArrowFlushOutcome {
     pub flushed_buffers: usize,
     pub timings: Vec<ArrowBatchBufferTiming>,
     pub active_write_buffers: Value,
+    pub(crate) replay_refs: Vec<ReplayRef>,
+    pub(crate) best_effort_rows: usize,
 }
 
 impl ArrowFlushOutcome {
+    pub(crate) fn replay_refs(&self) -> Vec<ReplayRef> {
+        self.replay_refs.clone()
+    }
+
+    pub(crate) fn best_effort_rows(&self) -> usize {
+        self.best_effort_rows
+    }
+
     pub fn to_json(&self) -> Value {
         json!({
             "supported": true,
             "force": self.force,
             "flushed_rows": self.flushed_rows,
             "flushed_buffers": self.flushed_buffers,
+            "replay_backed_records": self.replay_refs.len(),
+            "best_effort_rows": self.best_effort_rows,
             "timings": arrow_write_timing_snapshot(&self.timings),
             "active_write_buffers": self.active_write_buffers,
         })
@@ -54,6 +71,8 @@ impl ArrowWriteBuffer {
             rows: 0,
             bytes: 0,
             timestamp_days: BTreeSet::new(),
+            durability: BufferDurability::empty(),
+            best_effort_rows: 0,
             opened_at: now,
         }
     }
@@ -62,6 +81,8 @@ impl ArrowWriteBuffer {
         self.rows += prepared.rows;
         self.bytes += prepared.batch.get_array_memory_size().max(prepared.rows);
         self.timestamp_days.extend(prepared.timestamp_days);
+        self.durability.merge(prepared.durability);
+        self.best_effort_rows += prepared.best_effort_rows;
         self.batches.push(prepared.batch);
     }
 
@@ -69,6 +90,8 @@ impl ArrowWriteBuffer {
         self.rows += other.rows;
         self.bytes += other.bytes;
         self.timestamp_days.append(&mut other.timestamp_days);
+        self.durability.merge(other.durability);
+        self.best_effort_rows += other.best_effort_rows;
         if other.opened_at < self.opened_at {
             self.opened_at = other.opened_at;
         }
@@ -85,15 +108,15 @@ impl ArrowWriteBuffer {
             && (self.bytes >= target_bytes || now.duration_since(self.opened_at) >= max_age)
     }
 
-    pub(super) fn record_batch(&self, table: StorageSignal) -> Result<RecordBatch> {
+    pub(super) fn record_batch(&self, storage_signal: StorageSignal) -> Result<RecordBatch> {
         match self.batches.as_slice() {
-            [] => anyhow::bail!("Arrow write buffer for {table} is empty"),
+            [] => anyhow::bail!("Arrow write buffer for {storage_signal} is empty"),
             [batch] => Ok(batch.clone()),
             batches => {
                 let schema = batches[0].schema();
                 let refs = batches.iter().collect::<Vec<_>>();
                 concat_batches(&schema, refs)
-                    .with_context(|| format!("coalesce Arrow write buffer for {table}"))
+                    .with_context(|| format!("coalesce Arrow write buffer for {storage_signal}"))
             }
         }
     }
@@ -122,7 +145,8 @@ pub(super) fn arrow_write_timing_snapshot(timings: &[ArrowBatchBufferTiming]) ->
             .iter()
             .map(|timing| {
                 json!({
-                    "table": timing.table.as_str(),
+                    "storage_signal": timing.storage_signal.as_str(),
+                    "table": timing.storage_signal.as_str(),
                     "phase": timing.phase.as_str(),
                     "rows": timing.rows,
                     "seconds": timing.seconds,

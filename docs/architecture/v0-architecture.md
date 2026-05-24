@@ -63,7 +63,7 @@ OTLP/HTTP (JSON or protobuf, optional gzip)
   -> fsynced local raw spool write
   -> ingest worker decode, otlp2records transform, timestamp-skew validation
   -> Arrow RecordBatch
-  -> Arrow write buffer
+  -> Arrow write buffer (rows plus durability disposition)
   -> DuckDB Arrow appender into DuckLake tables
   -> DuckLake commit
   -> raw spool checkpoint
@@ -78,7 +78,7 @@ flowchart LR
   D --> E["Fsync raw request to local spool"]
   E --> F["Worker decode, transform, and timestamp validation"]
   F --> G["Arrow RecordBatch"]
-  G --> H["Arrow write buffer"]
+  G --> H["Arrow write buffer: rows + durability"]
   H --> I["DuckDB Arrow append"]
   I --> J["DuckLake commit"]
   J --> K["Raw spool checkpoint"]
@@ -219,6 +219,14 @@ across OS threads" concept; there is no separate dataflow topology or
 storage-sink stage. Worker-buffer ownership is intentionally low-cardinality:
 storage signal plus source encoding.
 
+Every write-buffer producer must declare its durability disposition:
+
+- replay-backed rows carry the raw-spool record ref that must be checkpointed
+  only after the rows commit to DuckLake; normal OTLP ingest uses this path.
+- best-effort rows carry no raw-spool ref; the opt-in operator-metrics snapshot
+  uses this sanctioned internal lane, so self-telemetry is not replayed after a
+  crash.
+
 Memory and worker-buffer guardrails:
 
 - `CANARDSTACK_MAX_BODY_BYTES`, default 8 MiB.
@@ -234,19 +242,20 @@ Seal triggers:
 - The seal-rate EWMA seed (4 MiB over 10 seconds) is a fixed internal warm-up
   mechanic, not a config knob; the estimator converges to measured throughput.
 
-A single scheduler-driven seal driver is the only seal path. It flushes on a
-frequent cadence (`CANARDSTACK_SEAL_INTERVAL_MS`, default 1s) or earlier when a
-buffered signal reaches its size
+A single scheduler-driven seal owner (`seal::commit_buffered_rows`) is the only
+seal path. It flushes on a frequent cadence (`CANARDSTACK_SEAL_INTERVAL_MS`,
+default 1s) or earlier when a buffered signal reaches its size
 (`CANARDSTACK_ARROW_WRITE_BUFFER_TARGET_BYTES`) or age
 (`CANARDSTACK_ARROW_WRITE_BUFFER_MAX_AGE_*`) threshold. The cadence must stay
 well under the freshness-budget SLA so Arrow write-buffer age never approaches
 the admission reject threshold; it is deliberately decoupled from the coarse
-maintenance interval. Each seal captures the set of pending raw-spool records,
-force-flushes the Arrow write buffer under seal admission, appends rows through
-DuckDB's Arrow appender, commits DuckLake, and then checkpoints exactly the
-captured records. Capturing before flushing is load-bearing for at-least-once: a
-record appended after the capture is checkpointed on a later seal, never before
-its rows are durable. Admin seal uses the same path on demand.
+maintenance interval. Each seal snapshots typed buffered rows, force-flushes the
+snapshot under seal admission, appends rows through DuckDB's Arrow appender,
+commits DuckLake, and then checkpoints exactly the replay-backed raw-spool refs
+from the committed snapshot. Commit failure restores the whole typed snapshot to
+the write buffer. Commit success plus checkpoint failure leaves the raw-spool
+records pending, so they replay as duplicate rows on a future restart. Admin
+seal uses the same path on demand.
 
 Freshness-budget admission happens before raw-spool append. The request path
 uses two local debt signals:

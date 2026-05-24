@@ -1,4 +1,5 @@
 use crate::config::Config;
+use crate::seal::BufferDurability;
 use crate::signal::StorageSignal;
 use anyhow::{Context, Result};
 use arrow58::record_batch::RecordBatch;
@@ -83,7 +84,7 @@ pub struct StorageCapabilities {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct ArrowWriteBufferMetric {
-    pub table: StorageSignal,
+    pub storage_signal: StorageSignal,
     pub rows: usize,
     pub bytes: usize,
     pub age_seconds: f64,
@@ -145,9 +146,10 @@ impl std::fmt::Display for QueryTimeoutError {
 impl std::error::Error for QueryTimeoutError {}
 
 pub struct ArrowBatchBuffer<'a> {
-    pub table: StorageSignal,
+    pub storage_signal: StorageSignal,
     pub batch: &'a RecordBatch,
     pub source_format: &'a str,
+    pub durability: BufferDurability,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -183,7 +185,7 @@ impl std::fmt::Display for TimingPhase {
 
 #[derive(Clone, Debug)]
 pub struct ArrowBatchBufferTiming {
-    pub table: StorageSignal,
+    pub storage_signal: StorageSignal,
     pub phase: TimingPhase,
     pub rows: usize,
     pub seconds: f64,
@@ -196,10 +198,12 @@ pub struct ArrowBatchBufferResult {
 }
 
 struct PreparedArrowBatch {
-    pub(super) table: StorageSignal,
+    pub(super) storage_signal: StorageSignal,
     pub(super) batch: RecordBatch,
     pub(super) rows: usize,
     pub(super) timestamp_days: Vec<String>,
+    pub(super) durability: BufferDurability,
+    pub(super) best_effort_rows: usize,
 }
 
 impl Storage {

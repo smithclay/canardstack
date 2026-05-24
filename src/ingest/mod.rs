@@ -2,6 +2,7 @@ use crate::admission_control::{AdmissionController, FreshnessBudgetInputs};
 use crate::config::Config;
 use crate::metrics::Metrics;
 use crate::otlp::{self, Transformed};
+use crate::seal::{BufferDurability, ReplayRef};
 use crate::signal::StorageSignal;
 use crate::storage::{ArrowBatchBuffer, ArrowBatchBufferTiming, Storage};
 use crate::validation::{self, ApiError, ApiResult};
@@ -9,7 +10,7 @@ use crate::LockExt;
 use anyhow::{Context, Result};
 use serde::Serialize;
 use serde_json::{json, Value};
-use spool::{Options, RecordId, SealRef, Writer};
+use spool::{AppendRef, Options, Writer};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
@@ -19,13 +20,13 @@ use std::time::Instant;
 
 mod admission;
 mod batches;
-mod lifecycle;
+pub(crate) mod lifecycle;
 pub mod spool;
 mod worker;
 
 pub use batches::IngestSnapshot;
 pub(in crate::ingest) use lifecycle::IngestStage;
-pub(in crate::ingest) use lifecycle::SealStage;
+pub(crate) use lifecycle::SealStage;
 use worker::IngestWorkerPool;
 pub(crate) use worker::INGEST_WORKER_CHANNEL_CAPACITY;
 
@@ -68,7 +69,6 @@ pub struct Ingestor {
     runtime_memory_reserved_bytes: Arc<AtomicUsize>,
     inflight: Arc<admission::InflightBytes>,
     raw_spools: BTreeMap<OtlpRequestKind, Writer>,
-    raw_spool_seal_refs: Arc<Mutex<BTreeMap<(OtlpRequestKind, RecordId), SealRef>>>,
     ingest_workers: Mutex<Option<IngestWorkerPool>>,
     /// First-transition latch so worker-pool saturation (caller-runs fallback)
     /// logs once per episode rather than once per saturated request. Set on the
@@ -81,10 +81,48 @@ pub(in crate::ingest) struct SpooledIngestWork {
     pub(in crate::ingest) route: OtlpRequestKind,
     headers: HashMap<String, String>,
     compressed_body: Vec<u8>,
-    raw_spool_ref: spool::AppendRef,
+    raw_spool_ref: AppendRef,
     inflight_reservation: admission::InflightReservation,
     runtime_memory_reservation: admission::RuntimeMemoryReservation,
     pub(in crate::ingest) metrics: Arc<Metrics>,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(in crate::ingest) enum SpooledIngestDisposition {
+    Buffered,
+    TerminallyDisposed,
+    LeftPendingForReplay,
+}
+
+impl SpooledIngestDisposition {
+    pub(in crate::ingest) fn as_str(self) -> &'static str {
+        match self {
+            Self::Buffered => "buffered",
+            Self::TerminallyDisposed => "terminally_disposed",
+            Self::LeftPendingForReplay => "left_pending_for_replay",
+        }
+    }
+}
+
+pub(in crate::ingest) struct SpooledIngestError {
+    pub(in crate::ingest) error: ApiError,
+    pub(in crate::ingest) disposition: SpooledIngestDisposition,
+}
+
+impl SpooledIngestError {
+    fn terminal(error: ApiError) -> Self {
+        Self {
+            error,
+            disposition: SpooledIngestDisposition::TerminallyDisposed,
+        }
+    }
+
+    fn pending_replay(error: ApiError) -> Self {
+        Self {
+            error,
+            disposition: SpooledIngestDisposition::LeftPendingForReplay,
+        }
+    }
 }
 
 impl Ingestor {
@@ -97,7 +135,6 @@ impl Ingestor {
             runtime_memory_reserved_bytes: Arc::new(AtomicUsize::new(0)),
             inflight: Arc::new(admission::InflightBytes::new(&config)),
             raw_spools,
-            raw_spool_seal_refs: Arc::new(Mutex::new(BTreeMap::new())),
             ingest_workers: Mutex::new(None),
             worker_pool_saturated: AtomicBool::new(false),
             config,
@@ -188,7 +225,7 @@ impl Ingestor {
         &self,
         work: SpooledIngestWork,
         storage: &Storage,
-    ) -> ApiResult<()> {
+    ) -> std::result::Result<SpooledIngestDisposition, SpooledIngestError> {
         let SpooledIngestWork {
             route,
             headers,
@@ -223,8 +260,12 @@ impl Ingestor {
                 } else {
                     "decode_failed"
                 };
-                self.checkpoint_raw_spool_terminal(raw_spool_ref, route, reason, metrics)?;
-                return Err(err);
+                if let Err(checkpoint_err) =
+                    self.checkpoint_raw_spool_terminal(raw_spool_ref, route, reason, metrics)
+                {
+                    return Err(SpooledIngestError::pending_replay(checkpoint_err));
+                }
+                return Err(SpooledIngestError::terminal(err));
             }
         };
         let decoded_body_materialized_bytes = match &body {
@@ -232,8 +273,15 @@ impl Ingestor {
             std::borrow::Cow::Owned(bytes) => bytes.len(),
         };
         if let Err(err) = validation::validate_body_size(body.len(), &self.config) {
-            self.checkpoint_raw_spool_terminal(raw_spool_ref, route, "body_size_invalid", metrics)?;
-            return Err(err);
+            if let Err(checkpoint_err) = self.checkpoint_raw_spool_terminal(
+                raw_spool_ref,
+                route,
+                "body_size_invalid",
+                metrics,
+            ) {
+                return Err(SpooledIngestError::pending_replay(checkpoint_err));
+            }
+            return Err(SpooledIngestError::terminal(err));
         }
         let started = Instant::now();
         #[cfg(feature = "otlp2records-observer")]
@@ -248,13 +296,15 @@ impl Ingestor {
         let transformed = match transformed_result {
             Ok(transformed) => transformed,
             Err(err) => {
-                self.checkpoint_raw_spool_terminal(
+                if let Err(checkpoint_err) = self.checkpoint_raw_spool_terminal(
                     raw_spool_ref,
                     route,
                     "transform_failed",
                     metrics,
-                )?;
-                return Err(err);
+                ) {
+                    return Err(SpooledIngestError::pending_replay(checkpoint_err));
+                }
+                return Err(SpooledIngestError::terminal(err));
             }
         };
         // otlp2records produced Arrow batches; see `crate::ingest::lifecycle`.
@@ -268,13 +318,15 @@ impl Ingestor {
             started.elapsed().as_secs_f64(),
         );
         if let Err(err) = skew_result {
-            self.checkpoint_raw_spool_terminal(
+            if let Err(checkpoint_err) = self.checkpoint_raw_spool_terminal(
                 raw_spool_ref,
                 route,
                 "timestamp_rejected",
                 metrics,
-            )?;
-            return Err(err);
+            ) {
+                return Err(SpooledIngestError::pending_replay(checkpoint_err));
+            }
+            return Err(SpooledIngestError::terminal(err));
         }
         let decoded_body_len = body.len();
         for (output_signal, rows) in transformed_rows_by_signal(&transformed) {
@@ -300,21 +352,31 @@ impl Ingestor {
             .saturating_add(decoded_body_materialized_bytes)
             .saturating_add(pending_bytes);
         if let Err(err) = runtime_memory_reservation.reserve_at_least(peak_bytes, route, metrics) {
-            self.checkpoint_raw_spool_terminal(raw_spool_ref, route, "memory_rejected", metrics)?;
-            return Err(err);
+            if let Err(checkpoint_err) =
+                self.checkpoint_raw_spool_terminal(raw_spool_ref, route, "memory_rejected", metrics)
+            {
+                return Err(SpooledIngestError::pending_replay(checkpoint_err));
+            }
+            return Err(SpooledIngestError::terminal(err));
         }
         if batches.is_empty() {
-            self.checkpoint_raw_spool_terminal(raw_spool_ref, route, "transform_empty", metrics)?;
-            return Ok(());
+            if let Err(checkpoint_err) =
+                self.checkpoint_raw_spool_terminal(raw_spool_ref, route, "transform_empty", metrics)
+            {
+                return Err(SpooledIngestError::pending_replay(checkpoint_err));
+            }
+            return Ok(SpooledIngestDisposition::TerminallyDisposed);
         }
 
+        let replay_ref = ReplayRef::new(route, raw_spool_ref);
         let buffers = batches
             .iter()
             .filter(|batch| batch.batch.num_rows() > 0)
             .map(|batch| ArrowBatchBuffer {
-                table: batch.signal,
+                storage_signal: batch.signal,
                 batch: &batch.batch,
                 source_format: batch.source_format,
+                durability: BufferDurability::replay_backed(replay_ref),
             })
             .collect::<Vec<_>>();
         let buffer_started = Instant::now();
@@ -341,10 +403,10 @@ impl Ingestor {
                     request_kind = route.as_str(),
                     error = %err
                 );
-                return Err(
+                return Err(SpooledIngestError::pending_replay(
                     ApiError::new(503, "storage_insert_failed", "storage insert failed")
                         .with_retry_after(5),
-                );
+                ));
             }
         };
         // Rows reached the Arrow write buffer; the per-request phase terminus.
@@ -357,12 +419,8 @@ impl Ingestor {
             1,
         );
 
-        // Rows are now in the Arrow write buffer. Track the raw-spool record so the
-        // scheduler checkpoints it after the next durable DuckLake commit, then release the
-        // admission credit (buffer occupancy is now reflected as buffered bytes
-        // for freshness, not as a held queue credit). See `crate::ingest::lifecycle`
-        // for the seal-side hops that take the tracked record to a checkpoint.
-        self.track_raw_spool_record(raw_spool_ref, route);
+        // Rows are now in the Arrow write buffer together with their replay ref,
+        // so the seal snapshot owns the commit->checkpoint binding.
         drop(inflight_reservation);
         tracing::debug!(event = "ingest_buffered", request_kind = route.as_str(),);
 
@@ -403,7 +461,7 @@ impl Ingestor {
             );
         }
 
-        Ok(())
+        Ok(SpooledIngestDisposition::Buffered)
     }
 
     fn dispatch_ingest_work(
@@ -502,9 +560,10 @@ impl Ingestor {
             tracing::warn!(
                 event = "ingest_inline_process_failed",
                 request_kind = route.as_str(),
-                status = err.status,
-                reason = err.reason,
-                message = %err.message,
+                status = err.error.status,
+                reason = err.error.reason,
+                disposition = err.disposition.as_str(),
+                message = %err.error.message,
                 "inline ingest processing failed after worker saturation; raw request stays durably spooled"
             );
         }
@@ -634,7 +693,7 @@ impl Ingestor {
         metrics.gauge(
             "canardstack_ingest_worker_queue_capacity",
             &[("state", "capacity")],
-            self.config.mechanics.ingest_worker_channel_capacity as f64,
+            self.config.test_overrides.ingest_worker_channel_capacity as f64,
         );
     }
 
@@ -700,7 +759,7 @@ impl Ingestor {
 fn observe_storage_timings(metrics: &Metrics, timings: &[ArrowBatchBufferTiming]) {
     for timing in timings {
         metrics.observe_storage_signal_phase_seconds(
-            timing.table.as_str(),
+            timing.storage_signal.as_str(),
             timing.phase.as_str(),
             timing.seconds,
         );
