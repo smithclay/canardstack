@@ -68,11 +68,18 @@ impl CommittedReplayRefs {
         &self.0
     }
 
-    pub(super) fn new(replay_refs: Vec<ReplayBackedRecordRef>) -> Self {
+    // Module-private on purpose: a committed-replay-refs token may be minted ONLY
+    // by the `storage` commit path, so holding one is proof the rows were
+    // DuckLake-committed. Do NOT widen to `pub(super)`/`pub(crate)` — `storage`
+    // is a depth-1 module, so either would make the token forgeable from any
+    // in-crate module (e.g. `seal`/`ingest`) and break the checkpoint-after-commit
+    // guarantee. The mint sites live in `storage`'s descendant modules
+    // (`arrow_write`, `arrow_write_buffer`), which can reach a private constructor.
+    fn new(replay_refs: Vec<ReplayBackedRecordRef>) -> Self {
         Self(replay_refs)
     }
 
-    pub(super) fn empty() -> Self {
+    fn empty() -> Self {
         Self(Vec::new())
     }
 }
