@@ -4,7 +4,9 @@ use crate::ingest::raw_spool::{RawSpool, RawSpoolAppendRef};
 use crate::metrics::Metrics;
 use crate::otlp::{self, Transformed};
 use crate::signal::StorageSignal;
-use crate::storage::{ArrowBatchBufferTiming, ReplayBackedArrowBatch, Storage};
+use crate::storage::{
+    ArrowBatchBufferResult, ArrowBatchBufferTiming, ReplayBackedArrowBatch, Storage,
+};
 use crate::validation::{self, ApiError, ApiResult};
 use crate::LockExt;
 use anyhow::Result;
@@ -468,6 +470,13 @@ impl IngestPipeline {
         self.dispatch_ingest_work(spooled, storage, metrics)
     }
 
+    /// At-least-once transaction script for one durably-spooled request, read as
+    /// the lifecycle funnel: spooled -> transformed -> buffered. Each phase is a
+    /// named helper that either transforms the payload or produces an explicit
+    /// disposition; every terminal/retryable raw-spool decision stays visible
+    /// here. Phase helpers never decide 202 — the raw request is already spooled,
+    /// so a failure only chooses how the spooled record is disposed (terminally
+    /// checkpointed, or left pending for replay).
     pub(in crate::ingest) fn process_spooled_ingest(
         &self,
         work: SpooledIngestWork,
@@ -488,95 +497,22 @@ impl IngestPipeline {
             event = "ingest_processing_started",
             request_kind = route.as_str(),
         );
-        let started = Instant::now();
-        let body_result = otlp::decompress_if_needed(
-            &headers,
-            &compressed_body,
-            self.config.operator.max_body_bytes,
-        );
-        metrics.observe_request_phase_seconds(
-            route.as_str(),
-            "decompress",
-            started.elapsed().as_secs_f64(),
-        );
-        let body = match body_result {
-            Ok(body) => body,
-            Err(err) => {
-                let reason = if err.reason == "payload_too_large" {
-                    "body_size_invalid"
-                } else {
-                    "decode_failed"
-                };
-                if let Err(checkpoint_err) =
-                    self.raw_spool
-                        .checkpoint_terminal(raw_spool_ref, route, reason, metrics)
-                {
-                    return Err(SpooledIngestError::pending_replay(checkpoint_err));
-                }
-                return Err(SpooledIngestError::terminal(err));
-            }
-        };
+
+        // spooled -> decoded: decompress and re-check the decoded body size.
+        let body =
+            self.decode_spooled_body(&headers, &compressed_body, raw_spool_ref, route, metrics)?;
         let decoded_body_materialized_bytes = match &body {
             std::borrow::Cow::Borrowed(_) => 0,
             std::borrow::Cow::Owned(bytes) => bytes.len(),
         };
-        if let Err(err) = validation::validate_body_size(body.len(), &self.config) {
-            if let Err(checkpoint_err) = self.raw_spool.checkpoint_terminal(
-                raw_spool_ref,
-                route,
-                "body_size_invalid",
-                metrics,
-            ) {
-                return Err(SpooledIngestError::pending_replay(checkpoint_err));
-            }
-            return Err(SpooledIngestError::terminal(err));
-        }
-        let started = Instant::now();
-        #[cfg(feature = "otlp2records-observer")]
-        let transformed_result = otlp::transform_observed(route, &headers, &body, metrics);
-        #[cfg(not(feature = "otlp2records-observer"))]
-        let transformed_result = otlp::transform(route, &headers, &body);
-        metrics.observe_request_phase_seconds(
-            route.as_str(),
-            "otlp_transform",
-            started.elapsed().as_secs_f64(),
-        );
-        let transformed = match transformed_result {
-            Ok(transformed) => transformed,
-            Err(err) => {
-                if let Err(checkpoint_err) = self.raw_spool.checkpoint_terminal(
-                    raw_spool_ref,
-                    route,
-                    "transform_failed",
-                    metrics,
-                ) {
-                    return Err(SpooledIngestError::pending_replay(checkpoint_err));
-                }
-                return Err(SpooledIngestError::terminal(err));
-            }
-        };
-        // otlp2records produced Arrow batches; see `crate::ingest::lifecycle`.
+        let decoded_body_len = body.len();
+
+        // decoded -> transformed: OTLP -> Arrow batches, then timestamp-skew gate.
+        let transformed =
+            self.transform_spooled_body(route, &headers, &body, raw_spool_ref, metrics)?;
         lifecycle::record(metrics, route, IngestStage::Transformed);
         let unsupported_histograms = transformed.unsupported_histograms;
-        let started = Instant::now();
-        let skew_result = self.validate_skew(&transformed);
-        metrics.observe_request_phase_seconds(
-            route.as_str(),
-            "timestamp_validation",
-            started.elapsed().as_secs_f64(),
-        );
-        if let Err(err) = skew_result {
-            if let Err(checkpoint_err) = self.raw_spool.checkpoint_terminal(
-                raw_spool_ref,
-                route,
-                "timestamp_rejected",
-                metrics,
-            ) {
-                return Err(SpooledIngestError::pending_replay(checkpoint_err));
-            }
-            return Err(SpooledIngestError::terminal(err));
-        }
-        let decoded_body_len = body.len();
+        self.validate_spooled_skew(&transformed, raw_spool_ref, route, metrics)?;
         for (output_signal, rows) in transformed_rows_by_signal(&transformed) {
             metrics.inc(
                 "canardstack_ingest_transformed_rows_total",
@@ -588,77 +524,37 @@ impl IngestPipeline {
             );
         }
 
+        // transformed -> accounted: exact in-flight correction + peak memory cap.
         let request_bytes = compressed_body.len();
         let batches = batches::pending_batches(transformed);
         let buffered_totals = pending_batch_totals(&batches);
-        // Correct the admission estimate to the exact buffered Arrow bytes. The
-        // request is already durably spooled, so this is infallible accounting,
-        // never a late rejection.
-        inflight_reservation.adjust(admission::inflight_bytes_by_signal(&batches));
-        let pending_bytes = batches.iter().map(|b| b.approx_bytes).sum::<usize>();
-        let peak_bytes = request_bytes
-            .saturating_add(decoded_body_materialized_bytes)
-            .saturating_add(pending_bytes);
-        if let Err(err) = runtime_memory_reservation.reserve_at_least(peak_bytes, route, metrics) {
-            if let Err(checkpoint_err) =
-                self.raw_spool
-                    .checkpoint_terminal(raw_spool_ref, route, "memory_rejected", metrics)
-            {
-                return Err(SpooledIngestError::pending_replay(checkpoint_err));
-            }
-            return Err(SpooledIngestError::terminal(err));
-        }
+        self.account_buffer_demand(
+            &batches,
+            request_bytes,
+            decoded_body_materialized_bytes,
+            &mut inflight_reservation,
+            &mut runtime_memory_reservation,
+            raw_spool_ref,
+            route,
+            metrics,
+        )?;
         if batches.is_empty() {
-            if let Err(checkpoint_err) =
-                self.raw_spool
-                    .checkpoint_terminal(raw_spool_ref, route, "transform_empty", metrics)
-            {
-                return Err(SpooledIngestError::pending_replay(checkpoint_err));
-            }
-            return Ok(SpooledIngestDisposition::TerminallyDisposed);
+            // Nothing to buffer (e.g. all rows were unsupported): terminally
+            // dispose so the spooled record will not replay.
+            return match self.raw_spool.checkpoint_terminal(
+                raw_spool_ref,
+                route,
+                "transform_empty",
+                metrics,
+            ) {
+                Ok(()) => Ok(SpooledIngestDisposition::TerminallyDisposed),
+                Err(checkpoint_err) => Err(SpooledIngestError::pending_replay(checkpoint_err)),
+            };
         }
 
-        let replay_ref = ReplayBackedRecordRef::new(raw_spool_ref);
-        let buffers = batches
-            .iter()
-            .filter(|batch| batch.batch.num_rows() > 0)
-            .map(|batch| ReplayBackedArrowBatch {
-                storage_signal: batch.signal,
-                batch: &batch.batch,
-                source_format: batch.source_format,
-                replay_ref,
-            })
-            .collect::<Vec<_>>();
-        let buffer_started = Instant::now();
-        let buffer_result = storage.buffer_replay_backed_arrow_batches(&buffers);
-        metrics.observe_request_phase_seconds(
-            route.as_str(),
-            "storage_buffer",
-            buffer_started.elapsed().as_secs_f64(),
-        );
-        let buffered = match buffer_result {
-            Ok(result) => result,
-            Err(err) => {
-                // The rows never reached the Arrow write buffer and the raw-spool
-                // record was not tracked, so it stays pending and replays on a
-                // future restart (at-least-once). Surface a retryable
-                // dependency error; the admission credit drops with this scope.
-                metrics.inc(
-                    "canardstack_ingest_storage_insert_total",
-                    &[("request_kind", route.as_str()), ("status", "error")],
-                    1,
-                );
-                tracing::warn!(
-                    event = "ingest_storage_insert_failed",
-                    request_kind = route.as_str(),
-                    error = %err
-                );
-                return Err(SpooledIngestError::pending_replay(
-                    ApiError::new(503, "storage_insert_failed", "storage insert failed")
-                        .with_retry_after(5),
-                ));
-            }
-        };
+        // accounted -> buffered: append replay-backed rows to the write buffer.
+        let buffered =
+            self.buffer_spooled_batches(storage, &batches, raw_spool_ref, route, metrics)?;
         // Rows reached the Arrow write buffer; the per-request phase terminus.
         // See `crate::ingest::lifecycle`.
         lifecycle::record(metrics, route, IngestStage::Buffered);
@@ -712,6 +608,196 @@ impl IngestPipeline {
         }
 
         Ok(SpooledIngestDisposition::Buffered)
+    }
+
+    /// Terminal checkpoint: the spooled record can never succeed, so checkpoint it
+    /// (mark committed so it will not replay) and surface the original rejection.
+    /// If the checkpoint itself fails, the record is left pending for replay
+    /// instead. The single place the terminal-vs-retryable raw-spool decision is
+    /// made on the worker path.
+    fn dispose_terminal(
+        &self,
+        raw_spool_ref: RawSpoolAppendRef,
+        route: OtlpRequestKind,
+        reason: &'static str,
+        err: ApiError,
+        metrics: &Metrics,
+    ) -> SpooledIngestError {
+        match self
+            .raw_spool
+            .checkpoint_terminal(raw_spool_ref, route, reason, metrics)
+        {
+            Ok(()) => SpooledIngestError::terminal(err),
+            Err(checkpoint_err) => SpooledIngestError::pending_replay(checkpoint_err),
+        }
+    }
+
+    /// Decode phase: decompress (if needed) and re-check the decoded body size.
+    /// Returns the decoded body borrowed from `compressed_body`, or a terminal
+    /// disposition for an undecodable / oversized payload.
+    fn decode_spooled_body<'b>(
+        &self,
+        headers: &HashMap<String, String>,
+        compressed_body: &'b [u8],
+        raw_spool_ref: RawSpoolAppendRef,
+        route: OtlpRequestKind,
+        metrics: &Metrics,
+    ) -> std::result::Result<std::borrow::Cow<'b, [u8]>, SpooledIngestError> {
+        let started = Instant::now();
+        let body_result = otlp::decompress_if_needed(
+            headers,
+            compressed_body,
+            self.config.operator.max_body_bytes,
+        );
+        metrics.observe_request_phase_seconds(
+            route.as_str(),
+            "decompress",
+            started.elapsed().as_secs_f64(),
+        );
+        let body = body_result.map_err(|err| {
+            let reason = if err.reason == "payload_too_large" {
+                "body_size_invalid"
+            } else {
+                "decode_failed"
+            };
+            self.dispose_terminal(raw_spool_ref, route, reason, err, metrics)
+        })?;
+        if let Err(err) = validation::validate_body_size(body.len(), &self.config) {
+            return Err(self.dispose_terminal(
+                raw_spool_ref,
+                route,
+                "body_size_invalid",
+                err,
+                metrics,
+            ));
+        }
+        Ok(body)
+    }
+
+    /// Transform phase: turn the decoded OTLP body into Arrow `RecordBatch`es, or
+    /// a terminal disposition for a payload that cannot be transformed.
+    fn transform_spooled_body(
+        &self,
+        route: OtlpRequestKind,
+        headers: &HashMap<String, String>,
+        body: &[u8],
+        raw_spool_ref: RawSpoolAppendRef,
+        metrics: &Metrics,
+    ) -> std::result::Result<Transformed, SpooledIngestError> {
+        let started = Instant::now();
+        #[cfg(feature = "otlp2records-observer")]
+        let transformed_result = otlp::transform_observed(route, headers, body, metrics);
+        #[cfg(not(feature = "otlp2records-observer"))]
+        let transformed_result = otlp::transform(route, headers, body);
+        metrics.observe_request_phase_seconds(
+            route.as_str(),
+            "otlp_transform",
+            started.elapsed().as_secs_f64(),
+        );
+        transformed_result.map_err(|err| {
+            self.dispose_terminal(raw_spool_ref, route, "transform_failed", err, metrics)
+        })
+    }
+
+    /// Timestamp-validation phase: reject batches whose timestamps fall outside
+    /// the configured skew window, as a terminal disposition.
+    fn validate_spooled_skew(
+        &self,
+        transformed: &Transformed,
+        raw_spool_ref: RawSpoolAppendRef,
+        route: OtlpRequestKind,
+        metrics: &Metrics,
+    ) -> std::result::Result<(), SpooledIngestError> {
+        let started = Instant::now();
+        let skew_result = self.validate_skew(transformed);
+        metrics.observe_request_phase_seconds(
+            route.as_str(),
+            "timestamp_validation",
+            started.elapsed().as_secs_f64(),
+        );
+        skew_result.map_err(|err| {
+            self.dispose_terminal(raw_spool_ref, route, "timestamp_rejected", err, metrics)
+        })
+    }
+
+    /// Exact-accounting phase: correct the in-flight reservation to the real
+    /// buffered Arrow byte size (infallible — the request is already spooled) and
+    /// reserve the peak runtime memory the buffer will demand. Only the optional
+    /// runtime-memory cap can reject, as a terminal disposition.
+    #[allow(clippy::too_many_arguments)]
+    fn account_buffer_demand(
+        &self,
+        batches: &[batches::PendingBatch],
+        request_bytes: usize,
+        decoded_body_materialized_bytes: usize,
+        inflight_reservation: &mut admission::InflightReservation,
+        runtime_memory_reservation: &mut admission::RuntimeMemoryReservation,
+        raw_spool_ref: RawSpoolAppendRef,
+        route: OtlpRequestKind,
+        metrics: &Metrics,
+    ) -> std::result::Result<(), SpooledIngestError> {
+        inflight_reservation.adjust(admission::inflight_bytes_by_signal(batches));
+        let pending_bytes = batches.iter().map(|b| b.approx_bytes).sum::<usize>();
+        let peak_bytes = request_bytes
+            .saturating_add(decoded_body_materialized_bytes)
+            .saturating_add(pending_bytes);
+        runtime_memory_reservation
+            .reserve_at_least(peak_bytes, route, metrics)
+            .map_err(|err| {
+                self.dispose_terminal(raw_spool_ref, route, "memory_rejected", err, metrics)
+            })
+    }
+
+    /// Buffer phase: append the transformed rows to the storage Arrow write
+    /// buffer, bound to their raw-spool replay ref so the seal owns the
+    /// commit->checkpoint binding. A storage fault leaves the record pending for
+    /// replay (retryable); the caller then stamps the `buffered` lifecycle stage.
+    fn buffer_spooled_batches(
+        &self,
+        storage: &Storage,
+        batches: &[batches::PendingBatch],
+        raw_spool_ref: RawSpoolAppendRef,
+        route: OtlpRequestKind,
+        metrics: &Metrics,
+    ) -> std::result::Result<ArrowBatchBufferResult, SpooledIngestError> {
+        let replay_ref = ReplayBackedRecordRef::new(raw_spool_ref);
+        let buffers = batches
+            .iter()
+            .filter(|batch| batch.batch.num_rows() > 0)
+            .map(|batch| ReplayBackedArrowBatch {
+                storage_signal: batch.signal,
+                batch: &batch.batch,
+                source_format: batch.source_format,
+                replay_ref,
+            })
+            .collect::<Vec<_>>();
+        let buffer_started = Instant::now();
+        let buffer_result = storage.buffer_replay_backed_arrow_batches(&buffers);
+        metrics.observe_request_phase_seconds(
+            route.as_str(),
+            "storage_buffer",
+            buffer_started.elapsed().as_secs_f64(),
+        );
+        buffer_result.map_err(|err| {
+            // The rows never reached the Arrow write buffer and the raw-spool
+            // record was not tracked, so it stays pending and replays on a future
+            // restart (at-least-once). Surface a retryable dependency error; the
+            // admission credit drops with this scope.
+            metrics.inc(
+                "canardstack_ingest_storage_insert_total",
+                &[("request_kind", route.as_str()), ("status", "error")],
+                1,
+            );
+            tracing::warn!(
+                event = "ingest_storage_insert_failed",
+                request_kind = route.as_str(),
+                error = %err
+            );
+            SpooledIngestError::pending_replay(
+                ApiError::new(503, "storage_insert_failed", "storage insert failed")
+                    .with_retry_after(5),
+            )
+        })
     }
 
     fn dispatch_ingest_work(
