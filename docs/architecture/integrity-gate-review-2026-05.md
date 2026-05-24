@@ -53,20 +53,19 @@ artifact.
   attributes, or start demanding typed columns. The latter is the trigger to build
   the migration path. Do not pre-build it.
 
-### 2. Best-effort buffer ingress if it spreads — confidence: MEDIUM (both reviewers)
+### 2. Internal telemetry direct commit if it spreads — confidence: MEDIUM (both reviewers)
 
-- **Concept:** durability class at the storage-buffer ingress.
-- **Evidence:** `BestEffortArrowBatch` carries no replay ref and can never be
-  checkpointed/replayed (`src/storage/mod.rs`); it shares the same buffer
-  machinery as replay-backed ingest via `BufferDurability`
-  (`src/storage/arrow_write.rs`); the sole sanctioned production caller is operator
-  self-telemetry (`Metrics::write_snapshot_to_storage`, `src/metrics.rs`). The
-  invariant is enforced by convention + `#[doc(hidden)]`, not by the type system.
-- **3-year cost:** any externally meaningful data later routed through this path
-  (recording rules, rollups, downsampling, backfill) silently opts out of the
-  at-least-once model.
-- **What to watch:** the first new caller of the best-effort path. That is the
-  moment to make the durability class a type-level distinction, not a doc comment.
+- **Concept:** separate internal telemetry storage path.
+- **Evidence:** operator self-telemetry now commits through
+  `Storage::commit_operator_metrics_snapshot`, outside the replay-backed Arrow
+  write buffer (`src/storage/arrow_write_buffer.rs`). The external ingest buffer
+  carries replay-backed refs only.
+- **3-year cost:** any externally meaningful data later routed through the internal
+  telemetry path (recording rules, rollups, downsampling, backfill) would still opt
+  out of the at-least-once model.
+- **What to watch:** the first new caller beyond operator self-telemetry. That is
+  the moment to either make it replay-backed or name a new explicit durability
+  promise.
 
 ### 3. Flush/commit vocabulary around the checkpoint boundary — confidence: LOW today → MEDIUM on first new write path
 

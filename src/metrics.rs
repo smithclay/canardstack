@@ -344,8 +344,9 @@ impl Metrics {
         if samples.is_empty() {
             return Ok(0);
         }
-        // Sanctioned best-effort producer: operator self-telemetry is queryable
-        // when enabled, but it has no raw-spool replay record.
+        // Sanctioned internal producer: operator self-telemetry is queryable when
+        // enabled, but it has no raw-spool replay record and does not enter the
+        // external ingest write buffer.
         let counters = samples
             .iter()
             .filter(|sample| sample.kind() == MetricKind::Counter)
@@ -359,19 +360,23 @@ impl Metrics {
         let mut rows = 0;
         if !counters.is_empty() {
             let batch = metric_samples_batch(&counters, StorageSignal::MetricSum)?;
-            rows += storage.buffer_operator_metrics_snapshot(
-                StorageSignal::MetricSum,
-                &batch,
-                "canardstack_operator_metrics",
-            )?;
+            rows += storage
+                .commit_operator_metrics_snapshot(
+                    StorageSignal::MetricSum,
+                    &batch,
+                    "canardstack_operator_metrics",
+                )?
+                .rows;
         }
         if !gauges.is_empty() {
             let batch = metric_samples_batch(&gauges, StorageSignal::MetricGauge)?;
-            rows += storage.buffer_operator_metrics_snapshot(
-                StorageSignal::MetricGauge,
-                &batch,
-                "canardstack_operator_metrics",
-            )?;
+            rows += storage
+                .commit_operator_metrics_snapshot(
+                    StorageSignal::MetricGauge,
+                    &batch,
+                    "canardstack_operator_metrics",
+                )?
+                .rows;
         }
         Ok(rows)
     }

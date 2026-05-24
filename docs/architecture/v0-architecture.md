@@ -220,13 +220,11 @@ across OS threads" concept; there is no separate dataflow topology or
 storage-sink stage. Worker-buffer ownership is intentionally low-cardinality:
 storage signal plus source encoding.
 
-Every write-buffer producer must declare its durability disposition:
-
-- replay-backed rows carry the raw-spool record ref that must be checkpointed
-  only after the rows commit to DuckLake; normal OTLP ingest uses this path.
-- best-effort rows carry no raw-spool ref; the opt-in operator-metrics snapshot
-  uses this sanctioned internal lane, so self-telemetry is not replayed after a
-  crash.
+The Arrow write buffer is replay-backed only: every buffered row carries the
+raw-spool record ref that must be checkpointed only after the rows commit to
+DuckLake. The opt-in operator-metrics snapshot is internal self-telemetry and
+commits through a separate direct path, so it cannot become a non-replay-backed
+producer inside the external ingest buffer.
 
 Memory and worker-buffer guardrails:
 

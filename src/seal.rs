@@ -136,7 +136,6 @@ fn commit_buffered_rows_with(
     tracing::debug!(
         event = "seal_committed_buffer_snapshot",
         replay_backed_records = replay_refs.len(),
-        best_effort_rows = outcome.best_effort_rows()
     );
     if seal_records {
         lifecycle::record_seal(metrics, SealStage::Committed);

@@ -6,7 +6,7 @@ use arrow58::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow58::record_batch::RecordBatch;
 use canardstack::config::Config;
 use canardstack::signal::StorageSignal;
-use canardstack::storage::{ArrowBatchBufferTiming, BestEffortArrowBatch, Storage};
+use canardstack::storage::{ArrowBatchBufferTiming, Storage};
 use chrono::Utc;
 use std::collections::BTreeMap;
 use std::env;
@@ -36,8 +36,8 @@ fn run() -> Result<()> {
     let mut phase_stats = PhaseStats::default();
     let mut total_rows = 0usize;
     let mut total_arrow_bytes = 0usize;
-    let mut flushed_rows = 0usize;
-    let mut flushed_buffers = 0usize;
+    let mut committed_rows = 0usize;
+    let mut committed_batches = 0usize;
 
     eprintln!(
         "{BENCH_NAME}: signals={} rows_per_batch={} iterations={} data_dir={}",
@@ -64,17 +64,15 @@ fn run() -> Result<()> {
 
         let started = Instant::now();
         for (signal, batch) in generated {
-            let result = storage.buffer_best_effort_arrow_batch(BestEffortArrowBatch {
-                storage_signal: signal,
-                batch: &batch,
-                source_format: "storage_pipeline_bench",
-            })?;
+            let result = storage.commit_internal_telemetry_batch(
+                signal,
+                &batch,
+                "storage_pipeline_bench",
+            )?;
+            committed_rows += result.rows;
+            committed_batches += usize::from(result.rows > 0);
             phase_stats.record_timings(result.timings);
         }
-        let flush = storage.commit_arrow_write_buffer()?;
-        flushed_rows += flush.flushed_rows;
-        flushed_buffers += flush.flushed_buffers;
-        phase_stats.record_timings(flush.timings);
         storage_elapsed += started.elapsed();
     }
 
@@ -83,8 +81,8 @@ fn run() -> Result<()> {
         elapsed: storage_elapsed,
         total_rows,
         total_arrow_bytes,
-        flushed_rows,
-        flushed_buffers,
+        committed_rows,
+        committed_batches,
     });
     phase_stats.print_csv();
     print_storage_layout(&storage)?;
@@ -115,15 +113,15 @@ struct SummaryInput<'a> {
     elapsed: Duration,
     total_rows: usize,
     total_arrow_bytes: usize,
-    flushed_rows: usize,
-    flushed_buffers: usize,
+    committed_rows: usize,
+    committed_batches: usize,
 }
 
 fn print_summary(input: &SummaryInput<'_>) {
     let seconds = input.elapsed.as_secs_f64();
     let arrow_mib = input.total_arrow_bytes as f64 / 1024.0 / 1024.0;
     println!(
-        "summary,name,write_path,signals,rows_per_batch,iterations,total_rows,flushed_rows,flushed_buffers,total_arrow_mib,total_seconds,rows_per_sec,arrow_mib_per_sec"
+        "summary,name,write_path,signals,rows_per_batch,iterations,total_rows,committed_rows,committed_batches,total_arrow_mib,total_seconds,rows_per_sec,arrow_mib_per_sec"
     );
     println!(
         "summary,{BENCH_NAME},duckdb_arrow_append,{},{},{},{},{},{},{:.3},{:.6},{:.0},{:.3}",
@@ -131,8 +129,8 @@ fn print_summary(input: &SummaryInput<'_>) {
         input.args.rows,
         input.args.iterations,
         input.total_rows,
-        input.flushed_rows,
-        input.flushed_buffers,
+        input.committed_rows,
+        input.committed_batches,
         arrow_mib,
         seconds,
         input.total_rows as f64 / seconds,

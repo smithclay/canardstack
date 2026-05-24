@@ -27,7 +27,7 @@ mod query_conn;
 mod schema;
 
 pub use arrow_write::ArrowFlushOutcome;
-use arrow_write::{ArrowWriteBuffer, BufferDurability};
+use arrow_write::ArrowWriteBuffer;
 pub use ducklake::install_ducklake_extension;
 use ducklake::{
     attach_ducklake_connection, configure_base_connection, configure_write_connection,
@@ -161,24 +161,10 @@ pub(crate) struct ReplayBackedArrowBatch<'a> {
     pub(crate) replay_ref: ReplayBackedRecordRef,
 }
 
-/// A storage-buffer input that **bypasses the raw spool**: it carries NO
-/// [`ReplayBackedRecordRef`], so its rows cannot be checkpointed or replayed.
-///
-/// INVARIANT: best-effort is reserved for sanctioned INTERNAL telemetry only — in
-/// v0 that is exclusively the operator metrics snapshot
-/// ([`crate::metrics::Metrics::write_snapshot_to_storage`]). External OTLP ingest
-/// MUST enter the write buffer through
-/// [`Storage::buffer_replay_backed_arrow_batches`] with a `ReplayBackedRecordRef`
-/// so at-least-once delivery holds; never route external ingest through the
-/// best-effort path. The replay-backed entry point is `pub(crate)`; this one is
-/// `pub` only so in-repo benches/tests (separate crates) can drive the storage
-/// write path directly, which is why it is `#[doc(hidden)]` rather than part of
-/// the supported API.
-#[doc(hidden)]
-pub struct BestEffortArrowBatch<'a> {
-    pub storage_signal: StorageSignal,
-    pub batch: &'a RecordBatch,
-    pub source_format: &'a str,
+#[derive(Clone, Debug)]
+pub struct InternalTelemetryCommitResult {
+    pub rows: usize,
+    pub timings: Vec<ArrowBatchBufferTiming>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -231,8 +217,7 @@ struct PreparedArrowBatch {
     pub(super) batch: RecordBatch,
     pub(super) rows: usize,
     pub(super) timestamp_days: Vec<String>,
-    pub(super) durability: BufferDurability,
-    pub(super) best_effort_rows: usize,
+    pub(super) replay_refs: BTreeSet<ReplayBackedRecordRef>,
 }
 
 impl Storage {

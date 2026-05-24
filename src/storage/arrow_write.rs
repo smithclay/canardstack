@@ -11,52 +11,13 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct BufferDurability {
-    replay_refs: BTreeSet<ReplayBackedRecordRef>,
-    best_effort: bool,
-}
-
-impl BufferDurability {
-    pub(super) fn empty() -> Self {
-        Self {
-            replay_refs: BTreeSet::new(),
-            best_effort: false,
-        }
-    }
-
-    pub(super) fn best_effort() -> Self {
-        Self {
-            replay_refs: BTreeSet::new(),
-            best_effort: true,
-        }
-    }
-
-    pub(super) fn replay_backed(replay_ref: ReplayBackedRecordRef) -> Self {
-        Self {
-            replay_refs: BTreeSet::from([replay_ref]),
-            best_effort: false,
-        }
-    }
-
-    pub(super) fn merge(&mut self, mut other: Self) {
-        self.replay_refs.append(&mut other.replay_refs);
-        self.best_effort |= other.best_effort;
-    }
-
-    pub(super) fn replay_refs(&self) -> Vec<ReplayBackedRecordRef> {
-        self.replay_refs.iter().copied().collect()
-    }
-}
-
 #[derive(Clone)]
 pub(super) struct ArrowWriteBuffer {
     pub(super) batches: Vec<RecordBatch>,
     pub(super) rows: usize,
     pub(super) bytes: usize,
     pub(super) timestamp_days: BTreeSet<String>,
-    pub(super) durability: BufferDurability,
-    pub(super) best_effort_rows: usize,
+    pub(super) replay_refs: BTreeSet<ReplayBackedRecordRef>,
     pub(super) opened_at: Instant,
 }
 
@@ -66,7 +27,6 @@ pub(super) struct ArrowFlushResult {
     pub(super) timings: Vec<ArrowBatchBufferTiming>,
     pub(super) affected: BTreeMap<StorageSignal, BTreeSet<String>>,
     pub(super) replay_refs: Vec<ReplayBackedRecordRef>,
-    pub(super) best_effort_rows: usize,
 }
 
 /// Result record of a durable Arrow write-buffer commit
@@ -80,16 +40,11 @@ pub struct ArrowFlushOutcome {
     pub timings: Vec<ArrowBatchBufferTiming>,
     pub active_write_buffers: Value,
     pub(crate) replay_refs: Vec<ReplayBackedRecordRef>,
-    pub(crate) best_effort_rows: usize,
 }
 
 impl ArrowFlushOutcome {
     pub(crate) fn replay_refs(&self) -> Vec<ReplayBackedRecordRef> {
         self.replay_refs.clone()
-    }
-
-    pub(crate) fn best_effort_rows(&self) -> usize {
-        self.best_effort_rows
     }
 
     pub fn to_json(&self) -> Value {
@@ -98,7 +53,6 @@ impl ArrowFlushOutcome {
             "flushed_rows": self.flushed_rows,
             "flushed_buffers": self.flushed_buffers,
             "replay_backed_records": self.replay_refs.len(),
-            "best_effort_rows": self.best_effort_rows,
             "timings": arrow_write_timing_snapshot(&self.timings),
             "active_write_buffers": self.active_write_buffers,
         })
@@ -112,8 +66,7 @@ impl ArrowWriteBuffer {
             rows: 0,
             bytes: 0,
             timestamp_days: BTreeSet::new(),
-            durability: BufferDurability::empty(),
-            best_effort_rows: 0,
+            replay_refs: BTreeSet::new(),
             opened_at: now,
         }
     }
@@ -122,8 +75,7 @@ impl ArrowWriteBuffer {
         self.rows += prepared.rows;
         self.bytes += prepared.batch.get_array_memory_size().max(prepared.rows);
         self.timestamp_days.extend(prepared.timestamp_days);
-        self.durability.merge(prepared.durability);
-        self.best_effort_rows += prepared.best_effort_rows;
+        self.replay_refs.extend(prepared.replay_refs);
         self.batches.push(prepared.batch);
     }
 
@@ -131,8 +83,7 @@ impl ArrowWriteBuffer {
         self.rows += other.rows;
         self.bytes += other.bytes;
         self.timestamp_days.append(&mut other.timestamp_days);
-        self.durability.merge(other.durability);
-        self.best_effort_rows += other.best_effort_rows;
+        self.replay_refs.append(&mut other.replay_refs);
         if other.opened_at < self.opened_at {
             self.opened_at = other.opened_at;
         }

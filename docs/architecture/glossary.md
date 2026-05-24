@@ -22,8 +22,8 @@ compatibility query surface uses), where that distinction applies.
 | replay-backed record ref (`ReplayBackedRecordRef`, `src/ingest/raw_spool.rs`) | The checkpoint identity carried by normal ingest rows after they enter the Arrow write buffer: the request kind it was spooled under (which is also its raw-spool writer) and the raw record id. Seal checkpoints these refs only after DuckLake commit. |
 | Arrow row batch (`RecordBatch`, a "batch") | The transformed columnar unit produced by `otlp2records`, grouped by storage signal. The columnar form of a chunk of rows; do not use "batch" for a raw-spool record or worker handoff. |
 | replay-backed Arrow batch (`ReplayBackedArrowBatch`, `src/storage/mod.rs`) | A storage-buffer input produced from a durably-spooled OTLP request. It must carry a replay-backed record ref. |
-| best-effort Arrow batch (`BestEffortArrowBatch`, `src/storage/mod.rs`) | A storage-buffer input produced by sanctioned internal telemetry. It has no raw-spool record and cannot be checkpointed or replayed. |
-| write buffer (`ArrowWriteBuffer`, `src/storage/arrow_write_buffer.rs`) | The in-memory, per-storage-signal accumulator that coalesces Arrow row batches before a seal flushes them. Each buffered unit is either replay-backed ingest data or best-effort internal data. |
+| internal telemetry commit (`Storage::commit_operator_metrics_snapshot`, `src/storage/arrow_write_buffer.rs`) | A separate storage path for sanctioned operator self-telemetry. It commits directly to DuckLake and does not enter the replay-backed ingest write buffer. |
+| write buffer (`ArrowWriteBuffer`, `src/storage/arrow_write_buffer.rs`) | The in-memory, per-storage-signal accumulator that coalesces replay-backed Arrow row batches before a seal flushes them. Every buffered unit came from a durably-spooled external request and carries a replay-backed record ref. |
 | row | A single logical record inside a batch or DuckLake table (one log line, one span, one metric data point). |
 
 ## Operations

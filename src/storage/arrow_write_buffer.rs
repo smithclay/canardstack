@@ -1,56 +1,21 @@
 use super::arrow::{batch_timestamp_days, storage_duckdb_batch};
 use super::arrow_write::{
     arrow_write_buffer_snapshot, size_or_age_due, ArrowFlushOutcome, ArrowFlushResult,
-    ArrowWriteBuffer, BufferDurability,
+    ArrowWriteBuffer,
 };
 use super::ducklake::configure_write_connection;
 use super::{
     ArrowBatchBufferResult, ArrowBatchBufferTiming, ArrowWriteBufferFreshness,
-    ArrowWriteBufferMetric, BestEffortArrowBatch, PreparedArrowBatch, ReplayBackedArrowBatch,
-    Storage, StorageSignal, TimingPhase,
+    ArrowWriteBufferMetric, InternalTelemetryCommitResult, PreparedArrowBatch,
+    ReplayBackedArrowBatch, Storage, StorageSignal, TimingPhase,
 };
 use crate::LockExt;
 use anyhow::{Context, Result};
 use arrow58::compute::concat_batches;
 use arrow58::record_batch::RecordBatch;
 use duckdb::Connection;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant;
-
-enum ArrowBatchInput<'a> {
-    ReplayBacked(&'a ReplayBackedArrowBatch<'a>),
-    BestEffort(&'a BestEffortArrowBatch<'a>),
-}
-
-impl<'a> ArrowBatchInput<'a> {
-    fn storage_signal(&self) -> StorageSignal {
-        match self {
-            Self::ReplayBacked(batch) => batch.storage_signal,
-            Self::BestEffort(batch) => batch.storage_signal,
-        }
-    }
-
-    fn batch(&self) -> &'a RecordBatch {
-        match self {
-            Self::ReplayBacked(batch) => batch.batch,
-            Self::BestEffort(batch) => batch.batch,
-        }
-    }
-
-    fn source_format(&self) -> &'a str {
-        match self {
-            Self::ReplayBacked(batch) => batch.source_format,
-            Self::BestEffort(batch) => batch.source_format,
-        }
-    }
-
-    fn durability(&self) -> BufferDurability {
-        match self {
-            Self::ReplayBacked(batch) => BufferDurability::replay_backed(batch.replay_ref),
-            Self::BestEffort(_) => BufferDurability::best_effort(),
-        }
-    }
-}
 
 impl Storage {
     /// The single size/age flush-threshold predicate, exposed so the
@@ -82,99 +47,59 @@ impl Storage {
         freshness_from_buffers(&buffers)
     }
 
-    /// The single sanctioned production entry to the best-effort write path:
-    /// buffer the operator metrics snapshot (the sole in-tree caller is
-    /// `crate::metrics::Metrics::write_snapshot_to_storage`). Operator
-    /// self-telemetry is queryable when enabled but carries no raw-spool replay
-    /// record, so it can never be checkpointed or replayed — see the invariant on
-    /// [`BestEffortArrowBatch`]. Production routes through this `pub(crate)` seam so
-    /// it never depends on the `#[doc(hidden)]` best-effort entry points below,
-    /// which exist only for in-repo benches/tests.
-    pub(crate) fn buffer_operator_metrics_snapshot(
+    /// Commit a sanctioned internal operator-metrics batch directly to DuckLake.
+    ///
+    /// This is deliberately not an Arrow write-buffer entry point: external OTLP
+    /// ingest reaches the buffer only through replay-backed batches, while internal
+    /// self-telemetry has no raw-spool record to checkpoint and commits on its own
+    /// clearly named path.
+    pub(crate) fn commit_operator_metrics_snapshot(
         &self,
         storage_signal: StorageSignal,
         batch: &RecordBatch,
         source_format: &str,
-    ) -> Result<usize> {
-        self.buffer_best_effort_arrow_records(storage_signal, batch, source_format)
+    ) -> Result<InternalTelemetryCommitResult> {
+        self.commit_internal_telemetry_batch(storage_signal, batch, source_format)
     }
 
-    /// Buffer best-effort rows, bypassing the raw spool. Not part of the supported
-    /// public API (`#[doc(hidden)]`): in production the sole best-effort caller is
-    /// [`Storage::buffer_operator_metrics_snapshot`]; this entry is `pub` only so
-    /// in-repo benches/tests (separate crates) can drive the path directly. Honor
-    /// the invariant on [`BestEffortArrowBatch`]: external ingest MUST NOT use this
-    /// path (no replay ref, cannot be checkpointed) — it goes through
-    /// [`Storage::buffer_replay_backed_arrow_batches`].
+    /// Direct internal telemetry commit helper for in-repo tests and benches.
+    /// Production operator metrics route through
+    /// [`Storage::commit_operator_metrics_snapshot`]. This helper does not touch
+    /// the ingest write buffer and must not be used for external OTLP ingest.
     #[doc(hidden)]
-    pub fn buffer_best_effort_arrow_records(
+    pub fn commit_internal_telemetry_batch(
         &self,
         storage_signal: StorageSignal,
         batch: &RecordBatch,
         source_format: &str,
-    ) -> Result<usize> {
-        let result = self.buffer_best_effort_arrow_batch(BestEffortArrowBatch {
-            storage_signal,
-            batch,
-            source_format,
-        })?;
-        Ok(result.rows)
-    }
-
-    /// Buffer one best-effort batch. Not part of the supported public API
-    /// (`#[doc(hidden)]`): in production the sole best-effort caller is
-    /// [`Storage::buffer_operator_metrics_snapshot`]; this entry is `pub` only so
-    /// in-repo benches/tests can reach it. See the invariant on
-    /// [`BestEffortArrowBatch`]: external ingest uses
-    /// [`Storage::buffer_replay_backed_arrow_batches`].
-    #[doc(hidden)]
-    pub fn buffer_best_effort_arrow_batch(
-        &self,
-        batch: BestEffortArrowBatch<'_>,
-    ) -> Result<ArrowBatchBufferResult> {
-        self.buffer_arrow_batches(&[ArrowBatchInput::BestEffort(&batch)])
+    ) -> Result<InternalTelemetryCommitResult> {
+        self.commit_internal_telemetry_records(storage_signal, batch, source_format)
     }
 
     pub(crate) fn buffer_replay_backed_arrow_batches(
         &self,
         batches: &[ReplayBackedArrowBatch<'_>],
     ) -> Result<ArrowBatchBufferResult> {
-        let inputs = batches
-            .iter()
-            .map(ArrowBatchInput::ReplayBacked)
-            .collect::<Vec<_>>();
-        self.buffer_arrow_batches(&inputs)
-    }
-
-    fn buffer_arrow_batches(
-        &self,
-        batches: &[ArrowBatchInput<'_>],
-    ) -> Result<ArrowBatchBufferResult> {
         let mut prepared = Vec::new();
         let mut prepare_timings = Vec::new();
         let mut attempted_rows = 0;
         let mut grouped =
-            BTreeMap::<(StorageSignal, &str), (Vec<&RecordBatch>, BufferDurability, usize)>::new();
+            BTreeMap::<(StorageSignal, &str), (Vec<&RecordBatch>, BTreeSet<_>)>::new();
         for batch in batches {
-            let storage_signal = batch.storage_signal();
-            let record_batch = batch.batch();
+            let storage_signal = batch.storage_signal;
+            let record_batch = batch.batch;
             if record_batch.num_rows() == 0 {
                 continue;
             }
             let rows = record_batch.num_rows();
             attempted_rows += rows;
-            let (batch_refs, durability, best_effort_rows) = grouped
-                .entry((storage_signal, batch.source_format()))
-                .or_insert_with(|| (Vec::new(), BufferDurability::empty(), 0));
-            let batch_durability = batch.durability();
-            let is_best_effort = matches!(batch, ArrowBatchInput::BestEffort(_));
-            durability.merge(batch_durability);
-            if is_best_effort {
-                *best_effort_rows += rows;
-            }
+            let (batch_refs, replay_refs) = grouped
+                .entry((storage_signal, batch.source_format))
+                .or_default();
+            replay_refs.insert(batch.replay_ref);
             batch_refs.push(record_batch);
         }
-        for ((storage_signal, source_format), (batches, durability, best_effort_rows)) in grouped {
+        for ((storage_signal, source_format), (batches, replay_refs)) in grouped {
             let rows = batches.iter().map(|batch| batch.num_rows()).sum();
             let coalesce_started = Instant::now();
             let batch = coalesce_storage_batches(storage_signal, &batches)?;
@@ -193,8 +118,7 @@ impl Storage {
                 batch: prepared_batch,
                 rows,
                 timestamp_days,
-                durability,
-                best_effort_rows,
+                replay_refs,
             });
             prepare_timings.push(ArrowBatchBufferTiming {
                 storage_signal,
@@ -212,6 +136,78 @@ impl Storage {
         }
 
         self.buffer_arrow_write_batches(prepared, prepare_timings, attempted_rows)
+    }
+
+    fn commit_internal_telemetry_records(
+        &self,
+        storage_signal: StorageSignal,
+        batch: &RecordBatch,
+        source_format: &str,
+    ) -> Result<InternalTelemetryCommitResult> {
+        if !self.ducklake_available {
+            anyhow::bail!("internal telemetry commit requires DuckLake storage");
+        }
+        if batch.num_rows() == 0 {
+            return Ok(InternalTelemetryCommitResult {
+                rows: 0,
+                timings: Vec::new(),
+            });
+        }
+
+        let rows = batch.num_rows();
+        let prepare_started = Instant::now();
+        let prepared = storage_duckdb_batch(storage_signal, batch, source_format)?;
+        let timestamp_days = batch_timestamp_days(&prepared)?;
+        let mut timings = vec![ArrowBatchBufferTiming {
+            storage_signal,
+            phase: TimingPhase::Prepare,
+            rows,
+            seconds: prepare_started.elapsed().as_secs_f64(),
+        }];
+
+        let writer_lock_wait_started = Instant::now();
+        let conn = self.writer.lock_or_poisoned();
+        timings.push(ArrowBatchBufferTiming {
+            storage_signal,
+            phase: TimingPhase::WriterLockWait,
+            rows,
+            seconds: writer_lock_wait_started.elapsed().as_secs_f64(),
+        });
+        configure_write_connection(&conn, &self.write_memory_limit)?;
+
+        conn.execute_batch("BEGIN TRANSACTION;")?;
+        let result = (|| -> Result<()> {
+            let append_started = Instant::now();
+            append_record_batch_to_ducklake(&conn, &self.catalog_name, storage_signal, prepared)?;
+            timings.push(ArrowBatchBufferTiming {
+                storage_signal,
+                phase: TimingPhase::DuckdbArrowAppend,
+                rows,
+                seconds: append_started.elapsed().as_secs_f64(),
+            });
+
+            let commit_started = Instant::now();
+            conn.execute_batch("COMMIT;")?;
+            timings.push(ArrowBatchBufferTiming {
+                storage_signal,
+                phase: TimingPhase::DucklakeCommit,
+                rows,
+                seconds: commit_started.elapsed().as_secs_f64(),
+            });
+            Ok(())
+        })();
+
+        if let Err(err) = result {
+            let _ = conn.execute_batch("ROLLBACK;");
+            return Err(err);
+        }
+
+        *self.last_error.lock_or_poisoned() = None;
+        self.mark_metadata_dirty(BTreeMap::from([(
+            storage_signal,
+            timestamp_days.into_iter().collect(),
+        )]));
+        Ok(InternalTelemetryCommitResult { rows, timings })
     }
 
     fn buffer_arrow_write_batches(
@@ -274,7 +270,6 @@ impl Storage {
                     timings: Vec::new(),
                     active_write_buffers: arrow_write_buffer_snapshot(&buffers),
                     replay_refs: Vec::new(),
-                    best_effort_rows: 0,
                 });
             }
             std::mem::take(&mut *buffers)
@@ -297,7 +292,6 @@ impl Storage {
             timings: commit_result.timings,
             active_write_buffers,
             replay_refs: commit_result.replay_refs,
-            best_effort_rows: commit_result.best_effort_rows,
         })
     }
 
@@ -308,14 +302,10 @@ impl Storage {
         let rows = buffers.values().map(|buffer| buffer.rows).sum();
         let replay_refs = buffers
             .values()
-            .flat_map(|buffer| buffer.durability.replay_refs())
+            .flat_map(|buffer| buffer.replay_refs.iter().copied())
             .collect::<std::collections::BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
-        let best_effort_rows = buffers
-            .values()
-            .map(|buffer| buffer.best_effort_rows)
-            .sum::<usize>();
         let affected = buffers
             .iter()
             .map(|(&storage_signal, buffer)| (storage_signal, buffer.timestamp_days.clone()))
@@ -342,7 +332,6 @@ impl Storage {
             timings,
             affected,
             replay_refs,
-            best_effort_rows,
         })
     }
 
