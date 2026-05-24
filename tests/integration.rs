@@ -1374,7 +1374,7 @@ fn raw_spool_replays_pending_request_on_startup() {
                 .join(OtlpRequestKind::Logs.as_str()),
             max_segment_bytes: config.mechanics.raw_spool_max_segment_bytes as u64,
             max_record_bytes: config.mechanics.raw_spool_max_record_bytes as u64,
-            max_total_bytes: config.mechanics.raw_spool_max_total_bytes as u64,
+            max_total_bytes: config.mechanics.raw_spool_max_total_bytes_per_request_kind as u64,
             checkpoint_fsync_records: 1024,
             checkpoint_fsync_delay: std::time::Duration::from_millis(1000),
         })
@@ -1434,7 +1434,7 @@ fn raw_spool_replays_one_metrics_request_into_gauge_and_sum_tables() {
                 .join(OtlpRequestKind::Metrics.as_str()),
             max_segment_bytes: config.mechanics.raw_spool_max_segment_bytes as u64,
             max_record_bytes: config.mechanics.raw_spool_max_record_bytes as u64,
-            max_total_bytes: config.mechanics.raw_spool_max_total_bytes as u64,
+            max_total_bytes: config.mechanics.raw_spool_max_total_bytes_per_request_kind as u64,
             checkpoint_fsync_records: 1024,
             checkpoint_fsync_delay: std::time::Duration::from_millis(1000),
         })
@@ -1470,6 +1470,69 @@ fn raw_spool_replays_one_metrics_request_into_gauge_and_sum_tables() {
 }
 
 #[test]
+fn metrics_request_fans_out_to_two_storage_signals_but_one_raw_spool_identity() {
+    // Pins the raw-spool partitioning policy on the normal ingest path: the raw
+    // spool is partitioned by OtlpRequestKind (one writer per logs/traces/metrics),
+    // NOT by StorageSignal. A single metrics request fans out to TWO storage
+    // signals (metric_gauge + metric_sum) but is spooled and checkpointed through
+    // exactly ONE request-kind raw-spool identity ("metrics"). So a future storage
+    // signal reuses its request kind's existing writer; only a new request kind
+    // needs a new writer.
+    let dir = tempdir().unwrap();
+    let mut config = Config::test(dir.path().join("canardstack.duckdb"));
+    config.operator.local_storage_dir = dir.path().join("storage");
+    config.mechanics.raw_spool_dir = dir.path().join("raw-spool");
+    let state = AppState::new(config).unwrap();
+
+    let body = metric_fixture(Utc::now().timestamp_nanos_opt().unwrap()).to_string();
+    let response = http::route(
+        "POST",
+        "/v1/metrics",
+        &HashMap::new(),
+        &headers(&state),
+        body.as_bytes(),
+        &state,
+    );
+    assert_eq!(response.status(), 202, "{}", response.json_body());
+
+    // One metrics request = exactly one raw-spool record under the "metrics"
+    // identity (not one record per storage signal).
+    let metrics = metrics_text(&state);
+    assert!(
+        metrics.contains(
+            "canardstack_raw_spool_records_total{request_kind=\"metrics\",status=\"spooled\"} 1"
+        ),
+        "{metrics}"
+    );
+
+    seal_all(&state);
+
+    // Fans out to two storage signals...
+    assert_eq!(metric_gauge_rows(&state), 1);
+    assert_eq!(metric_sum_rows(&state), 1);
+
+    // ...but checkpoints through exactly one request-kind raw-spool identity, and
+    // never touches the logs/traces raw-spool identities.
+    let metrics = metrics_text(&state);
+    assert!(
+        metrics.contains(
+            "canardstack_raw_spool_checkpointed_records_total{request_kind=\"metrics\",reason=\"storage_committed\"} 1"
+        ),
+        "{metrics}"
+    );
+    assert!(
+        !metrics.contains("canardstack_raw_spool_checkpointed_records_total{request_kind=\"logs\""),
+        "{metrics}"
+    );
+    assert!(
+        !metrics
+            .contains("canardstack_raw_spool_checkpointed_records_total{request_kind=\"traces\""),
+        "{metrics}"
+    );
+    assert_eq!(state.ingestor.raw_spool_stats().unwrap().pending_records, 0);
+}
+
+#[test]
 fn raw_spool_replay_failure_does_not_abort_boot() {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
@@ -1483,7 +1546,7 @@ fn raw_spool_replay_failure_does_not_abort_boot() {
                 .join(OtlpRequestKind::Logs.as_str()),
             max_segment_bytes: config.mechanics.raw_spool_max_segment_bytes as u64,
             max_record_bytes: config.mechanics.raw_spool_max_record_bytes as u64,
-            max_total_bytes: config.mechanics.raw_spool_max_total_bytes as u64,
+            max_total_bytes: config.mechanics.raw_spool_max_total_bytes_per_request_kind as u64,
             checkpoint_fsync_records: 1024,
             checkpoint_fsync_delay: std::time::Duration::from_millis(1000),
         })
@@ -1554,7 +1617,7 @@ fn raw_spool_full_returns_429_before_transform() {
     config.mechanics.raw_spool_dir = dir.path().join("raw-spool");
     config.mechanics.raw_spool_max_segment_bytes = 16 * 1024;
     config.mechanics.raw_spool_max_record_bytes = 16 * 1024;
-    config.mechanics.raw_spool_max_total_bytes = 1;
+    config.mechanics.raw_spool_max_total_bytes_per_request_kind = 1;
     let state = AppState::new(config).unwrap();
     let body = log_fixture(Utc::now().timestamp_nanos_opt().unwrap()).to_string();
 
@@ -3385,9 +3448,12 @@ fn config_validate_rejects_invalid_raw_spool_limits() {
     let mutations: [fn(&mut Config); 5] = [
         |c| c.mechanics.raw_spool_max_segment_bytes = 0,
         |c| c.mechanics.raw_spool_max_record_bytes = 0,
-        |c| c.mechanics.raw_spool_max_total_bytes = 0,
+        |c| c.mechanics.raw_spool_max_total_bytes_per_request_kind = 0,
         |c| c.mechanics.raw_spool_group_commit_delay = std::time::Duration::ZERO,
-        |c| c.mechanics.raw_spool_max_record_bytes = c.mechanics.raw_spool_max_total_bytes + 1,
+        |c| {
+            c.mechanics.raw_spool_max_record_bytes =
+                c.mechanics.raw_spool_max_total_bytes_per_request_kind + 1
+        },
     ];
     for mutate in mutations {
         let mut config = Config::test(path.clone());

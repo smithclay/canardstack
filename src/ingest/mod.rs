@@ -33,6 +33,12 @@ pub(crate) use raw_spool::ReplayBackedRecordRef;
 use worker::IngestWorkerPool;
 pub(crate) use worker::INGEST_WORKER_CHANNEL_CAPACITY;
 
+/// The OTLP ingress vocabulary, and the dimension the raw spool is partitioned
+/// by: one durable raw-spool writer per variant (see [`raw_spool::RawSpool`]). A
+/// request is spooled and checkpointed under one `OtlpRequestKind` identity even
+/// when it fans out to several [`StorageSignal`]s via [`Self::storage_signals`]
+/// (metrics -> `metric_gauge` + `metric_sum`). Adding a `StorageSignal` does not
+/// add a raw-spool writer; only adding a request kind here does.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize)]
 pub enum OtlpRequestKind {
     Logs,

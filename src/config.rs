@@ -126,9 +126,9 @@ pub struct Mechanics {
     /// Durable raw-spool byte capacity applied **per request kind**: each of the
     /// three raw-spool writers (logs/traces/metrics) enforces this cap on its own
     /// segment files independently, so the aggregate worst-case raw-spool
-    /// footprint is up to `3 * raw_spool_max_total_bytes`. Set via
+    /// footprint is up to `3 * raw_spool_max_total_bytes_per_request_kind`. Set via
     /// `CANARDSTACK_RAW_SPOOL_CAPACITY_BYTES` / `[raw_spool] capacity_bytes`.
-    pub raw_spool_max_total_bytes: usize,
+    pub raw_spool_max_total_bytes_per_request_kind: usize,
     pub raw_spool_group_commit_delay: Duration,
     pub ingest_workers: usize,
     /// When true, the scheduler's metrics-snapshot job writes a snapshot of the
@@ -219,7 +219,9 @@ impl Config {
         // Cross-field check spanning both sub-structs: the raw-spool max record
         // size derives from operator.max_body_bytes and must fit the mechanics
         // raw-spool total capacity.
-        if self.mechanics.raw_spool_max_record_bytes > self.mechanics.raw_spool_max_total_bytes {
+        if self.mechanics.raw_spool_max_record_bytes
+            > self.mechanics.raw_spool_max_total_bytes_per_request_kind
+        {
             anyhow::bail!(
                 "CANARDSTACK_MAX_BODY_BYTES must be <= CANARDSTACK_RAW_SPOOL_CAPACITY_BYTES"
             );
@@ -466,7 +468,7 @@ impl Mechanics {
             raw_spool_dir: data_dir.join("raw-spool"),
             raw_spool_max_segment_bytes: (64 * 1024 * 1024).min(raw_spool_capacity_bytes),
             raw_spool_max_record_bytes: max_body_bytes,
-            raw_spool_max_total_bytes: raw_spool_capacity_bytes,
+            raw_spool_max_total_bytes_per_request_kind: raw_spool_capacity_bytes,
             raw_spool_group_commit_delay: Duration::from_millis(
                 env_usize("CANARDSTACK_RAW_SPOOL_GROUP_COMMIT_MS")?
                     .or(file.usize(&["raw_spool", "group_commit_ms"])?)
@@ -492,7 +494,7 @@ impl Mechanics {
             raw_spool_dir: local_storage_dir.join("raw-spool"),
             raw_spool_max_segment_bytes: 64 * 1024 * 1024,
             raw_spool_max_record_bytes: 8 * 1024 * 1024,
-            raw_spool_max_total_bytes: 1024 * 1024 * 1024,
+            raw_spool_max_total_bytes_per_request_kind: 1024 * 1024 * 1024,
             raw_spool_group_commit_delay: Duration::from_millis(1),
             ingest_workers: 4,
             operator_metrics_to_storage: false,
@@ -509,7 +511,7 @@ impl Mechanics {
         }
         if self.raw_spool_max_segment_bytes == 0
             || self.raw_spool_max_record_bytes == 0
-            || self.raw_spool_max_total_bytes == 0
+            || self.raw_spool_max_total_bytes_per_request_kind == 0
         {
             anyhow::bail!("raw spool limits must be > 0");
         }
@@ -953,7 +955,10 @@ group_commit_ms = 3
             config.mechanics.scheduler_retention_interval,
             Duration::from_secs(4800)
         );
-        assert_eq!(config.mechanics.raw_spool_max_total_bytes, 16_384);
+        assert_eq!(
+            config.mechanics.raw_spool_max_total_bytes_per_request_kind,
+            16_384
+        );
         assert_eq!(config.mechanics.raw_spool_max_segment_bytes, 16_384);
         assert_eq!(config.mechanics.raw_spool_max_record_bytes, 12_345);
         assert_eq!(

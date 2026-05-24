@@ -9,7 +9,7 @@ compatibility query surface uses), where that distinction applies.
 
 | Term (type) | Unit | Definition |
 | --- | --- | --- |
-| request kind (`OtlpRequestKind`, `src/ingest/mod.rs`) | INGRESS | The OTLP request, one of `logs` / `traces` / `metrics`. This is the per-signal label `request_kind` on the ingest/raw-spool metric surface. |
+| request kind (`OtlpRequestKind`, `src/ingest/mod.rs`) | INGRESS | The OTLP request, one of `logs` / `traces` / `metrics`. This is the per-signal label `request_kind` on the ingest/raw-spool metric surface. It is also the dimension the raw spool is **partitioned** by: one durable writer per request kind, with per-kind capacity. A request is spooled and checkpointed under one request-kind identity even when it fans out to several storage signals, so a new storage signal reuses its request kind's existing writer; only a new request kind adds one. |
 | storage signal (`StorageSignal`, `src/signal.rs`) | STORAGE | One physical signal per DuckLake table: `logs` / `spans` / `metric_gauge` / `metric_sum`. A single `metrics` request kind fans out into both `metric_gauge` and `metric_sum` storage signals; histograms are rejected in v0. |
 | metric subtype (`MetricSignal`, `src/query/plan.rs`) | QUERY | The query-side metric distinction `gauge` / `sum`. It maps onto a `StorageSignal` via `MetricSignal::storage_signal()` (`Gauge -> MetricGauge`, `Sum -> MetricSum`). |
 
@@ -19,7 +19,7 @@ compatibility query surface uses), where that distinction applies.
 | --- | --- |
 | raw record (`spool::Record`, `src/ingest/spool/mod.rs`) | The durably-spooled raw OTLP request: exactly what the client sent, fsynced to the local raw spool before any transform. At-least-once delivery is anchored on this record. |
 | pending raw record (`PendingRawRecord`, `src/ingest/raw_spool.rs`) | A raw record recovered from the local raw spool because it has not been checkpointed. Startup replay hands these records back to the ingest pipeline without appending a second raw-spool copy. |
-| replay-backed record ref (`ReplayBackedRecordRef`, `src/ingest/raw_spool.rs`) | The checkpoint identity carried by normal ingest rows after they enter the Arrow write buffer: the original request kind, the raw-spool request-kind writer, and the raw record id. Seal checkpoints these refs only after DuckLake commit. |
+| replay-backed record ref (`ReplayBackedRecordRef`, `src/ingest/raw_spool.rs`) | The checkpoint identity carried by normal ingest rows after they enter the Arrow write buffer: the request kind it was spooled under (which is also its raw-spool writer) and the raw record id. Seal checkpoints these refs only after DuckLake commit. |
 | Arrow row batch (`RecordBatch`, a "batch") | The transformed columnar unit produced by `otlp2records`, grouped by storage signal. The columnar form of a chunk of rows; do not use "batch" for a raw-spool record or worker handoff. |
 | replay-backed Arrow batch (`ReplayBackedArrowBatch`, `src/storage/mod.rs`) | A storage-buffer input produced from a durably-spooled OTLP request. It must carry a replay-backed record ref. |
 | best-effort Arrow batch (`BestEffortArrowBatch`, `src/storage/mod.rs`) | A storage-buffer input produced by sanctioned internal telemetry. It has no raw-spool record and cannot be checkpointed or replayed. |

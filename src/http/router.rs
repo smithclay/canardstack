@@ -192,6 +192,11 @@ fn route_inner(
                     "raw_spool": raw_spool,
                     "raw_spool_by_request_kind": raw_spool_by_request_kind,
                     "raw_spool_config": {
+                        // The raw spool is partitioned by request kind (one writer
+                        // per logs/traces/metrics); capacity is per-kind, so the
+                        // aggregate worst case is 3x the limit below. See `RawSpool`.
+                        "partition": "per_request_kind",
+                        "max_total_bytes_per_request_kind": state.config.mechanics.raw_spool_max_total_bytes_per_request_kind,
                         "writer_queue_capacity": crate::ingest::spool::RAW_SPOOL_WRITER_QUEUE_CAPACITY,
                         "group_commit_records": crate::ingest::spool::RAW_SPOOL_GROUP_COMMIT_RECORDS,
                         "group_commit_ms": state.config.mechanics.raw_spool_group_commit_delay.as_millis(),

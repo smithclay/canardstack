@@ -42,19 +42,32 @@ pub(crate) struct PendingRawRecord {
     pub(crate) compressed_body: Vec<u8>,
 }
 
-/// One independent durable raw-spool writer per [`OtlpRequestKind`]
-/// (logs / traces / metrics), each owning its own directory, segment files, and
-/// checkpoint log.
+/// The durable raw-spool, **partitioned by [`OtlpRequestKind`]**: one
+/// independent writer per logs / traces / metrics, each owning its own
+/// directory, segment files, and checkpoint log. Request kind — NOT
+/// `StorageSignal` — is the partitioning dimension, and this is the settled v0
+/// policy, not an accident:
 ///
-/// Capacity is **per request kind, not a global aggregate.** The configured
-/// `raw_spool_max_total_bytes` (env `CANARDSTACK_RAW_SPOOL_CAPACITY_BYTES`,
-/// file `[raw_spool] capacity_bytes`) is applied independently to each of the
-/// three writers, so the worst-case on-disk raw-spool footprint is up to
-/// `3 * raw_spool_max_total_bytes`. A `raw_spool_full` 429 therefore means ONE
-/// request kind hit its own byte cap, not that the aggregate limit was reached.
-/// (Whether per-kind or aggregate accounting is the right operator model is a
-/// deliberate open decision; do not add a future storage signal's writer assuming
-/// one global limit without revisiting this.)
+/// - A request is spooled once, under its [`OtlpRequestKind`] identity, and is
+///   later checkpointed once, under that same identity — even when it fans out to
+///   several storage signals. A metrics request fans out to two storage signals
+///   (`metric_gauge` + `metric_sum`) but is spooled and checkpointed through the
+///   single `metrics` raw-spool identity (see `storage_signals`).
+/// - Therefore **a new storage signal reuses the existing writer of the request
+///   kind it arrives on; only a new request kind adds a writer.** A future metric
+///   subtype needs no new raw-spool writer; a hypothetical new OTLP request kind
+///   would. Adding a `StorageSignal` variant must not add a raw-spool writer.
+///
+/// Capacity follows the same dimension: it is **per request kind, not a global
+/// aggregate.** The configured `raw_spool_max_total_bytes_per_request_kind` (env
+/// `CANARDSTACK_RAW_SPOOL_CAPACITY_BYTES`, file `[raw_spool] capacity_bytes`) is
+/// applied independently to each writer, so the worst-case on-disk raw-spool
+/// footprint is up to `3 * raw_spool_max_total_bytes_per_request_kind`. A
+/// `raw_spool_full` 429 means ONE request kind hit its own byte cap, not that an
+/// aggregate limit was reached. The admin ingest-health `raw_spool_config` block
+/// reports this as `partition: per_request_kind`. Moving to an aggregate cap
+/// would require accounting across the three writers, not three independent
+/// limits dressed up as one.
 pub(crate) struct RawSpool {
     writers: BTreeMap<OtlpRequestKind, Writer>,
 }
@@ -611,7 +624,7 @@ fn spawn_raw_spool_writer(config: &Config, request_kind: OtlpRequestKind) -> Res
             max_record_bytes: config.mechanics.raw_spool_max_record_bytes as u64,
             // Per-request-kind cap: every writer gets the same configured value,
             // so the aggregate footprint is up to 3x this. See `RawSpool` docs.
-            max_total_bytes: config.mechanics.raw_spool_max_total_bytes as u64,
+            max_total_bytes: config.mechanics.raw_spool_max_total_bytes_per_request_kind as u64,
             checkpoint_fsync_records: spool::RAW_SPOOL_CHECKPOINT_FSYNC_RECORDS,
             checkpoint_fsync_delay: spool::RAW_SPOOL_CHECKPOINT_FSYNC_DELAY,
         },
