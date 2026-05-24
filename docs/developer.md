@@ -331,11 +331,13 @@ loop without operator action:
   threads do not perform DuckDB/DuckLake writes inline.
 - A periodic seal writes Arrow buffers through DuckDB Arrow append and commits
   DuckLake.
+- A checkpoint pass runs DuckDB/DuckLake `CHECKPOINT` as the single physical
+  maintenance primitive when DuckLake maintenance is enabled. `CHECKPOINT` owns
+  inlined-data flush, snapshot expiration, adjacent-file merge, delete-file
+  rewrite, cleanup, and orphan deletion.
 - A retention pass enforces the configured telemetry retention days, then runs
-  DuckDB/DuckLake `CHECKPOINT` as the single physical maintenance primitive when
-  DuckLake maintenance is enabled. `CHECKPOINT` owns inlined-data flush,
-  snapshot expiration, adjacent-file merge, delete-file rewrite, cleanup, and
-  orphan deletion.
+  the same checkpoint path. Use `POST /api/admin/maintenance/checkpoint/run`
+  when you want physical compaction without logical telemetry deletes.
 
 `POST /api/admin/maintenance/pause` pauses scheduled jobs only; manual seal and
 retention endpoints remain available for repair workflows. The base cadence is

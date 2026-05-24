@@ -177,12 +177,12 @@ because accepted requests are fsynced before acknowledgement.
 
 | Metric | Type | Labels | Purpose |
 | --- | --- | --- | --- |
-| `canardstack_maintenance_runs_total` | Counter | `job`, `status`, `reason` | Job outcomes (`status=ok` or `status=error`). |
+| `canardstack_maintenance_runs_total` | Counter | `job`, `status`, `reason` | Job outcomes (`status=ok` or `status=error`). Job names include scheduled jobs such as `seal`, `metadata_refresh`, `metrics_snapshot`, and `retention`, plus manual `checkpoint` runs. |
 | `canardstack_maintenance_duration_seconds` | Histogram (`_count` / `_sum`) | `job`, `storage_signal=all` (`table=all` legacy alias) | Job runtime. |
 | `canardstack_maintenance_failures_total` | Counter | `job`, `reason` | Failures only, broken out by classified reason. Bounded reason set: `disk_full`, `seal_failed`, `metadata_refresh_failed`, `metrics_snapshot_failed`, `retention_failed`, `scheduler_job_failed`. Reasons derive from the job name where possible (so dependency wording changes do not silently re-route alerts); only `disk_full` substring-matches OS / DuckDB errors. |
 | `canardstack_maintenance_consecutive_failures` | Gauge | `job` | Consecutive failure count; resets to 0 on success. Drives exponential backoff. |
 | `canardstack_maintenance_paused` | Gauge | none | `1` when scheduled maintenance is paused. |
-| `canardstack_ducklake_maintenance_enabled` | Gauge | none | `1` when canardstack is configured to run DuckLake `CHECKPOINT` after retention. |
+| `canardstack_ducklake_maintenance_enabled` | Gauge | none | `1` when canardstack is configured to run DuckLake `CHECKPOINT` maintenance. |
 | `canardstack_ducklake_checkpoint_runs_total` | Counter | `status`, `reason` | CHECKPOINT outcomes. Bounded reasons are `ok`, `dry_run`, `disabled`, `unsupported`, `other`, and `checkpoint_failed`. |
 
 ## Freshness Metrics

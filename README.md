@@ -73,37 +73,112 @@ SELECT * FROM logs;
 
 ## Demo
 
-Start canardstack and Grafana with local DuckLake storage:
+Run canardstack against the full
+[OpenTelemetry demo](https://github.com/open-telemetry/opentelemetry-demo).
+Keep the demo in a separate checkout; this repo only supplies the collector
+extras file that points the demo collector at canardstack.
+
+In the canardstack checkout, start canardstack and the bundled Grafana
+datasources:
 
 ```bash
-docker compose up --build
+cd canardstack
+docker compose up --build canardstack grafana
 ```
 
-Docker Compose runs:
+This publishes canardstack on `http://localhost:4318` with the default demo key
+`dev-canardstack-key`. Grafana is available on `http://localhost:3000`.
 
-- canardstack on `http://localhost:4318`
-- Grafana on `http://localhost:3000`
-- local DuckLake metadata and data files in the `canardstack-data` Docker volume
-
-In another terminal, send a representative demo workload:
+In a separate checkout, start the full OpenTelemetry demo and mount the
+canardstack collector extras file:
 
 ```bash
-docker compose run --rm smoke
+git clone https://github.com/open-telemetry/opentelemetry-demo.git ../opentelemetry-demo
+cd ../opentelemetry-demo
+
+CANARDSTACK_DIR="$(cd ../canardstack && pwd)"
+DEMO_VERSION="$(sed -n 's/^IMAGE_VERSION=//p' .env)"
+
+OTEL_COLLECTOR_CONFIG_EXTRAS="$CANARDSTACK_DIR/config/otel-demo-collector-extras.yml" \
+DEMO_VERSION="$DEMO_VERSION" \
+docker compose up -d
 ```
 
-The smoke command sends logs, a multi-span trace, gauge samples, and cumulative
-sum samples over OTLP/HTTP. It then checks storage health plus the Prometheus,
-Loki, and Tempo-compatible query paths.
+`DEMO_VERSION="$DEMO_VERSION"` keeps the demo images aligned with the checked-out
+demo config. Without that, some demo checkouts may combine older config files
+with newer `latest-*` images.
 
-Open the provisioned Grafana dashboard:
+Open the demo storefront:
+
+```text
+http://localhost:8080/
+```
+
+The demo load generator starts with the stack and sends logs, traces, and
+metrics through the demo collector. The checked-in extras file adds an
+`otlphttp/canardstack` exporter to the demo's logs, traces, and metrics
+pipelines, using OTLP/HTTP protobuf to `http://host.docker.internal:4318`.
+
+Check that canardstack is receiving the demo:
+
+```bash
+curl -sS -H 'x-api-key: dev-canardstack-key' http://127.0.0.1:4318/metrics \
+  | grep 'canardstack_ingest_requests_total'
+```
+
+You should see accepted `logs`, `traces`, and `metrics` counters climbing. Gauge
+and sum metrics are stored; histogram and exponential histogram datapoints are
+intentionally rejected in v0, so `canardstack_ingest_unsupported_histograms_total`
+is expected to increase during the demo.
+
+Useful query checks after the scheduler has sealed a few batches:
+
+```bash
+curl -sS -H 'x-api-key: dev-canardstack-key' \
+  http://127.0.0.1:4318/loki/api/v1/label/service_name/values
+
+curl -sS -H 'x-api-key: dev-canardstack-key' \
+  http://127.0.0.1:4318/api/search/tags
+```
+
+Open the canardstack Grafana dashboard:
 
 ```text
 http://localhost:3000/d/canardstack-overview/canardstack-overview
 ```
 
-Grafana is the bundled UI. The default dashboard shows the smoke workload
-alongside canardstack's stored self-metrics. Use `admin/admin` if you log in
-directly.
+If you only want the smaller built-in smoke workload instead of the full
+OpenTelemetry demo, run the deterministic smoke check from the canardstack
+checkout:
+
+```bash
+cd ../canardstack
+docker compose run --rm smoke
+```
+
+The smoke command sends logs, a multi-span trace, gauge samples, and cumulative
+sum samples over OTLP/HTTP, then checks storage health plus the Prometheus,
+Loki, and Tempo-compatible query paths.
+
+To stop the demo and canardstack:
+
+```bash
+cd ../opentelemetry-demo
+docker compose down
+
+cd ../canardstack
+docker compose down
+```
+
+Notes:
+
+- `host.docker.internal` works out of the box on Docker Desktop and OrbStack. On
+  plain Linux Docker Engine, use an equivalent host-gateway address or add a
+  host alias for the demo collector.
+- The extras file keeps the demo's Jaeger, Prometheus, and OpenSearch exporters
+  enabled, but narrows the metrics receivers to OTLP and spanmetrics for local
+  portability.
+- Use `admin/admin` if you log in to the bundled Grafana directly.
 
 ## What You Can Do
 

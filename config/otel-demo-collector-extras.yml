@@ -1,0 +1,36 @@
+# OpenTelemetry demo collector extras for sending demo telemetry to canardstack.
+#
+# Use this file from a separate opentelemetry-demo checkout:
+#
+#   OTEL_COLLECTOR_CONFIG_EXTRAS=/path/to/canardstack/config/otel-demo-collector-extras.yml \
+#     docker compose up -d
+#
+# The demo collector runs in Docker, so it reaches the canardstack port published
+# on the host through host.docker.internal. Docker Desktop and OrbStack provide
+# this host name by default.
+
+exporters:
+  otlphttp/canardstack:
+    endpoint: http://host.docker.internal:4318
+    encoding: proto
+    headers:
+      x-api-key: dev-canardstack-key
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [resourcedetection, memory_limiter, transform, batch]
+      exporters: [otlp, debug, spanmetrics, otlphttp/canardstack]
+    metrics:
+      # Keep the app/span metrics path small and portable. The upstream demo's
+      # default metrics receivers also scrape Docker, host, Postgres, Redis, and
+      # nginx; those are useful for the demo's own dashboards but can be brittle
+      # across local Docker runtimes.
+      receivers: [otlp, spanmetrics]
+      processors: [resourcedetection, memory_limiter, batch]
+      exporters: [otlphttp/prometheus, debug, otlphttp/canardstack]
+    logs:
+      receivers: [otlp]
+      processors: [resourcedetection, memory_limiter, batch]
+      exporters: [opensearch, debug, otlphttp/canardstack]

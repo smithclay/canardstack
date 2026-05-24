@@ -251,9 +251,14 @@ endpoint. Steps 2 and 3 require an operator-driven restart.
 
 ### Immediate Mitigation
 
-1. Run `POST /api/admin/maintenance/retention/dry-run`.
-2. Check the returned table counts and `/api/admin/health/storage`.
-3. Run `POST /api/admin/maintenance/retention/run`.
+1. Check `/api/admin/health/storage` and compare active DuckLake data-file counts
+   with logical rows.
+2. If active file counts are high but logical history should be preserved, run
+   `POST /api/admin/maintenance/checkpoint/run`. This triggers DuckLake physical
+   maintenance without applying telemetry retention deletes.
+3. If old telemetry should be removed, run
+   `POST /api/admin/maintenance/retention/dry-run`, check the returned table
+   counts, then run `POST /api/admin/maintenance/retention/run`.
 4. If storage is near full, reduce upstream ingest or add storage before accepting more data.
 5. Shorten retention only after confirming the run succeeds and physical bytes fall.
 

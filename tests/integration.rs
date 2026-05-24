@@ -11,7 +11,7 @@ use canardstack::{AppState, Config, Scheduler};
 
 mod common;
 use arrow58::array::{
-    Float64Array, Int32Array, Int64Array, StringArray, TimestampMicrosecondArray,
+    BooleanArray, Float64Array, Int32Array, Int64Array, StringArray, TimestampMicrosecondArray,
 };
 use arrow58::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow58::record_batch::RecordBatch;
@@ -358,6 +358,78 @@ fn append_gauge_rows(state: &AppState, rows: &[(i64, &str, f64, &str)], source_f
     state
         .storage
         .commit_internal_telemetry_batch(StorageSignal::MetricGauge, &batch, source_format)
+        .unwrap();
+}
+
+fn append_sum_rows(state: &AppState, rows: &[(i64, &str, f64, &str)], source_format: &str) {
+    let len = rows.len();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new(
+            "timestamp",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            true,
+        ),
+        Field::new("start_timestamp", DataType::Int64, true),
+        Field::new("metric_name", DataType::Utf8, true),
+        Field::new("metric_description", DataType::Utf8, true),
+        Field::new("metric_unit", DataType::Utf8, true),
+        Field::new("value", DataType::Float64, true),
+        Field::new("service_name", DataType::Utf8, true),
+        Field::new("service_namespace", DataType::Utf8, true),
+        Field::new("service_instance_id", DataType::Utf8, true),
+        Field::new("resource_attributes", DataType::Utf8, true),
+        Field::new("scope_name", DataType::Utf8, true),
+        Field::new("scope_version", DataType::Utf8, true),
+        Field::new("scope_attributes", DataType::Utf8, true),
+        Field::new("metric_attributes", DataType::Utf8, true),
+        Field::new("flags", DataType::Int32, true),
+        Field::new("exemplars_json", DataType::Utf8, true),
+        Field::new("aggregation_temporality", DataType::Int32, true),
+        Field::new("is_monotonic", DataType::Boolean, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(TimestampMicrosecondArray::from(
+                rows.iter()
+                    .map(|(ms, _, _, _)| Some(ms.saturating_mul(1000)))
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(Int64Array::from(vec![None; len])),
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|(_, name, _, _)| Some((*name).to_string()))
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(vec![None::<String>; len])),
+            Arc::new(StringArray::from(vec![None::<String>; len])),
+            Arc::new(Float64Array::from(
+                rows.iter()
+                    .map(|(_, _, value, _)| Some(*value))
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|(_, _, _, service)| Some((*service).to_string()))
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(vec![None::<String>; len])),
+            Arc::new(StringArray::from(vec![None::<String>; len])),
+            Arc::new(StringArray::from(vec![Some("{}".to_string()); len])),
+            Arc::new(StringArray::from(vec![None::<String>; len])),
+            Arc::new(StringArray::from(vec![None::<String>; len])),
+            Arc::new(StringArray::from(vec![None::<String>; len])),
+            Arc::new(StringArray::from(vec![None::<String>; len])),
+            Arc::new(Int32Array::from(vec![None; len])),
+            Arc::new(StringArray::from(vec![None::<String>; len])),
+            Arc::new(Int32Array::from(vec![Some(2); len])),
+            Arc::new(BooleanArray::from(vec![Some(true); len])),
+        ],
+    )
+    .unwrap();
+    state
+        .storage
+        .commit_internal_telemetry_batch(StorageSignal::MetricSum, &batch, source_format)
         .unwrap();
 }
 
@@ -1887,6 +1959,86 @@ fn prometheus_instant_query_returns_latest_bucket_in_lookback() {
 }
 
 #[test]
+fn prometheus_queries_sum_metric_without_counter_suffix() {
+    let (_dir, state) = app();
+    let at = Utc.with_ymd_and_hms(1970, 1, 1, 0, 11, 0).unwrap();
+    let older = Utc.with_ymd_and_hms(1970, 1, 1, 0, 6, 30).unwrap();
+    let newer = Utc.with_ymd_and_hms(1970, 1, 1, 0, 10, 30).unwrap();
+    append_sum_rows(
+        &state,
+        &[
+            (
+                older.timestamp_millis(),
+                "traces.span.metrics.calls",
+                7.0,
+                "frontend-proxy",
+            ),
+            (
+                newer.timestamp_millis(),
+                "traces.span.metrics.calls",
+                9.0,
+                "frontend-proxy",
+            ),
+        ],
+        "test",
+    );
+
+    let response = http::route(
+        "GET",
+        "/api/v1/query",
+        &HashMap::from([
+            ("query".to_string(), "traces.span.metrics.calls".to_string()),
+            ("time".to_string(), at.timestamp().to_string()),
+        ]),
+        &headers(&state),
+        &[],
+        &state,
+    );
+    assert_eq!(response.status(), 200, "{}", response.json_body());
+    assert_eq!(response.json_body()["data"]["result"][0]["value"][1], "9");
+
+    let response = http::route(
+        "GET",
+        "/api/v1/query_range",
+        &HashMap::from([
+            (
+                "query".to_string(),
+                "sum by (service_name) (traces.span.metrics.calls)".to_string(),
+            ),
+            (
+                "start".to_string(),
+                (at - Duration::minutes(6)).timestamp().to_string(),
+            ),
+            (
+                "end".to_string(),
+                (at + Duration::minutes(1)).timestamp().to_string(),
+            ),
+            ("step".to_string(), "60".to_string()),
+        ]),
+        &headers(&state),
+        &[],
+        &state,
+    );
+    assert_eq!(response.status(), 200, "{}", response.json_body());
+    let result = response.json_body()["data"]["result"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert!(
+        result.iter().any(|series| {
+            series["metric"]["service_name"] == "frontend-proxy"
+                && series["values"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|sample| sample[1] == "9")
+        }),
+        "sum metric fallback missing: {}",
+        response.json_body()
+    );
+}
+
+#[test]
 fn prometheus_query_range_supports_explicit_grouping_over_promoted_labels() {
     let (_dir, state) = app();
     let at = Utc.with_ymd_and_hms(1970, 1, 1, 0, 10, 0).unwrap();
@@ -3104,6 +3256,78 @@ fn retention_dry_run_reports_checkpoint_skipped() {
 }
 
 #[test]
+fn checkpoint_run_does_not_apply_logical_retention() {
+    let dir = tempdir().unwrap();
+    let mut config = Config::test(dir.path().join("canardstack.duckdb"));
+    config.operator.local_storage_dir = dir.path().join("storage");
+    config.operator.logs_retention_days = 1;
+    let state = AppState::new(config).unwrap();
+    let old_ms = (Utc::now() - Duration::days(3)).timestamp_millis();
+    append_log_rows(
+        &state,
+        &[(old_ms, "old checkpoint log", "legacy")],
+        "otlp_json",
+    );
+
+    let response = http::route(
+        "POST",
+        "/api/admin/maintenance/checkpoint/run",
+        &HashMap::new(),
+        &admin_headers(&state),
+        &[],
+        &state,
+    );
+
+    assert_eq!(response.status(), 200, "{}", response.json_body());
+    assert_eq!(response.json_body()["dry_run"], json!(false));
+    assert_eq!(
+        response.json_body()["ducklake_checkpoint"]["status"],
+        json!("ok")
+    );
+    assert!(response.json_body().get("retention").is_none());
+
+    let remaining = state
+        .storage
+        .with_conn(|conn, prefix| {
+            let sql = format!("SELECT count(*) FROM {prefix}logs");
+            let count: i64 = conn.query_row(&sql, [], |row| row.get(0))?;
+            Ok(count)
+        })
+        .unwrap();
+    assert_eq!(remaining, 1);
+}
+
+#[test]
+fn checkpoint_dry_run_reports_checkpoint_skipped() {
+    let (_dir, state) = app();
+
+    let response = http::route(
+        "POST",
+        "/api/admin/maintenance/checkpoint/dry-run",
+        &HashMap::new(),
+        &admin_headers(&state),
+        &[],
+        &state,
+    );
+
+    assert_eq!(response.status(), 200, "{}", response.json_body());
+    assert_eq!(response.json_body()["dry_run"], json!(true));
+    assert_eq!(
+        response.json_body()["ducklake_checkpoint"]["status"],
+        json!("skipped")
+    );
+    assert_eq!(
+        response.json_body()["ducklake_checkpoint"]["reason"],
+        json!("dry_run")
+    );
+    assert_eq!(
+        response.json_body()["ducklake_checkpoint"]["ran"],
+        json!(false)
+    );
+    assert!(response.json_body().get("retention").is_none());
+}
+
+#[test]
 fn disabled_ducklake_maintenance_skips_checkpoint_but_keeps_retention() {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
@@ -3263,6 +3487,8 @@ fn admin_endpoints_reject_data_key_and_unauthenticated_requests() {
         ("POST", "/api/admin/maintenance/pause"),
         ("POST", "/api/admin/maintenance/resume"),
         ("POST", "/api/admin/maintenance/seal"),
+        ("POST", "/api/admin/maintenance/checkpoint/dry-run"),
+        ("POST", "/api/admin/maintenance/checkpoint/run"),
         ("POST", "/api/admin/maintenance/retention/dry-run"),
         ("POST", "/api/admin/maintenance/retention/run"),
     ];

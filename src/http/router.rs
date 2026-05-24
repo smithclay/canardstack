@@ -240,6 +240,22 @@ fn route_inner(
             record_maintenance_metrics(state, "seal", &result, started);
             result
         }),
+        ("POST", "/api/admin/maintenance/checkpoint/dry-run") => admin(headers, state, || {
+            ensure_maintenance_allowed(state)?;
+            run_maintenance_job(state, "checkpoint", || {
+                state
+                    .maintenance
+                    .checkpoint(&state.storage, true, &state.metrics)
+            })
+        }),
+        ("POST", "/api/admin/maintenance/checkpoint/run") => admin(headers, state, || {
+            ensure_maintenance_allowed(state)?;
+            run_maintenance_job(state, "checkpoint", || {
+                state
+                    .maintenance
+                    .checkpoint(&state.storage, false, &state.metrics)
+            })
+        }),
         ("POST", "/api/admin/maintenance/retention/dry-run") => admin(headers, state, || {
             ensure_maintenance_allowed(state)?;
             run_maintenance_job(state, "retention", || {

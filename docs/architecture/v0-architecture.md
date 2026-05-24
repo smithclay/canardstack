@@ -453,8 +453,10 @@ default 14.
 The current implementation uses bounded table deletes for canardstack-owned
 telemetry timestamp retention, then lets DuckDB/DuckLake run the physical
 maintenance sequence with `CHECKPOINT`: inlined-data flush, snapshot expiration,
-adjacent-file merge, delete-file rewrite, cleanup, and orphan deletion. The
-configured DuckLake defaults are `data_inlining_row_limit = 10`,
+adjacent-file merge, delete-file rewrite, cleanup, and orphan deletion. Operators
+can also run `POST /api/admin/maintenance/checkpoint/run` to trigger this
+physical maintenance path without applying logical telemetry retention deletes.
+The configured DuckLake defaults are `data_inlining_row_limit = 10`,
 `auto_compact = true`, `expire_older_than` aligned with telemetry retention, and
 `delete_older_than = 1 day`. `rewrite_delete_threshold` and `target_file_size`
 are left to DuckLake defaults unless benchmark evidence says canardstack needs a

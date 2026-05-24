@@ -29,9 +29,9 @@ pub fn prometheus_query(state: &AppState, params: &HashMap<String, String>) -> A
     }
     let from = at - chrono::Duration::minutes(5);
     let prom = parse_prom_query(query)?;
-    let result = state.queries.execute_metric(
-        &state.storage,
-        &metric_plan(MetricPlanInput {
+    let rows = execute_metric_rows_with_sum_fallback(
+        state,
+        MetricPlanInput {
             metric_name: &prom.metric_name,
             signal: prom.signal,
             aggregation: prom.aggregation,
@@ -44,9 +44,8 @@ pub fn prometheus_query(state: &AppState, params: &HashMap<String, String>) -> A
             step_seconds: 300,
             limit: 1,
             order: SortDirection::Backward,
-        })?,
+        },
     )?;
-    let rows = result_rows(&result);
     if rows.is_empty() {
         return Ok(prom_success(json!({"resultType": "vector", "result": []})));
     }
@@ -78,13 +77,13 @@ pub fn prometheus_query_range(
     } else {
         vec!["service_name".to_string()]
     };
-    let result = state.queries.execute_metric(
-        &state.storage,
-        &metric_plan(MetricPlanInput {
+    let rows = execute_metric_rows_with_sum_fallback(
+        state,
+        MetricPlanInput {
             metric_name: &prom.metric_name,
             signal: prom.signal,
             aggregation: prom.aggregation,
-            filters: prom.filters,
+            filters: prom.filters.clone(),
             group_by: group_by.clone(),
             time_bounds: TimeBounds {
                 from: start,
@@ -93,10 +92,10 @@ pub fn prometheus_query_range(
             step_seconds: step,
             limit: 5000,
             order: SortDirection::Forward,
-        })?,
+        },
     )?;
     let mut series: BTreeMap<String, (Map<String, Value>, Vec<Value>)> = BTreeMap::new();
-    for row in result_rows(&result) {
+    for row in rows {
         let mut labels = Map::new();
         labels.insert("__name__".to_string(), json!(prom.metric_name));
         for label in &group_by {
@@ -184,6 +183,7 @@ fn prom_metric_labels(metric_name: &str, row: Option<&Value>) -> Value {
     Value::Object(labels)
 }
 
+#[derive(Clone)]
 struct MetricPlanInput<'a> {
     metric_name: &'a str,
     signal: &'a str,
@@ -194,6 +194,35 @@ struct MetricPlanInput<'a> {
     step_seconds: i64,
     limit: usize,
     order: SortDirection,
+}
+
+fn execute_metric_rows_with_sum_fallback(
+    state: &AppState,
+    input: MetricPlanInput<'_>,
+) -> ApiResult<Vec<Value>> {
+    let signal = MetricSignal::parse(input.signal)?;
+    let aggregation = MetricAggregation::parse(input.aggregation)?;
+    let result = state
+        .queries
+        .execute_metric(&state.storage, &metric_plan(input.clone())?)?;
+    let rows = result_rows(&result);
+    if !rows.is_empty() || signal != MetricSignal::Gauge || aggregation == MetricAggregation::Rate {
+        return Ok(rows);
+    }
+
+    let fallback = MetricPlanInput {
+        signal: "sum",
+        ..input
+    };
+    let result = state
+        .queries
+        .execute_metric(&state.storage, &metric_plan(fallback)?)?;
+    let fallback_rows = result_rows(&result);
+    if fallback_rows.is_empty() {
+        Ok(rows)
+    } else {
+        Ok(fallback_rows)
+    }
 }
 
 fn metric_plan(input: MetricPlanInput<'_>) -> ApiResult<MetricPlan> {

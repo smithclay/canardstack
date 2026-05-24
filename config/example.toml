@@ -23,7 +23,8 @@ memory_limit = "1GiB"
 # catalog and local data files under data_dir.
 # postgres_dsn = "dbname=ducklake_catalog host=localhost user=postgres password=postgres"
 # attach_uri = "md:test-ducklake"
-# canardstack-owned DuckLake maintenance runs CHECKPOINT after logical retention.
+# canardstack-owned DuckLake maintenance runs CHECKPOINT after logical retention
+# and can be triggered directly via /api/admin/maintenance/checkpoint/run.
 maintenance_enabled = true
 # DuckLake's documented default is 10 rows. Set to 0 when maintenance is disabled
 # to avoid accumulating inlined metadata that canardstack will not flush.

@@ -73,25 +73,29 @@ fn take_dirty_metadata_batch(
         return selected;
     }
 
-    let signals = dirty.keys().copied().collect::<Vec<_>>();
-    for signal in signals {
-        while remaining > 0 {
-            let Some(dates) = dirty.get_mut(&signal) else {
+    while remaining > 0 && !dirty.is_empty() {
+        let mut drained_any = false;
+        for signal in StorageSignal::ALL {
+            if remaining == 0 {
                 break;
+            }
+            let Some(dates) = dirty.get_mut(&signal) else {
+                continue;
             };
             let Some(date) = dates.iter().next().cloned() else {
                 dirty.remove(&signal);
-                break;
+                continue;
             };
             dates.remove(&date);
             selected.entry(signal).or_default().insert(date);
             remaining -= 1;
+            drained_any = true;
             if dates.is_empty() {
                 dirty.remove(&signal);
-                break;
             }
         }
-        if remaining == 0 {
+
+        if !drained_any {
             break;
         }
     }
@@ -121,15 +125,41 @@ mod tests {
 
         assert_eq!(
             selected,
-            dirty(&[(StorageSignal::Logs, &["2026-05-18", "2026-05-19"])])
+            dirty(&[
+                (StorageSignal::Logs, &["2026-05-18"]),
+                (StorageSignal::Spans, &["2026-05-19"]),
+            ])
         );
         assert_eq!(
             pending,
             dirty(&[
-                (StorageSignal::Spans, &["2026-05-19"]),
+                (StorageSignal::Logs, &["2026-05-19"]),
                 (StorageSignal::MetricGauge, &["2026-05-19"]),
             ])
         );
+    }
+
+    #[test]
+    fn metadata_batch_limit_covers_one_active_day_per_signal() {
+        let mut pending = dirty(&[
+            (StorageSignal::Logs, &["2026-05-19"]),
+            (StorageSignal::Spans, &["2026-05-19"]),
+            (StorageSignal::MetricGauge, &["2026-05-19"]),
+            (StorageSignal::MetricSum, &["2026-05-19"]),
+        ]);
+
+        let selected = take_dirty_metadata_batch(&mut pending, StorageSignal::ALL.len());
+
+        assert_eq!(
+            selected,
+            dirty(&[
+                (StorageSignal::Logs, &["2026-05-19"]),
+                (StorageSignal::Spans, &["2026-05-19"]),
+                (StorageSignal::MetricGauge, &["2026-05-19"]),
+                (StorageSignal::MetricSum, &["2026-05-19"]),
+            ])
+        );
+        assert!(pending.is_empty());
     }
 
     #[test]

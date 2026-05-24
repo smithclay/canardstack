@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-const SCHEDULER_METADATA_REFRESH_BUCKET_LIMIT: usize = 1;
+const SCHEDULER_METADATA_REFRESH_BUCKET_LIMIT: usize = 4;
 /// Fraction of the freshness-budget SLA (max Arrow-write-buffer age / SLA) at
 /// which the scheduler yields the metadata-refresh tick, so discovery
 /// re-aggregation never competes with the writer while a seal is approaching
@@ -101,7 +101,8 @@ impl Maintenance {
                 "spans": self.retention.spans_days,
                 "metrics": self.retention.metrics_days
             },
-            "scheduler_jobs": ["seal", "metadata_refresh", "metrics_snapshot", "retention"]
+            "scheduler_jobs": ["seal", "metadata_refresh", "metrics_snapshot", "retention"],
+            "manual_jobs": ["seal", "checkpoint", "retention_dry_run", "retention"]
         })
     }
 
@@ -110,6 +111,35 @@ impl Maintenance {
     /// single entry point can mark the `seal` job as having succeeded.
     pub(crate) fn record_seal_run(&self) {
         self.record_run("seal");
+    }
+
+    pub fn checkpoint(&self, storage: &Storage, dry_run: bool, metrics: &Metrics) -> Result<Value> {
+        let started = Instant::now();
+        let checkpoint = match storage.checkpoint_maintenance(dry_run) {
+            Ok(value) => {
+                record_ducklake_checkpoint_metrics(metrics, &value);
+                value
+            }
+            Err(err) => {
+                metrics.inc(
+                    MetricName::DucklakeCheckpointRunsTotal,
+                    &[("status", "error"), ("reason", "checkpoint_failed")],
+                    1,
+                );
+                return Err(err);
+            }
+        };
+        if dry_run {
+            self.record_run("checkpoint_dry_run");
+        } else {
+            self.record_run("checkpoint");
+        }
+        Ok(json!({
+            "status": "ok",
+            "dry_run": dry_run,
+            "ducklake_checkpoint": checkpoint,
+            "duration_ms": started.elapsed().as_millis()
+        }))
     }
 
     pub fn retention(&self, storage: &Storage, dry_run: bool, metrics: &Metrics) -> Result<Value> {
