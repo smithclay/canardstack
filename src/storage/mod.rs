@@ -9,9 +9,7 @@ use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::PathBuf;
-#[cfg(debug_assertions)]
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -30,8 +28,9 @@ pub use arrow_write::ArrowFlushOutcome;
 use arrow_write::ArrowWriteBuffer;
 pub use ducklake::install_ducklake_extension;
 use ducklake::{
-    attach_ducklake_connection, configure_base_connection, configure_write_connection,
-    ducklake_attach_plan, DUCKLAKE_CATALOG_NAME, DUCKLAKE_TARGET_PREFIX,
+    attach_ducklake_connection, configure_base_connection, configure_ducklake_maintenance_options,
+    configure_write_connection, ducklake_attach_plan, DUCKLAKE_CATALOG_NAME,
+    DUCKLAKE_TARGET_PREFIX,
 };
 pub use metadata::MetadataRefreshOutcome;
 use schema::{create_tables_on, enforce_schema_version_on};
@@ -100,8 +99,9 @@ impl StorageHealth {
 pub struct StorageCapabilities {
     pub insert: bool,
     pub query: bool,
-    pub snapshot_expiration: bool,
-    pub cleanup_old_files: bool,
+    pub ducklake_maintenance_enabled: bool,
+    pub ducklake_checkpoint_maintenance: bool,
+    pub ducklake_maintenance_options: bool,
     pub whole_day_retention: bool,
 }
 
@@ -140,7 +140,10 @@ pub struct Storage {
     force_dependency_unhealthy: AtomicBool,
     postgres_catalog_configured: bool,
     local_storage_dir: PathBuf,
-    ducklake_managed_maintenance: bool,
+    ducklake_maintenance_enabled: bool,
+    ducklake_maintenance_options_supported: bool,
+    ducklake_checkpoint_supported: AtomicBool,
+    ducklake_maintenance_capability_reason: Mutex<Option<String>>,
     arrow_write_buffers: Mutex<BTreeMap<StorageSignal, ArrowWriteBuffer>>,
     write_memory_limit: String,
     last_error: Mutex<Option<String>>,
@@ -268,7 +271,9 @@ impl Storage {
         let target_prefix = DUCKLAKE_TARGET_PREFIX.to_string();
         let plan = ducklake_attach_plan(config)?;
         let mode = format!("{}_arrow_append", plan.mode);
-        let ducklake_managed_maintenance = plan.managed_maintenance;
+        let ducklake_maintenance_capability =
+            configure_ducklake_maintenance_options(&writer, &config.operator.ducklake_maintenance)
+                .context("configure DuckLake maintenance options")?;
 
         create_tables_on(&writer, &target_prefix)?;
         // Fail-closed if this binary cannot safely operate on the catalog's
@@ -292,7 +297,15 @@ impl Storage {
             force_dependency_unhealthy: AtomicBool::new(false),
             postgres_catalog_configured: config.operator.postgres_dsn.is_some(),
             local_storage_dir: config.operator.local_storage_dir.clone(),
-            ducklake_managed_maintenance,
+            ducklake_maintenance_enabled: config.operator.ducklake_maintenance.enabled,
+            ducklake_maintenance_options_supported: ducklake_maintenance_capability
+                .options_supported,
+            ducklake_checkpoint_supported: AtomicBool::new(
+                ducklake_maintenance_capability.checkpoint_supported,
+            ),
+            ducklake_maintenance_capability_reason: Mutex::new(
+                ducklake_maintenance_capability.reason,
+            ),
             arrow_write_buffers: Mutex::new(BTreeMap::new()),
             write_memory_limit: config.operator.duckdb_write_memory_limit.clone(),
             last_error: Mutex::new(None),
@@ -305,9 +318,10 @@ impl Storage {
 #[cfg(test)]
 mod tests {
     use super::arrow::batch_timestamp_days;
-    use super::ducklake::build_ducklake_attach_plan;
+    use super::ducklake::{build_ducklake_attach_plan, ducklake_maintenance_options_sql};
     use super::metadata_refresh::metadata_refresh_sql;
     use super::*;
+    use crate::config::DuckLakeMaintenanceConfig;
     use arrow58::array as arrow58_array;
     use arrow58::datatypes as arrow58_types;
     use arrow58::record_batch::RecordBatch;
@@ -333,7 +347,6 @@ mod tests {
         assert_eq!(plan.mode, "ducklake_custom_uri");
         assert!(plan.needs_ducklake);
         assert!(!plan.needs_postgres);
-        assert!(plan.managed_maintenance);
     }
 
     #[test]
@@ -355,7 +368,6 @@ mod tests {
         assert!(!plan.needs_ducklake);
         assert!(plan.needs_motherduck);
         assert!(!plan.needs_postgres);
-        assert!(!plan.managed_maintenance);
     }
 
     #[test]
@@ -375,7 +387,7 @@ mod tests {
     }
 
     #[test]
-    fn local_ducklake_attach_uses_data_path_without_inlining() {
+    fn local_ducklake_attach_uses_data_path() {
         let dir = tempdir().unwrap();
         let plan = build_ducklake_attach_plan(
             None,
@@ -386,7 +398,34 @@ mod tests {
         .unwrap();
 
         assert!(plan.sql.contains("DATA_PATH"));
-        assert!(!plan.sql.contains("DATA_INLINING_ROW_LIMIT"));
+    }
+
+    #[test]
+    fn ducklake_maintenance_options_enable_checkpoint_owned_defaults() {
+        let sql = ducklake_maintenance_options_sql(&DuckLakeMaintenanceConfig {
+            enabled: true,
+            data_inlining_row_limit: 10,
+            expire_older_than_days: 14,
+            delete_older_than_secs: 86_400,
+        });
+
+        assert!(sql.contains("set_option('data_inlining_row_limit', 10)"));
+        assert!(sql.contains("set_option('auto_compact', true)"));
+        assert!(sql.contains("set_option('expire_older_than', '14 days')"));
+        assert!(sql.contains("set_option('delete_older_than', '86400 seconds')"));
+    }
+
+    #[test]
+    fn ducklake_maintenance_options_disable_compaction_and_inlining() {
+        let sql = ducklake_maintenance_options_sql(&DuckLakeMaintenanceConfig {
+            enabled: false,
+            data_inlining_row_limit: 0,
+            expire_older_than_days: 14,
+            delete_older_than_secs: 86_400,
+        });
+
+        assert!(sql.contains("set_option('data_inlining_row_limit', 0)"));
+        assert!(sql.contains("set_option('auto_compact', false)"));
     }
 
     #[test]

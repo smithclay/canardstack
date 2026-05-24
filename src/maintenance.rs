@@ -1,6 +1,6 @@
 use crate::app::AppState;
 use crate::config::Config;
-use crate::metrics::MetricName;
+use crate::metrics::{MetricName, Metrics};
 use crate::seal::SealDriver;
 use crate::storage::{RetentionPolicy, Storage};
 use crate::LockExt;
@@ -112,15 +112,23 @@ impl Maintenance {
         self.record_run("seal");
     }
 
-    pub fn retention(&self, storage: &Storage, dry_run: bool) -> Result<Value> {
+    pub fn retention(&self, storage: &Storage, dry_run: bool, metrics: &Metrics) -> Result<Value> {
         let started = Instant::now();
         let retention = storage.enforce_retention(&self.retention, dry_run)?;
-        let snapshot_expiration = if dry_run {
-            json!({"supported": storage.health().capabilities.snapshot_expiration, "dry_run": true})
-        } else {
-            storage.expire_snapshots(self.retention.metrics_days)?
+        let checkpoint = match storage.checkpoint_maintenance(dry_run) {
+            Ok(value) => {
+                record_ducklake_checkpoint_metrics(metrics, &value);
+                value
+            }
+            Err(err) => {
+                metrics.inc(
+                    MetricName::DucklakeCheckpointRunsTotal,
+                    &[("status", "error"), ("reason", "checkpoint_failed")],
+                    1,
+                );
+                return Err(err);
+            }
         };
-        let cleanup = storage.cleanup_old_files(dry_run)?;
         if !dry_run {
             self.record_run("retention");
         } else {
@@ -130,23 +138,7 @@ impl Maintenance {
             "status": "ok",
             "dry_run": dry_run,
             "retention": retention,
-            "snapshot_expiration": snapshot_expiration,
-            // Physical file compaction is a deliberate v0 non-goal, reported as
-            // `supported:false, enabled:false` rather than implemented. DuckLake's
-            // `ducklake_merge_adjacent_files` is intentionally NOT called: it stays
-            // disabled until proven stable for this append/seal write pattern.
-            // v0 therefore tolerates many small Parquet segment files; the Arrow
-            // write buffer's size/age coalescing (one seal -> one segment per
-            // signal) is the only file-count mitigation. Do not add a compaction
-            // code path here without revisiting that decision: trigger conditions
-            // and what it must touch are tracked as an explicit roadmap entry in
-            // docs/architecture/v0-architecture.md#compaction--small-files--roadmap--when-to-revisit.
-            "physical_file_compaction": {
-                "supported": false,
-                "enabled": false,
-                "reason": "ducklake_merge_adjacent_files is disabled until proven stable"
-            },
-            "cleanup": cleanup,
+            "ducklake_checkpoint": checkpoint,
             "duration_ms": started.elapsed().as_millis()
         }))
     }
@@ -180,6 +172,30 @@ impl Maintenance {
             .map(|r| r.consecutive)
             .unwrap_or(0)
     }
+}
+
+fn record_ducklake_checkpoint_metrics(metrics: &Metrics, checkpoint: &Value) {
+    let status = checkpoint
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("error");
+    let reason = checkpoint
+        .get("reason")
+        .and_then(Value::as_str)
+        .unwrap_or(status);
+    let (status, reason) = match (status, reason) {
+        ("ok", _) => ("ok", "ok"),
+        ("skipped", "dry_run") => ("skipped", "dry_run"),
+        ("skipped", "ducklake_maintenance_disabled") => ("skipped", "disabled"),
+        ("skipped", "unsupported") => ("skipped", "unsupported"),
+        ("skipped", _) => ("skipped", "other"),
+        _ => ("error", "checkpoint_failed"),
+    };
+    metrics.inc(
+        MetricName::DucklakeCheckpointRunsTotal,
+        &[("status", status), ("reason", reason)],
+        1,
+    );
 }
 
 pub struct Scheduler {
@@ -305,7 +321,7 @@ fn scheduler_loop(state: Arc<AppState>, stop: Arc<AtomicBool>) {
 
         if !seal_priority_active && now >= next_retention {
             let ok = run_job(&state, "retention", |s| {
-                s.maintenance.retention(&s.storage, false)
+                s.maintenance.retention(&s.storage, false, &s.metrics)
             });
             next_retention = now + next_interval(&state, "retention", retention_every, ok);
         }

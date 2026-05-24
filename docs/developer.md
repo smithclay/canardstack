@@ -34,7 +34,7 @@ canardstack is currently shaped as:
 - Grafana is the only bundled UI; canardstack itself does not serve a custom
   browser interface.
 - Whole-day retention execution for telemetry tables, followed by DuckLake
-  snapshot expiration and cleanup hooks when DuckLake is attached.
+  `CHECKPOINT` maintenance when canardstack DuckLake maintenance is enabled.
 - Storage health with freshness watermarks, logical row counts, and local
   physical bytes on admin health and scheduler-maintained metric snapshots.
 - Prometheus-style operator metrics at `/metrics`, also snapshotted into the
@@ -84,8 +84,12 @@ Default v0 writes prepared Arrow batches into an Arrow write buffer, then the
 scheduler flushes that buffer through DuckDB's Arrow appender into DuckLake
 tables inside an explicit transaction. `CANARDSTACK_ARROW_WRITE_BUFFER_TARGET_BYTES`
 defaults to 64 MiB and `CANARDSTACK_ARROW_WRITE_BUFFER_MAX_AGE_SECS` defaults to
-10 seconds. DuckLake adjacent-file compaction is disabled until
-`ducklake_merge_adjacent_files` is proven stable for this write pattern.
+10 seconds. DuckLake physical maintenance is DuckDB/DuckLake-owned: canardstack
+configures DuckLake options at attach/startup and the scheduler runs `CHECKPOINT`
+after telemetry retention. Disable this with
+`CANARDSTACK_DUCKLAKE_MAINTENANCE_ENABLED=false`; row-level retention still runs,
+but canardstack will not trigger CHECKPOINT compaction, cleanup, or inlined-data
+flushing.
 
 The Docker image build runs `canardstack install-ducklake-extension` and stores
 the required DuckDB extensions under `/usr/local/lib/duckdb/extensions`. That
@@ -327,11 +331,11 @@ loop without operator action:
   threads do not perform DuckDB/DuckLake writes inline.
 - A periodic seal writes Arrow buffers through DuckDB Arrow append and commits
   DuckLake.
-- DuckLake adjacent-file compaction is disabled and is not exposed as a v0
-  maintenance control until `ducklake_merge_adjacent_files` is proven stable;
-  flush sizing is controlled by Arrow write-buffer target bytes and max age.
-- A retention pass enforces the configured retention days, expires DuckLake
-  snapshots, and cleans old files.
+- A retention pass enforces the configured telemetry retention days, then runs
+  DuckDB/DuckLake `CHECKPOINT` as the single physical maintenance primitive when
+  DuckLake maintenance is enabled. `CHECKPOINT` owns inlined-data flush,
+  snapshot expiration, adjacent-file merge, delete-file rewrite, cleanup, and
+  orphan deletion.
 
 `POST /api/admin/maintenance/pause` pauses scheduled jobs only; manual seal and
 retention endpoints remain available for repair workflows. The base cadence is
