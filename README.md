@@ -36,7 +36,7 @@ Builds on prior work from
 - [Send Telemetry](#send-telemetry)
 - [Query Data](#query-data)
 - [Use MotherDuck](#use-motherduck)
-- [How It Works](#how-it-works)
+- [Architecture](#architecture)
 - [Operator Notes](#operator-notes)
 - [Limits](#limits)
 - [For Developers](#for-developers)
@@ -182,7 +182,7 @@ The canardstack container uses your `CANARDSTACK_DUCKLAKE_ATTACH_URI` and
 `MOTHERDUCK_TOKEN` for storage. Grafana stays local and queries canardstack
 through the provisioned Prometheus, Loki, and Tempo-compatible datasources.
 
-## How It Works
+## Architecture
 
 canardstack is one synchronous Rust process backed by one DuckDB process. It
 accepts OTLP over HTTP, normalizes telemetry into Arrow record batches, commits
@@ -192,28 +192,71 @@ query APIs over the same tables.
 ```mermaid
 flowchart LR
     Apps["Apps / collectors"]
-    Grafana["Grafana"]
+    Clients["Grafana / SQL clients"]
 
-    subgraph Canardstack["canardstack"]
+    subgraph Canardstack["canardstack (one process)"]
         direction TB
-        Ingest["OTLP/HTTP ingest"]
-        Spool["fsynced raw spool"]
+        Ingest["OTLP/HTTP ingest + validation"]
         Admission["freshness-first admission"]
+        Spool["fsynced raw spool"]
+        Workers["worker pool: OTLP to Arrow"]
         Buffer["Arrow write buffer"]
-        Storage["DuckDB + DuckLake"]
-        Compat["Prometheus / Loki / Tempo adapters"]
+        Seal["scheduler seal"]
+        Adapters["Prometheus / Loki / Tempo adapters"]
 
-        Ingest --> Spool
-        Spool --> Admission
-        Admission --> Buffer
-        Buffer --> Storage
-        Compat --> Storage
+        Ingest --> Admission
+        Admission --> Spool
+        Spool --> Workers
+        Workers --> Buffer
+        Buffer --> Seal
     end
 
     Apps -->|logs / traces / metrics| Ingest
-    Grafana -->|queries| Compat
-    Storage --> Lake[("DuckLake catalog + Parquet files")]
+    Admission -.->|429 under pressure| Apps
+    Seal -->|commit Parquet| Lake[("DuckLake catalog + Parquet files")]
+    Adapters --> Lake
+    Clients -->|queries| Adapters
 ```
+
+### The write path
+
+Every telemetry request crosses a fixed sequence of boundaries on its way to
+queryable storage:
+
+1. **Receive and validate.** Ingest checks auth, content type, body size, and
+   compression on the OTLP/HTTP request.
+2. **Admit.** Freshness-first admission projects how far behind the seal pipeline
+   is, in seconds of expected query-visibility delay. If accepting the request
+   would push that projection past the configured freshness budget, it is
+   rejected with `429` *before anything is written*.
+3. **Spool.** The raw request is appended to a local fsynced raw spool,
+   partitioned by request kind (logs / traces / metrics). Once it is durably on
+   disk, canardstack returns `2xx`. This is the durability point — not commit,
+   not query-visibility.
+4. **Transform.** A pool of worker threads decompresses and normalizes the
+   payload through `otlp2records` into Arrow record batches, one per storage
+   table. A metrics request fans out into both the `metric_gauge` and
+   `metric_sum` tables.
+5. **Buffer.** Batches accumulate in an in-memory Arrow write buffer. Each row
+   keeps a reference back to its raw-spool record so it can be checkpointed once
+   it is safely stored.
+6. **Seal.** A single scheduler thread flushes the buffer on a size or age
+   trigger: it appends the buffered rows and commits one immutable Parquet
+   segment per table through DuckLake, then checkpoints the raw-spool records it
+   just committed.
+
+The commit-then-checkpoint order is deliberate. canardstack commits to DuckLake
+*before* it checkpoints the spool, so a crash in between replays those records on
+restart rather than losing them. Delivery is at-least-once; v0 does not
+deduplicate replayed rows.
+
+### The read path
+
+Grafana, curl, and other clients query through bounded Prometheus-, Loki-, and
+Tempo-shaped adapters that translate into guarded reads over the DuckLake tables.
+Queries use a separate DuckDB connection from the writer, so the read path stays
+responsive while a seal is in flight. For anything the adapters do not cover, the
+same tables are open to direct DuckDB or MotherDuck SQL.
 
 The architecture is intentionally narrow:
 
