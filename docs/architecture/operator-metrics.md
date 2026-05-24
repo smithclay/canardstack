@@ -24,9 +24,10 @@ persist a snapshot into the `metric_gauge` / `metric_sum` storage tables. Set
 `[metrics] operator_metrics_to_storage = true`) to enable the write; the job then
 writes the current samples with `service_name="canardstack"` (counters land in
 `metric_sum`, gauges land in `metric_gauge`) so canardstack's own metrics are
-queryable through the compat query path. These rows are a sanctioned best-effort
-write-buffer producer: they do not have raw-spool replay refs and are not
-replayed after a crash. With the flag off the job reports `rows: 0` /
+queryable through the compat query path. These rows commit through a separate
+internal telemetry path: they do not have raw-spool replay refs, do not enter the
+external ingest write buffer, and are not replayed after a crash. With the flag off
+the job reports `rows: 0` /
 `"operator_metrics_to_storage": false` and `/metrics` still serves the live
 surface.
 

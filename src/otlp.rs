@@ -1,6 +1,6 @@
 use crate::ingest::OtlpRequestKind;
 #[cfg(feature = "otlp2records-observer")]
-use crate::metrics::Metrics;
+use crate::metrics::{MetricName, Metrics};
 use crate::signal::StorageSignal;
 use crate::validation::{ApiError, ApiResult};
 use arrow58::record_batch::RecordBatch;
@@ -225,7 +225,7 @@ impl OtlpTransformMetrics {
         }
         for (counter, value) in &self.counters {
             metrics.inc(
-                "canardstack_otlp2records_transform_events_total",
+                MetricName::Otlp2recordsTransformEventsTotal,
                 &[("request_kind", request_kind), ("event", counter)],
                 *value,
             );

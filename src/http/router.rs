@@ -1,5 +1,5 @@
 use crate::ingest::OtlpRequestKind;
-use crate::metrics::Metrics;
+use crate::metrics::{MetricName, Metrics};
 use crate::signal::StorageSignal;
 use crate::validation::{self, ApiError};
 use crate::AppState;
@@ -347,11 +347,8 @@ fn record_maintenance_metrics(
         .maintenance_run(job, status, reason, started.elapsed().as_secs_f64());
 }
 
-fn storage_signal_gauge(metrics: &Metrics, name: &'static str, storage_signal: &str, value: f64) {
+fn storage_signal_gauge(metrics: &Metrics, name: MetricName, storage_signal: &str, value: f64) {
     metrics.gauge(name, &[("storage_signal", storage_signal)], value);
-    // Deprecation window for the pre-glossary label. Keep dual emission until
-    // dashboards have migrated to `storage_signal`.
-    metrics.gauge(name, &[("table", storage_signal)], value);
 }
 
 pub(crate) fn record_operator_gauges(state: &AppState) {
@@ -383,19 +380,19 @@ pub(crate) fn record_operator_gauges(state: &AppState) {
             .unwrap_or(0.0);
         storage_signal_gauge(
             &state.metrics,
-            "canardstack_arrow_write_buffer_rows",
+            MetricName::ArrowWriteBufferRows,
             storage_signal.as_str(),
             rows as f64,
         );
         storage_signal_gauge(
             &state.metrics,
-            "canardstack_arrow_write_buffer_bytes",
+            MetricName::ArrowWriteBufferBytes,
             storage_signal.as_str(),
             bytes as f64,
         );
         storage_signal_gauge(
             &state.metrics,
-            "canardstack_arrow_write_buffer_age_seconds",
+            MetricName::ArrowWriteBufferAgeSeconds,
             storage_signal.as_str(),
             age_seconds,
         );
@@ -406,7 +403,7 @@ pub(crate) fn record_operator_gauges(state: &AppState) {
         .and_then(Value::as_bool)
         .unwrap_or(false);
     state.metrics.gauge(
-        "canardstack_maintenance_paused",
+        MetricName::MaintenancePaused,
         &[],
         if paused { 1.0 } else { 0.0 },
     );
@@ -416,7 +413,7 @@ pub(crate) fn record_storage_operator_gauges(state: &AppState) {
     let storage = state.storage.health();
     storage_signal_gauge(
         &state.metrics,
-        "canardstack_storage_physical_bytes",
+        MetricName::StoragePhysicalBytes,
         "all",
         storage.physical_bytes as f64,
     );
@@ -425,7 +422,7 @@ pub(crate) fn record_storage_operator_gauges(state: &AppState) {
             if let Some(count) = value.as_i64() {
                 storage_signal_gauge(
                     &state.metrics,
-                    "canardstack_storage_logical_rows",
+                    MetricName::StorageLogicalRows,
                     table.as_str(),
                     count as f64,
                 );
@@ -439,12 +436,9 @@ pub(crate) fn record_storage_operator_gauges(state: &AppState) {
     {
         for (table, value) in tables {
             for (metric, field) in [
+                (MetricName::DucklakeActiveDataFiles, "active_data_files"),
                 (
-                    "canardstack_ducklake_active_data_files",
-                    "active_data_files",
-                ),
-                (
-                    "canardstack_ducklake_active_data_file_rows",
+                    MetricName::DucklakeActiveDataFileRows,
                     "active_data_file_rows",
                 ),
             ] {
@@ -460,7 +454,7 @@ pub(crate) fn record_storage_operator_gauges(state: &AppState) {
             if let Some(epoch) = value.get("epoch_seconds").and_then(Value::as_f64) {
                 storage_signal_gauge(
                     &state.metrics,
-                    "canardstack_freshness_watermark_timestamp",
+                    MetricName::FreshnessWatermarkTimestamp,
                     table.as_str(),
                     epoch,
                 );
@@ -469,7 +463,7 @@ pub(crate) fn record_storage_operator_gauges(state: &AppState) {
                 max_freshness_lag = max_freshness_lag.max(lag.max(0.0));
                 storage_signal_gauge(
                     &state.metrics,
-                    "canardstack_ingest_to_query_lag_seconds",
+                    MetricName::IngestToQueryLagSeconds,
                     table.as_str(),
                     lag.max(0.0),
                 );

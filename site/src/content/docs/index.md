@@ -1,0 +1,101 @@
+---
+title: canardstack
+description: OpenTelemetry metrics, logs, and traces stored in DuckLake.
+hero:
+  tagline: OpenTelemetry metrics, logs, and traces stored in DuckLake.
+  image:
+    file: ../../assets/canardstack.png
+  actions:
+    - text: Get Started
+      link: '#start-locally'
+      icon: right-arrow
+    - text: View on GitHub
+      link: https://github.com/smithclay/canardstack
+      icon: external
+      variant: secondary
+---
+
+canardstack is an experimental, single-binary observability backend for storing
+OpenTelemetry logs, traces, gauge metrics, and sum metrics in DuckLake.
+
+It accepts OTLP/HTTP, normalizes telemetry into Arrow batches, stores immutable
+Parquet-backed DuckLake segments, and exposes bounded Prometheus, Loki, and
+Tempo compatibility APIs for Grafana-style clients.
+
+## What This Is
+
+- A single Rust process with synchronous std-library HTTP serving.
+- Local DuckLake storage by default, with remote DuckLake attach support.
+- A focused compatibility surface for inspecting telemetry through existing
+  Prometheus, Loki, Tempo, and DuckDB-compatible tools.
+
+## What This Is Not
+
+- A full observability suite.
+- A multi-tenant production service.
+- A full Prometheus, Loki, Tempo, PromQL, LogQL, or TraceQL implementation.
+
+## Start Locally
+
+Start canardstack and Grafana with local DuckLake storage:
+
+```bash
+docker compose up --build
+```
+
+The default local stack exposes:
+
+- canardstack: `http://localhost:4318`
+- Grafana: `http://localhost:3000`
+
+## Send Sample Telemetry
+
+In another terminal, run the smoke client:
+
+```bash
+docker compose run --rm smoke
+```
+
+The smoke workload sends logs, a multi-span trace, gauge samples, and
+cumulative sum samples through OTLP/HTTP. It also checks storage health and the
+Prometheus, Loki, and Tempo-compatible query paths.
+
+## Open Grafana
+
+Open the provisioned dashboard:
+
+```text
+http://localhost:3000/d/canardstack-overview/canardstack-overview
+```
+
+Use `admin/admin` if Grafana asks for credentials.
+
+## Send Your Own OTLP/HTTP Data
+
+Point an OpenTelemetry Collector `otlphttp` exporter at canardstack:
+
+```yaml
+exporters:
+  otlphttp/canardstack:
+    endpoint: http://localhost:4318
+    headers:
+      Authorization: Bearer dev-canardstack-key
+```
+
+canardstack accepts the standard OTLP/HTTP paths:
+
+- `POST /v1/logs`
+- `POST /v1/traces`
+- `POST /v1/metrics`
+
+## Build From Source
+
+For host development:
+
+```bash
+cargo check
+cargo test
+cargo run -- serve
+```
+
+The host server defaults to `127.0.0.1:4318`.

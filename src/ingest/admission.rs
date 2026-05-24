@@ -1,7 +1,7 @@
 use super::batches::PendingBatch;
 use super::OtlpRequestKind;
 use crate::config::Config;
-use crate::metrics::Metrics;
+use crate::metrics::{MetricName, Metrics};
 use crate::runtime::memory;
 use crate::signal::StorageSignal;
 use crate::validation::{ApiError, ApiResult};
@@ -54,14 +54,14 @@ impl RuntimeMemoryReservation {
         loop {
             let Some(rss) = memory::runtime_rss_bytes() else {
                 metrics.inc(
-                    "canardstack_ingest_runtime_memory_unknown_total",
+                    MetricName::IngestRuntimeMemoryUnknownTotal,
                     &[("request_kind", route.as_str())],
                     1,
                 );
                 return Ok(());
             };
-            metrics.gauge("canardstack_runtime_rss_bytes", &[], rss as f64);
-            metrics.gauge("canardstack_runtime_memory_limit_bytes", &[], limit as f64);
+            metrics.gauge(MetricName::RuntimeRssBytes, &[], rss as f64);
+            metrics.gauge(MetricName::RuntimeMemoryLimitBytes, &[], limit as f64);
 
             let current_reserved = self.reserved_bytes.load(Ordering::Acquire);
             let other_reserved = current_reserved.saturating_sub(self.bytes);

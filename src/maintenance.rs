@@ -1,5 +1,6 @@
 use crate::app::AppState;
 use crate::config::Config;
+use crate::metrics::MetricName;
 use crate::seal::SealDriver;
 use crate::storage::{RetentionPolicy, Storage};
 use crate::LockExt;
@@ -100,7 +101,7 @@ impl Maintenance {
                 "spans": self.retention.spans_days,
                 "metrics": self.retention.metrics_days
             },
-            "scheduler_jobs": ["metadata_refresh", "metrics_snapshot", "retention"]
+            "scheduler_jobs": ["seal", "metadata_refresh", "metrics_snapshot", "retention"]
         })
     }
 
@@ -271,7 +272,7 @@ fn scheduler_loop(state: Arc<AppState>, stop: Arc<AtomicBool>) {
                     .storage
                     .refresh_metadata_limited(SCHEDULER_METADATA_REFRESH_BUCKET_LIMIT)?;
                 s.metrics.observe_seconds(
-                    "canardstack_phase_duration_seconds",
+                    MetricName::PhaseDurationSeconds,
                     &[("phase", "writer_lock_wait"), ("path", "metadata_refresh")],
                     outcome.writer_lock_wait_seconds,
                 );
@@ -343,7 +344,7 @@ where
                 .metrics
                 .maintenance_run(job, "error", reason, started.elapsed().as_secs_f64());
             state.metrics.inc(
-                "canardstack_maintenance_failures_total",
+                MetricName::MaintenanceFailuresTotal,
                 &[("job", job), ("reason", reason)],
                 1,
             );
@@ -351,7 +352,7 @@ where
         }
     };
     state.metrics.gauge(
-        "canardstack_maintenance_consecutive_failures",
+        MetricName::MaintenanceConsecutiveFailures,
         &[("job", job)],
         state.maintenance.consecutive_failures(job) as f64,
     );

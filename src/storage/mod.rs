@@ -27,11 +27,11 @@ mod query_conn;
 mod schema;
 
 pub use arrow_write::ArrowFlushOutcome;
-use arrow_write::{ArrowWriteBuffer, BufferDurability};
+use arrow_write::ArrowWriteBuffer;
 pub use ducklake::install_ducklake_extension;
 use ducklake::{
     attach_ducklake_connection, configure_base_connection, configure_write_connection,
-    ducklake_attach_plan,
+    ducklake_attach_plan, DUCKLAKE_CATALOG_NAME, DUCKLAKE_TARGET_PREFIX,
 };
 pub use metadata::MetadataRefreshOutcome;
 use schema::{create_tables_on, enforce_schema_version_on};
@@ -41,8 +41,6 @@ pub struct StorageHealth {
     pub healthy: bool,
     pub mode: String,
     pub ducklake_catalog: String,
-    pub ducklake_available: bool,
-    pub ducklake_required: bool,
     pub postgres_catalog_configured: bool,
     pub last_error: Option<String>,
     pub capabilities: StorageCapabilities,
@@ -56,20 +54,45 @@ pub struct StorageHealth {
 pub struct StorageProbe {
     pub healthy: bool,
     pub mode: String,
-    pub ducklake_available: bool,
-    pub ducklake_required: bool,
     pub last_error: Option<String>,
+}
+
+pub(crate) struct CommittedReplayRefs(Vec<ReplayBackedRecordRef>);
+
+impl CommittedReplayRefs {
+    pub(crate) fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub(crate) fn as_slice(&self) -> &[ReplayBackedRecordRef] {
+        &self.0
+    }
+
+    // Module-private on purpose: a committed-replay-refs token may be minted ONLY
+    // by the `storage` commit path, so holding one is proof the rows were
+    // DuckLake-committed. Do NOT widen to `pub(super)`/`pub(crate)` — `storage`
+    // is a depth-1 module, so either would make the token forgeable from any
+    // in-crate module (e.g. `seal`/`ingest`) and break the checkpoint-after-commit
+    // guarantee. The mint sites live in `storage`'s descendant modules
+    // (`arrow_write`, `arrow_write_buffer`), which can reach a private constructor.
+    fn new(replay_refs: Vec<ReplayBackedRecordRef>) -> Self {
+        Self(replay_refs)
+    }
+
+    fn empty() -> Self {
+        Self(Vec::new())
+    }
 }
 
 impl StorageProbe {
     pub fn is_ready(&self) -> bool {
-        self.healthy && (!self.ducklake_required || self.ducklake_available)
+        self.healthy
     }
 }
 
 impl StorageHealth {
     pub fn is_ready(&self) -> bool {
-        self.healthy && (!self.ducklake_required || self.ducklake_available)
+        self.healthy
     }
 }
 
@@ -113,12 +136,10 @@ pub struct Storage {
     target_prefix: String,
     mode: String,
     catalog_name: String,
-    ducklake_available: bool,
     #[cfg(debug_assertions)]
     force_dependency_unhealthy: AtomicBool,
     postgres_catalog_configured: bool,
     local_storage_dir: PathBuf,
-    ducklake_required: bool,
     ducklake_managed_maintenance: bool,
     arrow_write_buffers: Mutex<BTreeMap<StorageSignal, ArrowWriteBuffer>>,
     write_memory_limit: String,
@@ -161,24 +182,10 @@ pub(crate) struct ReplayBackedArrowBatch<'a> {
     pub(crate) replay_ref: ReplayBackedRecordRef,
 }
 
-/// A storage-buffer input that **bypasses the raw spool**: it carries NO
-/// [`ReplayBackedRecordRef`], so its rows cannot be checkpointed or replayed.
-///
-/// INVARIANT: best-effort is reserved for sanctioned INTERNAL telemetry only — in
-/// v0 that is exclusively the operator metrics snapshot
-/// ([`crate::metrics::Metrics::write_snapshot_to_storage`]). External OTLP ingest
-/// MUST enter the write buffer through
-/// [`Storage::buffer_replay_backed_arrow_batches`] with a `ReplayBackedRecordRef`
-/// so at-least-once delivery holds; never route external ingest through the
-/// best-effort path. The replay-backed entry point is `pub(crate)`; this one is
-/// `pub` only so in-repo benches/tests (separate crates) can drive the storage
-/// write path directly, which is why it is `#[doc(hidden)]` rather than part of
-/// the supported API.
-#[doc(hidden)]
-pub struct BestEffortArrowBatch<'a> {
-    pub storage_signal: StorageSignal,
-    pub batch: &'a RecordBatch,
-    pub source_format: &'a str,
+#[derive(Clone, Debug)]
+pub struct InternalTelemetryCommitResult {
+    pub rows: usize,
+    pub timings: Vec<ArrowBatchBufferTiming>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -231,8 +238,7 @@ struct PreparedArrowBatch {
     pub(super) batch: RecordBatch,
     pub(super) rows: usize,
     pub(super) timestamp_days: Vec<String>,
-    pub(super) durability: BufferDurability,
-    pub(super) best_effort_rows: usize,
+    pub(super) replay_refs: BTreeSet<ReplayBackedRecordRef>,
 }
 
 impl Storage {
@@ -259,7 +265,7 @@ impl Storage {
         .context(
             "DuckLake attach failed. Fix the catalog config (URI, token, network, or extension path) and restart.",
         )?;
-        let target_prefix = "canardlake.".to_string();
+        let target_prefix = DUCKLAKE_TARGET_PREFIX.to_string();
         let plan = ducklake_attach_plan(config)?;
         let mode = format!("{}_arrow_append", plan.mode);
         let ducklake_managed_maintenance = plan.managed_maintenance;
@@ -281,13 +287,11 @@ impl Storage {
             reader: Mutex::new(reader),
             target_prefix,
             mode,
-            catalog_name: "canardlake".to_string(),
-            ducklake_available: true,
+            catalog_name: DUCKLAKE_CATALOG_NAME.to_string(),
             #[cfg(debug_assertions)]
             force_dependency_unhealthy: AtomicBool::new(false),
             postgres_catalog_configured: config.operator.postgres_dsn.is_some(),
             local_storage_dir: config.operator.local_storage_dir.clone(),
-            ducklake_required: true,
             ducklake_managed_maintenance,
             arrow_write_buffers: Mutex::new(BTreeMap::new()),
             write_memory_limit: config.operator.duckdb_write_memory_limit.clone(),

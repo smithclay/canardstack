@@ -40,7 +40,7 @@ RUN apt-get update \
     && chown -R canardstack:canardstack /var/lib/canardstack /usr/local/lib/duckdb
 
 COPY --from=builder /app/target/release/canardstack /usr/local/bin/canardstack
-COPY --from=builder /opt/duckdb/extensions /usr/local/lib/duckdb/extensions
+COPY --from=builder --chown=canardstack:canardstack /opt/duckdb/extensions /usr/local/lib/duckdb/extensions
 
 ENV HOME=/var/lib/canardstack \
     CANARDSTACK_BIND=0.0.0.0:4318 \

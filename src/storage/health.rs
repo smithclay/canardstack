@@ -24,15 +24,13 @@ impl Storage {
     }
 
     pub fn accepts_memory_ingest(&self) -> bool {
-        self.ducklake_available && {
-            #[cfg(debug_assertions)]
-            {
-                !self.force_dependency_unhealthy.load(Ordering::Acquire)
-            }
-            #[cfg(not(debug_assertions))]
-            {
-                true
-            }
+        #[cfg(debug_assertions)]
+        {
+            !self.force_dependency_unhealthy.load(Ordering::Acquire)
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            true
         }
     }
 
@@ -47,8 +45,6 @@ impl Storage {
             healthy: self.healthy(),
             mode: self.mode.clone(),
             ducklake_catalog: self.catalog_name.clone(),
-            ducklake_available: self.ducklake_available,
-            ducklake_required: self.ducklake_required,
             postgres_catalog_configured: self.postgres_catalog_configured,
             last_error: self.last_error.lock_or_poisoned().clone(),
             capabilities: StorageCapabilities {
@@ -75,15 +71,10 @@ impl Storage {
         StorageProbe {
             healthy: self.healthy(),
             mode: self.mode.clone(),
-            ducklake_available: self.ducklake_available,
-            ducklake_required: self.ducklake_required,
             last_error: self.last_error.lock_or_poisoned().clone(),
         }
     }
     pub fn ducklake_storage_layout(&self) -> Result<Value> {
-        if !self.ducklake_available {
-            return Ok(json!({"supported": false, "reason": "ducklake is not attached"}));
-        }
         self.with_conn(|conn, _| {
             let tables = self.ducklake_storage_layout_on(conn)?;
             Ok(json!({"supported": true, "tables": tables}))

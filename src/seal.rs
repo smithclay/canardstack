@@ -1,7 +1,7 @@
 use crate::app::AppState;
 use crate::config::Config;
 use crate::ingest::{lifecycle, Ingestor, SealStage};
-use crate::metrics::Metrics;
+use crate::metrics::{MetricName, Metrics};
 use crate::storage::{ArrowFlushOutcome, Storage, TimingPhase};
 use crate::validation::{ApiError, ApiResult};
 use serde_json::{json, Value};
@@ -83,9 +83,9 @@ impl SealDriver {
     }
 }
 
-/// The whole seal, in one place. In order: reserve seal capacity; COMMIT the
-/// Arrow write buffer to DuckLake (the "flush" — append buffered rows and commit
-/// the transaction so they become query-visible); checkpoint the now-durable
+/// The whole seal, in one place. In order: reserve seal capacity; commit the
+/// Arrow write buffer to DuckLake (append buffered rows and COMMIT the
+/// transaction so they become query-visible); checkpoint the now-durable
 /// raw-spool records (mark them committed so they will not replay); feed the
 /// observed throughput back into the admission EWMA; and record the run. The
 /// single named entry point for "perform a seal", used by both the scheduler tick
@@ -130,27 +130,27 @@ fn commit_buffered_rows_with(
     storage: &Storage,
     metrics: &Metrics,
 ) -> anyhow::Result<ArrowFlushOutcome> {
-    let outcome = storage.flush_arrow_write_buffer()?;
-    let replay_refs = outcome.replay_refs();
-    let seal_records = !replay_refs.is_empty();
+    let mut outcome = storage.commit_arrow_write_buffer()?;
+    let committed_replay_refs = outcome.take_committed_replay_refs();
+    let replay_backed_records = committed_replay_refs.len();
+    let seal_records = replay_backed_records != 0;
     tracing::debug!(
         event = "seal_committed_buffer_snapshot",
-        replay_backed_records = replay_refs.len(),
-        best_effort_rows = outcome.best_effort_rows()
+        replay_backed_records,
     );
     if seal_records {
         lifecycle::record_seal(metrics, SealStage::Committed);
     }
     observe_arrow_flush(metrics, &outcome);
     match ingestor.checkpoint_replay_backed_records(
-        &replay_refs,
+        committed_replay_refs,
         "storage_committed",
         Some(metrics),
     ) {
         Ok(()) => {
             tracing::debug!(
                 event = "seal_raw_spool_checkpointed",
-                checkpointed_records = replay_refs.len(),
+                checkpointed_records = replay_backed_records,
             );
             if seal_records {
                 lifecycle::record_seal(metrics, SealStage::Checkpointed);
@@ -184,23 +184,23 @@ fn observe_arrow_flush(metrics: &Metrics, outcome: &ArrowFlushOutcome) {
     for timing in &outcome.timings {
         if timing.phase == TimingPhase::DuckdbArrowAppend {
             metrics.inc(
-                "canardstack_duckdb_arrow_appends_total",
+                MetricName::DuckdbArrowAppendsTotal,
                 &[("storage_signal", timing.storage_signal.as_str())],
                 1,
             );
             metrics.inc(
-                "canardstack_duckdb_arrow_appended_rows_total",
+                MetricName::DuckdbArrowAppendedRowsTotal,
                 &[("storage_signal", timing.storage_signal.as_str())],
                 timing.rows as u64,
             );
         } else if timing.phase == TimingPhase::DucklakeCommit {
             metrics.inc(
-                "canardstack_arrow_flush_rows_total",
+                MetricName::ArrowFlushRowsTotal,
                 &[("storage_signal", timing.storage_signal.as_str())],
                 timing.rows as u64,
             );
             metrics.inc(
-                "canardstack_arrow_flushes_total",
+                MetricName::ArrowFlushesTotal,
                 &[("storage_signal", timing.storage_signal.as_str())],
                 1,
             );

@@ -72,7 +72,7 @@ fn seal_all(state: &AppState) -> usize {
     // Wait for in-flight ingest workers to finish buffering (admission credits
     // released after the buffer append), then run the single flush+checkpoint path
     // the scheduler uses so rows become query-visible and the raw spool is
-    // checkpointed. A bare flush_arrow_write_buffer would flush without
+    // checkpointed. A bare commit_arrow_write_buffer would commit without
     // checkpointing the raw spool, leaving records pending forever.
     let deadline = Instant::now() + StdDuration::from_secs(5);
     while Instant::now() < deadline {
@@ -357,9 +357,8 @@ fn append_gauge_rows(state: &AppState, rows: &[(i64, &str, f64, &str)], source_f
     .unwrap();
     state
         .storage
-        .buffer_best_effort_arrow_records(StorageSignal::MetricGauge, &batch, source_format)
+        .commit_internal_telemetry_batch(StorageSignal::MetricGauge, &batch, source_format)
         .unwrap();
-    state.storage.flush_arrow_write_buffer().unwrap();
 }
 
 fn append_log_rows(state: &AppState, rows: &[(i64, &str, &str)], source_format: &str) {
@@ -418,9 +417,8 @@ fn append_log_rows(state: &AppState, rows: &[(i64, &str, &str)], source_format: 
     .unwrap();
     state
         .storage
-        .buffer_best_effort_arrow_records(StorageSignal::Logs, &batch, source_format)
+        .commit_internal_telemetry_batch(StorageSignal::Logs, &batch, source_format)
         .unwrap();
-    state.storage.flush_arrow_write_buffer().unwrap();
     state.storage.refresh_metadata_limited(usize::MAX).unwrap();
 }
 
@@ -545,7 +543,6 @@ fn operator_metrics_snapshot_is_written_to_metric_store() {
         .write_snapshot_to_storage(&state.storage)
         .unwrap();
     assert!(rows >= 3, "expected operator metric rows, got {rows}");
-    state.storage.flush_arrow_write_buffer().unwrap();
     state.storage.refresh_metadata_limited(usize::MAX).unwrap();
 
     let now = Utc::now();
@@ -2816,7 +2813,6 @@ fn remote_ducklake_attach_uri_smoke() {
     let state = AppState::new(config).unwrap();
     let health = state.storage.health();
     assert!(health.mode.ends_with("_arrow_append"));
-    assert!(health.ducklake_available);
     assert!(health.capabilities.insert);
 
     let now = Utc::now();
@@ -2930,7 +2926,7 @@ fn scheduler_health_excludes_ingest_visibility_jobs() {
     );
     assert_eq!(
         maintenance_health.json_body()["scheduler_jobs"],
-        json!(["metadata_refresh", "metrics_snapshot", "retention"])
+        json!(["seal", "metadata_refresh", "metrics_snapshot", "retention"])
     );
 }
 

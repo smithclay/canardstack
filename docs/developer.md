@@ -88,10 +88,10 @@ defaults to 64 MiB and `CANARDSTACK_ARROW_WRITE_BUFFER_MAX_AGE_SECS` defaults to
 `ducklake_merge_adjacent_files` is proven stable for this write pattern.
 
 The Docker image build runs `canardstack install-ducklake-extension` and stores
-the DuckDB DuckLake extension under `/usr/local/lib/duckdb/extensions`. That
+the required DuckDB extensions under `/usr/local/lib/duckdb/extensions`. That
 build step needs network access to the DuckDB extension repository the first
 time the image is built. At runtime, startup first attempts to load the packaged
-extension. If it is missing, startup fails loudly with guidance to fix the
+extensions. If one is missing, startup fails loudly with guidance to fix the
 extension path or catalog configuration.
 
 `develop.watch` is intentionally not enabled. The Docker quickstart evaluates

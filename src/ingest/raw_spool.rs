@@ -3,7 +3,8 @@ use crate::ingest::spool::{
     self, full_info, AppendBatchStats, CheckpointBatchStats, Record, RecordId, Stats, Writer,
 };
 use crate::ingest::OtlpRequestKind;
-use crate::metrics::Metrics;
+use crate::metrics::{MetricName, Metrics};
+use crate::storage::CommittedReplayRefs;
 use crate::validation::{ApiError, ApiResult};
 use anyhow::{Context, Result};
 use std::collections::{BTreeMap, HashMap};
@@ -144,7 +145,7 @@ impl RawSpool {
                     Self::record_raw_spool_append_batch_metrics(metrics, request_kind, stats);
                 }
                 metrics.inc(
-                    "canardstack_raw_spool_records_total",
+                    MetricName::RawSpoolRecordsTotal,
                     &[
                         ("request_kind", request_kind.as_str()),
                         ("status", "spooled"),
@@ -152,7 +153,7 @@ impl RawSpool {
                     1,
                 );
                 metrics.inc(
-                    "canardstack_raw_spool_bytes_total",
+                    MetricName::RawSpoolBytesTotal,
                     &[("request_kind", request_kind.as_str())],
                     compressed_body_len as u64,
                 );
@@ -167,7 +168,7 @@ impl RawSpool {
             Err(err) => {
                 if full_info(&err).is_some() {
                     metrics.inc(
-                        "canardstack_raw_spool_records_total",
+                        MetricName::RawSpoolRecordsTotal,
                         &[("request_kind", request_kind.as_str()), ("status", "full")],
                         1,
                     );
@@ -178,7 +179,7 @@ impl RawSpool {
                     ))
                 } else if err.to_string().contains("raw spool writer queue is full") {
                     metrics.inc(
-                        "canardstack_raw_spool_records_total",
+                        MetricName::RawSpoolRecordsTotal,
                         &[
                             ("request_kind", request_kind.as_str()),
                             ("status", "queue_full"),
@@ -193,7 +194,7 @@ impl RawSpool {
                     .with_retry_after(5))
                 } else {
                     metrics.inc(
-                        "canardstack_raw_spool_records_total",
+                        MetricName::RawSpoolRecordsTotal,
                         &[("request_kind", request_kind.as_str()), ("status", "error")],
                         1,
                     );
@@ -214,22 +215,22 @@ impl RawSpool {
         stats: AppendBatchStats,
     ) {
         metrics.inc(
-            "canardstack_raw_spool_append_batches_total",
+            MetricName::RawSpoolAppendBatchesTotal,
             &[("request_kind", request_kind.as_str())],
             1,
         );
         metrics.inc(
-            "canardstack_raw_spool_append_batch_records_total",
+            MetricName::RawSpoolAppendBatchRecordsTotal,
             &[("request_kind", request_kind.as_str())],
             stats.records as u64,
         );
         metrics.inc(
-            "canardstack_raw_spool_append_batch_encoded_bytes_total",
+            MetricName::RawSpoolAppendBatchEncodedBytesTotal,
             &[("request_kind", request_kind.as_str())],
             stats.encoded_bytes,
         );
         metrics.inc(
-            "canardstack_raw_spool_append_file_fsyncs_total",
+            MetricName::RawSpoolAppendFileFsyncsTotal,
             &[("request_kind", request_kind.as_str())],
             stats.fsync_count,
         );
@@ -276,17 +277,17 @@ impl RawSpool {
             return;
         }
         metrics.inc(
-            "canardstack_raw_spool_checkpoint_batches_total",
+            MetricName::RawSpoolCheckpointBatchesTotal,
             &[("request_kind", request_kind.as_str())],
             1,
         );
         metrics.inc(
-            "canardstack_raw_spool_checkpoint_batch_records_total",
+            MetricName::RawSpoolCheckpointBatchRecordsTotal,
             &[("request_kind", request_kind.as_str())],
             stats.records as u64,
         );
         metrics.inc(
-            "canardstack_raw_spool_checkpoint_batch_commands_total",
+            MetricName::RawSpoolCheckpointBatchCommandsTotal,
             &[("request_kind", request_kind.as_str())],
             stats.commands as u64,
         );
@@ -310,10 +311,12 @@ impl RawSpool {
 
     /// Terminal disposition for a payload that can never succeed: checkpoint the
     /// raw-spool record so it will not replay; the caller returns the rejection
-    /// afterward. (Retryable storage faults do NOT take this path — they leave the
-    /// record pending so it replays on restart.) A terminally-rejected request is
-    /// dropped from the lifecycle funnel and stays covered by
-    /// `canardstack_raw_spool_checkpointed_records_total{reason}` and
+    /// afterward. This is intentionally separate from committed replay-backed
+    /// checkpoints: terminal never-buffered payloads do not have, and must not
+    /// require, a storage commit token. (Retryable storage faults do NOT take this
+    /// path — they leave the record pending so it replays on restart.) A
+    /// terminally-rejected request is dropped from the lifecycle funnel and stays
+    /// covered by `canardstack_raw_spool_checkpointed_records_total{reason}` and
     /// `canardstack_ingest_requests_total{reason}`; no stage counter is emitted.
     pub(crate) fn checkpoint_terminal(
         &self,
@@ -358,7 +361,7 @@ impl RawSpool {
                 stats,
             );
             metrics.observe_seconds(
-                "canardstack_phase_duration_seconds",
+                MetricName::PhaseDurationSeconds,
                 &[
                     ("request_kind", request_kind.as_str()),
                     ("phase", "raw_spool_terminal_checkpoint"),
@@ -372,7 +375,7 @@ impl RawSpool {
                 seconds,
             );
             metrics.inc(
-                "canardstack_raw_spool_checkpointed_records_total",
+                MetricName::RawSpoolCheckpointedRecordsTotal,
                 &[("request_kind", request_kind.as_str()), ("reason", reason)],
                 1,
             );
@@ -382,10 +385,11 @@ impl RawSpool {
 
     pub(crate) fn checkpoint_replay_backed_records(
         &self,
-        records: &[ReplayBackedRecordRef],
+        records: CommittedReplayRefs,
         reason: &'static str,
         metrics: Option<&Metrics>,
     ) -> Result<()> {
+        let records = records.as_slice();
         if records.is_empty() {
             return Ok(());
         }
@@ -408,7 +412,7 @@ impl RawSpool {
         }
         if let Some(metrics) = metrics {
             metrics.observe_seconds(
-                "canardstack_phase_duration_seconds",
+                MetricName::PhaseDurationSeconds,
                 &[("phase", "raw_spool_checkpoint")],
                 started.elapsed().as_secs_f64(),
             );
@@ -418,7 +422,7 @@ impl RawSpool {
             }
             for (request_kind, count) in by_request_kind {
                 metrics.inc(
-                    "canardstack_raw_spool_checkpointed_records_total",
+                    MetricName::RawSpoolCheckpointedRecordsTotal,
                     &[("request_kind", request_kind.as_str()), ("reason", reason)],
                     count,
                 );
@@ -508,57 +512,57 @@ impl RawSpool {
                 continue;
             };
             metrics.gauge(
-                "canardstack_raw_spool_segment_bytes",
+                MetricName::RawSpoolSegmentBytes,
                 &[("request_kind", request_kind.as_str())],
                 stats.segment_bytes as f64,
             );
             metrics.gauge(
-                "canardstack_raw_spool_segments",
+                MetricName::RawSpoolSegments,
                 &[("request_kind", request_kind.as_str())],
                 stats.segment_count as f64,
             );
             metrics.gauge(
-                "canardstack_raw_spool_pending_records",
+                MetricName::RawSpoolPendingRecords,
                 &[("request_kind", request_kind.as_str())],
                 stats.pending_records as f64,
             );
             metrics.gauge(
-                "canardstack_raw_spool_pending_bytes",
+                MetricName::RawSpoolPendingBytes,
                 &[("request_kind", request_kind.as_str())],
                 stats.pending_bytes as f64,
             );
             metrics.gauge(
-                "canardstack_raw_spool_unsynced_records",
+                MetricName::RawSpoolUnsyncedRecords,
                 &[("request_kind", request_kind.as_str())],
                 stats.unsynced_records as f64,
             );
             metrics.gauge(
-                "canardstack_raw_spool_unsynced_bytes",
+                MetricName::RawSpoolUnsyncedBytes,
                 &[("request_kind", request_kind.as_str())],
                 stats.unsynced_bytes as f64,
             );
             metrics.gauge(
-                "canardstack_raw_spool_unsynced_age_seconds",
+                MetricName::RawSpoolUnsyncedAgeSeconds,
                 &[("request_kind", request_kind.as_str())],
                 stats.unsynced_age_seconds,
             );
             metrics.gauge(
-                "canardstack_raw_spool_healthy",
+                MetricName::RawSpoolHealthy,
                 &[("request_kind", request_kind.as_str())],
                 if stats.healthy { 1.0 } else { 0.0 },
             );
             metrics.set_counter(
-                "canardstack_raw_spool_append_syncs_total",
+                MetricName::RawSpoolAppendSyncsTotal,
                 &[("request_kind", request_kind.as_str())],
                 stats.append_syncs_total,
             );
             metrics.set_counter(
-                "canardstack_raw_spool_append_sync_failures_total",
+                MetricName::RawSpoolAppendSyncFailuresTotal,
                 &[("request_kind", request_kind.as_str())],
                 stats.append_sync_failures_total,
             );
             metrics.set_counter(
-                "canardstack_raw_spool_append_file_fsyncs_total",
+                MetricName::RawSpoolAppendFileFsyncsTotal,
                 &[("request_kind", request_kind.as_str())],
                 stats.append_sync_file_fsyncs_total,
             );
@@ -567,7 +571,7 @@ impl RawSpool {
             // other spool internals.
             #[cfg(feature = "detailed-metrics")]
             metrics.set_observation(
-                "canardstack_phase_duration_seconds",
+                MetricName::PhaseDurationSeconds,
                 &[
                     ("request_kind", request_kind.as_str()),
                     ("phase", "raw_spool_append_fsync"),

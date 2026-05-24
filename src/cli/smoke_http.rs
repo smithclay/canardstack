@@ -4,6 +4,8 @@ use crate::Config;
 use anyhow::{bail, Result};
 use chrono::{Duration as ChronoDuration, Utc};
 use serde_json::{json, Value};
+use std::thread;
+use std::time::{Duration, Instant};
 
 const TRACE_ID: &str = "11111111111111111111111111111111";
 
@@ -78,9 +80,6 @@ fn ensure_ducklake_attached(client: &Client, admin_key: &str) -> Result<()> {
     let response = client.get("/api/admin/health/storage", Some(admin_key))?;
     ensure_status(&response, 200, "storage health")?;
     let body = parse_json(&response, "storage health")?;
-    if body.get("ducklake_available").and_then(Value::as_bool) != Some(true) {
-        bail!("DuckLake is not attached; storage health was {body}");
-    }
     let mode = body.get("mode").and_then(Value::as_str).unwrap_or_default();
     if !mode.starts_with("ducklake_") {
         bail!("expected a DuckLake-backed storage mode, got storage health {body}");
@@ -151,20 +150,7 @@ fn verify_fixture_evidence(client: &Client, api_key: &str, from: &str, to: &str)
         "Loki query did not find fixture log",
     )?;
 
-    let loki_values = client.get(
-        &format!(
-            "/loki/api/v1/label/http_route/values?start={}&end={}",
-            enc(from),
-            enc(to)
-        ),
-        Some(api_key),
-    )?;
-    ensure_status(&loki_values, 200, "Loki label values")?;
-    ensure_text(
-        &parse_json(&loki_values, "Loki label values")?,
-        "/smoke",
-        "Loki label values did not include route",
-    )?;
+    ensure_loki_route_label_value(client, api_key, from, to)?;
 
     let tempo_search = client.get(
         &format!(
@@ -206,6 +192,35 @@ fn verify_fixture_evidence(client: &Client, api_key: &str, from: &str, to: &str)
     )?;
 
     Ok(())
+}
+
+fn ensure_loki_route_label_value(
+    client: &Client,
+    api_key: &str,
+    from: &str,
+    to: &str,
+) -> Result<()> {
+    let path = format!(
+        "/loki/api/v1/label/http_route/values?start={}&end={}",
+        enc(from),
+        enc(to)
+    );
+    let deadline = Instant::now() + Duration::from_secs(45);
+    let mut last = json!({"data":[],"status":"success"});
+    while Instant::now() <= deadline {
+        let response = client.get(&path, Some(api_key))?;
+        ensure_status(&response, 200, "Loki label values")?;
+        let body = parse_json(&response, "Loki label values")?;
+        if body.to_string().contains("/smoke") {
+            return Ok(());
+        }
+        last = body;
+        thread::sleep(Duration::from_secs(1));
+    }
+    bail!(
+        "Loki label values did not include route after metadata refresh wait: {}",
+        last
+    )
 }
 
 fn verify_empty(client: &Client, api_key: &str, _from: &str, _to: &str) -> Result<()> {
