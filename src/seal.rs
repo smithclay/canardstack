@@ -130,7 +130,7 @@ fn commit_buffered_rows_with(
     storage: &Storage,
     metrics: &Metrics,
 ) -> anyhow::Result<ArrowFlushOutcome> {
-    let outcome = storage.flush_arrow_write_buffer(true)?;
+    let outcome = storage.flush_arrow_write_buffer()?;
     let replay_refs = outcome.replay_refs();
     let seal_records = !replay_refs.is_empty();
     tracing::debug!(

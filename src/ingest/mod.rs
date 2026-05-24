@@ -1049,22 +1049,17 @@ impl IngestPipeline {
     }
 
     pub fn freshness_budget_inputs(&self, storage: &Storage) -> FreshnessBudgetInputs {
-        let (buffered_bytes, buffered_active_count, oldest_buffer_age_seconds) = storage
-            .arrow_write_buffer_metrics()
-            .into_iter()
-            .fold((0usize, 0usize, 0.0f64), |(bytes, count, age), metric| {
-                (
-                    bytes.saturating_add(metric.bytes),
-                    count.saturating_add(usize::from(metric.bytes > 0)),
-                    age.max(metric.age_seconds),
-                )
-            });
+        // Ingest hot path: ask storage for exactly the three buffer scalars the
+        // freshness projection takes, folded under one lock with no per-signal
+        // vec allocation. The per-signal `arrow_write_buffer_metrics` detail is
+        // reserved for the scheduler/admin paths.
+        let buffers = storage.arrow_write_buffer_freshness();
         FreshnessBudgetInputs {
             inflight_bytes: self.inflight_bytes(),
             incoming_bytes: 0,
-            buffered_bytes,
-            buffered_active_count,
-            oldest_buffer_age_seconds,
+            buffered_bytes: buffers.buffered_bytes,
+            buffered_active_count: buffers.buffered_active_count,
+            oldest_buffer_age_seconds: buffers.oldest_buffer_age_seconds,
         }
     }
 

@@ -34,7 +34,7 @@ use ducklake::{
     ducklake_attach_plan,
 };
 pub use metadata::MetadataRefreshOutcome;
-use schema::create_tables_on;
+use schema::{create_tables_on, enforce_schema_version_on};
 
 #[derive(Clone, Debug, Serialize)]
 pub struct StorageHealth {
@@ -90,6 +90,17 @@ pub struct ArrowWriteBufferMetric {
     pub age_seconds: f64,
 }
 
+/// Folded Arrow write-buffer aggregates the ingest admission freshness
+/// projection consumes (the three [`crate::admission_control::FreshnessBudgetInputs`]
+/// buffer scalars), produced by [`Storage::arrow_write_buffer_freshness`] under a
+/// single lock without the per-signal [`ArrowWriteBufferMetric`] vec.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ArrowWriteBufferFreshness {
+    pub buffered_bytes: usize,
+    pub buffered_active_count: usize,
+    pub oldest_buffer_age_seconds: f64,
+}
+
 pub struct Storage {
     /// Write-side connection. Held for inserts, DDL, and DuckLake maintenance.
     /// Reader path never touches this mutex — that decoupling keeps /healthz,
@@ -109,8 +120,6 @@ pub struct Storage {
     local_storage_dir: PathBuf,
     ducklake_required: bool,
     ducklake_managed_maintenance: bool,
-    arrow_write_buffer_target_bytes: usize,
-    arrow_write_buffer_max_age: Duration,
     arrow_write_buffers: Mutex<BTreeMap<StorageSignal, ArrowWriteBuffer>>,
     write_memory_limit: String,
     last_error: Mutex<Option<String>>,
@@ -256,6 +265,9 @@ impl Storage {
         let ducklake_managed_maintenance = plan.managed_maintenance;
 
         create_tables_on(&writer, &target_prefix)?;
+        // Fail-closed if this binary cannot safely operate on the catalog's
+        // schema generation; stamp it on a fresh/legacy catalog.
+        enforce_schema_version_on(&writer, &target_prefix)?;
 
         // Reader must be cloned AFTER attach + create_tables so the new
         // session inherits the catalog.
@@ -277,8 +289,6 @@ impl Storage {
             local_storage_dir: config.operator.local_storage_dir.clone(),
             ducklake_required: true,
             ducklake_managed_maintenance,
-            arrow_write_buffer_target_bytes: config.mechanics.arrow_write_buffer_target_bytes,
-            arrow_write_buffer_max_age: config.mechanics.arrow_write_buffer_max_age,
             arrow_write_buffers: Mutex::new(BTreeMap::new()),
             write_memory_limit: config.operator.duckdb_write_memory_limit.clone(),
             last_error: Mutex::new(None),

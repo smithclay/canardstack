@@ -9,7 +9,7 @@ use arrow58::record_batch::RecordBatch;
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct BufferDurability {
@@ -70,7 +70,6 @@ pub(super) struct ArrowFlushResult {
 }
 
 pub struct ArrowFlushOutcome {
-    pub force: bool,
     pub flushed_rows: usize,
     pub flushed_buffers: usize,
     pub timings: Vec<ArrowBatchBufferTiming>,
@@ -91,7 +90,6 @@ impl ArrowFlushOutcome {
     pub fn to_json(&self) -> Value {
         json!({
             "supported": true,
-            "force": self.force,
             "flushed_rows": self.flushed_rows,
             "flushed_buffers": self.flushed_buffers,
             "replay_backed_records": self.replay_refs.len(),
@@ -136,21 +134,6 @@ impl ArrowWriteBuffer {
         self.batches.append(&mut other.batches);
     }
 
-    pub(super) fn should_flush(
-        &self,
-        target_bytes: usize,
-        max_age: Duration,
-        now: Instant,
-    ) -> bool {
-        self.rows > 0
-            && size_or_age_due(
-                self.bytes,
-                now.duration_since(self.opened_at).as_secs_f64(),
-                target_bytes,
-                max_age.as_secs_f64(),
-            )
-    }
-
     pub(super) fn record_batch(&self, storage_signal: StorageSignal) -> Result<RecordBatch> {
         match self.batches.as_slice() {
             [] => anyhow::bail!("Arrow write buffer for {storage_signal} is empty"),
@@ -167,10 +150,9 @@ impl ArrowWriteBuffer {
 
 /// Single source of truth for the Arrow write-buffer size/age flush threshold:
 /// a buffer is due when its byte size reaches `target_bytes` or its age reaches
-/// `max_age_seconds`. Both `ArrowWriteBuffer::should_flush` and the
-/// `SealDriver` seal-cadence decision delegate here so the two cannot diverge.
-/// Production always seals via `flush_arrow_write_buffer(force = true)`, so in
-/// practice this predicate also drives the `SealDriver` "should I seal now?" check.
+/// `max_age_seconds`. The `SealDriver` seal-cadence decision delegates here (via
+/// [`super::Storage::size_or_age_due`]); the seal then flushes everything
+/// buffered through `flush_arrow_write_buffer`.
 pub(crate) fn size_or_age_due(
     bytes: usize,
     age_seconds: f64,

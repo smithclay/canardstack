@@ -40,7 +40,10 @@ oversights. Each is documented in full in its own section below.
   tool or `ALTER ... ADD COLUMN` path. Changing columns requires a coordinated
   manual migration (or a fresh catalog). OTLP fields without a typed column are
   carried as JSON in the `*_attributes` columns, not promoted to new columns.
-  See [Storage](#storage).
+  A `schema_version` in a `canardstack_meta` catalog table fences this: boot
+  fails closed when the catalog is outside the binary's supported version window.
+  See [Storage](#storage) and [Schema Versioning and
+  Compatibility](storage-schema.md#schema-versioning-and-compatibility).
 - Row-level dedup — ingest is at-least-once, so crash-replay can produce
   duplicate rows and v0 surfaces them verbatim. See the delivery-semantics note
   under [Ingest Semantics](#ingest-semantics); not duplicated here.
@@ -484,8 +487,11 @@ than left as an inline "disabled" flag.
   flag lives in `Maintenance::retention` (`src/maintenance.rs`).
 
 Online schema evolution under continuous arrival is a separate but related v0
-punt (the storage schema is static); see [Punts / Non-Goals
-(v0)](#punts--non-goals-v0) and [Storage](#storage).
+punt (the storage schema is static); a catalog `schema_version` guard
+(`canardstack_meta`) keeps an incompatible binary/catalog pairing a loud boot
+failure rather than a silent misread. See [Punts / Non-Goals
+(v0)](#punts--non-goals-v0), [Storage](#storage), and [Schema Versioning and
+Compatibility](storage-schema.md#schema-versioning-and-compatibility).
 
 ## Compatibility Surface
 

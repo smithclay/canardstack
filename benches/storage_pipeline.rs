@@ -71,7 +71,7 @@ fn run() -> Result<()> {
             })?;
             phase_stats.record_timings(result.timings);
         }
-        let flush = storage.flush_arrow_write_buffer(true)?;
+        let flush = storage.flush_arrow_write_buffer()?;
         flushed_rows += flush.flushed_rows;
         flushed_buffers += flush.flushed_buffers;
         phase_stats.record_timings(flush.timings);

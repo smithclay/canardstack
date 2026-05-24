@@ -380,56 +380,63 @@ impl AdmissionController {
                 }
             }
         };
-        if !accepted {
+        let result = if !accepted {
             state.query_rejections_total += 1;
             metrics.inc(
                 "canardstack_admission_rejections_total",
                 &[("admission", "query"), ("reason", rejection_reason)],
                 1,
             );
-            drop(state);
-            self.record_metrics(metrics, inputs);
-            return Err(
+            Err(
                 ApiError::new(429, rejection_reason, query_rejection_message(class))
                     .with_retry_after(1),
-            );
-        }
+            )
+        } else {
+            Ok(QueryAdmissionGuard {
+                admission: self,
+                class,
+            })
+        };
+        // Query hot path: take the admission lock once, snapshot, release, then
+        // emit the (identical) gauges.
+        let snapshot = self.snapshot_from_state(&state);
         drop(state);
-        self.record_metrics(metrics, inputs);
-        Ok(QueryAdmissionGuard {
-            admission: self,
-            class,
-        })
+        self.emit_admission_gauges(metrics, &snapshot);
+        result
     }
 
     pub fn admit_ingest(&self, inputs: FreshnessBudgetInputs, metrics: &Metrics) -> ApiResult<()> {
         let mut state = self.inner.lock_or_poisoned();
         self.update_projection_locked(&mut state, inputs);
         let heavy_in_flight = state.heavy_query_active > 0;
-        let decision = ingest_admit(
+        let result = match ingest_admit(
             &state.debt,
             self.freshness_budget_sla_seconds,
             heavy_in_flight,
-        );
-        if let Err(reason) = decision {
-            state.ingest_freshness_rejections_total += 1;
-            metrics.inc(
-                "canardstack_admission_rejections_total",
-                &[("admission", "freshness_budget"), ("reason", reason)],
-                1,
-            );
-            drop(state);
-            self.record_metrics(metrics, inputs);
-            return Err(ApiError::new(
-                429,
-                reason,
-                "projected seal visibility exceeds freshness budget",
-            )
-            .with_retry_after(5));
-        }
+        ) {
+            Ok(()) => Ok(()),
+            Err(reason) => {
+                state.ingest_freshness_rejections_total += 1;
+                metrics.inc(
+                    "canardstack_admission_rejections_total",
+                    &[("admission", "freshness_budget"), ("reason", reason)],
+                    1,
+                );
+                Err(ApiError::new(
+                    429,
+                    reason,
+                    "projected seal visibility exceeds freshness budget",
+                )
+                .with_retry_after(5))
+            }
+        };
+        // Ingest hot path: take the admission lock once. Snapshot the
+        // decision-time state, release the lock, then emit the (identical)
+        // gauges, instead of dropping and re-acquiring inside record_metrics.
+        let snapshot = self.snapshot_from_state(&state);
         drop(state);
-        self.record_metrics(metrics, inputs);
-        Ok(())
+        self.emit_admission_gauges(metrics, &snapshot);
+        result
     }
 
     pub fn record_observed_freshness_lag(&self, lag_seconds: f64, metrics: &Metrics) {
@@ -455,19 +462,34 @@ impl AdmissionController {
     pub fn snapshot_for(&self, inputs: FreshnessBudgetInputs) -> AdmissionSnapshot {
         let mut state = self.inner.lock_or_poisoned();
         self.update_projection_locked(&mut state, inputs);
-        let heavy_query_effective_capacity = self.effective_heavy_capacity_locked(&state);
+        self.snapshot_from_state(&state)
+    }
+
+    /// Build the admission snapshot from already-locked state. A hot-path caller
+    /// that already holds the lock (and has refreshed the projection) snapshots
+    /// once and emits gauges after releasing the lock, instead of dropping the
+    /// lock and re-acquiring + re-projecting inside [`Self::record_metrics`].
+    fn snapshot_from_state(&self, state: &AdmissionState) -> AdmissionSnapshot {
         snapshot_locked(
-            &state,
+            state,
             self.seal_capacity,
             self.cheap_query_capacity,
             self.heavy_query_capacity,
-            heavy_query_effective_capacity,
+            self.effective_heavy_capacity_locked(state),
             self.freshness_budget_sla_seconds,
         )
     }
 
     pub fn record_metrics(&self, metrics: &Metrics, inputs: FreshnessBudgetInputs) {
         let snapshot = self.snapshot_for(inputs);
+        self.emit_admission_gauges(metrics, &snapshot);
+    }
+
+    /// Emit the admission gauge surface from a prepared snapshot. Hot-path
+    /// callers build the snapshot via [`Self::snapshot_from_state`] while holding
+    /// the lock and call this after releasing it; the emitted values are
+    /// identical to [`Self::record_metrics`].
+    fn emit_admission_gauges(&self, metrics: &Metrics, snapshot: &AdmissionSnapshot) {
         metrics.gauge(
             "canardstack_admission_capacity",
             &[("admission", "seal")],

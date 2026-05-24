@@ -106,6 +106,7 @@ Top-level modules map to pipeline stages or boundaries. Subdirectories group hel
 - Do not expose arbitrary SQL through the compatibility APIs. Direct SQL is intentionally an external DuckDB CLI / MotherDuck path.
 - Preserve the Prometheus/Loki error envelope shape: `{"status":"error","errorType":"...","error":"..."}`.
 - Assume one in-process scheduler and single writer. There is no Postgres-backed maintenance lease yet.
+- The storage schema is static and version-fenced. The DuckLake catalog carries a `schema_version` in `canardstack_meta`; `Storage::open` fails boot when it is outside `[MIN_COMPATIBLE_SCHEMA_VERSION, SCHEMA_VERSION]` (`src/storage/schema.rs`). Changing a `*_COLUMNS` set (or partitioning) means bumping `SCHEMA_VERSION` — additive/expand-contract keeps `MIN_COMPATIBLE` low; a breaking change raises both. The `*_COLUMNS`↔`otlp2records` contract is pinned by the `stored_columns_align_with_otlp2records_output` test, so an `otlp2records` bump that changes emitted columns fails `cargo test`, not ingest.
 
 ## Testing Expectations
 

@@ -5,8 +5,9 @@ use super::arrow_write::{
 };
 use super::ducklake::configure_write_connection;
 use super::{
-    ArrowBatchBufferResult, ArrowBatchBufferTiming, ArrowWriteBufferMetric, BestEffortArrowBatch,
-    PreparedArrowBatch, ReplayBackedArrowBatch, Storage, StorageSignal, TimingPhase,
+    ArrowBatchBufferResult, ArrowBatchBufferTiming, ArrowWriteBufferFreshness,
+    ArrowWriteBufferMetric, BestEffortArrowBatch, PreparedArrowBatch, ReplayBackedArrowBatch,
+    Storage, StorageSignal, TimingPhase,
 };
 use crate::LockExt;
 use anyhow::{Context, Result};
@@ -53,8 +54,8 @@ impl<'a> ArrowBatchInput<'a> {
 
 impl Storage {
     /// The single size/age flush-threshold predicate, exposed so the
-    /// `SealDriver` seal-cadence decision and `ArrowWriteBuffer::should_flush`
-    /// share one definition. See [`size_or_age_due`].
+    /// `SealDriver` seal-cadence decision delegates to one definition. See
+    /// [`size_or_age_due`].
     pub(crate) fn size_or_age_due(
         bytes: usize,
         age_seconds: f64,
@@ -75,6 +76,26 @@ impl Storage {
                 age_seconds: buffer.opened_at.elapsed().as_secs_f64(),
             })
             .collect()
+    }
+
+    /// Folded Arrow write-buffer aggregates the ingest admission freshness
+    /// projection consumes, read under one lock without allocating the
+    /// per-signal metric vec. This is the dedicated ingest hot-path accessor: the
+    /// request path needs only the three scalars [`FreshnessBudgetInputs`] takes,
+    /// so it asks for exactly those instead of piggybacking on
+    /// [`Self::arrow_write_buffer_metrics`] (which builds a per-signal vec for the
+    /// scheduler/admin detail paths). Equivalent to folding that vec.
+    pub fn arrow_write_buffer_freshness(&self) -> ArrowWriteBufferFreshness {
+        let buffers = self.arrow_write_buffers.lock_or_poisoned();
+        let mut freshness = ArrowWriteBufferFreshness::default();
+        for buffer in buffers.values() {
+            freshness.buffered_bytes = freshness.buffered_bytes.saturating_add(buffer.bytes);
+            freshness.buffered_active_count += usize::from(buffer.bytes > 0);
+            freshness.oldest_buffer_age_seconds = freshness
+                .oldest_buffer_age_seconds
+                .max(buffer.opened_at.elapsed().as_secs_f64());
+        }
+        freshness
     }
 
     /// The single sanctioned production entry to the best-effort write path:
@@ -248,36 +269,20 @@ impl Storage {
         })
     }
 
-    /// Commit buffered rows to DuckLake. For each storage signal whose Arrow
-    /// write buffer is due (`force`, or size/age per [`size_or_age_due`]), this
-    /// detaches the buffer, coalesces it into one `RecordBatch`, appends it
-    /// through the DuckDB Arrow appender, and COMMITs the DuckLake transaction.
-    /// "Flush" here means a durable DuckLake commit, not an in-memory drain. The
-    /// returned [`ArrowFlushOutcome`] carries the committed snapshot's replay refs
-    /// so the caller ([`crate::seal`]) can checkpoint exactly those raw-spool
-    /// records afterward. Production always calls this with `force = true` via the
-    /// single seal path.
-    pub fn flush_arrow_write_buffer(&self, force: bool) -> Result<ArrowFlushOutcome> {
-        let mut to_flush = BTreeMap::new();
-        {
+    /// Commit all buffered rows to DuckLake. Every storage signal with a
+    /// non-empty Arrow write buffer is detached, coalesced into one
+    /// `RecordBatch`, appended through the DuckDB Arrow appender, and COMMITted in
+    /// the DuckLake transaction. "Flush" here means a durable DuckLake commit, not
+    /// an in-memory drain. The returned [`ArrowFlushOutcome`] carries the
+    /// committed snapshot's replay refs so the caller ([`crate::seal`]) can
+    /// checkpoint exactly those raw-spool records afterward. Deciding *when* a
+    /// flush is due is the `SealDriver`'s job ([`crate::seal`]); this method
+    /// always flushes everything currently buffered.
+    pub fn flush_arrow_write_buffer(&self) -> Result<ArrowFlushOutcome> {
+        let to_flush = {
             let mut buffers = self.arrow_write_buffers.lock_or_poisoned();
-            let now = Instant::now();
-            let tables_to_flush = buffers
-                .iter()
-                .filter_map(|(table, buffer)| {
-                    (force
-                        || buffer.should_flush(
-                            self.arrow_write_buffer_target_bytes,
-                            self.arrow_write_buffer_max_age,
-                            now,
-                        ))
-                    .then_some(*table)
-                })
-                .collect::<Vec<_>>();
-
-            if tables_to_flush.is_empty() {
+            if buffers.is_empty() {
                 return Ok(ArrowFlushOutcome {
-                    force,
                     flushed_rows: 0,
                     flushed_buffers: 0,
                     timings: Vec::new(),
@@ -286,13 +291,8 @@ impl Storage {
                     best_effort_rows: 0,
                 });
             }
-
-            for table in tables_to_flush {
-                if let Some(buffer) = buffers.remove(&table) {
-                    to_flush.insert(table, buffer);
-                }
-            }
-        }
+            std::mem::take(&mut *buffers)
+        };
         let flush_result = match self.flush_arrow_write_buffers(&to_flush) {
             Ok(result) => result,
             Err(err) => {
@@ -306,7 +306,6 @@ impl Storage {
         self.mark_metadata_dirty(flush_result.affected);
 
         Ok(ArrowFlushOutcome {
-            force,
             flushed_rows: flush_result.rows,
             flushed_buffers: flush_result.buffers,
             timings: flush_result.timings,
