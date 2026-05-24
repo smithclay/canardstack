@@ -152,6 +152,20 @@ pub(crate) struct ReplayBackedArrowBatch<'a> {
     pub(crate) replay_ref: ReplayBackedRecordRef,
 }
 
+/// A storage-buffer input that **bypasses the raw spool**: it carries NO
+/// [`ReplayBackedRecordRef`], so its rows cannot be checkpointed or replayed.
+///
+/// INVARIANT: best-effort is reserved for sanctioned INTERNAL telemetry only — in
+/// v0 that is exclusively the operator metrics snapshot
+/// ([`crate::metrics::Metrics::write_snapshot_to_storage`]). External OTLP ingest
+/// MUST enter the write buffer through
+/// [`Storage::buffer_replay_backed_arrow_batches`] with a `ReplayBackedRecordRef`
+/// so at-least-once delivery holds; never route external ingest through the
+/// best-effort path. The replay-backed entry point is `pub(crate)`; this one is
+/// `pub` only so in-repo benches/tests (separate crates) can drive the storage
+/// write path directly, which is why it is `#[doc(hidden)]` rather than part of
+/// the supported API.
+#[doc(hidden)]
 pub struct BestEffortArrowBatch<'a> {
     pub storage_signal: StorageSignal,
     pub batch: &'a RecordBatch,

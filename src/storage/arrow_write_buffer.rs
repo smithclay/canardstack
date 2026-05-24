@@ -77,6 +77,12 @@ impl Storage {
             .collect()
     }
 
+    /// Buffer sanctioned internal telemetry that bypasses the raw spool. Honor the
+    /// invariant on [`BestEffortArrowBatch`]: external ingest must NOT use this
+    /// path (no replay ref, cannot be checkpointed) — it goes through
+    /// [`Storage::buffer_replay_backed_arrow_batches`]. `pub`/`#[doc(hidden)]` only
+    /// so in-repo benches/tests can reach it.
+    #[doc(hidden)]
     pub fn buffer_best_effort_arrow_records(
         &self,
         storage_signal: StorageSignal,
@@ -91,6 +97,11 @@ impl Storage {
         Ok(result.rows)
     }
 
+    /// Buffer one best-effort batch. See the invariant on [`BestEffortArrowBatch`]:
+    /// sanctioned internal telemetry only; external ingest uses
+    /// [`Storage::buffer_replay_backed_arrow_batches`]. `pub`/`#[doc(hidden)]` only
+    /// so in-repo benches/tests can reach it.
+    #[doc(hidden)]
     pub fn buffer_best_effort_arrow_batch(
         &self,
         batch: BestEffortArrowBatch<'_>,
