@@ -67,15 +67,7 @@ impl Storage {
 
     pub fn arrow_write_buffer_metrics(&self) -> Vec<ArrowWriteBufferMetric> {
         let buffers = self.arrow_write_buffers.lock_or_poisoned();
-        buffers
-            .iter()
-            .map(|(storage_signal, buffer)| ArrowWriteBufferMetric {
-                storage_signal: *storage_signal,
-                rows: buffer.rows,
-                bytes: buffer.bytes,
-                age_seconds: buffer.opened_at.elapsed().as_secs_f64(),
-            })
-            .collect()
+        metrics_from_buffers(&buffers)
     }
 
     /// Folded Arrow write-buffer aggregates the ingest admission freshness
@@ -87,15 +79,7 @@ impl Storage {
     /// scheduler/admin detail paths). Equivalent to folding that vec.
     pub fn arrow_write_buffer_freshness(&self) -> ArrowWriteBufferFreshness {
         let buffers = self.arrow_write_buffers.lock_or_poisoned();
-        let mut freshness = ArrowWriteBufferFreshness::default();
-        for buffer in buffers.values() {
-            freshness.buffered_bytes = freshness.buffered_bytes.saturating_add(buffer.bytes);
-            freshness.buffered_active_count += usize::from(buffer.bytes > 0);
-            freshness.oldest_buffer_age_seconds = freshness
-                .oldest_buffer_age_seconds
-                .max(buffer.opened_at.elapsed().as_secs_f64());
-        }
-        freshness
+        freshness_from_buffers(&buffers)
     }
 
     /// The single sanctioned production entry to the best-effort write path:
@@ -272,14 +256,16 @@ impl Storage {
     /// Commit all buffered rows to DuckLake. Every storage signal with a
     /// non-empty Arrow write buffer is detached, coalesced into one
     /// `RecordBatch`, appended through the DuckDB Arrow appender, and COMMITted in
-    /// the DuckLake transaction. "Flush" here means a durable DuckLake commit, not
-    /// an in-memory drain. The returned [`ArrowFlushOutcome`] carries the
-    /// committed snapshot's replay refs so the caller ([`crate::seal`]) can
-    /// checkpoint exactly those raw-spool records afterward. Deciding *when* a
-    /// flush is due is the `SealDriver`'s job ([`crate::seal`]); this method
-    /// always flushes everything currently buffered.
-    pub fn flush_arrow_write_buffer(&self) -> Result<ArrowFlushOutcome> {
-        let to_flush = {
+    /// the DuckLake transaction. This is the durable-commit verb on the seal path:
+    /// the COMMIT here is what makes raw-spool checkpointing legal, distinct from
+    /// the in-memory `appender.flush()` drain that runs inside the transaction
+    /// before it (see [`append_record_batch_to_ducklake`]). The returned
+    /// [`ArrowFlushOutcome`] carries the committed snapshot's replay refs so the
+    /// caller ([`crate::seal`]) can checkpoint exactly those raw-spool records
+    /// afterward. Deciding *when* a commit is due is the `SealDriver`'s job
+    /// ([`crate::seal`]); this method always commits everything currently buffered.
+    pub fn commit_arrow_write_buffer(&self) -> Result<ArrowFlushOutcome> {
+        let to_commit = {
             let mut buffers = self.arrow_write_buffers.lock_or_poisoned();
             if buffers.is_empty() {
                 return Ok(ArrowFlushOutcome {
@@ -293,29 +279,29 @@ impl Storage {
             }
             std::mem::take(&mut *buffers)
         };
-        let flush_result = match self.flush_arrow_write_buffers(&to_flush) {
+        let commit_result = match self.commit_arrow_write_buffers(&to_commit) {
             Ok(result) => result,
             Err(err) => {
-                self.restore_arrow_write_buffers(to_flush);
+                self.restore_arrow_write_buffers(to_commit);
                 return Err(err);
             }
         };
         let active_write_buffers =
             arrow_write_buffer_snapshot(&self.arrow_write_buffers.lock_or_poisoned());
         *self.last_error.lock_or_poisoned() = None;
-        self.mark_metadata_dirty(flush_result.affected);
+        self.mark_metadata_dirty(commit_result.affected);
 
         Ok(ArrowFlushOutcome {
-            flushed_rows: flush_result.rows,
-            flushed_buffers: flush_result.buffers,
-            timings: flush_result.timings,
+            flushed_rows: commit_result.rows,
+            flushed_buffers: commit_result.buffers,
+            timings: commit_result.timings,
             active_write_buffers,
-            replay_refs: flush_result.replay_refs,
-            best_effort_rows: flush_result.best_effort_rows,
+            replay_refs: commit_result.replay_refs,
+            best_effort_rows: commit_result.best_effort_rows,
         })
     }
 
-    fn flush_arrow_write_buffers(
+    fn commit_arrow_write_buffers(
         &self,
         buffers: &BTreeMap<StorageSignal, ArrowWriteBuffer>,
     ) -> Result<ArrowFlushResult> {
@@ -431,8 +417,11 @@ fn append_record_batch_to_ducklake(
     appender.append_record_batch(batch).with_context(|| {
         format!("append Arrow RecordBatch to {catalog_name}.main.{storage_signal}")
     })?;
+    // In-memory appender drain into the OPEN transaction — NOT the durable commit.
+    // The COMMIT in `append_buffers_to_ducklake` is what makes the rows durable and
+    // raw-spool checkpointing legal; this only flushes the appender's buffer.
     appender.flush().with_context(|| {
-        format!("flush DuckDB Arrow appender for {catalog_name}.main.{storage_signal}")
+        format!("drain DuckDB Arrow appender for {catalog_name}.main.{storage_signal}")
     })?;
     Ok(())
 }
@@ -464,6 +453,44 @@ fn distributed_buffer_timing(
         .collect()
 }
 
+/// Per-signal Arrow write-buffer metrics: the detail view the scheduler/admin
+/// paths consume. [`Storage::arrow_write_buffer_freshness`] folds the same buffer
+/// state into just the scalars the ingest hot path needs;
+/// [`freshness_from_buffers`] MUST stay equal to folding this vec, which the
+/// `freshness_matches_folded_metrics` test pins so the two accessors cannot drift.
+fn metrics_from_buffers(
+    buffers: &BTreeMap<StorageSignal, ArrowWriteBuffer>,
+) -> Vec<ArrowWriteBufferMetric> {
+    buffers
+        .iter()
+        .map(|(storage_signal, buffer)| ArrowWriteBufferMetric {
+            storage_signal: *storage_signal,
+            rows: buffer.rows,
+            bytes: buffer.bytes,
+            age_seconds: buffer.opened_at.elapsed().as_secs_f64(),
+        })
+        .collect()
+}
+
+/// Folded Arrow write-buffer freshness scalars for the ingest admission
+/// projection: sum of buffered bytes, count of active (non-empty) buffers, and
+/// the oldest buffer age. Equivalent to folding [`metrics_from_buffers`]; the
+/// equality is pinned by `freshness_matches_folded_metrics` so this hot-path fold
+/// cannot silently diverge from the per-signal detail accessor.
+fn freshness_from_buffers(
+    buffers: &BTreeMap<StorageSignal, ArrowWriteBuffer>,
+) -> ArrowWriteBufferFreshness {
+    let mut freshness = ArrowWriteBufferFreshness::default();
+    for buffer in buffers.values() {
+        freshness.buffered_bytes = freshness.buffered_bytes.saturating_add(buffer.bytes);
+        freshness.buffered_active_count += usize::from(buffer.bytes > 0);
+        freshness.oldest_buffer_age_seconds = freshness
+            .oldest_buffer_age_seconds
+            .max(buffer.opened_at.elapsed().as_secs_f64());
+    }
+    freshness
+}
+
 fn coalesce_storage_batches(
     storage_signal: StorageSignal,
     batches: &[&RecordBatch],
@@ -485,6 +512,46 @@ mod tests {
     use arrow58::array::Int64Array;
     use arrow58::datatypes::{DataType, Field, Schema};
     use std::sync::Arc;
+
+    #[test]
+    fn freshness_matches_folded_metrics() {
+        use std::time::{Duration, Instant};
+
+        let now = Instant::now();
+        let mut buffers = BTreeMap::new();
+        let mut logs = ArrowWriteBuffer::new(now - Duration::from_secs(3));
+        logs.rows = 10;
+        logs.bytes = 100;
+        let mut spans = ArrowWriteBuffer::new(now - Duration::from_secs(1));
+        spans.rows = 5;
+        spans.bytes = 40;
+        // An opened-but-empty buffer must not count toward the active total.
+        let empty = ArrowWriteBuffer::new(now);
+        buffers.insert(StorageSignal::Logs, logs);
+        buffers.insert(StorageSignal::Spans, spans);
+        buffers.insert(StorageSignal::MetricGauge, empty);
+
+        let freshness = freshness_from_buffers(&buffers);
+        let metrics = metrics_from_buffers(&buffers);
+
+        let folded_bytes: usize = metrics.iter().map(|m| m.bytes).sum();
+        let folded_active = metrics.iter().filter(|m| m.bytes > 0).count();
+        let folded_oldest = metrics
+            .iter()
+            .map(|m| m.age_seconds)
+            .fold(0.0_f64, f64::max);
+
+        assert_eq!(freshness.buffered_bytes, folded_bytes);
+        assert_eq!(freshness.buffered_active_count, folded_active);
+        // Both folds call `opened_at.elapsed()` independently, so allow a small
+        // wall-clock skew between the two reads of the oldest age.
+        assert!(
+            (freshness.oldest_buffer_age_seconds - folded_oldest).abs() < 0.25,
+            "freshness oldest {} vs folded {}",
+            freshness.oldest_buffer_age_seconds,
+            folded_oldest
+        );
+    }
 
     #[test]
     fn coalesce_storage_batches_concats_rows() {

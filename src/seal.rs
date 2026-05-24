@@ -83,9 +83,9 @@ impl SealDriver {
     }
 }
 
-/// The whole seal, in one place. In order: reserve seal capacity; COMMIT the
-/// Arrow write buffer to DuckLake (the "flush" — append buffered rows and commit
-/// the transaction so they become query-visible); checkpoint the now-durable
+/// The whole seal, in one place. In order: reserve seal capacity; commit the
+/// Arrow write buffer to DuckLake (append buffered rows and COMMIT the
+/// transaction so they become query-visible); checkpoint the now-durable
 /// raw-spool records (mark them committed so they will not replay); feed the
 /// observed throughput back into the admission EWMA; and record the run. The
 /// single named entry point for "perform a seal", used by both the scheduler tick
@@ -130,7 +130,7 @@ fn commit_buffered_rows_with(
     storage: &Storage,
     metrics: &Metrics,
 ) -> anyhow::Result<ArrowFlushOutcome> {
-    let outcome = storage.flush_arrow_write_buffer()?;
+    let outcome = storage.commit_arrow_write_buffer()?;
     let replay_refs = outcome.replay_refs();
     let seal_records = !replay_refs.is_empty();
     tracing::debug!(

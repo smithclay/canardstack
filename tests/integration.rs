@@ -72,7 +72,7 @@ fn seal_all(state: &AppState) -> usize {
     // Wait for in-flight ingest workers to finish buffering (admission credits
     // released after the buffer append), then run the single flush+checkpoint path
     // the scheduler uses so rows become query-visible and the raw spool is
-    // checkpointed. A bare flush_arrow_write_buffer would flush without
+    // checkpointed. A bare commit_arrow_write_buffer would commit without
     // checkpointing the raw spool, leaving records pending forever.
     let deadline = Instant::now() + StdDuration::from_secs(5);
     while Instant::now() < deadline {
@@ -359,7 +359,7 @@ fn append_gauge_rows(state: &AppState, rows: &[(i64, &str, f64, &str)], source_f
         .storage
         .buffer_best_effort_arrow_records(StorageSignal::MetricGauge, &batch, source_format)
         .unwrap();
-    state.storage.flush_arrow_write_buffer().unwrap();
+    state.storage.commit_arrow_write_buffer().unwrap();
 }
 
 fn append_log_rows(state: &AppState, rows: &[(i64, &str, &str)], source_format: &str) {
@@ -420,7 +420,7 @@ fn append_log_rows(state: &AppState, rows: &[(i64, &str, &str)], source_format: 
         .storage
         .buffer_best_effort_arrow_records(StorageSignal::Logs, &batch, source_format)
         .unwrap();
-    state.storage.flush_arrow_write_buffer().unwrap();
+    state.storage.commit_arrow_write_buffer().unwrap();
     state.storage.refresh_metadata_limited(usize::MAX).unwrap();
 }
 
@@ -545,7 +545,7 @@ fn operator_metrics_snapshot_is_written_to_metric_store() {
         .write_snapshot_to_storage(&state.storage)
         .unwrap();
     assert!(rows >= 3, "expected operator metric rows, got {rows}");
-    state.storage.flush_arrow_write_buffer().unwrap();
+    state.storage.commit_arrow_write_buffer().unwrap();
     state.storage.refresh_metadata_limited(usize::MAX).unwrap();
 
     let now = Utc::now();

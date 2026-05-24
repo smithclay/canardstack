@@ -69,6 +69,11 @@ pub(super) struct ArrowFlushResult {
     pub(super) best_effort_rows: usize,
 }
 
+/// Result record of a durable Arrow write-buffer commit
+/// ([`super::Storage::commit_arrow_write_buffer`]). The `flushed_*` field names
+/// (and the matching `flushed_rows`/`flushed_buffers` JSON keys plus the
+/// `canardstack_arrow_flush*` metrics) are a stable operator contract, so the
+/// noun "flush" is kept on the result even though the operation verb is "commit".
 pub struct ArrowFlushOutcome {
     pub flushed_rows: usize,
     pub flushed_buffers: usize,
@@ -151,8 +156,8 @@ impl ArrowWriteBuffer {
 /// Single source of truth for the Arrow write-buffer size/age flush threshold:
 /// a buffer is due when its byte size reaches `target_bytes` or its age reaches
 /// `max_age_seconds`. The `SealDriver` seal-cadence decision delegates here (via
-/// [`super::Storage::size_or_age_due`]); the seal then flushes everything
-/// buffered through `flush_arrow_write_buffer`.
+/// [`super::Storage::size_or_age_due`]); the seal then commits everything
+/// buffered through `commit_arrow_write_buffer`.
 pub(crate) fn size_or_age_due(
     bytes: usize,
     age_seconds: f64,
