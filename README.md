@@ -19,6 +19,7 @@ Builds on prior work from [otlp2parquet](https://github.com/smithclay/otlp2parqu
 ## Contents
 
 - [Quickstart](#quickstart)
+- [Demo](#demo)
 - [What You Can Do](#what-you-can-do)
 - [Send Telemetry](#send-telemetry)
 - [Query Data](#query-data)
@@ -29,7 +30,48 @@ Builds on prior work from [otlp2parquet](https://github.com/smithclay/otlp2parqu
 - [For Developers](#for-developers)
 - [Documentation](#documentation)
 
-## Quickstart
+## Quick Start
+
+Start canardstack from source. With no options, it uses local DuckLake storage
+under `.canardstack` and listens for OTLP data on `127.0.0.1:4318`.
+
+```bash
+# requires rust toolchain: `curl https://sh.rustup.rs -sSf | sh`
+# also assumes you have duckdb installed (`brew install duckdb`)
+git clone https://github.com/smithclay/canardstack.git && cd canardstack
+cargo run
+```
+
+In another terminal, send one OTLP/HTTP JSON log:
+
+```bash
+NOW_NANOS="$(date +%s)000000000"
+
+curl -sS -X POST http://127.0.0.1:4318/v1/logs \
+  -H 'Authorization: Bearer dev-canardstack-key' \
+  -H 'Content-Type: application/json' \
+  --data "{\"resourceLogs\":[{\"scopeLogs\":[{\"logRecords\":[{\"timeUnixNano\":\"$NOW_NANOS\",\"body\":{\"stringValue\":\"hello world\"}}]}]}]}"
+```
+
+canardstack acknowledges ingest after the raw request is fsynced locally. Give
+the scheduler a moment to sync the log into DuckLake, then query it directly:
+
+```bash
+sleep 2
+duckdb
+```
+
+```sql
+INSTALL ducklake;
+LOAD ducklake;
+ATTACH 'ducklake:.canardstack/canardstack.ducklake' AS canardlake
+  (DATA_PATH '.canardstack/storage');
+USE canardlake;
+
+SELECT * FROM logs;
+```
+
+## Demo
 
 Start canardstack and Grafana with local DuckLake storage:
 
