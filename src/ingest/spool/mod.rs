@@ -9,7 +9,6 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 mod codec;
-mod ingestor;
 #[cfg(test)]
 mod tests;
 mod writer;
@@ -19,7 +18,6 @@ use codec::{
     read_completed_sequences, scan_segment, segment_ids, segment_path, sync_dir, EncodedRecord,
     PreparedRecord,
 };
-pub(crate) use ingestor::AppendRef;
 pub use writer::Writer;
 
 const RECORD_MAGIC: &[u8; 8] = b"CSRAW01\n";
@@ -99,7 +97,7 @@ struct AppendedRecord {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-pub struct AppendSyncStats {
+pub struct AppendFsyncStats {
     pub seconds: f64,
     pub file_count: u64,
 }
@@ -110,8 +108,6 @@ pub struct Options {
     pub max_segment_bytes: u64,
     pub max_record_bytes: u64,
     pub max_total_bytes: u64,
-    pub append_sync_interval: Duration,
-    pub append_sync_bytes: u64,
     pub checkpoint_fsync_records: usize,
     pub checkpoint_fsync_delay: Duration,
 }
@@ -123,8 +119,6 @@ impl Options {
             max_segment_bytes: DEFAULT_MAX_SEGMENT_BYTES,
             max_record_bytes: DEFAULT_MAX_RECORD_BYTES,
             max_total_bytes: 1024 * 1024 * 1024,
-            append_sync_interval: Duration::from_millis(500),
-            append_sync_bytes: 16 * 1024 * 1024,
             checkpoint_fsync_records: 1024,
             checkpoint_fsync_delay: Duration::from_millis(1000),
         }
@@ -189,8 +183,6 @@ pub struct Spool {
     active_segment: u64,
     active: File,
     checkpoint: File,
-    append_sync_interval: Duration,
-    append_sync_bytes: u64,
     append_dirty_records: usize,
     append_dirty_bytes: u64,
     append_dirty_since: Option<Instant>,
@@ -206,7 +198,7 @@ pub struct Spool {
     checkpoint_last_sync: Instant,
     next_sequence: u64,
     #[cfg(test)]
-    fail_next_append_sync: bool,
+    fail_next_append_fsync: bool,
 }
 
 impl Spool {
@@ -214,8 +206,6 @@ impl Spool {
         let max_segment_bytes = options.max_segment_bytes.max(RECORD_HEADER_BYTES + 1);
         let max_record_bytes = options.max_record_bytes.max(1);
         let max_total_bytes = options.max_total_bytes.max(1);
-        let append_sync_interval = options.append_sync_interval.max(Duration::from_millis(1));
-        let append_sync_bytes = options.append_sync_bytes.max(1);
         let checkpoint_fsync_records = options.checkpoint_fsync_records.max(1);
         let checkpoint_fsync_delay = options.checkpoint_fsync_delay.max(Duration::from_millis(1));
         fs::create_dir_all(&options.dir)
@@ -321,8 +311,6 @@ impl Spool {
             active_segment,
             active,
             checkpoint,
-            append_sync_interval,
-            append_sync_bytes,
             append_dirty_records: 0,
             append_dirty_bytes: 0,
             append_dirty_since: None,
@@ -338,7 +326,7 @@ impl Spool {
             checkpoint_last_sync: Instant::now(),
             next_sequence: max_sequence.saturating_add(1).max(1),
             #[cfg(test)]
-            fail_next_append_sync: false,
+            fail_next_append_fsync: false,
         })
     }
 
@@ -570,37 +558,17 @@ impl Spool {
         })
     }
 
-    fn append_sync_due_in(&self) -> Option<Duration> {
-        if self.append_dirty_records == 0 {
-            return None;
-        }
-        if self.append_dirty_bytes >= self.append_sync_bytes {
-            return Some(Duration::ZERO);
-        }
-        self.append_dirty_since
-            .map(|started| self.append_sync_interval.saturating_sub(started.elapsed()))
-    }
-
-    fn sync_append_if_due(&mut self, force: bool) -> Result<Option<AppendSyncStats>> {
+    fn sync_append_if_dirty(&mut self) -> Result<Option<AppendFsyncStats>> {
         if self.append_dirty_records == 0 {
             return Ok(None);
         }
-        if force
-            || self.append_dirty_bytes >= self.append_sync_bytes
-            || self
-                .append_dirty_since
-                .map(|started| started.elapsed() >= self.append_sync_interval)
-                .unwrap_or(false)
-        {
-            return self.sync_append().map(Some);
-        }
-        Ok(None)
+        self.sync_append().map(Some)
     }
 
-    fn sync_append(&mut self) -> Result<AppendSyncStats> {
+    fn sync_append(&mut self) -> Result<AppendFsyncStats> {
         self.ensure_healthy()?;
         if self.append_dirty_records == 0 {
-            return Ok(AppendSyncStats::default());
+            return Ok(AppendFsyncStats::default());
         }
         let started = Instant::now();
         let dirty_segments = self
@@ -611,9 +579,9 @@ impl Spool {
         let mut file_count = 0u64;
         let result = (|| -> Result<()> {
             #[cfg(test)]
-            if self.fail_next_append_sync {
-                self.fail_next_append_sync = false;
-                bail!("injected raw spool append sync failure");
+            if self.fail_next_append_fsync {
+                self.fail_next_append_fsync = false;
+                bail!("injected raw spool append fsync failure");
             }
             for segment in dirty_segments {
                 if segment == self.active_segment {
@@ -644,7 +612,7 @@ impl Spool {
                 self.append_sync_file_fsyncs_total = self
                     .append_sync_file_fsyncs_total
                     .saturating_add(file_count);
-                Ok(AppendSyncStats {
+                Ok(AppendFsyncStats {
                     seconds: started.elapsed().as_secs_f64(),
                     file_count,
                 })
@@ -789,7 +757,7 @@ impl Spool {
 
     fn ensure_healthy(&self) -> Result<()> {
         if let Some(error) = &self.fatal_error {
-            bail!("raw spool append sync failed: {error}");
+            bail!("raw spool append fsync failed: {error}");
         }
         Ok(())
     }
@@ -812,8 +780,8 @@ impl Spool {
     }
 
     #[cfg(test)]
-    fn fail_next_append_sync(&mut self) {
-        self.fail_next_append_sync = true;
+    fn fail_next_append_fsync(&mut self) {
+        self.fail_next_append_fsync = true;
     }
 }
 

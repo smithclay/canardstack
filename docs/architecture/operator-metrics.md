@@ -70,17 +70,17 @@ Do not label metrics by `service_name`, trace id, query text, API key, or arbitr
 | `canardstack_raw_spool_append_batches_total` | Counter | `request_kind` | Raw-spool append batches written by the writer. |
 | `canardstack_raw_spool_append_batch_records_total` | Counter | `request_kind` | Raw-spool records included in append batches. |
 | `canardstack_raw_spool_append_batch_encoded_bytes_total` | Counter | `request_kind` | Encoded raw-spool bytes included in append batches. |
-| `canardstack_raw_spool_append_syncs_total` | Counter | `request_kind` | Successful raw-spool append sync cycles. |
-| `canardstack_raw_spool_append_file_fsyncs_total` | Counter | `request_kind` | Segment file fsync calls performed by append sync cycles. |
-| `canardstack_raw_spool_append_sync_failures_total` | Counter | `request_kind` | Failed raw-spool append sync cycles. Any increase should make the raw spool unhealthy and subsequent ingest return `503`. |
+| `canardstack_raw_spool_append_syncs_total` | Counter | `request_kind` | Successful raw-spool append fsync cycles; append batches are fsynced before acknowledgement. |
+| `canardstack_raw_spool_append_file_fsyncs_total` | Counter | `request_kind` | Segment file fsync calls performed by append fsync cycles. |
+| `canardstack_raw_spool_append_sync_failures_total` | Counter | `request_kind` | Failed raw-spool append fsync cycles. Any increase should make the raw spool unhealthy and subsequent ingest return `503`. |
 | `canardstack_raw_spool_replayed_records_total` | Counter | `request_kind`, `status` | Startup replay attempts and outcomes for uncheckpointed raw-spool records. |
 | `canardstack_raw_spool_checkpointed_records_total` | Counter | `request_kind`, `reason` | Raw-spool records made reclaimable after terminal rejection or DuckLake storage commit. |
 | `canardstack_raw_spool_pending_records` | Gauge | `request_kind` | Uncheckpointed raw-spool records currently pending replay or storage commit. |
 | `canardstack_raw_spool_pending_bytes` | Gauge | `request_kind` | Compressed bytes for uncheckpointed raw-spool records. |
-| `canardstack_raw_spool_unsynced_records` | Gauge | `request_kind` | Written raw-spool records not yet covered by a successful append sync. |
-| `canardstack_raw_spool_unsynced_bytes` | Gauge | `request_kind` | Encoded raw-spool bytes not yet covered by a successful append sync. |
+| `canardstack_raw_spool_unsynced_records` | Gauge | `request_kind` | Written raw-spool records not yet covered by a successful append fsync. |
+| `canardstack_raw_spool_unsynced_bytes` | Gauge | `request_kind` | Encoded raw-spool bytes not yet covered by a successful append fsync. |
 | `canardstack_raw_spool_unsynced_age_seconds` | Gauge | `request_kind` | Age of the oldest unsynced append data, or `0` when fully synced. |
-| `canardstack_raw_spool_healthy` | Gauge | `request_kind` | `1` when the writer is accepting appends; `0` after a fatal append sync failure. |
+| `canardstack_raw_spool_healthy` | Gauge | `request_kind` | `1` when the writer is accepting appends; `0` after a fatal append fsync failure. |
 | `canardstack_raw_spool_segment_bytes` | Gauge | `request_kind` | Total raw-spool segment bytes on disk. |
 | `canardstack_raw_spool_segments` | Gauge | `request_kind` | Raw-spool segment file count. |
 | `canardstack_ingest_records_total` | Counter | `request_kind` | Records accepted into the Arrow write buffer. |
@@ -143,7 +143,7 @@ request-visible `raw_spool_append` and `raw_spool_checkpoint` phases with
 `request_kind` and `phase` labels (the coarse batch-checkpoint phase is emitted
 once, label-free). The raw-spool writer internals
 (`raw_spool_append_batch_wait` collecting a group-commit batch,
-`raw_spool_append_write` file write time, `raw_spool_append_fsync` append sync
+`raw_spool_append_write` file write time, `raw_spool_append_fsync` append fsync
 time, and the checkpoint micro-timings) are only emitted when built with
 `--features detailed-metrics`. `raw_spool_append_fsync` is part of `202` latency
 because accepted requests are fsynced before acknowledgement.

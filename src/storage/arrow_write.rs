@@ -1,5 +1,5 @@
 use super::{ArrowBatchBufferTiming, PreparedArrowBatch};
-use crate::seal::{BufferDurability, ReplayRef};
+use crate::ingest::ReplayBackedRecordRef;
 use crate::signal::StorageSignal;
 use anyhow::{Context, Result};
 use arrow58::array as arrow58_array;
@@ -10,6 +10,44 @@ use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct BufferDurability {
+    replay_refs: BTreeSet<ReplayBackedRecordRef>,
+    best_effort: bool,
+}
+
+impl BufferDurability {
+    pub(super) fn empty() -> Self {
+        Self {
+            replay_refs: BTreeSet::new(),
+            best_effort: false,
+        }
+    }
+
+    pub(super) fn best_effort() -> Self {
+        Self {
+            replay_refs: BTreeSet::new(),
+            best_effort: true,
+        }
+    }
+
+    pub(super) fn replay_backed(replay_ref: ReplayBackedRecordRef) -> Self {
+        Self {
+            replay_refs: BTreeSet::from([replay_ref]),
+            best_effort: false,
+        }
+    }
+
+    pub(super) fn merge(&mut self, mut other: Self) {
+        self.replay_refs.append(&mut other.replay_refs);
+        self.best_effort |= other.best_effort;
+    }
+
+    pub(super) fn replay_refs(&self) -> Vec<ReplayBackedRecordRef> {
+        self.replay_refs.iter().copied().collect()
+    }
+}
 
 #[derive(Clone)]
 pub(super) struct ArrowWriteBuffer {
@@ -27,7 +65,7 @@ pub(super) struct ArrowFlushResult {
     pub(super) buffers: usize,
     pub(super) timings: Vec<ArrowBatchBufferTiming>,
     pub(super) affected: BTreeMap<StorageSignal, BTreeSet<String>>,
-    pub(super) replay_refs: Vec<ReplayRef>,
+    pub(super) replay_refs: Vec<ReplayBackedRecordRef>,
     pub(super) best_effort_rows: usize,
 }
 
@@ -37,12 +75,12 @@ pub struct ArrowFlushOutcome {
     pub flushed_buffers: usize,
     pub timings: Vec<ArrowBatchBufferTiming>,
     pub active_write_buffers: Value,
-    pub(crate) replay_refs: Vec<ReplayRef>,
+    pub(crate) replay_refs: Vec<ReplayBackedRecordRef>,
     pub(crate) best_effort_rows: usize,
 }
 
 impl ArrowFlushOutcome {
-    pub(crate) fn replay_refs(&self) -> Vec<ReplayRef> {
+    pub(crate) fn replay_refs(&self) -> Vec<ReplayBackedRecordRef> {
         self.replay_refs.clone()
     }
 

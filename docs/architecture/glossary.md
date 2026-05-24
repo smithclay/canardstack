@@ -18,8 +18,12 @@ compatibility query surface uses), where that distinction applies.
 | Term (type) | Definition |
 | --- | --- |
 | raw record (`spool::Record`, `src/ingest/spool/mod.rs`) | The durably-spooled raw OTLP request: exactly what the client sent, fsynced to the local raw spool before any transform. At-least-once delivery is anchored on this record. |
-| Arrow row batch (`RecordBatch`, a "batch") | The transformed columnar unit produced by `otlp2records`, grouped by storage signal. The columnar form of a chunk of rows. |
-| write buffer (`ArrowWriteBuffer`, `src/storage/arrow_write_buffer.rs`) | The in-memory, per-storage-signal accumulator that coalesces batches before a seal flushes them. Each buffered unit carries a durability disposition: replay-backed raw-spool refs for normal ingest, or best-effort for sanctioned internal rows. |
+| pending raw record (`PendingRawRecord`, `src/ingest/raw_spool.rs`) | A raw record recovered from the local raw spool because it has not been checkpointed. Startup replay hands these records back to the ingest pipeline without appending a second raw-spool copy. |
+| replay-backed record ref (`ReplayBackedRecordRef`, `src/ingest/raw_spool.rs`) | The checkpoint identity carried by normal ingest rows after they enter the Arrow write buffer: the original request kind, the raw-spool request-kind writer, and the raw record id. Seal checkpoints these refs only after DuckLake commit. |
+| Arrow row batch (`RecordBatch`, a "batch") | The transformed columnar unit produced by `otlp2records`, grouped by storage signal. The columnar form of a chunk of rows; do not use "batch" for a raw-spool record or worker handoff. |
+| replay-backed Arrow batch (`ReplayBackedArrowBatch`, `src/storage/mod.rs`) | A storage-buffer input produced from a durably-spooled OTLP request. It must carry a replay-backed record ref. |
+| best-effort Arrow batch (`BestEffortArrowBatch`, `src/storage/mod.rs`) | A storage-buffer input produced by sanctioned internal telemetry. It has no raw-spool record and cannot be checkpointed or replayed. |
+| write buffer (`ArrowWriteBuffer`, `src/storage/arrow_write_buffer.rs`) | The in-memory, per-storage-signal accumulator that coalesces Arrow row batches before a seal flushes them. Each buffered unit is either replay-backed ingest data or best-effort internal data. |
 | row | A single logical record inside a batch or DuckLake table (one log line, one span, one metric data point). |
 
 ## Operations
@@ -27,7 +31,7 @@ compatibility query surface uses), where that distinction applies.
 | Term | Definition |
 | --- | --- |
 | flush | Moving the write buffer's accumulated batches into DuckDB via the Arrow appender. |
-| seal | The scheduler operation in `seal::run` (`src/seal.rs`): snapshot typed buffered rows, flush and commit them to DuckLake, then checkpoint exactly the replay-backed raw-spool refs from that committed snapshot. Snapshot-before-flush is load-bearing for at-least-once. |
+| seal | The scheduler operation owned by `SealDriver` / `seal::run` (`src/seal.rs`): decide when a flush is due, reserve seal admission, snapshot typed buffered rows, flush and commit them to DuckLake, then checkpoint exactly the replay-backed raw-spool refs from that committed snapshot. Snapshot-before-flush is load-bearing for at-least-once. |
 | checkpoint | Disposing of a raw-spool record — after a successful DuckLake commit, or after a terminal rejection — so it will not replay on restart. |
 
 ## Reserved term
@@ -47,6 +51,10 @@ freshness projection formula and its `FreshnessBudgetInputs` fields live in
   plus `incoming_bytes` for the current request), drained by the seal pipeline.
 - buffer debt: write-buffer bytes/age beyond the configured buffer target and
   max age (`buffered_bytes`, `buffered_active_count`, `oldest_buffer_age_seconds`).
+- visibility debt: the max of projected seal seconds and projected buffer
+  seconds; ingest rejects when this exceeds the freshness budget band.
+- freshness lag: observed query visibility delay from committed storage
+  watermarks, distinct from event-time age.
 - seal-rate EWMA (`ewma_seal_bytes_per_second`): the single observed seal
   throughput estimate that drains both the in-flight seal debt and the
   buffer-size debt.

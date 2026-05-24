@@ -183,11 +183,10 @@ writes and forced append fsync. It uses a bounded command queue; a saturated
 append queue returns `429 raw_spool_queue_full` instead of parking request
 threads. It batches channel receives and writes internally up to 64 records, or
 until `CANARDSTACK_RAW_SPOOL_GROUP_COMMIT_MS` elapses from the first record in
-the group. Append sync is forced before each `202`; the interval and byte knobs
-still bound dirty data for internal writer cycles and shutdown. Append sync
-knobs reject zero values at startup.
+the group. Append fsync is forced before each append acknowledgement, so there
+are no delayed append-sync interval or byte knobs.
 
-Checkpoint durability remains weaker than append sync. A lost checkpoint only
+Checkpoint durability remains weaker than append fsync. A lost checkpoint only
 causes duplicate replay of data already accepted into storage. Checkpoint log
 writes therefore acknowledge after the local write and fsync on looser internal
 thresholds, plus writer shutdown.
@@ -196,8 +195,6 @@ Main knobs:
 
 - `CANARDSTACK_RAW_SPOOL_CAPACITY_BYTES`
 - `CANARDSTACK_RAW_SPOOL_GROUP_COMMIT_MS`
-- `CANARDSTACK_RAW_SPOOL_APPEND_SYNC_MS`
-- `CANARDSTACK_RAW_SPOOL_APPEND_SYNC_BYTES`
 
 `CANARDSTACK_RAW_SPOOL_CAPACITY_BYTES` applies to each per-request-kind raw
 spool. The current request kinds are logs, traces, and metrics, so worst-case
@@ -242,8 +239,9 @@ Seal triggers:
 - The seal-rate EWMA seed (4 MiB over 10 seconds) is a fixed internal warm-up
   mechanic, not a config knob; the estimator converges to measured throughput.
 
-A single scheduler-driven seal owner (`seal::commit_buffered_rows`) is the only
-seal path. It flushes on a frequent cadence (`CANARDSTACK_SEAL_INTERVAL_MS`,
+A single scheduler-driven seal owner (`seal::SealDriver` plus
+`seal::commit_buffered_rows`) is the only seal path. It flushes on a frequent
+cadence (`CANARDSTACK_SEAL_INTERVAL_MS`,
 default 1s) or earlier when a buffered signal reaches its size
 (`CANARDSTACK_ARROW_WRITE_BUFFER_TARGET_BYTES`) or age
 (`CANARDSTACK_ARROW_WRITE_BUFFER_MAX_AGE_*`) threshold. The cadence must stay

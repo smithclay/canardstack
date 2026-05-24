@@ -63,7 +63,7 @@ pub struct QueryLimits {
 ///   body/connection caps, socket timeouts, scheduler on/off).
 /// - [`Mechanics`] — advanced mechanics that are either env/file-tunable or
 ///   derived from an operator setting (Arrow write-buffer target/age, raw-spool
-///   max sizes + append-sync + group-commit cadence, ingest worker count,
+///   max sizes + group-commit cadence, ingest worker count,
 ///   scheduler intervals).
 /// - [`TestOverrides`] — fixed production defaults exposed only so tests can
 ///   exercise edge cases deterministically. Operators cannot configure these.
@@ -125,8 +125,6 @@ pub struct Mechanics {
     pub raw_spool_max_record_bytes: usize,
     pub raw_spool_max_total_bytes: usize,
     pub raw_spool_group_commit_delay: Duration,
-    pub raw_spool_append_sync_interval: Duration,
-    pub raw_spool_append_sync_bytes: usize,
     pub ingest_workers: usize,
     /// When true, the scheduler's metrics-snapshot job writes a snapshot of the
     /// current operator metrics into the `metric_gauge` / `metric_sum` storage
@@ -469,14 +467,6 @@ impl Mechanics {
                     .or(file.usize(&["raw_spool", "group_commit_ms"])?)
                     .unwrap_or(1) as u64,
             ),
-            raw_spool_append_sync_interval: Duration::from_millis(
-                env_usize("CANARDSTACK_RAW_SPOOL_APPEND_SYNC_MS")?
-                    .or(file.usize(&["raw_spool", "append_sync_ms"])?)
-                    .unwrap_or(500) as u64,
-            ),
-            raw_spool_append_sync_bytes: env_usize("CANARDSTACK_RAW_SPOOL_APPEND_SYNC_BYTES")?
-                .or(file.usize(&["raw_spool", "append_sync_bytes"])?)
-                .unwrap_or(16 * 1024 * 1024),
             ingest_workers: env_usize("CANARDSTACK_INGEST_WORKERS")?
                 .or(file.usize(&["ingest", "workers"])?)
                 .unwrap_or(4),
@@ -499,8 +489,6 @@ impl Mechanics {
             raw_spool_max_record_bytes: 8 * 1024 * 1024,
             raw_spool_max_total_bytes: 1024 * 1024 * 1024,
             raw_spool_group_commit_delay: Duration::from_millis(1),
-            raw_spool_append_sync_interval: Duration::from_millis(500),
-            raw_spool_append_sync_bytes: 16 * 1024 * 1024,
             ingest_workers: 4,
             operator_metrics_to_storage: false,
         }
@@ -517,15 +505,11 @@ impl Mechanics {
         if self.raw_spool_max_segment_bytes == 0
             || self.raw_spool_max_record_bytes == 0
             || self.raw_spool_max_total_bytes == 0
-            || self.raw_spool_append_sync_bytes == 0
         {
             anyhow::bail!("raw spool limits must be > 0");
         }
         if self.raw_spool_group_commit_delay.is_zero() {
             anyhow::bail!("CANARDSTACK_RAW_SPOOL_GROUP_COMMIT_MS must be > 0");
-        }
-        if self.raw_spool_append_sync_interval.is_zero() {
-            anyhow::bail!("CANARDSTACK_RAW_SPOOL_APPEND_SYNC_MS must be > 0");
         }
         if self.ingest_workers == 0 {
             anyhow::bail!("CANARDSTACK_INGEST_WORKERS must be > 0");
@@ -903,8 +887,6 @@ seal_interval_ms = 250
 [raw_spool]
 capacity_bytes = 16384
 group_commit_ms = 3
-append_sync_ms = 250
-append_sync_bytes = 8192
 "#,
         )
         .unwrap();
@@ -973,14 +955,8 @@ append_sync_bytes = 8192
             config.mechanics.raw_spool_group_commit_delay,
             Duration::from_millis(3)
         );
-        assert_eq!(
-            config.mechanics.raw_spool_append_sync_interval,
-            Duration::from_millis(250)
-        );
-        assert_eq!(config.mechanics.raw_spool_append_sync_bytes, 8192);
         assert_eq!(config.mechanics.ingest_workers, 3);
-        // Internal mechanics are no longer file/env driven; they stay at their
-        // fixed defaults regardless of any (now-ignored) file keys above.
+        // Fixed test hooks stay out of the operator/file config surface.
         assert_eq!(
             config.test_overrides.ingest_worker_channel_capacity,
             crate::ingest::INGEST_WORKER_CHANNEL_CAPACITY

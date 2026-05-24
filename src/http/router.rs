@@ -195,8 +195,6 @@ fn route_inner(
                         "writer_queue_capacity": crate::ingest::spool::RAW_SPOOL_WRITER_QUEUE_CAPACITY,
                         "group_commit_records": crate::ingest::spool::RAW_SPOOL_GROUP_COMMIT_RECORDS,
                         "group_commit_ms": state.config.mechanics.raw_spool_group_commit_delay.as_millis(),
-                        "append_sync_ms": state.config.mechanics.raw_spool_append_sync_interval.as_millis(),
-                        "append_sync_bytes": state.config.mechanics.raw_spool_append_sync_bytes,
                         "checkpoint_fsync_records": crate::ingest::spool::RAW_SPOOL_CHECKPOINT_FSYNC_RECORDS,
                         "checkpoint_fsync_ms": crate::ingest::spool::RAW_SPOOL_CHECKPOINT_FSYNC_DELAY.as_millis()
                     }

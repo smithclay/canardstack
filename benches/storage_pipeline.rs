@@ -5,9 +5,8 @@ use arrow58::array::{
 use arrow58::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow58::record_batch::RecordBatch;
 use canardstack::config::Config;
-use canardstack::seal::BufferDurability;
 use canardstack::signal::StorageSignal;
-use canardstack::storage::{ArrowBatchBuffer, ArrowBatchBufferTiming, Storage};
+use canardstack::storage::{ArrowBatchBufferTiming, BestEffortArrowBatch, Storage};
 use chrono::Utc;
 use std::collections::BTreeMap;
 use std::env;
@@ -65,12 +64,11 @@ fn run() -> Result<()> {
 
         let started = Instant::now();
         for (signal, batch) in generated {
-            let result = storage.buffer_arrow_batches(&[ArrowBatchBuffer {
+            let result = storage.buffer_best_effort_arrow_batch(BestEffortArrowBatch {
                 storage_signal: signal,
                 batch: &batch,
                 source_format: "storage_pipeline_bench",
-                durability: BufferDurability::best_effort(),
-            }])?;
+            })?;
             phase_stats.record_timings(result.timings);
         }
         let flush = storage.flush_arrow_write_buffer(true)?;

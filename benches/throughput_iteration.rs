@@ -3239,7 +3239,7 @@ impl StageThroughputReport {
             StageMetric {
                 stage: "raw_spooled_records",
                 metric: "canardstack_raw_spool_records_total",
-                label: "spool_lane",
+                label: "request_kind",
                 kind: StageMetricKind::Counter,
             },
             StageMetric {

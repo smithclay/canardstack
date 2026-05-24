@@ -18,8 +18,6 @@ fn options(dir: &Path) -> Options {
         max_segment_bytes: 256,
         max_record_bytes: 1024,
         max_total_bytes: 1024 * 1024,
-        append_sync_interval: Duration::from_millis(500),
-        append_sync_bytes: 16 * 1024 * 1024,
         checkpoint_fsync_records: 1,
         checkpoint_fsync_delay: Duration::from_millis(1),
     }
@@ -202,16 +200,12 @@ fn raw_spool_writer_batches_deferred_checkpoint_commands() {
 }
 
 #[test]
-fn raw_spool_periodic_append_sync_clears_unsynced_accounting() {
+fn raw_spool_append_fsync_clears_unsynced_accounting() {
     let dir = tempdir().unwrap();
-    let mut opts = options(dir.path());
-    opts.append_sync_interval = Duration::from_millis(500);
-    opts.append_sync_bytes = 1024 * 1024;
-    let mut spool = Spool::open(opts).unwrap();
+    let mut spool = Spool::open(options(dir.path())).unwrap();
 
     spool.append(record(b"first")).unwrap();
-    spool.append_dirty_since = Some(Instant::now() - Duration::from_secs(1));
-    let sync = spool.sync_append_if_due(false).unwrap().unwrap();
+    let sync = spool.sync_append_if_dirty().unwrap().unwrap();
 
     assert!(sync.file_count >= 1);
     assert!(sync.seconds >= 0.0);
@@ -224,52 +218,31 @@ fn raw_spool_periodic_append_sync_clears_unsynced_accounting() {
 }
 
 #[test]
-fn raw_spool_append_sync_byte_threshold_clears_unsynced_accounting() {
-    let dir = tempdir().unwrap();
-    let mut opts = options(dir.path());
-    opts.append_sync_interval = Duration::from_secs(60);
-    opts.append_sync_bytes = 1;
-    let mut spool = Spool::open(opts).unwrap();
-
-    spool.append(record(b"first")).unwrap();
-    let sync = spool.sync_append_if_due(false).unwrap().unwrap();
-
-    assert!(sync.file_count >= 1);
-    let stats = spool.stats().unwrap();
-    assert_eq!(stats.unsynced_records, 0);
-    assert_eq!(stats.unsynced_bytes, 0);
-    assert_eq!(stats.append_syncs_total, 1);
-}
-
-#[test]
-fn raw_spool_forced_append_sync_on_shutdown_clears_unsynced_accounting() {
-    let dir = tempdir().unwrap();
-    let mut opts = options(dir.path());
-    opts.append_sync_interval = Duration::from_secs(60);
-    opts.append_sync_bytes = 1024 * 1024;
-    let mut spool = Spool::open(opts).unwrap();
-
-    spool.append(record(b"first")).unwrap();
-    assert_eq!(spool.stats().unwrap().unsynced_records, 1);
-    spool.sync_append_if_due(true).unwrap();
-
-    let stats = spool.stats().unwrap();
-    assert_eq!(stats.unsynced_records, 0);
-    assert_eq!(stats.unsynced_bytes, 0);
-    assert_eq!(stats.append_syncs_total, 1);
-}
-
-#[test]
-fn raw_spool_append_sync_failure_marks_unhealthy_and_blocks_appends() {
+fn raw_spool_shutdown_append_fsync_clears_unsynced_accounting() {
     let dir = tempdir().unwrap();
     let mut spool = Spool::open(options(dir.path())).unwrap();
 
     spool.append(record(b"first")).unwrap();
-    spool.fail_next_append_sync();
-    let err = spool.sync_append_if_due(true).unwrap_err();
+    assert_eq!(spool.stats().unwrap().unsynced_records, 1);
+    spool.sync_append_if_dirty().unwrap();
+
+    let stats = spool.stats().unwrap();
+    assert_eq!(stats.unsynced_records, 0);
+    assert_eq!(stats.unsynced_bytes, 0);
+    assert_eq!(stats.append_syncs_total, 1);
+}
+
+#[test]
+fn raw_spool_append_fsync_failure_marks_unhealthy_and_blocks_appends() {
+    let dir = tempdir().unwrap();
+    let mut spool = Spool::open(options(dir.path())).unwrap();
+
+    spool.append(record(b"first")).unwrap();
+    spool.fail_next_append_fsync();
+    let err = spool.sync_append_if_dirty().unwrap_err();
     assert!(err
         .to_string()
-        .contains("injected raw spool append sync failure"));
+        .contains("injected raw spool append fsync failure"));
 
     let stats = spool.stats().unwrap();
     assert_eq!(stats.unsynced_records, 1);
@@ -278,10 +251,10 @@ fn raw_spool_append_sync_failure_marks_unhealthy_and_blocks_appends() {
     assert!(stats
         .error
         .unwrap()
-        .contains("injected raw spool append sync failure"));
+        .contains("injected raw spool append fsync failure"));
 
     let err = spool.append(record(b"second")).unwrap_err();
-    assert!(err.to_string().contains("raw spool append sync failed"));
+    assert!(err.to_string().contains("raw spool append fsync failed"));
 }
 
 #[test]

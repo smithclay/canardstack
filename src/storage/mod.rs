@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::seal::BufferDurability;
+use crate::ingest::ReplayBackedRecordRef;
 use crate::signal::StorageSignal;
 use anyhow::{Context, Result};
 use arrow58::record_batch::RecordBatch;
@@ -27,7 +27,7 @@ mod query_conn;
 mod schema;
 
 pub use arrow_write::ArrowFlushOutcome;
-use arrow_write::ArrowWriteBuffer;
+use arrow_write::{ArrowWriteBuffer, BufferDurability};
 pub use ducklake::install_ducklake_extension;
 use ducklake::{
     attach_ducklake_connection, configure_base_connection, configure_write_connection,
@@ -145,11 +145,17 @@ impl std::fmt::Display for QueryTimeoutError {
 
 impl std::error::Error for QueryTimeoutError {}
 
-pub struct ArrowBatchBuffer<'a> {
+pub(crate) struct ReplayBackedArrowBatch<'a> {
+    pub(crate) storage_signal: StorageSignal,
+    pub(crate) batch: &'a RecordBatch,
+    pub(crate) source_format: &'a str,
+    pub(crate) replay_ref: ReplayBackedRecordRef,
+}
+
+pub struct BestEffortArrowBatch<'a> {
     pub storage_signal: StorageSignal,
     pub batch: &'a RecordBatch,
     pub source_format: &'a str,
-    pub durability: BufferDurability,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

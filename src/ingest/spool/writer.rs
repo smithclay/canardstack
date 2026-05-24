@@ -178,7 +178,7 @@ pub(super) fn run_raw_spool_writer(
                 None => match receiver.recv() {
                     Ok(command) => command,
                     Err(_) => {
-                        let _ = spool.sync_append_if_due(true);
+                        let _ = spool.sync_append_if_dirty();
                         let _ = spool.sync_checkpoint_if_due(true);
                         break;
                     }
@@ -186,12 +186,11 @@ pub(super) fn run_raw_spool_writer(
                 Some(sync_due_in) => match receiver.recv_timeout(sync_due_in) {
                     Ok(command) => command,
                     Err(RecvTimeoutError::Timeout) => {
-                        let _ = spool.sync_append_if_due(false);
                         let _ = spool.sync_checkpoint_if_due(false);
                         continue;
                     }
                     Err(RecvTimeoutError::Disconnected) => {
-                        let _ = spool.sync_append_if_due(true);
+                        let _ = spool.sync_append_if_dirty();
                         let _ = spool.sync_checkpoint_if_due(true);
                         break;
                     }
@@ -226,17 +225,12 @@ pub(super) fn run_raw_spool_writer(
                 let _ = reply.send(());
             }
         }
-        let _ = spool.sync_append_if_due(false);
+        let _ = spool.sync_append_if_dirty();
     }
 }
 
 pub(super) fn next_writer_timeout(spool: &Spool) -> Option<Duration> {
-    match (spool.append_sync_due_in(), spool.checkpoint_sync_due_in()) {
-        (Some(append), Some(checkpoint)) => Some(append.min(checkpoint)),
-        (Some(append), None) => Some(append),
-        (None, Some(checkpoint)) => Some(checkpoint),
-        (None, None) => None,
-    }
+    spool.checkpoint_sync_due_in()
 }
 
 pub(super) fn handle_append_batch(
@@ -275,7 +269,7 @@ pub(super) fn handle_append_batch(
     let wait_seconds = collect_started.elapsed().as_secs_f64();
     match spool.append_prepared_batch(records) {
         Ok(mut appended) => {
-            match spool.sync_append_if_due(true) {
+            match spool.sync_append_if_dirty() {
                 Ok(Some(sync)) => {
                     appended.stats.fsync_seconds = sync.seconds;
                     appended.stats.fsync_count = sync.file_count;

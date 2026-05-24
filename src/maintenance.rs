@@ -1,5 +1,6 @@
 use crate::app::AppState;
 use crate::config::Config;
+use crate::seal::SealDriver;
 use crate::storage::{RetentionPolicy, Storage};
 use crate::LockExt;
 use anyhow::Result;
@@ -208,13 +209,8 @@ impl Drop for Scheduler {
 }
 
 fn scheduler_loop(state: Arc<AppState>, stop: Arc<AtomicBool>) {
+    let mut seal_driver = SealDriver::new(&state.config, Instant::now());
     let seal_cadence = state.config.mechanics.scheduler_seal_interval;
-    let buffer_target_bytes = state.config.mechanics.arrow_write_buffer_target_bytes;
-    let buffer_max_age_seconds = state
-        .config
-        .mechanics
-        .arrow_write_buffer_max_age
-        .as_secs_f64();
     let metadata_every = state.config.mechanics.scheduler_metadata_interval;
     let metrics_every = state.config.mechanics.scheduler_metrics_interval;
     let retention_every = state.config.mechanics.scheduler_retention_interval;
@@ -226,8 +222,6 @@ fn scheduler_loop(state: Arc<AppState>, stop: Arc<AtomicBool>) {
         .min(metadata_every)
         .min(Duration::from_millis(250))
         .max(Duration::from_millis(10));
-    let mut next_seal = Instant::now() + seal_cadence;
-    let mut seal_backoff_until = Instant::now();
     let mut next_metadata = Instant::now() + metadata_every;
     let mut next_metrics = Instant::now() + metrics_every;
     let mut next_retention = Instant::now() + retention_every;
@@ -246,30 +240,8 @@ fn scheduler_loop(state: Arc<AppState>, stop: Arc<AtomicBool>) {
             continue;
         }
 
-        // Single seal driver. Flush when a buffered signal reaches its size/age
-        // threshold, or on the freshness cadence, keeping Arrow write-buffer age
-        // well under the freshness-budget SLA. A failed seal backs off so a
-        // broken catalog cannot spin the writer.
-        let buffers = state.storage.arrow_write_buffer_metrics();
-        let max_buffer_age_seconds = buffers
-            .iter()
-            .map(|metric| metric.age_seconds)
-            .fold(0.0, f64::max);
-        if now >= seal_backoff_until {
-            let buffered = buffers.iter().any(|metric| metric.bytes > 0);
-            let threshold_due = buffers.iter().any(|metric| {
-                metric.bytes >= buffer_target_bytes || metric.age_seconds >= buffer_max_age_seconds
-            });
-            if buffered && (threshold_due || now >= next_seal) {
-                let ok = run_seal_tick(&state);
-                next_seal = now + seal_cadence;
-                if !ok {
-                    seal_backoff_until = now + seal_cadence;
-                }
-            } else if now >= next_seal {
-                next_seal = now + seal_cadence;
-            }
-        }
+        let seal_tick = seal_driver.tick(&state, now, run_seal_tick);
+        let max_buffer_age_seconds = seal_tick.max_buffer_age_seconds;
 
         // Seal priority: when the oldest Arrow write buffer is within
         // SEAL_PRIORITY_SLA_FRACTION of the freshness SLA, skip the non-seal

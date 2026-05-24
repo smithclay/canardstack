@@ -357,7 +357,7 @@ fn append_gauge_rows(state: &AppState, rows: &[(i64, &str, f64, &str)], source_f
     .unwrap();
     state
         .storage
-        .buffer_arrow_records(StorageSignal::MetricGauge, &batch, source_format)
+        .buffer_best_effort_arrow_records(StorageSignal::MetricGauge, &batch, source_format)
         .unwrap();
     state.storage.flush_arrow_write_buffer(true).unwrap();
 }
@@ -418,7 +418,7 @@ fn append_log_rows(state: &AppState, rows: &[(i64, &str, &str)], source_format: 
     .unwrap();
     state
         .storage
-        .buffer_arrow_records(StorageSignal::Logs, &batch, source_format)
+        .buffer_best_effort_arrow_records(StorageSignal::Logs, &batch, source_format)
         .unwrap();
     state.storage.flush_arrow_write_buffer(true).unwrap();
     state.storage.refresh_metadata_limited(usize::MAX).unwrap();
@@ -689,14 +689,6 @@ fn admin_ingest_health_includes_raw_spool_backlog() {
     assert_eq!(
         response.json_body()["raw_spool_config"]["group_commit_ms"],
         1
-    );
-    assert_eq!(
-        response.json_body()["raw_spool_config"]["append_sync_ms"],
-        500
-    );
-    assert_eq!(
-        response.json_body()["raw_spool_config"]["append_sync_bytes"],
-        16 * 1024 * 1024
     );
     assert_eq!(response.json_body()["raw_spool"]["healthy"], true);
     assert_eq!(
@@ -1383,8 +1375,6 @@ fn raw_spool_replays_pending_request_on_startup() {
             max_segment_bytes: config.mechanics.raw_spool_max_segment_bytes as u64,
             max_record_bytes: config.mechanics.raw_spool_max_record_bytes as u64,
             max_total_bytes: config.mechanics.raw_spool_max_total_bytes as u64,
-            append_sync_interval: config.mechanics.raw_spool_append_sync_interval,
-            append_sync_bytes: config.mechanics.raw_spool_append_sync_bytes as u64,
             checkpoint_fsync_records: 1024,
             checkpoint_fsync_delay: std::time::Duration::from_millis(1000),
         })
@@ -1445,8 +1435,6 @@ fn raw_spool_replays_one_metrics_request_into_gauge_and_sum_tables() {
             max_segment_bytes: config.mechanics.raw_spool_max_segment_bytes as u64,
             max_record_bytes: config.mechanics.raw_spool_max_record_bytes as u64,
             max_total_bytes: config.mechanics.raw_spool_max_total_bytes as u64,
-            append_sync_interval: config.mechanics.raw_spool_append_sync_interval,
-            append_sync_bytes: config.mechanics.raw_spool_append_sync_bytes as u64,
             checkpoint_fsync_records: 1024,
             checkpoint_fsync_delay: std::time::Duration::from_millis(1000),
         })
@@ -1496,8 +1484,6 @@ fn raw_spool_replay_failure_does_not_abort_boot() {
             max_segment_bytes: config.mechanics.raw_spool_max_segment_bytes as u64,
             max_record_bytes: config.mechanics.raw_spool_max_record_bytes as u64,
             max_total_bytes: config.mechanics.raw_spool_max_total_bytes as u64,
-            append_sync_interval: config.mechanics.raw_spool_append_sync_interval,
-            append_sync_bytes: config.mechanics.raw_spool_append_sync_bytes as u64,
             checkpoint_fsync_records: 1024,
             checkpoint_fsync_delay: std::time::Duration::from_millis(1000),
         })
@@ -3396,13 +3382,11 @@ fn config_validate_rejects_invalid_raw_spool_limits() {
         "baseline test config must validate"
     );
 
-    let mutations: [fn(&mut Config); 7] = [
+    let mutations: [fn(&mut Config); 5] = [
         |c| c.mechanics.raw_spool_max_segment_bytes = 0,
         |c| c.mechanics.raw_spool_max_record_bytes = 0,
         |c| c.mechanics.raw_spool_max_total_bytes = 0,
         |c| c.mechanics.raw_spool_group_commit_delay = std::time::Duration::ZERO,
-        |c| c.mechanics.raw_spool_append_sync_interval = std::time::Duration::ZERO,
-        |c| c.mechanics.raw_spool_append_sync_bytes = 0,
         |c| c.mechanics.raw_spool_max_record_bytes = c.mechanics.raw_spool_max_total_bytes + 1,
     ];
     for mutate in mutations {

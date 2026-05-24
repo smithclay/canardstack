@@ -1,79 +1,81 @@
 use crate::app::AppState;
-use crate::ingest::spool::{AppendRef, RecordId};
-use crate::ingest::{lifecycle, Ingestor, OtlpRequestKind, SealStage};
+use crate::config::Config;
+use crate::ingest::{lifecycle, Ingestor, SealStage};
 use crate::metrics::Metrics;
-use crate::storage::{ArrowFlushOutcome, Storage};
+use crate::storage::{ArrowFlushOutcome, Storage, TimingPhase};
 use crate::validation::{ApiError, ApiResult};
 use serde_json::{json, Value};
-use std::collections::BTreeSet;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-/// Raw-spool record to checkpoint after its associated buffered rows commit.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
-pub(crate) struct ReplayRef {
-    pub(crate) request_kind: OtlpRequestKind,
-    pub(crate) spool: OtlpRequestKind,
-    pub(crate) id: RecordId,
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SealDriverTick {
+    pub(crate) max_buffer_age_seconds: f64,
 }
 
-impl ReplayRef {
-    pub(crate) fn new(request_kind: OtlpRequestKind, append_ref: AppendRef) -> Self {
-        Self {
-            request_kind,
-            spool: append_ref.spool,
-            id: append_ref.id,
-        }
-    }
+pub(crate) struct SealDriver {
+    cadence: Duration,
+    buffer_target_bytes: usize,
+    buffer_max_age_seconds: f64,
+    next_seal: Instant,
+    backoff_until: Instant,
 }
 
-/// Durability contract carried by buffered rows.
-///
-/// A buffer may legally contain replay-backed ingest rows, best-effort internal
-/// rows, or both. Replay-backed refs are checkpointed only after the rows commit
-/// to DuckLake; best-effort rows have no raw-spool record to checkpoint.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct BufferDurability {
-    replay_refs: BTreeSet<ReplayRef>,
-    best_effort: bool,
-}
-
-impl BufferDurability {
-    pub(crate) fn empty() -> Self {
+impl SealDriver {
+    pub(crate) fn new(config: &Config, now: Instant) -> Self {
+        let cadence = config.mechanics.scheduler_seal_interval;
         Self {
-            replay_refs: BTreeSet::new(),
-            best_effort: false,
+            cadence,
+            buffer_target_bytes: config.mechanics.arrow_write_buffer_target_bytes,
+            buffer_max_age_seconds: config.mechanics.arrow_write_buffer_max_age.as_secs_f64(),
+            next_seal: now + cadence,
+            backoff_until: now,
         }
     }
 
-    pub fn best_effort() -> Self {
-        Self {
-            replay_refs: BTreeSet::new(),
-            best_effort: true,
+    /// Single seal trigger policy. Flush when any buffered storage signal reaches
+    /// its size/age threshold, or on the seal cadence. A failed seal backs off
+    /// one cadence so a broken catalog cannot spin the writer.
+    pub(crate) fn tick<F>(
+        &mut self,
+        state: &AppState,
+        now: Instant,
+        mut run_seal: F,
+    ) -> SealDriverTick
+    where
+        F: FnMut(&AppState) -> bool,
+    {
+        let buffers = state.storage.arrow_write_buffer_metrics();
+        let max_buffer_age_seconds = buffers
+            .iter()
+            .map(|metric| metric.age_seconds)
+            .fold(0.0, f64::max);
+        if now < self.backoff_until {
+            return SealDriverTick {
+                max_buffer_age_seconds,
+            };
         }
-    }
 
-    pub(crate) fn replay_backed(replay_ref: ReplayRef) -> Self {
-        Self {
-            replay_refs: BTreeSet::from([replay_ref]),
-            best_effort: false,
+        let buffered = buffers.iter().any(|metric| metric.bytes > 0);
+        let threshold_due = buffers.iter().any(|metric| {
+            metric.bytes >= self.buffer_target_bytes
+                || metric.age_seconds >= self.buffer_max_age_seconds
+        });
+        if buffered && (threshold_due || now >= self.next_seal) {
+            let ok = run_seal(state);
+            self.next_seal = now + self.cadence;
+            if !ok {
+                self.backoff_until = now + self.cadence;
+            }
+            return SealDriverTick {
+                max_buffer_age_seconds,
+            };
         }
-    }
-
-    pub(crate) fn merge(&mut self, mut other: Self) {
-        self.replay_refs.append(&mut other.replay_refs);
-        self.best_effort |= other.best_effort;
-    }
-
-    pub(crate) fn replay_refs(&self) -> Vec<ReplayRef> {
-        self.replay_refs.iter().copied().collect()
-    }
-
-    pub(crate) fn has_best_effort(&self) -> bool {
-        self.best_effort
-    }
-
-    pub(crate) fn is_declared(&self) -> bool {
-        self.best_effort || !self.replay_refs.is_empty()
+        if now >= self.next_seal {
+            self.next_seal = now + self.cadence;
+        }
+        SealDriverTick {
+            max_buffer_age_seconds,
+        }
     }
 }
 
@@ -132,8 +134,12 @@ fn commit_buffered_rows_with(
     if seal_records {
         lifecycle::record_seal(metrics, SealStage::Committed);
     }
-    ingestor.observe_arrow_flush(metrics, &outcome);
-    match ingestor.checkpoint_replay_refs(&replay_refs, "storage_committed", Some(metrics)) {
+    observe_arrow_flush(metrics, &outcome);
+    match ingestor.checkpoint_replay_backed_records(
+        &replay_refs,
+        "storage_committed",
+        Some(metrics),
+    ) {
         Ok(()) => {
             tracing::debug!(
                 event = "seal_raw_spool_checkpointed",
@@ -155,4 +161,42 @@ fn commit_buffered_rows_with(
         }
     }
     Ok(outcome)
+}
+
+fn observe_arrow_flush(metrics: &Metrics, outcome: &ArrowFlushOutcome) {
+    for timing in &outcome.timings {
+        metrics.observe_storage_signal_phase_seconds(
+            timing.storage_signal.as_str(),
+            timing.phase.as_str(),
+            timing.seconds,
+        );
+    }
+    if outcome.flushed_rows == 0 {
+        return;
+    }
+    for timing in &outcome.timings {
+        if timing.phase == TimingPhase::DuckdbArrowAppend {
+            metrics.inc(
+                "canardstack_duckdb_arrow_appends_total",
+                &[("storage_signal", timing.storage_signal.as_str())],
+                1,
+            );
+            metrics.inc(
+                "canardstack_duckdb_arrow_appended_rows_total",
+                &[("storage_signal", timing.storage_signal.as_str())],
+                timing.rows as u64,
+            );
+        } else if timing.phase == TimingPhase::DucklakeCommit {
+            metrics.inc(
+                "canardstack_arrow_flush_rows_total",
+                &[("storage_signal", timing.storage_signal.as_str())],
+                timing.rows as u64,
+            );
+            metrics.inc(
+                "canardstack_arrow_flushes_total",
+                &[("storage_signal", timing.storage_signal.as_str())],
+                1,
+            );
+        }
+    }
 }

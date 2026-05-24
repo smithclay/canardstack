@@ -1,13 +1,13 @@
 use super::arrow::{batch_timestamp_days, storage_duckdb_batch};
 use super::arrow_write::{
     arrow_write_buffer_snapshot, ArrowFlushOutcome, ArrowFlushResult, ArrowWriteBuffer,
+    BufferDurability,
 };
 use super::ducklake::configure_write_connection;
 use super::{
-    ArrowBatchBuffer, ArrowBatchBufferResult, ArrowBatchBufferTiming, ArrowWriteBufferMetric,
-    PreparedArrowBatch, Storage, StorageSignal, TimingPhase,
+    ArrowBatchBufferResult, ArrowBatchBufferTiming, ArrowWriteBufferMetric, BestEffortArrowBatch,
+    PreparedArrowBatch, ReplayBackedArrowBatch, Storage, StorageSignal, TimingPhase,
 };
-use crate::seal::BufferDurability;
 use crate::LockExt;
 use anyhow::{Context, Result};
 use arrow58::compute::concat_batches;
@@ -15,6 +15,41 @@ use arrow58::record_batch::RecordBatch;
 use duckdb::Connection;
 use std::collections::BTreeMap;
 use std::time::Instant;
+
+enum ArrowBatchInput<'a> {
+    ReplayBacked(&'a ReplayBackedArrowBatch<'a>),
+    BestEffort(&'a BestEffortArrowBatch<'a>),
+}
+
+impl<'a> ArrowBatchInput<'a> {
+    fn storage_signal(&self) -> StorageSignal {
+        match self {
+            Self::ReplayBacked(batch) => batch.storage_signal,
+            Self::BestEffort(batch) => batch.storage_signal,
+        }
+    }
+
+    fn batch(&self) -> &'a RecordBatch {
+        match self {
+            Self::ReplayBacked(batch) => batch.batch,
+            Self::BestEffort(batch) => batch.batch,
+        }
+    }
+
+    fn source_format(&self) -> &'a str {
+        match self {
+            Self::ReplayBacked(batch) => batch.source_format,
+            Self::BestEffort(batch) => batch.source_format,
+        }
+    }
+
+    fn durability(&self) -> BufferDurability {
+        match self {
+            Self::ReplayBacked(batch) => BufferDurability::replay_backed(batch.replay_ref),
+            Self::BestEffort(_) => BufferDurability::best_effort(),
+        }
+    }
+}
 
 impl Storage {
     pub fn arrow_write_buffer_metrics(&self) -> Vec<ArrowWriteBufferMetric> {
@@ -30,24 +65,41 @@ impl Storage {
             .collect()
     }
 
-    pub fn buffer_arrow_records(
+    pub fn buffer_best_effort_arrow_records(
         &self,
         storage_signal: StorageSignal,
         batch: &RecordBatch,
         source_format: &str,
     ) -> Result<usize> {
-        let result = self.buffer_arrow_batches(&[ArrowBatchBuffer {
+        let result = self.buffer_best_effort_arrow_batch(BestEffortArrowBatch {
             storage_signal,
             batch,
             source_format,
-            durability: BufferDurability::best_effort(),
-        }])?;
+        })?;
         Ok(result.rows)
     }
 
-    pub fn buffer_arrow_batches(
+    pub fn buffer_best_effort_arrow_batch(
         &self,
-        batches: &[ArrowBatchBuffer<'_>],
+        batch: BestEffortArrowBatch<'_>,
+    ) -> Result<ArrowBatchBufferResult> {
+        self.buffer_arrow_batches(&[ArrowBatchInput::BestEffort(&batch)])
+    }
+
+    pub(crate) fn buffer_replay_backed_arrow_batches(
+        &self,
+        batches: &[ReplayBackedArrowBatch<'_>],
+    ) -> Result<ArrowBatchBufferResult> {
+        let inputs = batches
+            .iter()
+            .map(ArrowBatchInput::ReplayBacked)
+            .collect::<Vec<_>>();
+        self.buffer_arrow_batches(&inputs)
+    }
+
+    fn buffer_arrow_batches(
+        &self,
+        batches: &[ArrowBatchInput<'_>],
     ) -> Result<ArrowBatchBufferResult> {
         let mut prepared = Vec::new();
         let mut prepare_timings = Vec::new();
@@ -55,25 +107,23 @@ impl Storage {
         let mut grouped =
             BTreeMap::<(StorageSignal, &str), (Vec<&RecordBatch>, BufferDurability, usize)>::new();
         for batch in batches {
-            if batch.batch.num_rows() == 0 {
+            let storage_signal = batch.storage_signal();
+            let record_batch = batch.batch();
+            if record_batch.num_rows() == 0 {
                 continue;
             }
-            if !batch.durability.is_declared() {
-                anyhow::bail!(
-                    "Arrow write buffer producer for {} did not declare durability",
-                    batch.storage_signal
-                );
-            }
-            let rows = batch.batch.num_rows();
+            let rows = record_batch.num_rows();
             attempted_rows += rows;
             let (batch_refs, durability, best_effort_rows) = grouped
-                .entry((batch.storage_signal, batch.source_format))
+                .entry((storage_signal, batch.source_format()))
                 .or_insert_with(|| (Vec::new(), BufferDurability::empty(), 0));
-            durability.merge(batch.durability.clone());
-            if batch.durability.has_best_effort() {
+            let batch_durability = batch.durability();
+            let is_best_effort = matches!(batch, ArrowBatchInput::BestEffort(_));
+            durability.merge(batch_durability);
+            if is_best_effort {
                 *best_effort_rows += rows;
             }
-            batch_refs.push(batch.batch);
+            batch_refs.push(record_batch);
         }
         for ((storage_signal, source_format), (batches, durability, best_effort_rows)) in grouped {
             let rows = batches.iter().map(|batch| batch.num_rows()).sum();

@@ -1,4 +1,4 @@
-use super::{Ingestor, SpooledIngestWork};
+use super::{IngestPipeline, Ingestor, SpooledIngestWork};
 use crate::storage::Storage;
 use crate::LockExt;
 use anyhow::{Context, Result};
@@ -35,6 +35,12 @@ impl Drop for IngestWorkerPool {
 
 impl Ingestor {
     pub fn start_ingest_workers(self: &Arc<Self>, storage: Arc<Storage>) -> Result<()> {
+        self.pipeline().start_ingest_workers(storage)
+    }
+}
+
+impl IngestPipeline {
+    pub(crate) fn start_ingest_workers(self: &Arc<Self>, storage: Arc<Storage>) -> Result<()> {
         let worker_count = self.config.mechanics.ingest_workers;
         let mut pool = self.ingest_workers.lock_or_poisoned();
         if pool.is_some() {
@@ -77,14 +83,14 @@ impl Ingestor {
 
 fn run_ingest_worker(
     receiver: mpsc::Receiver<SpooledIngestWork>,
-    ingestor: Weak<Ingestor>,
+    ingestor: Weak<IngestPipeline>,
     storage: Arc<Storage>,
 ) {
     while let Ok(work) = receiver.recv() {
         let Some(ingestor) = ingestor.upgrade() else {
             return;
         };
-        let route = work.route;
+        let route = work.request_kind;
         let metrics = Arc::clone(&work.metrics);
         // `process_spooled_ingest` emits the per-request boundary counters itself.
         let started = Instant::now();
