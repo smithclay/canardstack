@@ -8,26 +8,13 @@
 [![DuckLake](https://img.shields.io/badge/storage-DuckLake-fff000.svg?logo=duckdb&logoColor=black)](https://ducklake.select/)
 [![OpenTelemetry](https://img.shields.io/badge/OTLP-HTTP-425cc7.svg?logo=opentelemetry&logoColor=white)](https://opentelemetry.io/)
 
-> OpenTelemetry logs, traces, and metrics stored in DuckLake. Inspect them with
-> Grafana or DuckDB-compatible tools.
+> OpenTelemetry logs, traces, and metrics stored in DuckLake, visualized in Grafana.
 
-canardstack is an experimental, single-tenant observability backend for people
-who want telemetry in DuckLake/DuckDB-accessible tables.
+canardstack is an experimental observability backend that stores data in [DuckLake](https://ducklake.select/), an open-standard lakehouse format from the creators of duckdb. Inspired by ClickStack and HyperDX, the project goal is to explore cheap and simple ways to store and query terabytes of observability data *from a single node*.
 
-It accepts OpenTelemetry logs, traces, gauge metrics, and sum metrics over
-OTLP/HTTP, stores normalized tables in [DuckLake](https://ducklake.select/),
-and exposes small Prometheus-, Loki-, and Tempo-shaped query APIs for Grafana,
-curl, and other compatible clients.
+It accepts OpenTelemetry logs, traces, gauge metrics, and sum metrics over OTLP/HTTP, stores normalized tables in [DuckLake](https://ducklake.select/), and exposes query APIs for Grafana to visualize the data.
 
-It is not a full observability suite. There is no custom UI, no alerting
-system, no multi-tenancy, and no full Prometheus, Loki, or Tempo implementation.
-The goal is a small backend that makes OpenTelemetry data easy to land in
-DuckLake and inspect with familiar tools.
-
-Builds on prior work from
-[otlp2parquet](https://github.com/smithclay/otlp2parquet),
-[otlp2pipeline](https://github.com/smithclay/otlp2pipeline), and
-[duckdb-otlp](https://github.com/smithclay/duckdb-otlp).
+Builds on prior work from [otlp2parquet](https://github.com/smithclay/otlp2parquet), [otlp2pipeline](https://github.com/smithclay/otlp2pipeline), and [duckdb-otlp](https://github.com/smithclay/duckdb-otlp).
 
 ## Contents
 
