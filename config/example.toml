@@ -26,21 +26,17 @@ memory_limit = "1GiB"
 
 [ingest]
 max_body_bytes = 8388608
-memory_bytes = 2147483648
 # process_memory_limit_bytes = 3221225472
-seal_rate_seed_bytes = 4194304
-seal_rate_seed_window_secs = 10
 # Parallel transform across OS threads; the scheduler is the single seal driver.
 # workers = 4
-# buffer_capacity = 1024
 
 [validation]
 accept_late_secs = 86400
 accept_future_secs = 600
 
 [storage]
-segment_target_bytes = 67108864
-segment_max_age_secs = 10
+arrow_write_buffer_target_bytes = 67108864
+arrow_write_buffer_max_age_secs = 10
 
 [raw_spool]
 capacity_bytes = 1073741824
@@ -64,8 +60,17 @@ days = 14
 enabled = true
 maintenance_interval_secs = 30
 # Seal cadence for the single seal driver. Keep well under the freshness SLA so
-# immutable-buffer age never approaches the freshness-budget reject threshold (default 1000ms).
+# Arrow write-buffer age never approaches the freshness-budget reject threshold (default 1000ms).
 # seal_interval_ms = 1000
 
-[bench]
-http_keepalive = true
+[metrics]
+# Persist a snapshot of operator metrics into the metric_gauge / metric_sum
+# storage tables so canardstack's own metrics are queryable via the compat
+# path. Off by default to avoid the extra write load and the
+# canardstack_operator_metrics rows; /metrics still serves the live surface.
+# operator_metrics_to_storage = false
+#
+# Fine-grained spool phase micro-timings (raw_spool_append_*/raw_spool_checkpoint_*)
+# are a compile-time opt-in, not a config knob: build with
+# `cargo build --features detailed-metrics` to emit them. The coarse phases are
+# always on.

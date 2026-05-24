@@ -42,7 +42,7 @@ impl AppState {
         let ingestor = Arc::new(Ingestor::new(config.clone())?);
         let admission = AdmissionController::new(&config);
         let metrics = Arc::new(Metrics::default());
-        if config.serve_role.accepts_ingest() {
+        if config.operator.serve_role.accepts_ingest() {
             ingestor.start_ingest_workers(storage.clone())?;
             let replayed = ingestor.replay_raw_spool(&storage, &admission, metrics.clone())?;
             if replayed > 0 {

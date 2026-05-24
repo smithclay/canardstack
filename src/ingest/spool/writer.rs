@@ -88,11 +88,19 @@ impl Writer {
         rx.recv().context("receive raw spool append result")?
     }
 
-    pub fn mark_committed(&self, id: RecordId) -> Result<CheckpointBatchStats> {
-        self.mark_committed_batch(&[id])
+    /// Checkpoint a single durably-spooled record: durably mark its sequence
+    /// committed so it will not replay on restart. Convenience wrapper over
+    /// [`Writer::checkpoint_records`].
+    pub fn checkpoint_record(&self, id: RecordId) -> Result<CheckpointBatchStats> {
+        self.checkpoint_records(&[id])
     }
 
-    pub fn mark_committed_batch(&self, ids: &[RecordId]) -> Result<CheckpointBatchStats> {
+    /// Checkpoint a batch of durably-spooled records: durably mark their
+    /// sequences committed (append to the checkpoint log + fsync per the writer's
+    /// batching policy) so they will not replay on restart. This is the raw-spool
+    /// "checkpoint" primitive in the ingest lifecycle vocabulary; the seal path
+    /// calls it after a successful DuckLake commit.
+    pub fn checkpoint_records(&self, ids: &[RecordId]) -> Result<CheckpointBatchStats> {
         if ids.is_empty() {
             return Ok(CheckpointBatchStats::default());
         }
@@ -178,7 +186,7 @@ pub(super) fn run_raw_spool_writer(
                 None => match receiver.recv() {
                     Ok(command) => command,
                     Err(_) => {
-                        let _ = spool.sync_append_if_due(true);
+                        let _ = spool.sync_append_if_dirty();
                         let _ = spool.sync_checkpoint_if_due(true);
                         break;
                     }
@@ -186,12 +194,11 @@ pub(super) fn run_raw_spool_writer(
                 Some(sync_due_in) => match receiver.recv_timeout(sync_due_in) {
                     Ok(command) => command,
                     Err(RecvTimeoutError::Timeout) => {
-                        let _ = spool.sync_append_if_due(false);
                         let _ = spool.sync_checkpoint_if_due(false);
                         continue;
                     }
                     Err(RecvTimeoutError::Disconnected) => {
-                        let _ = spool.sync_append_if_due(true);
+                        let _ = spool.sync_append_if_dirty();
                         let _ = spool.sync_checkpoint_if_due(true);
                         break;
                     }
@@ -226,17 +233,12 @@ pub(super) fn run_raw_spool_writer(
                 let _ = reply.send(());
             }
         }
-        let _ = spool.sync_append_if_due(false);
+        let _ = spool.sync_append_if_dirty();
     }
 }
 
 pub(super) fn next_writer_timeout(spool: &Spool) -> Option<Duration> {
-    match (spool.append_sync_due_in(), spool.checkpoint_sync_due_in()) {
-        (Some(append), Some(checkpoint)) => Some(append.min(checkpoint)),
-        (Some(append), None) => Some(append),
-        (None, Some(checkpoint)) => Some(checkpoint),
-        (None, None) => None,
-    }
+    spool.checkpoint_sync_due_in()
 }
 
 pub(super) fn handle_append_batch(
@@ -275,7 +277,7 @@ pub(super) fn handle_append_batch(
     let wait_seconds = collect_started.elapsed().as_secs_f64();
     match spool.append_prepared_batch(records) {
         Ok(mut appended) => {
-            match spool.sync_append_if_due(true) {
+            match spool.sync_append_if_dirty() {
                 Ok(Some(sync)) => {
                     appended.stats.fsync_seconds = sync.seconds;
                     appended.stats.fsync_count = sync.file_count;
@@ -394,7 +396,7 @@ pub(super) fn handle_checkpoint_batch(
         wait_seconds: collect_started.elapsed().as_secs_f64(),
         deferred_append_commands,
     };
-    match spool.mark_committed_batch(ids) {
+    match spool.checkpoint_records(ids) {
         Ok(()) => {
             let mut stats = Some(stats);
             for command in batch {

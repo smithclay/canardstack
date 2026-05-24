@@ -10,9 +10,9 @@ The current MVP architecture is:
 
 ```text
 OTLP/HTTP -> cheap validation + freshness/runtime/queue admission
-  -> fsynced local raw spool write -> ingest worker transform -> immutable buffer
-  -> scheduler single seal driver (protected seal admission) -> immutable Parquet segments
-  -> DuckLake registration -> logical DuckLake SQL compatibility APIs
+  -> fsynced local raw spool write -> ingest worker transform -> Arrow write buffer
+  -> scheduler single seal driver (protected seal admission) -> DuckDB Arrow append
+  -> DuckLake commit -> logical DuckLake SQL compatibility APIs
 ```
 
 Current product constraints:
@@ -25,8 +25,8 @@ Current product constraints:
   second service, or arbitrary SQL over compatibility APIs.
 - `202` means the raw request was fsynced to the local raw spool and accepted
   for bounded processing. It does not mean rows are committed or query-visible.
-- QueryEngine and compatibility APIs read registered logical DuckLake tables,
-  not raw Parquet file paths.
+- QueryEngine and compatibility APIs read logical DuckLake tables, not physical
+  file paths.
 - Admission control reserves seal capacity before query capacity. Cheap
   discovery/probe/instant-ish queries retain a protected admission; heavy range/search
   queries degrade or reject first under freshness debt.
@@ -43,10 +43,10 @@ The MVP gates prove these behaviors:
   least `128 MiB` pending raw spool data if the fixture reaches that first.
 - **Operator surface:** `/metrics`, `/healthz`, and
   `/api/admin/health/ingest` distinguish accepted, raw-spooled, pending replay,
-  queued, sealed, DuckLake-visible, checkpointed, spool full, and
+  buffered, Arrow-flushed, DuckLake-visible, checkpointed, spool full, and
   storage unavailable states.
 - **Query path:** backward Loki `query_range` and Tempo search/lookup use
-  bounded logical DuckLake queries. There is no active raw-Parquet shadow mode
+  bounded logical DuckLake queries. There is no active raw-file shadow mode
   or custom manifest path.
 - **Cutover cleanliness:** old memory-only acceptance paths, null-sink storage,
   validation-only/transform-only ingest controls, and raw-spool crash hooks are
@@ -65,7 +65,7 @@ cargo clippy --all-targets --all-features --locked -- -D warnings
 
 # Focused tests
 cargo test raw_spool -- --nocapture
-cargo test raw_spool_replays_accepted_unsealed_request_after_restart -- --nocapture
+cargo test raw_spool_replays_accepted_uncommitted_request_after_restart -- --nocapture
 cargo test admin_ingest_health_includes_raw_spool_backlog -- --nocapture
 cargo test loki_query_range_backward_uses_standard_log_query -- --nocapture
 

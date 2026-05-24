@@ -55,8 +55,32 @@ pub struct QueryLimits {
     pub memory_limit: String,
 }
 
+/// Process configuration, split by responsibility:
+///
+/// - [`OperatorConfig`] — the public, supported deployment surface operators
+///   set to run a deployment (endpoints, auth, catalog, retention, query
+///   limits, freshness SLA, admission capacities, memory limits,
+///   body/connection caps, socket timeouts, scheduler on/off).
+/// - [`Mechanics`] — advanced mechanics that are either env/file-tunable or
+///   derived from an operator setting (Arrow write-buffer target/age, raw-spool
+///   max sizes + group-commit cadence, ingest worker count,
+///   scheduler intervals).
+/// - [`TestOverrides`] — fixed production defaults exposed only so tests can
+///   exercise edge cases deterministically. Operators cannot configure these.
+///
+/// Purely internal raw-spool batching/durability mechanics with no operator
+/// meaning are NOT fields here; they live as consts in `ingest::spool`.
 #[derive(Clone, Debug)]
 pub struct Config {
+    pub operator: OperatorConfig,
+    pub mechanics: Mechanics,
+    pub test_overrides: TestOverrides,
+}
+
+/// The public, supported deployment surface: settings operators set to run a
+/// deployment. Validation errors for these settings name their env vars.
+#[derive(Clone, Debug)]
+pub struct OperatorConfig {
     pub serve_role: ServeRole,
     pub bind: String,
     pub api_key: String,
@@ -67,16 +91,10 @@ pub struct Config {
     pub postgres_dsn: Option<String>,
     pub ducklake_attach_uri: Option<String>,
     pub max_body_bytes: usize,
-    pub per_signal_inflight_bytes: usize,
-    pub process_ingest_bytes: usize,
     pub runtime_memory_limit_bytes: Option<usize>,
-    pub seal_rate_seed_bytes: usize,
-    pub seal_rate_seed_window: Duration,
     pub duckdb_write_memory_limit: String,
     pub late_accept_secs: i64,
     pub future_accept_secs: i64,
-    pub immutable_segment_target_bytes: usize,
-    pub immutable_segment_max_age: Duration,
     pub query_interactive: QueryLimits,
     pub seal_admission_capacity: usize,
     pub cheap_query_admission_capacity: usize,
@@ -85,56 +103,135 @@ pub struct Config {
     pub logs_retention_days: i64,
     pub spans_retention_days: i64,
     pub metrics_retention_days: i64,
+    pub max_concurrent_connections: usize,
+    pub socket_read_timeout: Duration,
+    pub socket_write_timeout: Duration,
     pub scheduler_enabled: bool,
+}
+
+/// Advanced mechanics operators may tune, plus derived mechanics from operator
+/// settings. Fixed production defaults used only for tests live in
+/// [`TestOverrides`], not here.
+#[derive(Clone, Debug)]
+pub struct Mechanics {
+    pub arrow_write_buffer_target_bytes: usize,
+    pub arrow_write_buffer_max_age: Duration,
     pub scheduler_seal_interval: Duration,
     pub scheduler_metadata_interval: Duration,
     pub scheduler_metrics_interval: Duration,
     pub scheduler_retention_interval: Duration,
-    pub max_concurrent_connections: usize,
-    pub socket_read_timeout: Duration,
-    pub socket_write_timeout: Duration,
-    pub bench_http_keepalive: bool,
     pub raw_spool_dir: PathBuf,
     pub raw_spool_max_segment_bytes: usize,
     pub raw_spool_max_record_bytes: usize,
-    pub raw_spool_max_total_bytes: usize,
-    pub raw_spool_writer_queue_capacity: usize,
-    pub raw_spool_group_commit_records: usize,
+    /// Durable raw-spool byte capacity applied **per request kind**: each of the
+    /// three raw-spool writers (logs/traces/metrics) enforces this cap on its own
+    /// segment files independently, so the aggregate worst-case raw-spool
+    /// footprint is up to `3 * raw_spool_max_total_bytes_per_request_kind`. Set via
+    /// `CANARDSTACK_RAW_SPOOL_CAPACITY_BYTES` / `[raw_spool] capacity_bytes`.
+    pub raw_spool_max_total_bytes_per_request_kind: usize,
     pub raw_spool_group_commit_delay: Duration,
-    pub raw_spool_append_sync_interval: Duration,
-    pub raw_spool_append_sync_bytes: usize,
-    pub raw_spool_checkpoint_fsync_records: usize,
-    pub raw_spool_checkpoint_fsync_delay: Duration,
     pub ingest_workers: usize,
-    pub ingest_buffer_capacity: usize,
+    /// When true, the scheduler's metrics-snapshot job writes a snapshot of the
+    /// current operator metrics into the `metric_gauge` / `metric_sum` storage
+    /// tables (queryable via the Prometheus-compatible path). Off by default to
+    /// avoid the extra write load and the `canardstack_operator_metrics` rows;
+    /// the operator gauges still refresh and `/metrics` still serves them.
+    pub operator_metrics_to_storage: bool,
+}
+
+/// Fixed-default hooks that production code reads but only tests mutate.
+#[derive(Clone, Debug)]
+pub struct TestOverrides {
+    pub seal_rate_seed_bytes: usize,
+    pub seal_rate_seed_window: Duration,
+    pub bench_http_keepalive: bool,
+    pub ingest_worker_channel_capacity: usize,
 }
 
 const DEFAULT_CONFIG_PATH: &str = "config.toml";
 const CONFIG_PATH_ENV: &str = "CANARDSTACK_CONFIG";
 
+/// Internal seal-rate EWMA warm-up mechanics: the seed rate
+/// (`seal_rate_seed_bytes` / `seal_rate_seed_window`) only primes the estimator
+/// until measured throughput converges, so it is not an operator policy knob.
+/// Kept as `Config` fields purely for deterministic test injection (see the
+/// admission-control characterization tests).
+const DEFAULT_SEAL_RATE_SEED_BYTES: usize = 4 * 1024 * 1024;
+const DEFAULT_SEAL_RATE_SEED_WINDOW: Duration = Duration::from_secs(10);
+
 impl Config {
     pub fn from_env() -> Result<Self> {
         let file = FileConfig::load()?;
+        // Shared inputs that feed both sub-structs: the data_dir drives derived
+        // paths in both, max_body_bytes feeds mechanics.raw_spool_max_record_bytes,
+        // and the raw-spool capacity / maintenance interval feed mechanics.
         let data_dir = env_path("CANARDSTACK_DATA_DIR")?
             .or(file.path(&["paths", "data_dir"])?)
             .unwrap_or_else(|| PathBuf::from(".canardstack"));
         let max_body_bytes = env_usize("CANARDSTACK_MAX_BODY_BYTES")?
             .or(file.usize(&["ingest", "max_body_bytes"])?)
             .unwrap_or(8 * 1024 * 1024);
-        let ingest_memory_bytes = env_usize("CANARDSTACK_INGEST_MEMORY_BYTES")?
-            .or(file.usize(&["ingest", "memory_bytes"])?)
-            .unwrap_or(2 * 1024 * 1024 * 1024);
-        let seal_rate_seed_bytes = env_usize("CANARDSTACK_SEAL_RATE_SEED_BYTES")?
-            .or(file.usize(&["ingest", "seal_rate_seed_bytes"])?)
-            .unwrap_or(4 * 1024 * 1024);
-        let seal_rate_seed_window = duration_ms_or_secs(
+        let raw_spool_capacity_bytes = env_usize("CANARDSTACK_RAW_SPOOL_CAPACITY_BYTES")?
+            .or(file.usize(&["raw_spool", "capacity_bytes"])?)
+            .unwrap_or(1024 * 1024 * 1024);
+        let maintenance_interval = duration_ms_or_secs(
             &file,
-            &["ingest", "seal_rate_seed_window_ms"],
-            &["ingest", "seal_rate_seed_window_secs"],
-            "CANARDSTACK_SEAL_RATE_SEED_WINDOW_MS",
-            "CANARDSTACK_SEAL_RATE_SEED_WINDOW_SECS",
-            10,
+            &["scheduler", "maintenance_interval_ms"],
+            &["scheduler", "maintenance_interval_secs"],
+            "CANARDSTACK_MAINTENANCE_INTERVAL_MS",
+            "CANARDSTACK_MAINTENANCE_INTERVAL_SECS",
+            30,
         )?;
+
+        let operator = OperatorConfig::from_env(&file, &data_dir, max_body_bytes)?;
+        let mechanics = Mechanics::from_env(
+            &file,
+            &data_dir,
+            max_body_bytes,
+            raw_spool_capacity_bytes,
+            maintenance_interval,
+        )?;
+
+        Ok(Self {
+            operator,
+            mechanics,
+            test_overrides: TestOverrides::production(),
+        })
+    }
+
+    pub fn test(duckdb_path: PathBuf) -> Self {
+        let local_storage_dir = duckdb_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("storage");
+        Self {
+            operator: OperatorConfig::test(duckdb_path, local_storage_dir.clone()),
+            mechanics: Mechanics::test(local_storage_dir),
+            test_overrides: TestOverrides::test(),
+        }
+    }
+
+    /// Fail boot rather than start with a misconfiguration that's invisible at runtime.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        self.operator.validate()?;
+        self.mechanics.validate()?;
+        self.test_overrides.validate()?;
+        // Cross-field check spanning both sub-structs: the raw-spool max record
+        // size derives from operator.max_body_bytes and must fit the mechanics
+        // raw-spool total capacity.
+        if self.mechanics.raw_spool_max_record_bytes
+            > self.mechanics.raw_spool_max_total_bytes_per_request_kind
+        {
+            anyhow::bail!(
+                "CANARDSTACK_MAX_BODY_BYTES must be <= CANARDSTACK_RAW_SPOOL_CAPACITY_BYTES"
+            );
+        }
+        Ok(())
+    }
+}
+
+impl OperatorConfig {
+    fn from_env(file: &FileConfig, data_dir: &Path, max_body_bytes: usize) -> Result<Self> {
         let query_concurrency = env_usize("CANARDSTACK_QUERY_CONCURRENCY")?
             .or(file.usize(&["query", "concurrency"])?)
             .unwrap_or(4);
@@ -147,17 +244,6 @@ impl Config {
         let retention_days = env_i64("CANARDSTACK_RETENTION_DAYS")?
             .or(file.i64(&["retention", "days"])?)
             .unwrap_or(14);
-        let maintenance_interval = duration_ms_or_secs(
-            &file,
-            &["scheduler", "maintenance_interval_ms"],
-            &["scheduler", "maintenance_interval_secs"],
-            "CANARDSTACK_MAINTENANCE_INTERVAL_MS",
-            "CANARDSTACK_MAINTENANCE_INTERVAL_SECS",
-            30,
-        )?;
-        let raw_spool_capacity_bytes = env_usize("CANARDSTACK_RAW_SPOOL_CAPACITY_BYTES")?
-            .or(file.usize(&["raw_spool", "capacity_bytes"])?)
-            .unwrap_or(1024 * 1024 * 1024);
 
         Ok(Self {
             serve_role: ServeRole::All,
@@ -185,16 +271,12 @@ impl Config {
                 None => file.optional_string(&["ducklake", "attach_uri"])?,
             },
             max_body_bytes,
-            per_signal_inflight_bytes: (ingest_memory_bytes / 4).max(max_body_bytes),
-            process_ingest_bytes: ingest_memory_bytes,
             runtime_memory_limit_bytes: match env_optional_usize(
                 "CANARDSTACK_PROCESS_MEMORY_LIMIT_BYTES",
             )? {
                 Some(value) => value,
                 None => file.usize(&["ingest", "process_memory_limit_bytes"])?,
             },
-            seal_rate_seed_bytes,
-            seal_rate_seed_window,
             duckdb_write_memory_limit: env_string("CANARDSTACK_DUCKDB_MEMORY_LIMIT")?
                 .or(file.string(&["duckdb", "memory_limit"])?)
                 .unwrap_or_else(|| "1GiB".to_string()),
@@ -204,17 +286,6 @@ impl Config {
             future_accept_secs: env_i64("CANARDSTACK_ACCEPT_FUTURE_SECS")?
                 .or(file.i64(&["validation", "accept_future_secs"])?)
                 .unwrap_or(10 * 60),
-            immutable_segment_target_bytes: env_usize("CANARDSTACK_SEGMENT_TARGET_BYTES")?
-                .or(file.usize(&["storage", "segment_target_bytes"])?)
-                .unwrap_or(64 * 1024 * 1024),
-            immutable_segment_max_age: duration_ms_or_secs(
-                &file,
-                &["storage", "segment_max_age_ms"],
-                &["storage", "segment_max_age_secs"],
-                "CANARDSTACK_SEGMENT_MAX_AGE_MS",
-                "CANARDSTACK_SEGMENT_MAX_AGE_SECS",
-                10,
-            )?,
             query_interactive: QueryLimits {
                 concurrency: query_concurrency,
                 timeout_secs: query_timeout_secs,
@@ -232,7 +303,7 @@ impl Config {
                 .or(file.usize(&["admission", "heavy_query_degraded_capacity"])?)
                 .unwrap_or(1),
             freshness_budget_sla: duration_ms_or_secs(
-                &file,
+                file,
                 &["admission", "freshness_budget_sla_ms"],
                 &["admission", "freshness_budget_sla_secs"],
                 "CANARDSTACK_FRESHNESS_BUDGET_SLA_MS",
@@ -242,23 +313,6 @@ impl Config {
             logs_retention_days: retention_days,
             spans_retention_days: retention_days,
             metrics_retention_days: retention_days,
-            scheduler_enabled: env_bool("CANARDSTACK_SCHEDULER_ENABLED")?
-                .or(file.bool(&["scheduler", "enabled"])?)
-                .unwrap_or(true),
-            // Seal cadence for the single seal driver. Decoupled from the coarse
-            // maintenance interval: it must stay well under the freshness-budget SLA so
-            // immutable-buffer age never approaches the freshness-budget reject threshold.
-            scheduler_seal_interval: duration_ms_or_secs(
-                &file,
-                &["scheduler", "seal_interval_ms"],
-                &["scheduler", "seal_interval_secs"],
-                "CANARDSTACK_SEAL_INTERVAL_MS",
-                "CANARDSTACK_SEAL_INTERVAL_SECS",
-                1,
-            )?,
-            scheduler_metadata_interval: maintenance_interval,
-            scheduler_metrics_interval: maintenance_interval.saturating_mul(2),
-            scheduler_retention_interval: maintenance_interval.saturating_mul(120),
             max_concurrent_connections: env_usize("CANARDSTACK_MAX_CONNECTIONS")?
                 .or(file.usize(&["server", "max_connections"])?)
                 .unwrap_or(1024),
@@ -272,65 +326,28 @@ impl Config {
                     .or(file.usize(&["server", "socket_write_timeout_secs"])?)
                     .unwrap_or(30) as u64,
             ),
-            bench_http_keepalive: env_bool("CANARDSTACK_BENCH_HTTP_KEEPALIVE")?
-                .or(file.bool(&["bench", "http_keepalive"])?)
+            scheduler_enabled: env_bool("CANARDSTACK_SCHEDULER_ENABLED")?
+                .or(file.bool(&["scheduler", "enabled"])?)
                 .unwrap_or(true),
-            raw_spool_dir: data_dir.join("raw-spool"),
-            raw_spool_max_segment_bytes: (64 * 1024 * 1024).min(raw_spool_capacity_bytes),
-            raw_spool_max_record_bytes: max_body_bytes,
-            raw_spool_max_total_bytes: raw_spool_capacity_bytes,
-            raw_spool_writer_queue_capacity: 1024,
-            raw_spool_group_commit_records: 64,
-            raw_spool_group_commit_delay: Duration::from_millis(
-                env_usize("CANARDSTACK_RAW_SPOOL_GROUP_COMMIT_MS")?
-                    .or(file.usize(&["raw_spool", "group_commit_ms"])?)
-                    .unwrap_or(1) as u64,
-            ),
-            raw_spool_append_sync_interval: Duration::from_millis(
-                env_usize("CANARDSTACK_RAW_SPOOL_APPEND_SYNC_MS")?
-                    .or(file.usize(&["raw_spool", "append_sync_ms"])?)
-                    .unwrap_or(500) as u64,
-            ),
-            raw_spool_append_sync_bytes: env_usize("CANARDSTACK_RAW_SPOOL_APPEND_SYNC_BYTES")?
-                .or(file.usize(&["raw_spool", "append_sync_bytes"])?)
-                .unwrap_or(16 * 1024 * 1024),
-            raw_spool_checkpoint_fsync_records: 1024,
-            raw_spool_checkpoint_fsync_delay: Duration::from_millis(1000),
-            ingest_workers: env_usize("CANARDSTACK_INGEST_WORKERS")?
-                .or(file.usize(&["ingest", "workers"])?)
-                .unwrap_or(4),
-            ingest_buffer_capacity: env_usize("CANARDSTACK_INGEST_BUFFER_CAPACITY")?
-                .or(file.usize(&["ingest", "buffer_capacity"])?)
-                .unwrap_or(1024),
         })
     }
 
-    pub fn test(duckdb_path: PathBuf) -> Self {
-        let local_storage_dir = duckdb_path
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new("."))
-            .join("storage");
+    fn test(duckdb_path: PathBuf, local_storage_dir: PathBuf) -> Self {
         Self {
             serve_role: ServeRole::All,
             bind: "127.0.0.1:0".to_string(),
             api_key: "test-key".to_string(),
             admin_api_key: "test-admin-key".to_string(),
             duckdb_path,
-            local_storage_dir: local_storage_dir.clone(),
+            local_storage_dir,
             duckdb_extension_dir: None,
             postgres_dsn: None,
             ducklake_attach_uri: None,
             max_body_bytes: 8 * 1024 * 1024,
-            per_signal_inflight_bytes: 1024 * 1024,
-            process_ingest_bytes: 4 * 1024 * 1024,
             runtime_memory_limit_bytes: None,
-            seal_rate_seed_bytes: 256 * 1024,
-            seal_rate_seed_window: Duration::from_millis(50),
             duckdb_write_memory_limit: "512MiB".to_string(),
             late_accept_secs: 24 * 60 * 60,
             future_accept_secs: 10 * 60,
-            immutable_segment_target_bytes: 64 * 1024 * 1024,
-            immutable_segment_max_age: Duration::from_secs(10),
             query_interactive: QueryLimits {
                 concurrency: 4,
                 timeout_secs: 15,
@@ -343,33 +360,15 @@ impl Config {
             logs_retention_days: 14,
             spans_retention_days: 14,
             metrics_retention_days: 30,
-            scheduler_enabled: false,
-            scheduler_seal_interval: Duration::from_millis(200),
-            scheduler_metadata_interval: Duration::from_millis(200),
-            scheduler_metrics_interval: Duration::from_millis(200),
-            scheduler_retention_interval: Duration::from_secs(3_600),
             max_concurrent_connections: 64,
             socket_read_timeout: Duration::from_secs(5),
             socket_write_timeout: Duration::from_secs(5),
-            bench_http_keepalive: false,
-            raw_spool_dir: local_storage_dir.join("raw-spool"),
-            raw_spool_max_segment_bytes: 64 * 1024 * 1024,
-            raw_spool_max_record_bytes: 8 * 1024 * 1024,
-            raw_spool_max_total_bytes: 1024 * 1024 * 1024,
-            raw_spool_writer_queue_capacity: 1024,
-            raw_spool_group_commit_records: 64,
-            raw_spool_group_commit_delay: Duration::from_millis(1),
-            raw_spool_append_sync_interval: Duration::from_millis(500),
-            raw_spool_append_sync_bytes: 16 * 1024 * 1024,
-            raw_spool_checkpoint_fsync_records: 1024,
-            raw_spool_checkpoint_fsync_delay: Duration::from_millis(1000),
-            ingest_workers: 4,
-            ingest_buffer_capacity: 1024,
+            scheduler_enabled: false,
         }
     }
 
-    /// Fail boot rather than start with a misconfiguration that's invisible at runtime.
-    pub fn validate(&self) -> anyhow::Result<()> {
+    /// Validate operator-facing settings; messages name their env vars.
+    fn validate(&self) -> anyhow::Result<()> {
         if self.api_key.trim().is_empty() {
             anyhow::bail!("CANARDSTACK_API_KEY must not be empty");
         }
@@ -381,36 +380,14 @@ impl Config {
                 "CANARDSTACK_API_KEY and CANARDSTACK_ADMIN_API_KEY must differ; reusing a single key collapses the admin authorization gate"
             );
         }
-        if self.per_signal_inflight_bytes > self.process_ingest_bytes {
-            anyhow::bail!(
-                "derived per-signal ingest in-flight bytes ({}) must be <= CANARDSTACK_INGEST_MEMORY_BYTES ({})",
-                self.per_signal_inflight_bytes,
-                self.process_ingest_bytes
-            );
-        }
         if self.max_body_bytes == 0 {
             anyhow::bail!("CANARDSTACK_MAX_BODY_BYTES must be > 0");
-        }
-        if self.process_ingest_bytes == 0 || self.per_signal_inflight_bytes == 0 {
-            anyhow::bail!("ingest memory caps must be > 0");
         }
         if matches!(self.runtime_memory_limit_bytes, Some(0)) {
             anyhow::bail!("CANARDSTACK_PROCESS_MEMORY_LIMIT_BYTES must be > 0 when set");
         }
-        if self.seal_rate_seed_bytes == 0 {
-            anyhow::bail!("seal-rate seed bytes must be > 0");
-        }
-        if self.seal_rate_seed_window.is_zero() {
-            anyhow::bail!("seal-rate seed window must be > 0");
-        }
         if self.duckdb_write_memory_limit.trim().is_empty() {
             anyhow::bail!("CANARDSTACK_DUCKDB_MEMORY_LIMIT must not be empty");
-        }
-        if self.immutable_segment_target_bytes == 0 {
-            anyhow::bail!("CANARDSTACK_SEGMENT_TARGET_BYTES must be > 0");
-        }
-        if self.immutable_segment_max_age.is_zero() {
-            anyhow::bail!("CANARDSTACK_SEGMENT_MAX_AGE_MS/SECS must be > 0");
         }
         if self.logs_retention_days <= 0
             || self.spans_retention_days <= 0
@@ -448,35 +425,101 @@ impl Config {
         if self.socket_read_timeout.is_zero() || self.socket_write_timeout.is_zero() {
             anyhow::bail!("socket timeouts must be > 0");
         }
+        Ok(())
+    }
+}
+
+impl Mechanics {
+    fn from_env(
+        file: &FileConfig,
+        data_dir: &Path,
+        max_body_bytes: usize,
+        raw_spool_capacity_bytes: usize,
+        maintenance_interval: Duration,
+    ) -> Result<Self> {
+        Ok(Self {
+            arrow_write_buffer_target_bytes: env_usize(
+                "CANARDSTACK_ARROW_WRITE_BUFFER_TARGET_BYTES",
+            )?
+            .or(file.usize(&["storage", "arrow_write_buffer_target_bytes"])?)
+            .unwrap_or(64 * 1024 * 1024),
+            arrow_write_buffer_max_age: duration_ms_or_secs(
+                file,
+                &["storage", "arrow_write_buffer_max_age_ms"],
+                &["storage", "arrow_write_buffer_max_age_secs"],
+                "CANARDSTACK_ARROW_WRITE_BUFFER_MAX_AGE_MS",
+                "CANARDSTACK_ARROW_WRITE_BUFFER_MAX_AGE_SECS",
+                10,
+            )?,
+            // Seal cadence for the single seal driver. Decoupled from the coarse
+            // maintenance interval: it must stay well under the freshness-budget SLA so
+            // Arrow write-buffer age never approaches the freshness-budget reject threshold.
+            scheduler_seal_interval: duration_ms_or_secs(
+                file,
+                &["scheduler", "seal_interval_ms"],
+                &["scheduler", "seal_interval_secs"],
+                "CANARDSTACK_SEAL_INTERVAL_MS",
+                "CANARDSTACK_SEAL_INTERVAL_SECS",
+                1,
+            )?,
+            scheduler_metadata_interval: maintenance_interval,
+            scheduler_metrics_interval: maintenance_interval.saturating_mul(2),
+            scheduler_retention_interval: maintenance_interval.saturating_mul(120),
+            raw_spool_dir: data_dir.join("raw-spool"),
+            raw_spool_max_segment_bytes: (64 * 1024 * 1024).min(raw_spool_capacity_bytes),
+            raw_spool_max_record_bytes: max_body_bytes,
+            raw_spool_max_total_bytes_per_request_kind: raw_spool_capacity_bytes,
+            raw_spool_group_commit_delay: Duration::from_millis(
+                env_usize("CANARDSTACK_RAW_SPOOL_GROUP_COMMIT_MS")?
+                    .or(file.usize(&["raw_spool", "group_commit_ms"])?)
+                    .unwrap_or(1) as u64,
+            ),
+            ingest_workers: env_usize("CANARDSTACK_INGEST_WORKERS")?
+                .or(file.usize(&["ingest", "workers"])?)
+                .unwrap_or(4),
+            operator_metrics_to_storage: env_bool("CANARDSTACK_OPERATOR_METRICS_TO_STORAGE")?
+                .or(file.bool(&["metrics", "operator_metrics_to_storage"])?)
+                .unwrap_or(false),
+        })
+    }
+
+    fn test(local_storage_dir: PathBuf) -> Self {
+        Self {
+            arrow_write_buffer_target_bytes: 64 * 1024 * 1024,
+            arrow_write_buffer_max_age: Duration::from_secs(10),
+            scheduler_seal_interval: Duration::from_millis(200),
+            scheduler_metadata_interval: Duration::from_millis(200),
+            scheduler_metrics_interval: Duration::from_millis(200),
+            scheduler_retention_interval: Duration::from_secs(3_600),
+            raw_spool_dir: local_storage_dir.join("raw-spool"),
+            raw_spool_max_segment_bytes: 64 * 1024 * 1024,
+            raw_spool_max_record_bytes: 8 * 1024 * 1024,
+            raw_spool_max_total_bytes_per_request_kind: 1024 * 1024 * 1024,
+            raw_spool_group_commit_delay: Duration::from_millis(1),
+            ingest_workers: 4,
+            operator_metrics_to_storage: false,
+        }
+    }
+
+    /// Validate advanced/internal mechanics knobs.
+    fn validate(&self) -> anyhow::Result<()> {
+        if self.arrow_write_buffer_target_bytes == 0 {
+            anyhow::bail!("CANARDSTACK_ARROW_WRITE_BUFFER_TARGET_BYTES must be > 0");
+        }
+        if self.arrow_write_buffer_max_age.is_zero() {
+            anyhow::bail!("CANARDSTACK_ARROW_WRITE_BUFFER_MAX_AGE_MS/SECS must be > 0");
+        }
         if self.raw_spool_max_segment_bytes == 0
             || self.raw_spool_max_record_bytes == 0
-            || self.raw_spool_max_total_bytes == 0
-            || self.raw_spool_writer_queue_capacity == 0
-            || self.raw_spool_group_commit_records == 0
-            || self.raw_spool_append_sync_bytes == 0
-            || self.raw_spool_checkpoint_fsync_records == 0
+            || self.raw_spool_max_total_bytes_per_request_kind == 0
         {
             anyhow::bail!("raw spool limits must be > 0");
         }
         if self.raw_spool_group_commit_delay.is_zero() {
             anyhow::bail!("CANARDSTACK_RAW_SPOOL_GROUP_COMMIT_MS must be > 0");
         }
-        if self.raw_spool_append_sync_interval.is_zero() {
-            anyhow::bail!("CANARDSTACK_RAW_SPOOL_APPEND_SYNC_MS must be > 0");
-        }
-        if self.raw_spool_checkpoint_fsync_delay.is_zero() {
-            anyhow::bail!("raw spool checkpoint fsync delay must be > 0");
-        }
         if self.ingest_workers == 0 {
             anyhow::bail!("CANARDSTACK_INGEST_WORKERS must be > 0");
-        }
-        if self.ingest_buffer_capacity == 0 {
-            anyhow::bail!("CANARDSTACK_INGEST_BUFFER_CAPACITY must be > 0");
-        }
-        if self.raw_spool_max_record_bytes > self.raw_spool_max_total_bytes {
-            anyhow::bail!(
-                "CANARDSTACK_MAX_BODY_BYTES must be <= CANARDSTACK_RAW_SPOOL_CAPACITY_BYTES"
-            );
         }
         if self.scheduler_seal_interval.is_zero()
             || self.scheduler_metadata_interval.is_zero()
@@ -484,6 +527,39 @@ impl Config {
             || self.scheduler_retention_interval.is_zero()
         {
             anyhow::bail!("scheduler intervals must be > 0");
+        }
+        Ok(())
+    }
+}
+
+impl TestOverrides {
+    fn production() -> Self {
+        Self {
+            seal_rate_seed_bytes: DEFAULT_SEAL_RATE_SEED_BYTES,
+            seal_rate_seed_window: DEFAULT_SEAL_RATE_SEED_WINDOW,
+            bench_http_keepalive: true,
+            ingest_worker_channel_capacity: crate::ingest::INGEST_WORKER_CHANNEL_CAPACITY,
+        }
+    }
+
+    fn test() -> Self {
+        Self {
+            seal_rate_seed_bytes: 256 * 1024,
+            seal_rate_seed_window: Duration::from_millis(50),
+            bench_http_keepalive: false,
+            ingest_worker_channel_capacity: 1024,
+        }
+    }
+
+    fn validate(&self) -> anyhow::Result<()> {
+        if self.seal_rate_seed_bytes == 0 {
+            anyhow::bail!("seal-rate seed bytes must be > 0");
+        }
+        if self.seal_rate_seed_window.is_zero() {
+            anyhow::bail!("seal-rate seed window must be > 0");
+        }
+        if self.ingest_worker_channel_capacity == 0 {
+            anyhow::bail!("ingest worker channel capacity must be > 0");
         }
         Ok(())
     }
@@ -691,17 +767,13 @@ mod tests {
         "CANARDSTACK_POSTGRES_DSN",
         "CANARDSTACK_DUCKLAKE_ATTACH_URI",
         "CANARDSTACK_MAX_BODY_BYTES",
-        "CANARDSTACK_INGEST_MEMORY_BYTES",
         "CANARDSTACK_PROCESS_MEMORY_LIMIT_BYTES",
-        "CANARDSTACK_SEAL_RATE_SEED_BYTES",
-        "CANARDSTACK_SEAL_RATE_SEED_WINDOW_MS",
-        "CANARDSTACK_SEAL_RATE_SEED_WINDOW_SECS",
         "CANARDSTACK_DUCKDB_MEMORY_LIMIT",
         "CANARDSTACK_ACCEPT_LATE_SECS",
         "CANARDSTACK_ACCEPT_FUTURE_SECS",
-        "CANARDSTACK_SEGMENT_TARGET_BYTES",
-        "CANARDSTACK_SEGMENT_MAX_AGE_MS",
-        "CANARDSTACK_SEGMENT_MAX_AGE_SECS",
+        "CANARDSTACK_ARROW_WRITE_BUFFER_TARGET_BYTES",
+        "CANARDSTACK_ARROW_WRITE_BUFFER_MAX_AGE_MS",
+        "CANARDSTACK_ARROW_WRITE_BUFFER_MAX_AGE_SECS",
         "CANARDSTACK_QUERY_CONCURRENCY",
         "CANARDSTACK_QUERY_TIMEOUT_SECS",
         "CANARDSTACK_QUERY_MEMORY_LIMIT",
@@ -717,11 +789,10 @@ mod tests {
         "CANARDSTACK_MAX_CONNECTIONS",
         "CANARDSTACK_SOCKET_READ_TIMEOUT_SECS",
         "CANARDSTACK_SOCKET_WRITE_TIMEOUT_SECS",
-        "CANARDSTACK_BENCH_HTTP_KEEPALIVE",
         "CANARDSTACK_RAW_SPOOL_CAPACITY_BYTES",
         "CANARDSTACK_RAW_SPOOL_GROUP_COMMIT_MS",
         "CANARDSTACK_INGEST_WORKERS",
-        "CANARDSTACK_INGEST_BUFFER_CAPACITY",
+        "CANARDSTACK_OPERATOR_METRICS_TO_STORAGE",
     ];
 
     fn env_lock() -> &'static Mutex<()> {
@@ -790,20 +861,16 @@ attach_uri = "md:file"
 
 [ingest]
 max_body_bytes = 12345
-memory_bytes = 3000000
 process_memory_limit_bytes = 4000000
-seal_rate_seed_bytes = 654321
-seal_rate_seed_window_secs = 11
 workers = 3
-buffer_capacity = 33
 
 [validation]
 accept_late_secs = 100
 accept_future_secs = 20
 
 [storage]
-segment_target_bytes = 777
-segment_max_age_secs = 12
+arrow_write_buffer_target_bytes = 777
+arrow_write_buffer_max_age_secs = 12
 
 [query]
 concurrency = 6
@@ -827,11 +894,6 @@ seal_interval_ms = 250
 [raw_spool]
 capacity_bytes = 16384
 group_commit_ms = 3
-append_sync_ms = 250
-append_sync_bytes = 8192
-
-[bench]
-http_keepalive = true
 "#,
         )
         .unwrap();
@@ -839,70 +901,85 @@ http_keepalive = true
         unsafe {
             env::set_var(CONFIG_PATH_ENV, &config_path);
             env::set_var("CANARDSTACK_BIND", "127.0.0.1:4319");
-            env::set_var("CANARDSTACK_SEAL_RATE_SEED_WINDOW_MS", "125");
             env::set_var("CANARDSTACK_DUCKLAKE_ATTACH_URI", "");
         }
 
         let config = Config::from_env().unwrap();
-        assert_eq!(config.bind, "127.0.0.1:4319");
-        assert_eq!(config.api_key, "file-api-key");
-        assert_eq!(config.admin_api_key, "file-admin-api-key");
+        assert_eq!(config.operator.bind, "127.0.0.1:4319");
+        assert_eq!(config.operator.api_key, "file-api-key");
+        assert_eq!(config.operator.admin_api_key, "file-admin-api-key");
         assert_eq!(
-            config.duckdb_path,
+            config.operator.duckdb_path,
             PathBuf::from("file-data/canardstack.duckdb")
         );
-        assert_eq!(config.local_storage_dir, PathBuf::from("file-data/storage"));
         assert_eq!(
-            config.duckdb_extension_dir,
+            config.operator.local_storage_dir,
+            PathBuf::from("file-data/storage")
+        );
+        assert_eq!(
+            config.operator.duckdb_extension_dir,
             Some(PathBuf::from("/opt/duckdb/extensions"))
         );
-        assert_eq!(config.ducklake_attach_uri, None);
-        assert_eq!(config.max_body_bytes, 12345);
-        assert_eq!(config.process_ingest_bytes, 3_000_000);
-        assert_eq!(config.per_signal_inflight_bytes, 750_000);
-        assert_eq!(config.runtime_memory_limit_bytes, Some(4_000_000));
-        assert_eq!(config.seal_rate_seed_bytes, 654_321);
-        assert_eq!(config.seal_rate_seed_window, Duration::from_millis(125));
-        assert_eq!(config.duckdb_write_memory_limit, "2GiB");
-        assert_eq!(config.immutable_segment_target_bytes, 777);
-        assert_eq!(config.immutable_segment_max_age, Duration::from_secs(12));
-        assert_eq!(config.query_interactive.concurrency, 6);
-        assert_eq!(config.query_interactive.timeout_secs, 7);
-        assert_eq!(config.query_interactive.memory_limit, "384MiB");
-        assert_eq!(config.seal_admission_capacity, 1);
-        assert_eq!(config.cheap_query_admission_capacity, 2);
-        assert_eq!(config.heavy_query_degraded_capacity, 1);
-        assert_eq!(config.freshness_budget_sla, Duration::from_secs(9));
-        assert_eq!(config.logs_retention_days, 5);
-        assert_eq!(config.metrics_retention_days, 5);
-        assert!(!config.scheduler_enabled);
-        assert_eq!(config.scheduler_seal_interval, Duration::from_millis(250));
-        assert_eq!(config.scheduler_metadata_interval, Duration::from_secs(40));
-        assert_eq!(config.scheduler_metrics_interval, Duration::from_secs(80));
+        assert_eq!(config.operator.ducklake_attach_uri, None);
+        assert_eq!(config.operator.max_body_bytes, 12345);
+        assert_eq!(config.operator.runtime_memory_limit_bytes, Some(4_000_000));
+        assert_eq!(config.operator.duckdb_write_memory_limit, "2GiB");
+        assert_eq!(config.mechanics.arrow_write_buffer_target_bytes, 777);
         assert_eq!(
-            config.scheduler_retention_interval,
-            Duration::from_secs(4800)
+            config.mechanics.arrow_write_buffer_max_age,
+            Duration::from_secs(12)
         );
-        assert_eq!(config.raw_spool_max_total_bytes, 16_384);
-        assert_eq!(config.raw_spool_max_segment_bytes, 16_384);
-        assert_eq!(config.raw_spool_max_record_bytes, 12_345);
+        assert_eq!(config.operator.query_interactive.concurrency, 6);
+        assert_eq!(config.operator.query_interactive.timeout_secs, 7);
+        assert_eq!(config.operator.query_interactive.memory_limit, "384MiB");
+        assert_eq!(config.operator.seal_admission_capacity, 1);
+        assert_eq!(config.operator.cheap_query_admission_capacity, 2);
+        assert_eq!(config.operator.heavy_query_degraded_capacity, 1);
+        assert_eq!(config.operator.freshness_budget_sla, Duration::from_secs(9));
+        assert_eq!(config.operator.logs_retention_days, 5);
+        assert_eq!(config.operator.metrics_retention_days, 5);
+        assert!(!config.operator.scheduler_enabled);
         assert_eq!(
-            config.raw_spool_group_commit_delay,
-            Duration::from_millis(3)
-        );
-        assert_eq!(
-            config.raw_spool_append_sync_interval,
+            config.mechanics.scheduler_seal_interval,
             Duration::from_millis(250)
         );
-        assert_eq!(config.raw_spool_append_sync_bytes, 8192);
-        assert_eq!(config.raw_spool_checkpoint_fsync_records, 1024);
         assert_eq!(
-            config.raw_spool_checkpoint_fsync_delay,
-            Duration::from_millis(1000)
+            config.mechanics.scheduler_metadata_interval,
+            Duration::from_secs(40)
         );
-        assert_eq!(config.ingest_workers, 3);
-        assert_eq!(config.ingest_buffer_capacity, 33);
-        assert!(config.bench_http_keepalive);
+        assert_eq!(
+            config.mechanics.scheduler_metrics_interval,
+            Duration::from_secs(80)
+        );
+        assert_eq!(
+            config.mechanics.scheduler_retention_interval,
+            Duration::from_secs(4800)
+        );
+        assert_eq!(
+            config.mechanics.raw_spool_max_total_bytes_per_request_kind,
+            16_384
+        );
+        assert_eq!(config.mechanics.raw_spool_max_segment_bytes, 16_384);
+        assert_eq!(config.mechanics.raw_spool_max_record_bytes, 12_345);
+        assert_eq!(
+            config.mechanics.raw_spool_group_commit_delay,
+            Duration::from_millis(3)
+        );
+        assert_eq!(config.mechanics.ingest_workers, 3);
+        // Fixed test hooks stay out of the operator/file config surface.
+        assert_eq!(
+            config.test_overrides.ingest_worker_channel_capacity,
+            crate::ingest::INGEST_WORKER_CHANNEL_CAPACITY
+        );
+        assert_eq!(
+            config.test_overrides.seal_rate_seed_bytes,
+            DEFAULT_SEAL_RATE_SEED_BYTES
+        );
+        assert_eq!(
+            config.test_overrides.seal_rate_seed_window,
+            DEFAULT_SEAL_RATE_SEED_WINDOW
+        );
+        assert!(config.test_overrides.bench_http_keepalive);
     }
 
     #[test]
@@ -912,7 +989,24 @@ http_keepalive = true
 
         let config = Config::from_env().unwrap();
 
-        assert!(config.bench_http_keepalive);
+        assert!(config.test_overrides.bench_http_keepalive);
+    }
+
+    #[test]
+    fn arrow_write_buffer_defaults_to_current_flush_policy() {
+        let _guard = env_lock().lock_or_poisoned();
+        let _snapshot = EnvSnapshot::capture_and_clear();
+
+        let config = Config::from_env().unwrap();
+
+        assert_eq!(
+            config.mechanics.arrow_write_buffer_target_bytes,
+            64 * 1024 * 1024
+        );
+        assert_eq!(
+            config.mechanics.arrow_write_buffer_max_age,
+            Duration::from_secs(10)
+        );
     }
 
     #[test]
@@ -952,5 +1046,15 @@ max_body_bytes = "large"
         }
 
         Config::from_env().unwrap().validate().unwrap();
+    }
+
+    #[test]
+    fn operator_metrics_to_storage_defaults_off() {
+        let _guard = env_lock().lock_or_poisoned();
+        let _snapshot = EnvSnapshot::capture_and_clear();
+
+        let config = Config::from_env().unwrap();
+
+        assert!(!config.mechanics.operator_metrics_to_storage);
     }
 }

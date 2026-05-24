@@ -1,7 +1,6 @@
 use crate::app::AppState;
 use crate::config::Config;
-use crate::ingest::{IngestSnapshot, Ingestor};
-use crate::metrics::Metrics;
+use crate::seal::SealDriver;
 use crate::storage::{RetentionPolicy, Storage};
 use crate::LockExt;
 use anyhow::Result;
@@ -13,7 +12,17 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 const SCHEDULER_METADATA_REFRESH_BUCKET_LIMIT: usize = 1;
-const METADATA_REFRESH_QUEUE_PRESSURE_YIELD: f64 = 0.70;
+/// Fraction of the freshness-budget SLA (max Arrow-write-buffer age / SLA) at
+/// which the scheduler yields the metadata-refresh tick, so discovery
+/// re-aggregation never competes with the writer while a seal is approaching
+/// due.
+const METADATA_REFRESH_BUFFER_AGE_YIELD: f64 = 0.70;
+/// Fraction of the freshness-budget SLA at which the single scheduler thread
+/// stops running non-seal maintenance (metadata refresh, metrics snapshot,
+/// retention) for the tick. Past this point the Arrow-write-buffer age is close
+/// enough to the SLA that letting a slow maintenance job hold the thread could
+/// delay the next due seal and burn the freshness budget.
+const SEAL_PRIORITY_SLA_FRACTION: f64 = 0.5;
 
 #[derive(Clone, Debug)]
 struct FailureRecord {
@@ -36,9 +45,9 @@ impl Maintenance {
             last_runs: Mutex::new(BTreeMap::new()),
             last_failures: Mutex::new(BTreeMap::new()),
             retention: RetentionPolicy {
-                logs_days: config.logs_retention_days,
-                spans_days: config.spans_retention_days,
-                metrics_days: config.metrics_retention_days,
+                logs_days: config.operator.logs_retention_days,
+                spans_days: config.operator.spans_retention_days,
+                metrics_days: config.operator.metrics_retention_days,
             },
         }
     }
@@ -95,20 +104,11 @@ impl Maintenance {
         })
     }
 
-    pub fn run_seal(
-        &self,
-        ingestor: &Ingestor,
-        storage: &Storage,
-        metrics: &Metrics,
-    ) -> Result<Value> {
-        let started = Instant::now();
-        let immutable = ingestor.seal_committed_to_storage(storage, metrics)?;
+    /// Record a successful seal run. The seal operation itself lives in
+    /// [`crate::seal::run`]; this exposes the private run bookkeeping so that
+    /// single entry point can mark the `seal` job as having succeeded.
+    pub(crate) fn record_seal_run(&self) {
         self.record_run("seal");
-        Ok(json!({
-            "status": "ok",
-            "immutable_segments": immutable.to_json(),
-            "duration_ms": started.elapsed().as_millis()
-        }))
     }
 
     pub fn retention(&self, storage: &Storage, dry_run: bool) -> Result<Value> {
@@ -130,6 +130,21 @@ impl Maintenance {
             "dry_run": dry_run,
             "retention": retention,
             "snapshot_expiration": snapshot_expiration,
+            // Physical file compaction is a deliberate v0 non-goal, reported as
+            // `supported:false, enabled:false` rather than implemented. DuckLake's
+            // `ducklake_merge_adjacent_files` is intentionally NOT called: it stays
+            // disabled until proven stable for this append/seal write pattern.
+            // v0 therefore tolerates many small Parquet segment files; the Arrow
+            // write buffer's size/age coalescing (one seal -> one segment per
+            // signal) is the only file-count mitigation. Do not add a compaction
+            // code path here without revisiting that decision: trigger conditions
+            // and what it must touch are tracked as an explicit roadmap entry in
+            // docs/architecture/v0-architecture.md#compaction--small-files--roadmap--when-to-revisit.
+            "physical_file_compaction": {
+                "supported": false,
+                "enabled": false,
+                "reason": "ducklake_merge_adjacent_files is disabled until proven stable"
+            },
             "cleanup": cleanup,
             "duration_ms": started.elapsed().as_millis()
         }))
@@ -196,12 +211,12 @@ impl Drop for Scheduler {
 }
 
 fn scheduler_loop(state: Arc<AppState>, stop: Arc<AtomicBool>) {
-    let seal_cadence = state.config.scheduler_seal_interval;
-    let segment_target_bytes = state.config.immutable_segment_target_bytes;
-    let segment_max_age_seconds = state.config.immutable_segment_max_age.as_secs_f64();
-    let metadata_every = state.config.scheduler_metadata_interval;
-    let metrics_every = state.config.scheduler_metrics_interval;
-    let retention_every = state.config.scheduler_retention_interval;
+    let mut seal_driver = SealDriver::new(&state.config, Instant::now());
+    let seal_cadence = state.config.mechanics.scheduler_seal_interval;
+    let metadata_every = state.config.mechanics.scheduler_metadata_interval;
+    let metrics_every = state.config.mechanics.scheduler_metrics_interval;
+    let retention_every = state.config.mechanics.scheduler_retention_interval;
+    let freshness_budget_sla_seconds = state.config.operator.freshness_budget_sla.as_secs_f64();
     // Poll fast enough to seal on the freshness cadence and to catch a
     // size-due buffer promptly; the maintenance jobs are gated by their own
     // (coarse) timers regardless of how often we wake.
@@ -209,8 +224,6 @@ fn scheduler_loop(state: Arc<AppState>, stop: Arc<AtomicBool>) {
         .min(metadata_every)
         .min(Duration::from_millis(250))
         .max(Duration::from_millis(10));
-    let mut next_seal = Instant::now() + seal_cadence;
-    let mut seal_backoff_until = Instant::now();
     let mut next_metadata = Instant::now() + metadata_every;
     let mut next_metrics = Instant::now() + metrics_every;
     let mut next_retention = Instant::now() + retention_every;
@@ -229,57 +242,67 @@ fn scheduler_loop(state: Arc<AppState>, stop: Arc<AtomicBool>) {
             continue;
         }
 
-        // Single seal driver. Seal when a buffered signal reaches its size/age
-        // threshold, or on the freshness cadence, keeping immutable-buffer age
-        // well under the freshness-budget SLA so ingest is never shed for freshness debt. A
-        // failed seal backs off so a broken catalog cannot spin the writer.
-        if now >= seal_backoff_until {
-            let buffers = state.storage.immutable_buffer_metrics();
-            let buffered = buffers.iter().any(|metric| metric.bytes > 0);
-            let threshold_due = buffers.iter().any(|metric| {
-                metric.bytes >= segment_target_bytes
-                    || metric.age_seconds >= segment_max_age_seconds
-            });
-            if buffered && (threshold_due || now >= next_seal) {
-                let ok = run_seal_tick(&state);
-                next_seal = now + seal_cadence;
-                if !ok {
-                    seal_backoff_until = now + seal_cadence;
-                }
-            } else if now >= next_seal {
-                next_seal = now + seal_cadence;
-            }
-        }
+        let seal_tick = seal_driver.tick(&state, now, run_seal_tick);
+        let max_buffer_age_seconds = seal_tick.max_buffer_age_seconds;
 
-        if now >= next_metadata {
+        // Seal priority: when the oldest Arrow write buffer is within
+        // SEAL_PRIORITY_SLA_FRACTION of the freshness SLA, skip the non-seal
+        // maintenance jobs this tick so a slow metadata/metrics/retention job
+        // cannot hold the scheduler thread and delay the next due seal. The
+        // skipped jobs do NOT advance their `next_*` timers, so they run as soon
+        // as the buffer-age pressure clears.
+        let buffer_age_pressure = if freshness_budget_sla_seconds > 0.0 {
+            max_buffer_age_seconds / freshness_budget_sla_seconds
+        } else {
+            0.0
+        };
+        let seal_priority_active = buffer_age_pressure >= SEAL_PRIORITY_SLA_FRACTION;
+
+        if !seal_priority_active && now >= next_metadata {
             let ok = run_job(&state, "metadata_refresh", |s| {
-                let snapshots = s.ingestor.snapshots();
-                if metadata_refresh_should_yield_to_ingest(&snapshots) {
+                if metadata_refresh_should_yield_to_ingest(buffer_age_pressure) {
                     return Ok(json!({
                         "status": "skipped",
                         "reason": "ingest_pressure",
-                        "max_queue_pressure": max_queue_pressure(&snapshots)
+                        "buffer_age_pressure": buffer_age_pressure
                     }));
                 }
-                let buckets = s
+                let outcome = s
                     .storage
                     .refresh_metadata_limited(SCHEDULER_METADATA_REFRESH_BUCKET_LIMIT)?;
-                Ok(json!({"status": "ok", "buckets": buckets}))
+                s.metrics.observe_seconds(
+                    "canardstack_phase_duration_seconds",
+                    &[("phase", "writer_lock_wait"), ("path", "metadata_refresh")],
+                    outcome.writer_lock_wait_seconds,
+                );
+                Ok(json!({"status": "ok", "buckets": outcome.buckets}))
             });
             next_metadata = now + next_interval(&state, "metadata_refresh", metadata_every, ok);
         }
 
-        if now >= next_metrics {
+        if !seal_priority_active && now >= next_metrics {
             let ok = run_job(&state, "metrics_snapshot", |s| {
                 crate::http::record_operator_gauges(s);
                 crate::http::record_storage_operator_gauges(s);
-                let rows = s.metrics.write_snapshot_to_storage(&s.storage)?;
-                Ok(json!({"status": "ok", "rows": rows}))
+                // The operator gauges above always refresh. Persisting a snapshot
+                // into the metric_gauge / metric_sum storage tables is opt-in to
+                // avoid the extra write load and the canardstack_operator_metrics
+                // rows by default.
+                if s.config.mechanics.operator_metrics_to_storage {
+                    let rows = s.metrics.write_snapshot_to_storage(&s.storage)?;
+                    Ok(json!({"status": "ok", "rows": rows}))
+                } else {
+                    Ok(json!({
+                        "status": "ok",
+                        "rows": 0,
+                        "operator_metrics_to_storage": false
+                    }))
+                }
             });
             next_metrics = now + next_interval(&state, "metrics_snapshot", metrics_every, ok);
         }
 
-        if now >= next_retention {
+        if !seal_priority_active && now >= next_retention {
             let ok = run_job(&state, "retention", |s| {
                 s.maintenance.retention(&s.storage, false)
             });
@@ -290,20 +313,7 @@ fn scheduler_loop(state: Arc<AppState>, stop: Arc<AtomicBool>) {
 
 fn run_seal_tick(state: &AppState) -> bool {
     run_job(state, "seal", |s| {
-        let pending_bytes: usize = s
-            .storage
-            .immutable_buffer_metrics()
-            .iter()
-            .map(|metric| metric.bytes)
-            .sum();
-        let mut guard = s
-            .admission
-            .reserve_seal(&s.metrics)
-            .map_err(|err| anyhow::anyhow!(err.message.clone()))?;
-        guard.record_bytes(pending_bytes);
-        let result = s.maintenance.run_seal(&s.ingestor, &s.storage, &s.metrics);
-        guard.finish(&s.metrics);
-        result
+        crate::seal::run(s).map_err(|err| anyhow::anyhow!(err.message.clone()))
     })
 }
 
@@ -364,15 +374,12 @@ fn next_interval(state: &AppState, job: &str, base: Duration, ok: bool) -> Durat
     backoff.min(Duration::from_secs(300)).max(base)
 }
 
-fn metadata_refresh_should_yield_to_ingest(snapshots: &[IngestSnapshot]) -> bool {
-    max_queue_pressure(snapshots) >= METADATA_REFRESH_QUEUE_PRESSURE_YIELD
-}
-
-fn max_queue_pressure(snapshots: &[IngestSnapshot]) -> f64 {
-    snapshots
-        .iter()
-        .map(|snapshot| snapshot.pressure)
-        .fold(0.0, f64::max)
+/// Yield the metadata-refresh tick when Arrow-write-buffer age pressure (max
+/// buffer age / freshness SLA) crosses the yield threshold, so discovery
+/// re-aggregation never competes with the writer while a seal is approaching
+/// due.
+fn metadata_refresh_should_yield_to_ingest(buffer_age_pressure: f64) -> bool {
+    buffer_age_pressure >= METADATA_REFRESH_BUFFER_AGE_YIELD
 }
 
 /// Bounded `reason` label. Most reasons derive from `job` (a static str we
@@ -395,28 +402,17 @@ fn classify_job_error(err: &anyhow::Error, job: &str) -> &'static str {
 mod tests {
     use super::*;
 
-    fn snapshot(signal: &'static str, pressure: f64) -> IngestSnapshot {
-        IngestSnapshot {
-            storage_signal: signal,
-            inflight_bytes: 0,
-            inflight_capacity_bytes: 0,
-            pressure,
-        }
+    #[test]
+    fn metadata_refresh_runs_when_buffer_age_pressure_below_threshold() {
+        assert!(!metadata_refresh_should_yield_to_ingest(0.69));
     }
 
     #[test]
-    fn metadata_refresh_yields_to_high_queue_pressure() {
-        assert!(metadata_refresh_should_yield_to_ingest(&[
-            snapshot("logs", 0.10),
-            snapshot("spans", METADATA_REFRESH_QUEUE_PRESSURE_YIELD),
-        ]));
-    }
-
-    #[test]
-    fn metadata_refresh_runs_when_queues_are_below_pressure_threshold() {
-        assert!(!metadata_refresh_should_yield_to_ingest(&[
-            snapshot("logs", 0.69),
-            snapshot("spans", 0.10),
-        ]));
+    fn metadata_refresh_yields_to_high_buffer_age_pressure_alone() {
+        // The oldest buffer is past the yield threshold fraction of the SLA ->
+        // yield so the seal stays ahead of discovery re-aggregation.
+        assert!(metadata_refresh_should_yield_to_ingest(
+            METADATA_REFRESH_BUFFER_AGE_YIELD
+        ));
     }
 }

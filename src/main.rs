@@ -15,26 +15,26 @@ fn main() -> anyhow::Result<()> {
         Some("healthcheck") => healthcheck::run(args.next()),
         Some("install-ducklake-extension") => {
             let config = Config::from_env()?;
-            storage::install_ducklake_extension(config.duckdb_extension_dir.as_deref())
+            storage::install_ducklake_extension(config.operator.duckdb_extension_dir.as_deref())
         }
         Some("serve") | None => {
             install_shutdown_signal_handlers();
             let role = parse_serve_role(args)?;
             let mut config = Config::from_env()?;
-            config.serve_role = role;
+            config.operator.serve_role = role;
             config.validate()?;
             let state = Arc::new(AppState::new(config)?);
-            if !state.config.scheduler_enabled {
+            if !state.config.operator.scheduler_enabled {
                 tracing::warn!(
                     event = "scheduler_disabled",
-                    "scheduler disabled; ingest workers still accept and buffer requests, but the scheduler is the single seal driver, so buffered rows will not be sealed to DuckLake (and maintenance will not run) until it is enabled or an admin seal is issued"
+                    "scheduler disabled; ingest workers still accept and buffer requests, but the scheduler is the single seal driver, so buffered rows will not be flushed to DuckLake (and maintenance will not run) until it is enabled or an admin seal is issued"
                 );
             }
             let _scheduler = state
                 .config
-                .scheduler_enabled
+                .operator.scheduler_enabled
                 .then_some(())
-                .filter(|_| state.config.serve_role.runs_scheduler())
+                .filter(|_| state.config.operator.serve_role.runs_scheduler())
                 .map(|_| Scheduler::spawn(state.clone()));
             http::serve_until(state, &SHUTDOWN_REQUESTED)
         }

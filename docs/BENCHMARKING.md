@@ -9,17 +9,19 @@ pass/fail criteria that future agents should compare against.
 Use this as the reusable performance smoke for ingest-topology or scheduler
 changes when the machine can afford a 10 minute run.
 
-Baseline, latest clean run:
-[report.json](/private/tmp/canardstack-arch-v2-400-10m-20260522T210045Z/20260522T211203Z/report.json)
+Current baseline, latest clean run (branch `arch-v3`, after the full architecture
+action plan through the ingest-lifecycle collapse to coarse boundary counters):
+[report.json](/private/tmp/cs-lifecycle-report/20260523T232746Z/report.json)
 
 - Target: `400 GB/day`, `logs`, `mixed-query`, persistent connections.
-- Actual: `4,631,089 B/s` against target `4,629,630 B/s`.
+- Write path: Arrow write buffer -> DuckDB Arrow append -> DuckLake commit.
+- Actual: `4,631,113 B/s` against target `4,629,630 B/s`.
 - Statuses: `200:240`, `202:2890`, no `429`.
 - Queries: `240/240`, transport errors `0`.
-- Ingest p50/p95/p99: `13.5 / 15.9 / 18.6 ms`.
-- Query p50/p95/p99: `86.5 / 104.0 / 107.0 ms`.
-- Freshness lag final: `0.9s`; measured trend data was unavailable, but
-  progress logs oscillated between `0.1s` and `1.0s` without sustained growth.
+- Ingest p50/p95/p99: `11.7 / 13.6 / 16.6 ms`.
+- Query p50/p95/p99: `84.1 / 99.9 / 104.2 ms`.
+- Freshness lag final: `0.8s`; progress logs oscillated between `0.4s` and `1.0s`
+  without sustained growth.
 
 Run the server in one shell with a fresh data directory and a free local port:
 

@@ -5,6 +5,16 @@ use crate::LockExt;
 use anyhow::Result;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::Ordering;
+use std::time::Instant;
+
+/// Result of a bounded `metadata_summary` re-aggregation pass, carrying the
+/// number of re-aggregated buckets plus the time spent waiting on the single
+/// writer connection so the scheduler can emit the `writer_lock_wait` phase.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MetadataRefreshOutcome {
+    pub buckets: usize,
+    pub writer_lock_wait_seconds: f64,
+}
 
 impl Storage {
     pub fn metadata_generation(&self) -> u64 {
@@ -21,22 +31,29 @@ impl Storage {
     /// metadata discovery work cannot monopolize the writer connection while
     /// ingest is under load. The `metadata_refresh` scheduler job passes a small
     /// limit; pass `usize::MAX` to drain every pending bucket in one pass. On
-    /// failure the drained buckets are re-queued so the next call retries them —
+    /// failure the drained buckets are re-marked dirty so the next call retries them —
     /// committed telemetry must not stay invisible to the discovery APIs.
-    pub fn refresh_metadata_limited(&self, max_buckets: usize) -> Result<usize> {
+    pub fn refresh_metadata_limited(&self, max_buckets: usize) -> Result<MetadataRefreshOutcome> {
         let affected = {
             let mut dirty = self.dirty_metadata.lock_or_poisoned();
             take_dirty_metadata_batch(&mut dirty, max_buckets)
         };
         if affected.is_empty() {
-            return Ok(0);
+            return Ok(MetadataRefreshOutcome::default());
         }
+        // Time the wait to acquire the single writer connection so contention
+        // against the seal flush path is observable via `writer_lock_wait`.
+        let writer_lock_wait_started = Instant::now();
         let conn = self.writer.lock_or_poisoned();
+        let writer_lock_wait_seconds = writer_lock_wait_started.elapsed().as_secs_f64();
         configure_write_connection(&conn, &self.write_memory_limit)?;
         match refresh_metadata_summaries_on(&conn, &self.target_prefix, &affected) {
             Ok(buckets) => {
                 self.metadata_generation.fetch_add(1, Ordering::SeqCst);
-                Ok(buckets)
+                Ok(MetadataRefreshOutcome {
+                    buckets,
+                    writer_lock_wait_seconds,
+                })
             }
             Err(err) => {
                 self.mark_metadata_dirty(affected);

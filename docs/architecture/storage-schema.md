@@ -18,6 +18,14 @@ The table names are:
 
 All arbitrary attributes are JSON strings in v0. Do not use DuckDB `VARIANT` while Postgres is the DuckLake catalog.
 
+This contract is pinned by the `stored_columns_align_with_otlp2records_output`
+unit test: every stored column (except the locally synthesized `ingested_at` /
+`source_format`) must exist in the matching `otlp2records::schema_def` with a
+compatible type. An `otlp2records` upgrade that renames, drops, or retypes an
+emitted column fails at `cargo test` rather than silently failing every ingest at
+the by-name column copy. See [Schema Versioning and
+Compatibility](#schema-versioning-and-compatibility).
+
 ## Common Physical Columns
 
 Each table should add a small number of storage-management columns around the canonical payload:
@@ -155,7 +163,7 @@ lookup. The table is durable in both local DuckDB and DuckLake modes.
 Committed inserts record their affected `(signal, event_date)` buckets as dirty.
 The `metadata_refresh` scheduler job drains that set, rebuilding each bucket's
 summary rows from canonical columns and JSON attribute extraction; a failed
-refresh re-queues the buckets for the next tick. Keeping the day-partition scan
+refresh re-marks the buckets dirty for the next tick. Keeping the day-partition scan
 off the commit path stops it from blocking the writer on every seal. An
 in-process generation counter, bumped after each committed refresh, lets bounded
 discovery caches invalidate.
@@ -183,4 +191,46 @@ If DuckLake partition-drop behavior is not cheap enough, switch to physical day 
 - Store unknown fields only inside the existing JSON attribute columns.
 - The current schema contract is proven for fresh DuckLake catalogs. In-place
   migration of catalogs that already contain older promoted telemetry columns is
-  not yet a proven path and should be gated separately before reuse.
+  not yet a proven path and should be gated separately before reuse. The version
+  guard below turns an incompatible catalog into a loud boot failure rather than
+  a silent misread.
+
+## Schema Versioning and Compatibility
+
+The catalog carries its own schema generation so an incompatible binary fails
+loudly instead of silently reading or writing a mismatched layout. A
+key/value `canardstack_meta` table, created in the DuckLake catalog alongside the
+telemetry tables, holds:
+
+| Key | Enforced? | Meaning |
+| --- | --- | --- |
+| `schema_version` | yes | The stored schema generation (integer). |
+| `canardstack_version` | no | The binary that last wrote the catalog (provenance). |
+| `otlp2records_schema_fingerprint` | no | FNV-1a over `otlp2records::schema_defs()` (provenance). |
+
+`Storage::open` enforces a min/current compatibility window — the
+Delta/Iceberg min-reader/min-writer pattern, scaled to v0 — defined by two consts
+in `src/storage/schema.rs`:
+
+- `SCHEMA_VERSION` — the generation this binary writes.
+- `MIN_COMPATIBLE_SCHEMA_VERSION` — the oldest catalog it can safely operate on.
+
+On boot:
+
+- a fresh or pre-versioning catalog is stamped at `SCHEMA_VERSION`;
+- a catalog `schema_version` below `MIN_COMPATIBLE_SCHEMA_VERSION` (too old) or
+  above `SCHEMA_VERSION` (written by a newer binary) aborts boot with a
+  remediation message;
+- otherwise boot proceeds. Provenance rows are rewritten only when changed, so an
+  unchanged restart adds no catalog writes.
+
+### Bumping the schema
+
+Prefer expand/contract (additive-first) so most changes stay backward compatible
+and the compatibility window stays wide:
+
+- Additive, schema-on-read-tolerant change (e.g. a new nullable column): bump
+  `SCHEMA_VERSION` and leave `MIN_COMPATIBLE_SCHEMA_VERSION` low, so a newer
+  binary still opens older catalogs.
+- Breaking change (rename / remove / retype): raise both consts and plan a
+  coordinated manual catalog migration — v0 still has no in-place migration tool.

@@ -1,8 +1,9 @@
 use super::batches::PendingBatch;
-use super::{OtlpRequestKind, StorageSignal};
+use super::OtlpRequestKind;
 use crate::config::Config;
 use crate::metrics::Metrics;
 use crate::runtime::memory;
+use crate::signal::StorageSignal;
 use crate::validation::{ApiError, ApiResult};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -99,25 +100,25 @@ impl Drop for RuntimeMemoryReservation {
 }
 
 /// Per-signal accounting of bytes that have been admitted (durably spooled and
-/// handed to an ingest worker) but not yet appended to the immutable buffer.
+/// handed to an ingest worker) but not yet appended to the Arrow write buffer.
 ///
 /// Freshness-first admission in
-/// [`crate::admission_control::AdmissionController::admit_ingest`] is
-/// the single authority that sheds ingest under projected-visibility pressure.
-/// This tracker only adds a cheap per-signal ceiling so one signal's burst
-/// cannot monopolize the in-flight window, and exposes the in-flight total the
-/// freshness projection treats as "queued" bytes. It is lock-free: the former
-/// watermark/hysteresis credit ledger collapsed into plain atomics.
+/// [`crate::admission_control::AdmissionController::admit_ingest`] is the SOLE
+/// soft shed for ingest: it projects seal visibility from the in-flight TOTAL
+/// this tracker exposes and rejects with 429 when projected visibility exceeds
+/// the freshness budget. The optional process RSS limit
+/// ([`RuntimeMemoryReservation`]) is the sole hard cap. This tracker is pure
+/// per-signal accounting that feeds the freshness in-flight total; it enforces
+/// no admission ceiling and never rejects. It is lock-free: the per-signal
+/// counters are plain atomics.
 pub(super) struct InflightBytes {
     counters: [AtomicUsize; StorageSignal::ALL.len()],
-    per_signal_capacity_bytes: usize,
 }
 
 impl InflightBytes {
-    pub(super) fn new(config: &Config) -> Self {
+    pub(super) fn new(_config: &Config) -> Self {
         Self {
             counters: std::array::from_fn(|_| AtomicUsize::new(0)),
-            per_signal_capacity_bytes: config.per_signal_inflight_bytes.max(1),
         }
     }
 
@@ -132,10 +133,6 @@ impl InflightBytes {
         self.counters[signal_index(signal)].load(Ordering::Acquire)
     }
 
-    pub(super) fn capacity_bytes(&self) -> usize {
-        self.per_signal_capacity_bytes
-    }
-
     pub(super) fn estimate_for_request(
         &self,
         route: OtlpRequestKind,
@@ -146,47 +143,23 @@ impl InflightBytes {
         inflight_estimate_by_request(route, headers, compressed_body_bytes, max_body_bytes)
     }
 
-    /// Reserve the per-signal estimate, rejecting with `signal_inflight_full` if a
-    /// signal would exceed its in-flight ceiling. The returned guard releases
-    /// the reservation on drop, so an ingest worker that panics mid-process
-    /// returns its bytes instead of leaking toward a permanent 429.
+    /// Reserve the per-signal estimate. This is pure accounting and never
+    /// rejects: freshness-first admission has already run as the sole soft shed
+    /// before this point. The returned guard releases the reservation on drop,
+    /// so an ingest worker that panics mid-process returns its bytes instead of
+    /// leaking and inflating the freshness projection forever.
     pub(super) fn reserve(
         self: &Arc<Self>,
         estimate: BTreeMap<StorageSignal, usize>,
-    ) -> ApiResult<InflightReservation> {
+    ) -> InflightReservation {
         let estimate = normalized_bytes(estimate);
         for (&signal, &bytes) in &estimate {
-            let after =
-                self.counters[signal_index(signal)].fetch_add(bytes, Ordering::AcqRel) + bytes;
-            if after > self.per_signal_capacity_bytes {
-                // Roll back this signal and any already added earlier in the
-                // (sorted) iteration order, then reject before the durable
-                // raw-spool append.
-                sub_saturating(&self.counters[signal_index(signal)], bytes);
-                for (&done, &done_bytes) in &estimate {
-                    if done == signal {
-                        break;
-                    }
-                    sub_saturating(&self.counters[signal_index(done)], done_bytes);
-                }
-                tracing::warn!(
-                    event = "ingest_signal_inflight_full",
-                    signal = signal.as_str(),
-                    inflight_bytes = after,
-                    capacity_bytes = self.per_signal_capacity_bytes
-                );
-                return Err(ApiError::new(
-                    429,
-                    "signal_inflight_full",
-                    format!("{signal} queue is full"),
-                )
-                .with_retry_after(5));
-            }
+            self.counters[signal_index(signal)].fetch_add(bytes, Ordering::AcqRel);
         }
-        Ok(InflightReservation {
+        InflightReservation {
             tracker: Arc::clone(self),
             bytes: estimate,
-        })
+        }
     }
 }
 
@@ -285,24 +258,22 @@ fn inflight_estimate_by_request(
     compressed_body_bytes: usize,
     max_body_bytes: usize,
 ) -> BTreeMap<StorageSignal, usize> {
-    match route {
-        OtlpRequestKind::Logs => BTreeMap::from([(
-            StorageSignal::Logs,
-            inflight_estimate_bytes(headers, compressed_body_bytes, max_body_bytes),
-        )]),
-        OtlpRequestKind::Traces => BTreeMap::from([(
-            StorageSignal::Spans,
-            inflight_estimate_bytes(headers, compressed_body_bytes, max_body_bytes),
-        )]),
+    // Metric requests fan out into gauge+sum and carry more per-byte expansion;
+    // pick the estimate once, then assign it to each storage signal the request
+    // fans out to.
+    let bytes = match route {
         OtlpRequestKind::Metrics => {
-            let bytes =
-                metric_inflight_estimate_bytes(headers, compressed_body_bytes, max_body_bytes);
-            BTreeMap::from([
-                (StorageSignal::MetricGauge, bytes),
-                (StorageSignal::MetricSum, bytes),
-            ])
+            metric_inflight_estimate_bytes(headers, compressed_body_bytes, max_body_bytes)
         }
-    }
+        OtlpRequestKind::Logs | OtlpRequestKind::Traces => {
+            inflight_estimate_bytes(headers, compressed_body_bytes, max_body_bytes)
+        }
+    };
+    route
+        .storage_signals()
+        .iter()
+        .map(|&signal| (signal, bytes))
+        .collect()
 }
 
 fn metric_inflight_estimate_bytes(
@@ -348,6 +319,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn storage_signals_fan_out_matches_request_kind() {
+        assert_eq!(
+            OtlpRequestKind::Logs.storage_signals(),
+            &[StorageSignal::Logs]
+        );
+        assert_eq!(
+            OtlpRequestKind::Traces.storage_signals(),
+            &[StorageSignal::Spans]
+        );
+        assert_eq!(
+            OtlpRequestKind::Metrics.storage_signals(),
+            &[StorageSignal::MetricGauge, StorageSignal::MetricSum]
+        );
+    }
+
+    #[test]
     fn metric_inflight_estimate_reserves_both_metric_signals() {
         let estimate =
             inflight_estimate_by_request(OtlpRequestKind::Metrics, &HashMap::new(), 100, 1_000);
@@ -373,9 +360,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = Config::test(dir.path().join("canardstack.duckdb"));
         let tracker = Arc::new(InflightBytes::new(&config));
-        let reservation = tracker
-            .reserve(BTreeMap::from([(StorageSignal::Logs, 1_024)]))
-            .unwrap();
+        let reservation = tracker.reserve(BTreeMap::from([(StorageSignal::Logs, 1_024)]));
         assert_eq!(tracker.total_bytes(), 1_024);
 
         // Simulate an ingest worker panicking before it can explicitly release:
@@ -390,37 +375,13 @@ mod tests {
     }
 
     #[test]
-    fn reserve_rejects_when_signal_ceiling_exceeded() {
-        use crate::config::Config;
-
-        let dir = tempfile::tempdir().unwrap();
-        let mut config = Config::test(dir.path().join("canardstack.duckdb"));
-        config.per_signal_inflight_bytes = 16;
-        let tracker = Arc::new(InflightBytes::new(&config));
-
-        let err = match tracker.reserve(BTreeMap::from([(StorageSignal::Logs, 64)])) {
-            Ok(_) => panic!("reservation above the per-signal ceiling must reject"),
-            Err(err) => err,
-        };
-        assert_eq!(err.status, 429);
-        assert_eq!(err.reason, "signal_inflight_full");
-        assert_eq!(
-            tracker.total_bytes(),
-            0,
-            "a rejected reservation must not leave bytes reserved"
-        );
-    }
-
-    #[test]
     fn adjust_then_drop_returns_exact_bytes() {
         use crate::config::Config;
 
         let dir = tempfile::tempdir().unwrap();
         let config = Config::test(dir.path().join("canardstack.duckdb"));
         let tracker = Arc::new(InflightBytes::new(&config));
-        let mut reservation = tracker
-            .reserve(BTreeMap::from([(StorageSignal::Logs, 1_000)]))
-            .unwrap();
+        let mut reservation = tracker.reserve(BTreeMap::from([(StorageSignal::Logs, 1_000)]));
         reservation.adjust(BTreeMap::from([(StorageSignal::Logs, 250)]));
         assert_eq!(tracker.signal_bytes(StorageSignal::Logs), 250);
         drop(reservation);

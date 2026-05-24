@@ -1,5 +1,21 @@
+//! Derived metadata refresh stage (the read side).
+//!
+//! These are the bounded discovery adapters for the Prometheus, Loki, and Tempo
+//! compatibility surfaces (label/tag values, series, metric metadata). They read
+//! the pre-aggregated `metadata_summary` table that the derived metadata refresh
+//! stage maintains off the commit path (see
+//! [`crate::storage::metadata_refresh`]); they never scan the raw telemetry
+//! tables or run unbounded discovery scans.
+//!
+//! Reads are served through a small generation-keyed in-process cache. Each
+//! cached entry is tagged with the storage `metadata_generation`; the refresh
+//! stage bumps that generation whenever it re-aggregates `metadata_summary`, so
+//! a generation mismatch invalidates the cached answer and the adapter rebuilds
+//! it from the latest summary rows.
+
 use crate::db::sql::quote as sql_quote;
 use crate::query::QueryEngine;
+use crate::signal::StorageSignal;
 use crate::storage::Storage;
 use crate::validation::ApiResult;
 use crate::LockExt;
@@ -44,7 +60,7 @@ impl Metadata {
             label_values(
                 queries,
                 storage,
-                &["metric_gauge", "metric_sum"],
+                &[StorageSignal::MetricGauge, StorageSignal::MetricSum],
                 "label_value",
                 name,
                 from,
@@ -66,12 +82,14 @@ impl Metadata {
         self.cached(storage, key, || {
             let mut out = Vec::new();
             queries.run_interactive(storage, |conn, prefix| {
+                let metric_signals =
+                    signal_in_list(&[StorageSignal::MetricGauge, StorageSignal::MetricSum]);
                 let sql = format!(
                     "\
                     SELECT name, service_name, deployment_environment, sum(row_count) AS rows \
                     FROM {prefix}metadata_summary \
                     WHERE kind = 'series' \
-                      AND signal IN ('metric_gauge', 'metric_sum') \
+                      AND signal IN ({metric_signals}) \
                       AND {} \
                     GROUP BY 1,2,3 \
                     ORDER BY rows DESC, name, service_name, deployment_environment \
@@ -112,6 +130,8 @@ impl Metadata {
         self.cached(storage, key, || {
             let mut metadata = Map::new();
             queries.run_interactive(storage, |conn, prefix| {
+                let metric_signals =
+                    signal_in_list(&[StorageSignal::MetricGauge, StorageSignal::MetricSum]);
                 let sql = format!(
                     "\
                     SELECT name, metric_type, \
@@ -120,7 +140,7 @@ impl Metadata {
                            max(last_seen) AS last_seen \
                     FROM {prefix}metadata_summary \
                     WHERE kind = 'metric_metadata' \
-                      AND signal IN ('metric_gauge', 'metric_sum') \
+                      AND signal IN ({metric_signals}) \
                     GROUP BY 1,2 \
                     ORDER BY last_seen DESC, name, metric_type \
                     LIMIT {DISCOVERY_LIMIT}"
@@ -171,8 +191,16 @@ impl Metadata {
         }
         let key = CacheKey::window(Api::Loki, Discovery::LabelValue, name, from, to);
         let value = self.cached(storage, key, || {
-            label_values(queries, storage, &["logs"], "label_value", name, from, to)
-                .map(|values| json!(values))
+            label_values(
+                queries,
+                storage,
+                &[StorageSignal::Logs],
+                "label_value",
+                name,
+                from,
+                to,
+            )
+            .map(|values| json!(values))
         })?;
         Ok(string_array(value))
     }
@@ -188,12 +216,13 @@ impl Metadata {
         self.cached(storage, key, || {
             let mut out = Vec::new();
             queries.run_interactive(storage, |conn, prefix| {
+                let log_signals = signal_in_list(&[StorageSignal::Logs]);
                 let sql = format!(
                     "\
                     SELECT service_name, deployment_environment, severity_text, sum(row_count) AS rows \
                     FROM {prefix}metadata_summary \
                     WHERE kind = 'series' \
-                      AND signal = 'logs' \
+                      AND signal IN ({log_signals}) \
                       AND {} \
                     GROUP BY 1,2,3 \
                     ORDER BY rows DESC, service_name, deployment_environment, severity_text \
@@ -234,8 +263,16 @@ impl Metadata {
         };
         let key = CacheKey::window(Api::Tempo, Discovery::TagValue, name, from, to);
         let value = self.cached(storage, key, || {
-            label_values(queries, storage, &["spans"], "tag_value", name, from, to)
-                .map(|values| json!(values))
+            label_values(
+                queries,
+                storage,
+                &[StorageSignal::Spans],
+                "tag_value",
+                name,
+                from,
+                to,
+            )
+            .map(|values| json!(values))
         })?;
         Ok(string_array(value))
     }
@@ -370,20 +407,27 @@ impl DiscoveryCache {
     }
 }
 
+/// Render the quoted value list for a SQL `signal IN (...)` filter from storage
+/// signals, so metadata SQL never hard-codes a table name that could drift from
+/// [`StorageSignal::as_str`].
+fn signal_in_list(signals: &[StorageSignal]) -> String {
+    signals
+        .iter()
+        .map(|signal| sql_quote(signal.as_str()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn label_values(
     queries: &QueryEngine,
     storage: &Storage,
-    signals: &[&str],
+    signals: &[StorageSignal],
     kind: &str,
     name: &str,
     from: DateTime<Utc>,
     to: DateTime<Utc>,
 ) -> ApiResult<Vec<String>> {
-    let signal_list = signals
-        .iter()
-        .map(|signal| sql_quote(signal))
-        .collect::<Vec<_>>()
-        .join(", ");
+    let signal_list = signal_in_list(signals);
     let mut values = BTreeSet::new();
     queries.run_interactive(storage, |conn, prefix| {
         let sql = format!(

@@ -1,5 +1,5 @@
-use super::StorageSignal;
 use crate::otlp::Transformed;
+use crate::signal::StorageSignal;
 use arrow58::record_batch::RecordBatch;
 use serde::Serialize;
 
@@ -10,16 +10,14 @@ pub(super) struct PendingBatch {
     pub(super) approx_bytes: usize,
 }
 
-/// Per-signal view of ingest in-flight pressure: bytes that have been admitted
-/// (durably spooled, handed to a worker) but not yet appended to the immutable
-/// buffer. There is no separate in-memory queue, so this is the only "queue"
-/// depth ingest exposes; freshness/visibility debt lives in the admission snapshot.
+/// Per-signal view of ingest in-flight accounting: bytes admitted (durably
+/// spooled, handed to a worker) but not yet appended to the Arrow write buffer.
+/// There is no separate in-memory queue; freshness/visibility debt lives in the
+/// admission snapshot.
 #[derive(Debug, Serialize)]
 pub struct IngestSnapshot {
     pub storage_signal: &'static str,
     pub inflight_bytes: usize,
-    pub inflight_capacity_bytes: usize,
-    pub pressure: f64,
 }
 
 pub(super) fn pending_batches(transformed: Transformed) -> Vec<PendingBatch> {

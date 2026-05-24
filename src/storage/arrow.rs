@@ -1,6 +1,6 @@
-use super::immutable::timestamp_day;
+use super::arrow_write::timestamp_day;
 use super::schema::table_columns;
-use crate::ingest::StorageSignal;
+use crate::signal::StorageSignal;
 use anyhow::{Context, Result};
 use arrow58::array as arrow58_array;
 use arrow58::array::Array as _;
@@ -12,16 +12,16 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 pub(super) fn storage_duckdb_batch(
-    table: StorageSignal,
+    storage_signal: StorageSignal,
     batch: &RecordBatch,
     source_format: &str,
 ) -> Result<RecordBatch> {
     let rows = batch.num_rows();
     let ingested_at = Utc::now().timestamp_micros();
-    let mut fields = Vec::with_capacity(table_columns(table).len());
-    let mut arrays = Vec::with_capacity(table_columns(table).len());
+    let mut fields = Vec::with_capacity(table_columns(storage_signal).len());
+    let mut arrays = Vec::with_capacity(table_columns(storage_signal).len());
 
-    for &(name, _) in table_columns(table) {
+    for &(name, _) in table_columns(storage_signal) {
         let (field, array) = match name {
             "ingested_at" => (
                 arrow58_types::Field::new(

@@ -62,8 +62,8 @@ OTLP/HTTP (JSON or protobuf, optional gzip)
   -> validation (auth, content type, size, timestamp skew)
   -> local fsync raw spool
   -> otlp2records -> Arrow RecordBatch grouped by storage signal
-  -> freshness-first admission (freshness budget + per-storage-signal in-flight ceiling)
-  -> ingest worker pool inserts into the storage immutable buffer
+  -> freshness-first admission (freshness budget; per-storage-signal in-flight bytes are pure accounting that feeds the freshness total)
+  -> ingest worker pool inserts into the Arrow write buffer
   -> scheduler single seal driver -> immutable Parquet segment files registered with DuckLake
   -> bounded compat query adapters for Prometheus / Loki / Tempo subsets
 ```
@@ -81,7 +81,8 @@ Top-level modules map to pipeline stages or boundaries. Subdirectories group hel
 - `src/http.rs` - hand-rolled std-library HTTP/1.1 server with bounded per-connection threads and non-blocking accept shutdown.
 - `src/validation.rs` - auth, content-type, size, compression, timestamp-skew checks, `ApiError`, and error envelopes.
 - `src/otlp.rs` - OTLP JSON/protobuf decode and `Transformed` payload construction.
-- `src/ingest/` - request flow, freshness-first admission, per-signal in-flight accounting, the durable raw spool, and the ingest worker pool that inserts into the storage immutable buffer.
+- `src/signal.rs` - shared `StorageSignal` physical signal/table vocabulary (one variant per DuckLake table) used across ingest, storage, query, metrics, validation, and metadata.
+- `src/ingest/` - request flow (`OtlpRequestKind`), freshness-first admission, per-signal in-flight accounting, the durable raw spool, and the ingest worker pool that inserts into the Arrow write buffer.
 - `src/admission_control.rs` - seal admission, freshness-budget ingest admission, and cheap/heavy query admission.
 - `src/storage/` - DuckDB lifecycle, DuckLake `ATTACH`, extension install, immutable segment writes, `StorageProbe`, retention, and maintenance SQL.
 - `src/query/` - bounded query helpers, shared query plans, and Prometheus/Loki/Tempo selector parsing.
@@ -97,7 +98,7 @@ Top-level modules map to pipeline stages or boundaries. Subdirectories group hel
 
 - Keep the code synchronous. Do not add `tokio`, `async fn`, gRPC, Kafka, a second binary, or another long-running service unless the task explicitly changes the architecture.
 - Use OS threads plus `Arc<Mutex<_>>`. Prefer `LockExt::lock_or_poisoned()` over `.lock().unwrap()` for shared state.
-- Treat ingest as at-least-once after local durable spool: a 2xx response means the raw request was fsynced to the local raw spool and accepted for bounded processing. It does not mean the rows are DuckLake-committed or query-visible yet.
+- Treat ingest as at-least-once after local durable spool: a 2xx response means the raw request was fsynced to the local raw spool and accepted for bounded processing. It does not mean the rows are DuckLake-committed or query-visible yet. Because the raw-spool checkpoint follows the DuckLake commit, a crash between commit and checkpoint replays records as duplicate rows that v0 surfaces to queries without dedup.
 - Preserve pressure behavior: ingest admission returns 429 under pressure, and storage/dependency failures surface as 503 where appropriate.
 - Preserve freshness-first admission: request-path checks may reject with 429 before raw-spool append when projected seal visibility exceeds the configured freshness SLA.
 - Preserve seal/query admission priority: seal capacity is reserved before query capacity; cheap metadata/probe/discovery/instant-ish queries keep protected admission, and heavy range/search queries degrade or reject first under freshness debt.
@@ -105,6 +106,7 @@ Top-level modules map to pipeline stages or boundaries. Subdirectories group hel
 - Do not expose arbitrary SQL through the compatibility APIs. Direct SQL is intentionally an external DuckDB CLI / MotherDuck path.
 - Preserve the Prometheus/Loki error envelope shape: `{"status":"error","errorType":"...","error":"..."}`.
 - Assume one in-process scheduler and single writer. There is no Postgres-backed maintenance lease yet.
+- The storage schema is static and version-fenced. The DuckLake catalog carries a `schema_version` in `canardstack_meta`; `Storage::open` fails boot when it is outside `[MIN_COMPATIBLE_SCHEMA_VERSION, SCHEMA_VERSION]` (`src/storage/schema.rs`). Changing a `*_COLUMNS` set (or partitioning) means bumping `SCHEMA_VERSION` — additive/expand-contract keeps `MIN_COMPATIBLE` low; a breaking change raises both. The `*_COLUMNS`↔`otlp2records` contract is pinned by the `stored_columns_align_with_otlp2records_output` test, so an `otlp2records` bump that changes emitted columns fails `cargo test`, not ingest.
 
 ## Testing Expectations
 
@@ -131,6 +133,12 @@ Before handing work back, confirm the requested behavior is implemented and the 
 - CI treats clippy warnings as errors with `-D warnings`; match that locally before pushing.
 - Prefer existing module patterns and helper APIs over new abstractions.
 - Keep edits scoped. Do not refactor unrelated code while fixing a narrow issue.
+- Vocabulary: "queue" means exactly one thing — a bounded mpsc channel (the spool
+  writer command channel and the worker handoff). The single per-signal metric
+  label for the ingest/raw-spool surface is `request_kind` (`logs`/`traces`/`metrics`);
+  `spool_lane` was retired. Fine spool phase micro-timings are gated behind the
+  `detailed-metrics` cargo feature (off by default). See
+  `docs/architecture/glossary.md` for one definition per core term.
 
 Examples:
 

@@ -1,4 +1,6 @@
-use crate::ingest::{OtlpRequestKind, StorageSignal};
+use crate::ingest::OtlpRequestKind;
+use crate::metrics::Metrics;
+use crate::signal::StorageSignal;
 use crate::validation::{self, ApiError};
 use crate::AppState;
 use serde_json::{json, Value};
@@ -75,7 +77,9 @@ fn route_inner(
     state: &AppState,
 ) -> HttpResponse {
     if let Some(matched) = match_compat_route(method, path) {
-        if matched.role_category().serves_queries() && !state.config.serve_role.serves_queries() {
+        if matched.role_category().serves_queries()
+            && !state.config.operator.serve_role.serves_queries()
+        {
             return HttpResponse::from_api_error(&ApiError::new(
                 404,
                 "not_found",
@@ -92,10 +96,10 @@ fn route_inner(
             // the node must report NOT ready even when storage is fine.
             let unhealthy_spools: Vec<Value> = state
                 .ingestor
-                .raw_spool_health_by_lane()
+                .raw_spool_health_by_request_kind()
                 .into_iter()
                 .filter(|(_, (healthy, _))| !healthy)
-                .map(|(lane, (_, error))| json!({"spool_lane": lane, "error": error}))
+                .map(|(request_kind, (_, error))| json!({"request_kind": request_kind, "error": error}))
                 .collect();
             let raw_spool_healthy = unhealthy_spools.is_empty();
             let ok = probe.is_ready() && raw_spool_healthy;
@@ -118,7 +122,7 @@ fn route_inner(
             );
         }
         ("POST", "/v1/logs") => {
-            if !state.config.serve_role.accepts_ingest() {
+            if !state.config.operator.serve_role.accepts_ingest() {
                 return HttpResponse::from_api_error(&ApiError::new(
                     404,
                     "not_found",
@@ -133,7 +137,7 @@ fn route_inner(
             ));
         }
         ("POST", "/v1/traces") => {
-            if !state.config.serve_role.accepts_ingest() {
+            if !state.config.operator.serve_role.accepts_ingest() {
                 return HttpResponse::from_api_error(&ApiError::new(
                     404,
                     "not_found",
@@ -148,7 +152,7 @@ fn route_inner(
             ));
         }
         ("POST", "/v1/metrics") => {
-            if !state.config.serve_role.accepts_ingest() {
+            if !state.config.operator.serve_role.accepts_ingest() {
                 return HttpResponse::from_api_error(&ApiError::new(
                     404,
                     "not_found",
@@ -176,25 +180,28 @@ fn route_inner(
                     .raw_spool_stats()
                     .map(|stats| json!(stats))
                     .unwrap_or_else(|err| json!({"error": err.to_string()}));
-                let raw_spool_by_lane = state
+                let raw_spool_by_request_kind = state
                     .ingestor
-                    .raw_spool_stats_by_lane()
+                    .raw_spool_stats_by_request_kind()
                     .map(|stats| json!(stats))
                     .unwrap_or_else(|err| json!({"error": err.to_string()}));
                 let body = json!({
                     "raw_spool_healthy": raw_spool_healthy,
-                    "queues": state.ingestor.snapshots(),
+                    "inflight": state.ingestor.snapshots(),
                     "admission": state.admission.snapshot_for(state.ingestor.freshness_budget_inputs(&state.storage)),
                     "raw_spool": raw_spool,
-                    "raw_spool_by_lane": raw_spool_by_lane,
+                    "raw_spool_by_request_kind": raw_spool_by_request_kind,
                     "raw_spool_config": {
-                        "writer_queue_capacity": state.config.raw_spool_writer_queue_capacity,
-                        "group_commit_records": state.config.raw_spool_group_commit_records,
-                        "group_commit_ms": state.config.raw_spool_group_commit_delay.as_millis(),
-                        "append_sync_ms": state.config.raw_spool_append_sync_interval.as_millis(),
-                        "append_sync_bytes": state.config.raw_spool_append_sync_bytes,
-                        "checkpoint_fsync_records": state.config.raw_spool_checkpoint_fsync_records,
-                        "checkpoint_fsync_ms": state.config.raw_spool_checkpoint_fsync_delay.as_millis()
+                        // The raw spool is partitioned by request kind (one writer
+                        // per logs/traces/metrics); capacity is per-kind, so the
+                        // aggregate worst case is 3x the limit below. See `RawSpool`.
+                        "partition": "per_request_kind",
+                        "max_total_bytes_per_request_kind": state.config.mechanics.raw_spool_max_total_bytes_per_request_kind,
+                        "writer_queue_capacity": crate::ingest::spool::RAW_SPOOL_WRITER_QUEUE_CAPACITY,
+                        "group_commit_records": crate::ingest::spool::RAW_SPOOL_GROUP_COMMIT_RECORDS,
+                        "group_commit_ms": state.config.mechanics.raw_spool_group_commit_delay.as_millis(),
+                        "checkpoint_fsync_records": crate::ingest::spool::RAW_SPOOL_CHECKPOINT_FSYNC_RECORDS,
+                        "checkpoint_fsync_ms": crate::ingest::spool::RAW_SPOOL_CHECKPOINT_FSYNC_DELAY.as_millis()
                     }
                 });
                 (raw_spool_healthy, body)
@@ -229,7 +236,7 @@ fn route_inner(
         ("POST", "/api/admin/maintenance/seal") => admin(headers, state, || {
             ensure_maintenance_allowed(state)?;
             let started = Instant::now();
-            let result = run_seal_with_admission(state);
+            let result = crate::seal::run(state);
             record_maintenance_metrics(state, "seal", &result, started);
             result
         }),
@@ -308,18 +315,13 @@ fn run_maintenance_job(
     result
 }
 
-fn run_seal_with_admission(state: &AppState) -> Result<Value, ApiError> {
-    let guard = state.admission.reserve_seal(&state.metrics)?;
-    let result = state
-        .maintenance
-        .run_seal(&state.ingestor, &state.storage, &state.metrics)
-        .map_err(storage_error);
-    guard.finish(&state.metrics);
-    result
-}
-
 fn ensure_maintenance_allowed(state: &AppState) -> Result<(), ApiError> {
-    if state.config.serve_role.allows_maintenance_mutation() {
+    if state
+        .config
+        .operator
+        .serve_role
+        .allows_maintenance_mutation()
+    {
         Ok(())
     } else {
         Err(ApiError::new(
@@ -345,46 +347,56 @@ fn record_maintenance_metrics(
         .maintenance_run(job, status, reason, started.elapsed().as_secs_f64());
 }
 
+fn storage_signal_gauge(metrics: &Metrics, name: &'static str, storage_signal: &str, value: f64) {
+    metrics.gauge(name, &[("storage_signal", storage_signal)], value);
+    // Deprecation window for the pre-glossary label. Keep dual emission until
+    // dashboards have migrated to `storage_signal`.
+    metrics.gauge(name, &[("table", storage_signal)], value);
+}
+
 pub(crate) fn record_operator_gauges(state: &AppState) {
     state.ingestor.record_inflight_metrics(&state.metrics);
     state.ingestor.record_raw_spool_metrics(&state.metrics);
-    let immutable_buffers = state
+    let arrow_write_buffers = state
         .storage
-        .immutable_buffer_metrics()
+        .arrow_write_buffer_metrics()
         .into_iter()
-        .map(|buffer| (buffer.table, buffer))
+        .map(|buffer| (buffer.storage_signal, buffer))
         .collect::<HashMap<_, _>>();
-    for table in [
+    for storage_signal in [
         StorageSignal::Logs,
         StorageSignal::Spans,
         StorageSignal::MetricGauge,
         StorageSignal::MetricSum,
     ] {
-        let rows = immutable_buffers
-            .get(&table)
+        let rows = arrow_write_buffers
+            .get(&storage_signal)
             .map(|buffer| buffer.rows)
             .unwrap_or(0);
-        let bytes = immutable_buffers
-            .get(&table)
+        let bytes = arrow_write_buffers
+            .get(&storage_signal)
             .map(|buffer| buffer.bytes)
             .unwrap_or(0);
-        let age_seconds = immutable_buffers
-            .get(&table)
+        let age_seconds = arrow_write_buffers
+            .get(&storage_signal)
             .map(|buffer| buffer.age_seconds)
             .unwrap_or(0.0);
-        state.metrics.gauge(
-            "canardstack_immutable_buffer_rows",
-            &[("table", table.as_str())],
+        storage_signal_gauge(
+            &state.metrics,
+            "canardstack_arrow_write_buffer_rows",
+            storage_signal.as_str(),
             rows as f64,
         );
-        state.metrics.gauge(
-            "canardstack_immutable_buffer_bytes",
-            &[("table", table.as_str())],
+        storage_signal_gauge(
+            &state.metrics,
+            "canardstack_arrow_write_buffer_bytes",
+            storage_signal.as_str(),
             bytes as f64,
         );
-        state.metrics.gauge(
-            "canardstack_immutable_buffer_age_seconds",
-            &[("table", table.as_str())],
+        storage_signal_gauge(
+            &state.metrics,
+            "canardstack_arrow_write_buffer_age_seconds",
+            storage_signal.as_str(),
             age_seconds,
         );
     }
@@ -402,17 +414,19 @@ pub(crate) fn record_operator_gauges(state: &AppState) {
 
 pub(crate) fn record_storage_operator_gauges(state: &AppState) {
     let storage = state.storage.health();
-    state.metrics.gauge(
+    storage_signal_gauge(
+        &state.metrics,
         "canardstack_storage_physical_bytes",
-        &[("table", "all")],
+        "all",
         storage.physical_bytes as f64,
     );
     if let Some(rows) = storage.logical_rows.as_object() {
         for (table, value) in rows {
             if let Some(count) = value.as_i64() {
-                state.metrics.gauge(
+                storage_signal_gauge(
+                    &state.metrics,
                     "canardstack_storage_logical_rows",
-                    &[("table", table.as_str())],
+                    table.as_str(),
                     count as f64,
                 );
             }
@@ -425,13 +439,17 @@ pub(crate) fn record_storage_operator_gauges(state: &AppState) {
     {
         for (table, value) in tables {
             for (metric, field) in [
-                ("canardstack_ducklake_parquet_files", "parquet_files"),
-                ("canardstack_ducklake_parquet_rows", "parquet_rows"),
+                (
+                    "canardstack_ducklake_active_data_files",
+                    "active_data_files",
+                ),
+                (
+                    "canardstack_ducklake_active_data_file_rows",
+                    "active_data_file_rows",
+                ),
             ] {
                 if let Some(count) = value.get(field).and_then(Value::as_i64) {
-                    state
-                        .metrics
-                        .gauge(metric, &[("table", table.as_str())], count as f64);
+                    storage_signal_gauge(&state.metrics, metric, table.as_str(), count as f64);
                 }
             }
         }
@@ -440,17 +458,19 @@ pub(crate) fn record_storage_operator_gauges(state: &AppState) {
     if let Some(watermarks) = storage.freshness_watermarks.as_object() {
         for (table, value) in watermarks {
             if let Some(epoch) = value.get("epoch_seconds").and_then(Value::as_f64) {
-                state.metrics.gauge(
+                storage_signal_gauge(
+                    &state.metrics,
                     "canardstack_freshness_watermark_timestamp",
-                    &[("table", table.as_str())],
+                    table.as_str(),
                     epoch,
                 );
             }
             if let Some(lag) = value.get("lag_seconds").and_then(Value::as_f64) {
                 max_freshness_lag = max_freshness_lag.max(lag.max(0.0));
-                state.metrics.gauge(
+                storage_signal_gauge(
+                    &state.metrics,
                     "canardstack_ingest_to_query_lag_seconds",
-                    &[("table", table.as_str())],
+                    table.as_str(),
                     lag.max(0.0),
                 );
             }
@@ -471,7 +491,7 @@ mod tests {
     fn ingest_role_disables_every_registered_compat_route() {
         let dir = tempdir().unwrap();
         let mut config = Config::test(dir.path().join("canardstack.duckdb"));
-        config.serve_role = ServeRole::Ingest;
+        config.operator.serve_role = ServeRole::Ingest;
         let state = AppState::new(config).unwrap();
 
         for (method, path) in super::super::compat_routes::compat_route_examples_for_tests() {

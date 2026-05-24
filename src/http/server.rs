@@ -25,7 +25,7 @@ fn log_startup_storage_mode(probe: &crate::storage::StorageProbe) {
     tracing::info!(
         event = "storage_mode",
         mode = probe.mode,
-        "telemetry lands in immutable DuckLake data files"
+        "telemetry lands through DuckDB Arrow append into DuckLake"
     );
 }
 
@@ -34,7 +34,7 @@ pub fn serve(state: Arc<AppState>) -> anyhow::Result<()> {
 }
 
 pub fn serve_until(state: Arc<AppState>, shutdown: &AtomicBool) -> anyhow::Result<()> {
-    let listener = TcpListener::bind(&state.config.bind)?;
+    let listener = TcpListener::bind(&state.config.operator.bind)?;
     listener.set_nonblocking(true)?;
     let addr = listener.local_addr()?;
     let probe = state.storage.probe();
@@ -45,9 +45,9 @@ pub fn serve_until(state: Arc<AppState>, shutdown: &AtomicBool) -> anyhow::Resul
         "2xx means fsynced to the local raw spool and accepted for bounded processing"
     );
     let active = Arc::new(AtomicUsize::new(0));
-    let max_conns = state.config.max_concurrent_connections;
-    let read_timeout = state.config.socket_read_timeout;
-    let write_timeout = state.config.socket_write_timeout;
+    let max_conns = state.config.operator.max_concurrent_connections;
+    let read_timeout = state.config.operator.socket_read_timeout;
+    let write_timeout = state.config.operator.socket_write_timeout;
     while !shutdown.load(Ordering::SeqCst) {
         let stream = match listener.accept() {
             Ok((stream, _addr)) => stream,
@@ -168,7 +168,7 @@ fn is_socket_timeout(err: &anyhow::Error) -> bool {
 
 fn handle_stream(mut stream: TcpStream, state: Arc<AppState>) -> anyhow::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
-    let keepalive_enabled = state.config.bench_http_keepalive;
+    let keepalive_enabled = state.config.test_overrides.bench_http_keepalive;
     let mut requests = 0usize;
     loop {
         let mut first = String::new();
@@ -235,14 +235,14 @@ fn handle_stream(mut stream: TcpStream, state: Arc<AppState>) -> anyhow::Result<
             },
             None => 0,
         };
-        if content_length > state.config.max_body_bytes {
+        if content_length > state.config.operator.max_body_bytes {
             let response = HttpResponse::json(
                 400,
                 json!({
                     "error": "payload_too_large",
                     "message": format!(
                         "payload has {content_length} bytes; max is {}",
-                        state.config.max_body_bytes
+                        state.config.operator.max_body_bytes
                     )
                 }),
             );
@@ -316,8 +316,8 @@ mod tests {
     fn benchmark_keepalive_allows_multiple_requests_on_one_connection() {
         let dir = tempfile::tempdir().unwrap();
         let mut config = Config::test(dir.path().join("canardstack.duckdb"));
-        config.local_storage_dir = dir.path().join("storage");
-        config.bench_http_keepalive = true;
+        config.operator.local_storage_dir = dir.path().join("storage");
+        config.test_overrides.bench_http_keepalive = true;
         let state = Arc::new(AppState::new(config).unwrap());
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();

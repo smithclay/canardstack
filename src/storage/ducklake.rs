@@ -54,10 +54,10 @@ pub(super) struct DuckLakeAttachPlan {
 
 pub(super) fn ducklake_attach_plan(config: &Config) -> Result<DuckLakeAttachPlan> {
     build_ducklake_attach_plan(
-        config.postgres_dsn.as_deref(),
-        config.ducklake_attach_uri.as_deref(),
-        &config.duckdb_path,
-        &config.local_storage_dir,
+        config.operator.postgres_dsn.as_deref(),
+        config.operator.ducklake_attach_uri.as_deref(),
+        &config.operator.duckdb_path,
+        &config.operator.local_storage_dir,
     )
 }
 
@@ -87,7 +87,7 @@ pub(super) fn build_ducklake_attach_plan(
         let is_ducklake = uri.starts_with("ducklake:");
         if !is_motherduck && !is_ducklake {
             anyhow::bail!(
-                "CANARDSTACK_DUCKLAKE_ATTACH_URI must be an md: or ducklake: URI because immutable ingest registers data files with DuckLake"
+                "CANARDSTACK_DUCKLAKE_ATTACH_URI must be an md: or ducklake: URI because Arrow appends write through DuckLake"
             );
         }
         return Ok(DuckLakeAttachPlan {

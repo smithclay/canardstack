@@ -2,8 +2,8 @@
 
 Canardstack is a single-binary OTLP/HTTP observability backend. It accepts
 OpenTelemetry logs, traces, gauge metrics, and sum metrics; normalizes them with
-`otlp2records`; stores immutable Parquet segments registered in DuckLake; and
-serves bounded Prometheus, Loki, and Tempo compatibility APIs.
+`otlp2records`; appends Arrow `RecordBatch`es through DuckDB into DuckLake
+tables; and serves bounded Prometheus, Loki, and Tempo compatibility APIs.
 
 ## Boundaries
 
@@ -18,13 +18,45 @@ Canardstack keeps these constraints:
 - No async runtime, OTLP/gRPC, Kafka, separate hot store, bundled Collector,
   DataFusion, Vortex, arbitrary SQL HTTP API, or second long-running service.
 
-DuckLake/DuckDB is the source of truth for registered telemetry files and query
-execution. Compatibility APIs must not plan or read raw Parquet files directly,
-and canardstack must not maintain a custom manifest duplicating DuckLake file
-membership.
+DuckLake/DuckDB is the source of truth for telemetry rows, snapshots, and query
+execution. Compatibility APIs must not plan or read physical files directly, and
+canardstack must not maintain a custom manifest duplicating DuckLake membership.
 
 Metrics are supported for ingest and bounded compatibility behavior, but the
 current sustained MVP performance envelope is only claimed for logs and traces.
+
+## Punts / Non-Goals (v0)
+
+These are deliberate v0 non-goals, called out so they are not mistaken for
+oversights. Each is documented in full in its own section below.
+
+- Physical file compaction — disabled until proven stable. DuckLake
+  `ducklake_merge_adjacent_files` is intentionally not called; v0 tolerates many
+  small Parquet segment files, with the Arrow write buffer's size/age coalescing
+  as the only file-count mitigation. See [Compaction & small files — roadmap /
+  when to revisit](#compaction--small-files--roadmap--when-to-revisit).
+- Online schema evolution — the storage schema is static. Columns are fixed
+  const lists created with `CREATE TABLE IF NOT EXISTS`; there is no migration
+  tool or `ALTER ... ADD COLUMN` path. Changing columns requires a coordinated
+  manual migration (or a fresh catalog). OTLP fields without a typed column are
+  carried as JSON in the `*_attributes` columns, not promoted to new columns.
+  A `schema_version` in a `canardstack_meta` catalog table fences this: boot
+  fails closed when the catalog is outside the binary's supported version window.
+  See [Storage](#storage) and [Schema Versioning and
+  Compatibility](storage-schema.md#schema-versioning-and-compatibility).
+- Row-level dedup — ingest is at-least-once, so crash-replay can produce
+  duplicate rows and v0 surfaces them verbatim. See the delivery-semantics note
+  under [Ingest Semantics](#ingest-semantics); not duplicated here.
+- Single in-process scheduler / single writer — there is no Postgres-backed
+  maintenance lease yet, so assume exactly one scheduler thread and one DuckDB
+  writer. See [Maintenance](#maintenance).
+
+NOT a punt: metadata refresh is a first-class derived pipeline stage, not a
+deferred feature. It runs off the ingest commit path — dirty signal/date buckets
+recorded at seal commit are re-aggregated into `metadata_summary` by the bounded
+`metadata_refresh` scheduler job, which bumps the storage `metadata_generation`
+to invalidate the generation-keyed discovery cache. See
+[Maintenance](#maintenance) and [Operator Surface](#operator-surface).
 
 ## Data Flow
 
@@ -34,9 +66,10 @@ OTLP/HTTP (JSON or protobuf, optional gzip)
   -> dependency, freshness, runtime-memory, and worker-queue admission
   -> fsynced local raw spool write
   -> ingest worker decode, otlp2records transform, timestamp-skew validation
-  -> immutable buffer insert
-  -> scheduler single seal driver writes immutable Parquet segment files
-  -> ducklake_add_data_files registration
+  -> Arrow RecordBatch
+  -> Arrow write buffer (rows plus durability disposition)
+  -> DuckDB Arrow appender into DuckLake tables
+  -> DuckLake commit
   -> raw spool checkpoint
   -> logical DuckLake SQL compatibility queries
 ```
@@ -48,22 +81,26 @@ flowchart LR
   C --> D["Dependency, freshness, memory, and worker-queue admission"]
   D --> E["Fsync raw request to local spool"]
   E --> F["Worker decode, transform, and timestamp validation"]
-  F --> G["Insert into immutable buffer"]
-  G --> H["Scheduler single seal driver: Parquet segment seal"]
-  H --> I["DuckLake registration"]
-  I --> J["Raw spool checkpoint"]
-  I --> K["Logical DuckLake SQL"]
-  K --> L["Prometheus / Loki / Tempo adapters"]
+  F --> G["Arrow RecordBatch"]
+  G --> H["Arrow write buffer: rows + durability"]
+  H --> I["DuckDB Arrow append"]
+  I --> J["DuckLake commit"]
+  J --> K["Raw spool checkpoint"]
+  J --> L["Logical DuckLake SQL"]
+  L --> M["Prometheus / Loki / Tempo adapters"]
 ```
 
 Admission is freshness-first: before the durable raw-spool append, the request
 projects seal visibility through the admission controller and is shed with `429`
-when projected visibility exceeds the freshness budget. A cheap per-storage-signal
-in-flight ceiling (`signal_inflight_full`) keeps one storage signal's burst from
-monopolizing the accepted-but-not-yet-buffered window. There is no separate
-in-memory queue and no seal worker: ingest workers insert directly into the
-storage immutable buffer, and a single scheduler-driven seal driver is the only
-path that seals that buffer to durable Parquet and checkpoints the raw spool.
+when projected visibility exceeds the freshness budget. That freshness
+projection is the sole soft shed; the optional process RSS limit
+(`runtime_memory_full`) is the sole hard cap. The per-storage-signal in-flight
+bytes are pure accounting: the freshness projection consumes their total, and
+the `canardstack_ingest_inflight_bytes` gauge exposes per-signal occupancy.
+They do not gate admission. There is no separate in-memory queue and no separate storage-sink
+worker: ingest workers insert directly into the Arrow write buffer, and a single
+scheduler-driven seal driver is the only path that flushes that buffer to
+DuckLake and checkpoints the raw spool.
 
 ## Ingest Semantics
 
@@ -76,7 +113,7 @@ A successful ingest response is `202`.
 - The compressed raw request was written and fsynced to the local raw spool.
 - The request was handed to an ingest worker, or — when every worker buffer is
   full — processed inline on the request thread, so accepted work always reaches
-  the immutable buffer without waiting for restart replay.
+  the Arrow write buffer without waiting for restart replay.
 
 `202` does not mean:
 
@@ -93,11 +130,19 @@ Crash behavior:
 - If an append fsync fails before `202`, canardstack rejects that request with
   `503 raw_spool_unavailable` and marks the raw spool unhealthy.
 
-At-least-once duplicate window:
+Delivery semantics (at-least-once, duplicate rows possible):
 
-- If the process crashes after DuckLake storage commit but before raw-spool
-  checkpoint, restart replay can duplicate that raw request.
-- Exactly-once or request-id dedupe is post-MVP.
+- A `202` means the raw request was durably spooled (written and fsynced), and
+  the system is at-least-once from that point on.
+- The raw-spool checkpoint deliberately follows the DuckLake commit
+  (capture-before-flush, checkpoint-after-commit) so that only storage-committed
+  records are ever checkpointed.
+- The consequence: if the process crashes after DuckLake storage commit but
+  before raw-spool checkpoint, restart replay re-ingests that raw request,
+  producing duplicate ROWS in storage.
+- v0 does NOT dedup. Those duplicate rows are surfaced verbatim, so query results
+  can contain duplicates after a crash-recovery. Exactly-once or request-id
+  dedupe is post-MVP.
 
 Retryable failure behavior:
 
@@ -127,14 +172,14 @@ Recovery sequence:
 ```text
 open segment -> append record on raw-spool writer
   -> write append batch -> force append fsync -> return 202
-  -> worker decode/transform/timestamp check -> immutable buffer insert
+  -> worker decode/transform/timestamp check -> Arrow write buffer insert
   -> DuckLake storage commit
   -> checkpoint raw-spool record -> delayed checkpoint fsync -> segment reclaimable
 ```
 
 Startup replays uncheckpointed records found by checksummed segment scanning
 before scheduler work starts.
-Replay enters the same decode, transform, buffer, seal, and DuckLake commit path
+Replay enters the same decode, transform, buffer, flush, and DuckLake commit path
 as normal ingest.
 
 The raw-spool writer is on the ingest acknowledgement path through local file
@@ -142,11 +187,10 @@ writes and forced append fsync. It uses a bounded command queue; a saturated
 append queue returns `429 raw_spool_queue_full` instead of parking request
 threads. It batches channel receives and writes internally up to 64 records, or
 until `CANARDSTACK_RAW_SPOOL_GROUP_COMMIT_MS` elapses from the first record in
-the group. Append sync is forced before each `202`; the interval and byte knobs
-still bound dirty data for internal writer cycles and shutdown. Append sync
-knobs reject zero values at startup.
+the group. Append fsync is forced before each append acknowledgement, so there
+are no delayed append-sync interval or byte knobs.
 
-Checkpoint durability remains weaker than append sync. A lost checkpoint only
+Checkpoint durability remains weaker than append fsync. A lost checkpoint only
 causes duplicate replay of data already accepted into storage. Checkpoint log
 writes therefore acknowledge after the local write and fsync on looser internal
 thresholds, plus writer shutdown.
@@ -155,20 +199,19 @@ Main knobs:
 
 - `CANARDSTACK_RAW_SPOOL_CAPACITY_BYTES`
 - `CANARDSTACK_RAW_SPOOL_GROUP_COMMIT_MS`
-- `CANARDSTACK_RAW_SPOOL_APPEND_SYNC_MS`
-- `CANARDSTACK_RAW_SPOOL_APPEND_SYNC_BYTES`
 
-`CANARDSTACK_RAW_SPOOL_CAPACITY_BYTES` applies to each raw-spool lane. The
-current lanes are logs, traces, and metrics, so worst-case aggregate raw-spool
-disk use can reach roughly three times the configured value.
-Size the local data directory for the aggregate budget, not just one lane.
+`CANARDSTACK_RAW_SPOOL_CAPACITY_BYTES` applies to each per-request-kind raw
+spool. The current request kinds are logs, traces, and metrics, so worst-case
+aggregate raw-spool disk use can reach roughly three times the configured value.
+Size the local data directory for the aggregate budget, not just one request
+kind.
 
 ## Worker Buffers And Seal
 
 HTTP request threads run only cheap validation and rejectable admission gates,
 then hand durably-spooled work to a fixed pool of ingest workers over bounded
 worker buffers. Workers perform decompression, `otlp2records` transform,
-timestamp-skew validation, and immutable-buffer insertion. When every worker
+timestamp-skew validation, and Arrow write-buffer insertion. When every worker
 buffer is full the request thread processes that spooled work inline rather than
 deferring it, so accepted data is never stranded until a restart. Malformed or
 skew-rejected accepted payloads are durably terminal-checkpointed so they do
@@ -177,53 +220,70 @@ across OS threads" concept; there is no separate dataflow topology or
 storage-sink stage. Worker-buffer ownership is intentionally low-cardinality:
 storage signal plus source encoding.
 
+Every write-buffer producer must declare its durability disposition:
+
+- replay-backed rows carry the raw-spool record ref that must be checkpointed
+  only after the rows commit to DuckLake; normal OTLP ingest uses this path.
+- best-effort rows carry no raw-spool ref; the opt-in operator-metrics snapshot
+  uses this sanctioned internal lane, so self-telemetry is not replayed after a
+  crash.
+
 Memory and worker-buffer guardrails:
 
 - `CANARDSTACK_MAX_BODY_BYTES`, default 8 MiB.
-- `CANARDSTACK_INGEST_MEMORY_BYTES`, default 2 GiB. The per-signal in-flight
-  ceiling derives from this total budget.
+- There is no per-signal ingest memory budget knob; the freshness projection
+  (and the optional process RSS limit) are the only memory backstops.
 - `CANARDSTACK_INGEST_WORKERS`, default 4 ingest workers.
-- `CANARDSTACK_INGEST_BUFFER_CAPACITY`, default 1024 in-flight handoffs, split
-  across workers.
+- The worker-handoff channel capacity is a fixed internal mechanic (1024
+  in-flight handoffs, split across workers), not a config knob.
 - Optional `CANARDSTACK_PROCESS_MEMORY_LIMIT_BYTES`.
 
 Seal triggers:
 
-- `CANARDSTACK_SEAL_RATE_SEED_BYTES`, default 4 MiB.
-- `CANARDSTACK_SEAL_RATE_SEED_WINDOW_SECS` or `_MS`, default 10 seconds.
+- The seal-rate EWMA seed (4 MiB over 10 seconds) is a fixed internal warm-up
+  mechanic, not a config knob; the estimator converges to measured throughput.
 
-A single scheduler-driven seal driver is the only seal path. It seals on a frequent
-cadence (`CANARDSTACK_SEAL_INTERVAL_MS`, default 1s) or earlier when a buffered
-signal reaches its size (`CANARDSTACK_SEGMENT_TARGET_BYTES`) or age
-(`CANARDSTACK_SEGMENT_MAX_AGE_*`) threshold. The cadence must stay well under the
-freshness-budget SLA so immutable-buffer age never approaches the admission reject threshold;
-it is deliberately decoupled from the coarse maintenance interval. Each seal
-captures the set of pending raw-spool records, force-seals the immutable buffer
-to Parquet under seal admission, registers the files in DuckLake, and then
-checkpoints exactly the captured records. Capturing before sealing is
-load-bearing for at-least-once: a record appended after the capture is
-checkpointed on a later seal, never before its rows are durable. Admin seal
-uses the same path on demand.
+A single scheduler-driven seal owner (`seal::SealDriver` plus
+`seal::commit_buffered_rows`) is the only seal path. It flushes on a frequent
+cadence (`CANARDSTACK_SEAL_INTERVAL_MS`,
+default 1s) or earlier when a buffered signal reaches its size
+(`CANARDSTACK_ARROW_WRITE_BUFFER_TARGET_BYTES`) or age
+(`CANARDSTACK_ARROW_WRITE_BUFFER_MAX_AGE_*`) threshold. The cadence must stay
+well under the freshness-budget SLA so Arrow write-buffer age never approaches
+the admission reject threshold; it is deliberately decoupled from the coarse
+maintenance interval. Each seal snapshots typed buffered rows, force-flushes the
+snapshot under seal admission, appends rows through DuckDB's Arrow appender,
+commits DuckLake, and then checkpoints exactly the replay-backed raw-spool refs
+from the committed snapshot. Commit failure restores the whole typed snapshot to
+the write buffer. Commit success plus checkpoint failure leaves the raw-spool
+records pending, so they replay as duplicate rows on a future restart. Admin
+seal uses the same path on demand.
 
 Freshness-budget admission happens before raw-spool append. The request path
 uses two local debt signals:
 
-- in-flight debt: accepted-but-not-yet-buffered (in-flight) bytes and oldest
-  age before ingest workers move batches into storage buffers.
-- visibility-buffer debt: immutable storage-buffer bytes and age beyond the
-  configured segment target and max age, before files are DuckLake-registered.
+- in-flight debt: accepted-but-not-yet-buffered (in-flight) bytes, plus the
+  incoming request bytes, before ingest workers move batches into the Arrow
+  write buffer.
+- visibility-buffer debt: Arrow write-buffer bytes and age beyond the
+  configured buffer target and max age, before rows are DuckLake-committed.
 
 The admission controller estimates freshness budget:
 
 ```text
-projected_seal_seconds = inflight_bytes / ewma_seal_bytes_per_sec
-projected_buffer_seconds =
-  excess_buffer_bytes / immutable_buffer_bytes_per_sec
-  + max(0, oldest_buffer_age_seconds - immutable_segment_max_age_seconds)
-projected_visibility_seconds =
-  max(oldest_queue_age_seconds + projected_seal_seconds,
-      projected_buffer_seconds)
+projected_seal_seconds   = (inflight_bytes + incoming_bytes) / ewma_seal_bytes_per_second
+projected_buffer_seconds = buffer_size_debt + buffer_age_debt
+    buffer_size_debt = max(0, buffered_bytes - arrow_write_buffer_target_bytes * buffered_active_count)
+                       / ewma_seal_bytes_per_second
+    buffer_age_debt  = max(0, oldest_buffer_age_seconds - arrow_write_buffer_max_age_seconds)
+projected_visibility_seconds = max(projected_seal_seconds, projected_buffer_seconds)
 ```
+
+The inputs are the `FreshnessBudgetInputs` fields (`inflight_bytes`,
+`incoming_bytes`, `buffered_bytes`, `buffered_active_count`,
+`oldest_buffer_age_seconds`). A single observed seal-rate EWMA
+(`ewma_seal_bytes_per_second`) drains BOTH the seal debt and the buffer-size
+debt, so the two share one drain estimate.
 
 If projected visibility exceeds `CANARDSTACK_FRESHNESS_BUDGET_SLA_SECS` or
 `_MS`, the request returns retryable `429 freshness_budget_exceeded` and does
@@ -234,14 +294,26 @@ remain bounded and retryable.
 
 The process has one small admission controller with three distinct primitives:
 
-- freshness budget: checks projected visibility plus a per-storage-signal
-  in-flight ceiling before durable raw-spool append.
+- freshness budget: checks projected visibility before durable raw-spool append
+  and is the sole soft ingest shed. The per-storage-signal in-flight bytes are
+  accounting plus a soft pressure reference that feeds that projection, not an
+  admission ceiling.
 - seal admission: reserves capacity for the scheduled seal driver and manual
   seal before query capacity is considered.
 - query admission: splits compatibility routes into cheap and heavy classes.
 
 Operator/control routes keep health, metrics, and admin health available in
 every serve role without using query admission.
+
+Default memory backstop: the freshness budget is the default ingest memory
+backstop. The former per-signal in-flight ceiling was removed, and the process
+RSS hard cap is opt-in and OFF by default. Because admit_ingest rejects when
+projected seal visibility exceeds ~0.95x the SLA, it transitively bounds
+in-flight bytes at roughly
+`0.95 x freshness_budget_sla_seconds x ewma_seal_bytes_per_second`. During EWMA
+warm-up that bound rides on the fixed internal seal-rate seed (4 MiB over 10
+seconds), which is not configurable. Operators who want an explicit RSS hard cap
+must set `CANARDSTACK_PROCESS_MEMORY_LIMIT_BYTES` / `runtime_memory_limit_bytes`.
 
 Heavy range/search/trace queries consume only the remaining query capacity after
 the seal and cheap-query reservations. When projected visibility debt reaches
@@ -262,8 +334,10 @@ Admission knobs:
 
 DuckLake is the storage coordinator. It owns snapshots, registered data-file
 membership, partition metadata, and table visibility. Canardstack writes
-immutable Parquet segment files and registers them through
-`ducklake_add_data_files`.
+prepared Arrow `RecordBatch`es to DuckLake tables through DuckDB's Arrow
+appender inside an explicit DuckDB transaction per flush batch. The appender is
+the only supported ingest write path; appender or commit failure restores the
+Arrow write buffer and leaves raw-spool records uncheckpointed for retry.
 
 Tables:
 
@@ -273,10 +347,10 @@ Tables:
 - `metric_sum`
 - `metadata_summary`
 
-Segment sizing is controlled by:
+Arrow write-buffer flushing is controlled by:
 
-- `CANARDSTACK_SEGMENT_TARGET_BYTES`
-- `CANARDSTACK_SEGMENT_MAX_AGE_SECS` or `_MS`
+- `CANARDSTACK_ARROW_WRITE_BUFFER_TARGET_BYTES`
+- `CANARDSTACK_ARROW_WRITE_BUFFER_MAX_AGE_SECS` or `_MS`
 
 Local DuckLake is the default. Remote DuckLake attach URIs are supported, but
 the core architecture remains the same.
@@ -323,9 +397,9 @@ The operator surface distinguishes:
 - accepted requests
 - raw-spooled records and bytes
 - pending replay records and bytes
-- queued rows and bytes
-- sealed rows
-- DuckLake-visible rows and files
+- buffered (Arrow write-buffer) rows and bytes
+- Arrow-appended and DuckLake-flushed rows
+- DuckLake-visible rows and active data files
 - checkpointed raw-spool records
 - raw-spool full
 - raw-spool unavailable
@@ -343,8 +417,8 @@ sets the base cadence; individual job cadences are derived from it.
 
 Scheduler jobs:
 
-- single seal driver (seals the immutable buffer on size/age threshold or the
-  freshness cadence, then checkpoints the raw spool)
+- single seal driver (flushes the Arrow write buffer on size/age threshold or
+  the freshness cadence, then checkpoints the raw spool after DuckLake commit)
 - metadata refresh
 - operator metric snapshot
 - retention
@@ -354,6 +428,19 @@ Maintenance can be paused and resumed through admin endpoints. There is no
 Postgres-backed maintenance lease yet, so assume one in-process scheduler and
 one writer. Pause applies to scheduled jobs only; manual repair endpoints such
 as seal and retention remain available.
+
+The single writer connection plus the single in-process scheduler is a
+deliberate throughput ceiling for v0, not an accident: all writes (seal flush,
+metadata refresh, retention) serialize on one DuckDB writer driven by one
+scheduler thread. On that thread seal is prioritized over the non-seal jobs —
+when the oldest Arrow write buffer approaches the freshness-budget SLA the
+scheduler skips metadata refresh, the operator-metric snapshot, and retention for
+that tick so a slow job cannot hold the thread and delay a due seal. The eventual
+answer to scaling maintenance horizontally is the Postgres-backed maintenance
+lease (not yet implemented), which would let more than one node coordinate writes
+safely. Until then, watch the `writer_lock_wait` phase on
+`canardstack_phase_duration_seconds` (emitted on both the seal flush and
+metadata-refresh paths) as the signal that this ceiling is being hit.
 
 In `serve --role query`, ingest routes and maintenance mutation routes are not
 served. Public health, `/metrics`, and admin health endpoints stay available.
@@ -367,8 +454,44 @@ Retention is whole-day oriented and bounded by `CANARDSTACK_RETENTION_DAYS`,
 default 14.
 
 The current implementation uses bounded table deletes plus DuckLake snapshot
-expiration/cleanup hooks where available. Physical day-table layouts are not
-part of the current MVP.
+expiration/cleanup hooks where available. Physical file compaction is not
+enabled until DuckLake `ducklake_merge_adjacent_files` is proven stable for this
+write pattern. Physical day-table layouts are not part of the current MVP.
+
+### Compaction & small files — roadmap / when to revisit
+
+Small-batch streaming ingest produces many small Parquet segment files, which is
+the opposite of what columnar storage prefers; merging them back into larger
+files is real but deliberately deferred. This is the central deferred difficulty
+of this write pattern, so it is tracked here as an explicit roadmap entry rather
+than left as an inline "disabled" flag.
+
+- **What is punted.** Physical Parquet file compaction stays disabled: DuckLake
+  `ducklake_merge_adjacent_files` is intentionally not called, and v0 tolerates
+  many small segment files. The only current mitigation is the Arrow write
+  buffer's size/age coalescing, which keeps one seal producing one segment per
+  storage signal — there is no second pass that rewrites already-sealed files.
+- **Why.** Compaction is unproven-stable for this append/seal write pattern, and
+  rewriting sealed files introduces write amplification (re-reading and
+  re-writing data already on disk) that competes with the seal path for the
+  single writer.
+- **When to revisit.** Treat this as triggered when the small-file ratio or
+  per-signal segment count grows unbounded under steady ingest, or when query
+  latency degrades from physical-file fan-out (too many files scanned per range).
+  Those are the signals that the no-compaction tolerance has stopped paying off.
+- **What it will touch when implemented.** Compaction must reuse the single seal
+  owner / single DuckDB writer rather than adding a parallel write path. Expect
+  to coordinate the seal path (`src/seal.rs`), retention (`src/maintenance.rs`
+  and `src/storage/maintenance.rs`), the single writer lock (`src/storage`), and
+  metadata refresh so compacted membership stays consistent. The inline non-goal
+  flag lives in `Maintenance::retention` (`src/maintenance.rs`).
+
+Online schema evolution under continuous arrival is a separate but related v0
+punt (the storage schema is static); a catalog `schema_version` guard
+(`canardstack_meta`) keeps an incompatible binary/catalog pairing a loud boot
+failure rather than a silent misread. See [Punts / Non-Goals
+(v0)](#punts--non-goals-v0), [Storage](#storage), and [Schema Versioning and
+Compatibility](storage-schema.md#schema-versioning-and-compatibility).
 
 ## Compatibility Surface
 

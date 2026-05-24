@@ -2,8 +2,9 @@ use canardstack::admission_control::AdmissionController;
 use canardstack::config::ServeRole;
 use canardstack::http;
 use canardstack::ingest::spool::{Options, Record, Spool};
-use canardstack::ingest::{Ingestor, OtlpRequestKind, RawSpoolLane, StorageSignal};
+use canardstack::ingest::{Ingestor, OtlpRequestKind};
 use canardstack::metrics::Metrics;
+use canardstack::signal::StorageSignal;
 use canardstack::storage::Storage;
 use canardstack::validation;
 use canardstack::{AppState, Config, Scheduler};
@@ -32,7 +33,7 @@ use tempfile::tempdir;
 fn app() -> (tempfile::TempDir, AppState) {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
-    config.local_storage_dir = dir.path().join("storage");
+    config.operator.local_storage_dir = dir.path().join("storage");
     (dir, AppState::new(config).unwrap())
 }
 
@@ -40,7 +41,7 @@ fn headers(state: &AppState) -> HashMap<String, String> {
     HashMap::from([
         (
             "authorization".to_string(),
-            format!("Bearer {}", state.config.api_key),
+            format!("Bearer {}", state.config.operator.api_key),
         ),
         ("content-type".to_string(), "application/json".to_string()),
         ("accept".to_string(), "application/json".to_string()),
@@ -50,7 +51,7 @@ fn headers(state: &AppState) -> HashMap<String, String> {
 fn admin_headers(state: &AppState) -> HashMap<String, String> {
     HashMap::from([(
         "authorization".to_string(),
-        format!("Bearer {}", state.config.admin_api_key),
+        format!("Bearer {}", state.config.operator.admin_api_key),
     )])
 }
 
@@ -69,9 +70,9 @@ fn metrics_text(state: &AppState) -> String {
 
 fn seal_all(state: &AppState) -> usize {
     // Wait for in-flight ingest workers to finish buffering (admission credits
-    // released after the buffer append), then run the single seal+checkpoint path
+    // released after the buffer append), then run the single flush+checkpoint path
     // the scheduler uses so rows become query-visible and the raw spool is
-    // checkpointed. A bare seal_immutable_segments would seal without
+    // checkpointed. A bare flush_arrow_write_buffer would flush without
     // checkpointing the raw spool, leaving records pending forever.
     let deadline = Instant::now() + StdDuration::from_secs(5);
     while Instant::now() < deadline {
@@ -80,10 +81,7 @@ fn seal_all(state: &AppState) -> usize {
         }
         thread::sleep(StdDuration::from_millis(10));
     }
-    state
-        .ingestor
-        .seal_committed_to_storage(&state.storage, &state.metrics)
-        .unwrap();
+    canardstack::seal::commit_buffered_rows(state).unwrap();
     state
         .storage
         .logical_rows()
@@ -359,9 +357,9 @@ fn append_gauge_rows(state: &AppState, rows: &[(i64, &str, f64, &str)], source_f
     .unwrap();
     state
         .storage
-        .buffer_arrow_records(StorageSignal::MetricGauge, &batch, source_format)
+        .buffer_best_effort_arrow_records(StorageSignal::MetricGauge, &batch, source_format)
         .unwrap();
-    state.storage.seal_immutable_segments(true).unwrap();
+    state.storage.flush_arrow_write_buffer().unwrap();
 }
 
 fn append_log_rows(state: &AppState, rows: &[(i64, &str, &str)], source_format: &str) {
@@ -420,10 +418,61 @@ fn append_log_rows(state: &AppState, rows: &[(i64, &str, &str)], source_format: 
     .unwrap();
     state
         .storage
-        .buffer_arrow_records(StorageSignal::Logs, &batch, source_format)
+        .buffer_best_effort_arrow_records(StorageSignal::Logs, &batch, source_format)
         .unwrap();
-    state.storage.seal_immutable_segments(true).unwrap();
+    state.storage.flush_arrow_write_buffer().unwrap();
     state.storage.refresh_metadata_limited(usize::MAX).unwrap();
+}
+
+#[test]
+fn arrow_append_write_path_flushes_visible_rows() {
+    let (_dir, state) = app();
+    let now = Utc::now();
+    let body = log_fixture(now.timestamp_nanos_opt().unwrap()).to_string();
+    let ingest = http::route(
+        "POST",
+        "/v1/logs",
+        &HashMap::new(),
+        &headers(&state),
+        body.as_bytes(),
+        &state,
+    );
+    assert_eq!(ingest.status(), 202, "{}", ingest.json_body());
+    seal_all(&state);
+
+    let rows = state.storage.logical_rows().unwrap();
+    assert_eq!(rows["logs"], 1);
+    let metrics = metrics_text(&state);
+    assert!(
+        metrics.contains("phase=\"storage_duckdb_arrow_append\""),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains("canardstack_duckdb_arrow_appended_rows_total"),
+        "{metrics}"
+    );
+    assert!(!metrics.contains("storage_parquet_encode"), "{metrics}");
+    let response = http::route(
+        "GET",
+        "/loki/api/v1/query_range",
+        &HashMap::from([
+            (
+                "query".to_string(),
+                "{service_name=\"checkout\"} |= \"smoke\"".to_string(),
+            ),
+            (
+                "start".to_string(),
+                (now - Duration::minutes(1)).to_rfc3339(),
+            ),
+            ("end".to_string(), (now + Duration::minutes(1)).to_rfc3339()),
+            ("limit".to_string(), "10".to_string()),
+        ]),
+        &headers(&state),
+        &[],
+        &state,
+    );
+    assert_eq!(response.status(), 200, "{}", response.json_body());
+    assert!(response.json_body().to_string().contains("smoke"));
 }
 
 #[test]
@@ -496,7 +545,7 @@ fn operator_metrics_snapshot_is_written_to_metric_store() {
         .write_snapshot_to_storage(&state.storage)
         .unwrap();
     assert!(rows >= 3, "expected operator metric rows, got {rows}");
-    state.storage.seal_immutable_segments(true).unwrap();
+    state.storage.flush_arrow_write_buffer().unwrap();
     state.storage.refresh_metadata_limited(usize::MAX).unwrap();
 
     let now = Utc::now();
@@ -555,7 +604,7 @@ fn metrics_route_renders_core_metrics_without_storage_health_scan() {
         "{metrics}"
     );
     assert!(
-        metrics.contains("canardstack_immutable_buffer_rows"),
+        metrics.contains("canardstack_arrow_write_buffer_rows"),
         "{metrics}"
     );
     assert!(
@@ -563,7 +612,7 @@ fn metrics_route_renders_core_metrics_without_storage_health_scan() {
         "{metrics}"
     );
     assert!(
-        !metrics.contains("canardstack_ducklake_parquet_files"),
+        !metrics.contains("canardstack_ducklake_active_data_files"),
         "{metrics}"
     );
     assert!(
@@ -592,7 +641,7 @@ fn healthz_is_cheap_and_unauthenticated() {
 fn admin_ingest_health_includes_raw_spool_backlog() {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
-    config.raw_spool_dir = dir.path().join("raw-spool");
+    config.mechanics.raw_spool_dir = dir.path().join("raw-spool");
     let state = AppState::new(config).unwrap();
     let body = log_fixture(Utc::now().timestamp_nanos_opt().unwrap()).to_string();
     let ingest = http::route(
@@ -616,15 +665,15 @@ fn admin_ingest_health_includes_raw_spool_backlog() {
     assert_eq!(response.status(), 200, "{}", response.json_body());
     assert_eq!(response.json_body()["raw_spool"]["pending_records"], 1);
     assert_eq!(
-        response.json_body()["raw_spool_by_lane"]["logs"]["pending_records"],
+        response.json_body()["raw_spool_by_request_kind"]["logs"]["pending_records"],
         1
     );
     assert_eq!(
-        response.json_body()["raw_spool_by_lane"]["traces"]["pending_records"],
+        response.json_body()["raw_spool_by_request_kind"]["traces"]["pending_records"],
         0
     );
     assert_eq!(
-        response.json_body()["raw_spool_by_lane"]["metrics"]["pending_records"],
+        response.json_body()["raw_spool_by_request_kind"]["metrics"]["pending_records"],
         0
     );
     assert!(
@@ -641,23 +690,18 @@ fn admin_ingest_health_includes_raw_spool_backlog() {
         response.json_body()["raw_spool_config"]["group_commit_ms"],
         1
     );
-    assert_eq!(
-        response.json_body()["raw_spool_config"]["append_sync_ms"],
-        500
-    );
-    assert_eq!(
-        response.json_body()["raw_spool_config"]["append_sync_bytes"],
-        16 * 1024 * 1024
-    );
     assert_eq!(response.json_body()["raw_spool"]["healthy"], true);
-    assert_eq!(response.json_body()["queues"][0]["storage_signal"], "logs");
+    assert_eq!(
+        response.json_body()["inflight"][0]["storage_signal"],
+        "logs"
+    );
 }
 
 #[test]
 fn unhealthy_raw_spool_writer_makes_readiness_not_ready() {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
-    config.raw_spool_dir = dir.path().join("raw-spool");
+    config.mechanics.raw_spool_dir = dir.path().join("raw-spool");
     let state = AppState::new(config).unwrap();
 
     // Baseline: storage and every spool writer healthy, so readiness is ready.
@@ -672,13 +716,13 @@ fn unhealthy_raw_spool_writer_makes_readiness_not_ready() {
     assert_eq!(healthy.status(), 200, "{}", healthy.json_body());
     assert_eq!(healthy.json_body()["raw_spool_healthy"], true);
 
-    // Wedge one raw-spool lane writer (mirrors a fatal append/fsync failure).
+    // Wedge one raw-spool request-kind writer (mirrors a fatal append/fsync failure).
     state
         .ingestor
-        .force_raw_spool_unhealthy(RawSpoolLane::Logs, "injected fatal for test")
+        .force_raw_spool_unhealthy(OtlpRequestKind::Logs, "injected fatal for test")
         .unwrap();
 
-    // /healthz must now report NOT ready and name the wedged raw-spool lane.
+    // /healthz must now report NOT ready and name the wedged raw-spool request kind.
     let response = http::route(
         "GET",
         "/healthz",
@@ -695,8 +739,10 @@ fn unhealthy_raw_spool_writer_makes_readiness_not_ready() {
         .cloned()
         .unwrap_or_default();
     assert!(
-        unhealthy.iter().any(|entry| entry["spool_lane"] == "logs"),
-        "expected logs raw-spool lane listed as unhealthy: {}",
+        unhealthy
+            .iter()
+            .any(|entry| entry["request_kind"] == "logs"),
+        "expected logs raw-spool request kind listed as unhealthy: {}",
         response.json_body()
     );
 
@@ -712,15 +758,15 @@ fn unhealthy_raw_spool_writer_makes_readiness_not_ready() {
     assert_eq!(ingest_health.status(), 503, "{}", ingest_health.json_body());
     assert_eq!(ingest_health.json_body()["raw_spool_healthy"], false);
     assert_eq!(
-        ingest_health.json_body()["raw_spool_by_lane"]["logs"]["healthy"],
+        ingest_health.json_body()["raw_spool_by_request_kind"]["logs"]["healthy"],
         false
     );
     assert_eq!(
-        ingest_health.json_body()["raw_spool_by_lane"]["traces"]["healthy"],
+        ingest_health.json_body()["raw_spool_by_request_kind"]["traces"]["healthy"],
         true
     );
     assert_eq!(
-        ingest_health.json_body()["raw_spool_by_lane"]["metrics"]["healthy"],
+        ingest_health.json_body()["raw_spool_by_request_kind"]["metrics"]["healthy"],
         true
     );
 }
@@ -801,13 +847,13 @@ fn ingest_terminal_checkpoints_missing_event_timestamps_after_acceptance() {
 fn gzip_payloads_over_decoded_limit_are_terminal_checkpointed() {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
-    config.max_body_bytes = 128;
+    config.operator.max_body_bytes = 128;
     let state = AppState::new(config).unwrap();
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
     encoder.write_all(&vec![b' '; 4096]).unwrap();
     let compressed = encoder.finish().unwrap();
     assert!(
-        compressed.len() <= state.config.max_body_bytes,
+        compressed.len() <= state.config.operator.max_body_bytes,
         "test fixture must be compressed below the request limit"
     );
 
@@ -892,12 +938,18 @@ fn dependency_unhealthy_returns_503() {
 }
 
 #[test]
-fn queue_pressure_returns_429() {
+fn ingest_pressure_returns_429_and_holds_no_inflight() {
+    // Freshness-first admission is the sole soft shed. Pin the freshness
+    // projection so even one small incoming log projects over the budget, and
+    // assert the request is rejected before the durable raw-spool append and
+    // leaves no in-flight bytes reserved.
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
-    config.per_signal_inflight_bytes = 16;
-    config.process_ingest_bytes = 64;
-    config.seal_rate_seed_bytes = 10_000;
+    config.operator.freshness_budget_sla = StdDuration::from_millis(1);
+    config.test_overrides.seal_rate_seed_window = StdDuration::from_secs(1);
+    config.test_overrides.seal_rate_seed_bytes = 1_000;
+    config.mechanics.arrow_write_buffer_target_bytes = 1_000;
+    config.mechanics.arrow_write_buffer_max_age = StdDuration::from_secs(1);
     let state = AppState::new(config).unwrap();
     let body = log_fixture(Utc::now().timestamp_nanos_opt().unwrap()).to_string();
     let response = http::route(
@@ -909,10 +961,11 @@ fn queue_pressure_returns_429() {
         &state,
     );
     assert_eq!(response.status(), 429);
+    assert_eq!(response.json_body()["error"], "freshness_budget_exceeded");
     assert_eq!(
         state.ingestor.raw_spool_stats().unwrap().pending_records,
         0,
-        "queue credit rejection should happen before durable raw spool append"
+        "freshness rejection should happen before durable raw spool append"
     );
     assert_eq!(
         state
@@ -929,10 +982,15 @@ fn queue_pressure_returns_429() {
 fn freshness_budget_rejects_before_raw_spool_append() {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
-    config.raw_spool_dir = dir.path().join("raw-spool");
-    config.freshness_budget_sla = StdDuration::from_millis(1);
-    config.seal_rate_seed_window = StdDuration::from_secs(1);
-    config.seal_rate_seed_bytes = 1_000;
+    config.mechanics.raw_spool_dir = dir.path().join("raw-spool");
+    config.operator.freshness_budget_sla = StdDuration::from_millis(1);
+    config.test_overrides.seal_rate_seed_window = StdDuration::from_secs(1);
+    config.test_overrides.seal_rate_seed_bytes = 1_000;
+    // The observed seal-rate EWMA is seeded from max(seal-rate seed,
+    // target/max-age); pin the buffer drain rate to the same 1000 B/s so the
+    // tiny incoming log still projects over the 1ms freshness budget.
+    config.mechanics.arrow_write_buffer_target_bytes = 1_000;
+    config.mechanics.arrow_write_buffer_max_age = StdDuration::from_secs(1);
     let state = AppState::new(config).unwrap();
     let body = log_fixture(Utc::now().timestamp_nanos_opt().unwrap()).to_string();
     let response = http::route(
@@ -957,7 +1015,7 @@ fn freshness_budget_rejects_before_raw_spool_append() {
 fn runtime_memory_pressure_returns_429_before_enqueue() {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
-    config.runtime_memory_limit_bytes = Some(1);
+    config.operator.runtime_memory_limit_bytes = Some(1);
     let state = AppState::new(config).unwrap();
     let body = log_fixture(Utc::now().timestamp_nanos_opt().unwrap()).to_string();
     let response = http::route(
@@ -978,7 +1036,7 @@ fn runtime_memory_pressure_returns_429_before_enqueue() {
     let metrics = metrics_text(&state);
     assert!(
         metrics.contains(
-            "canardstack_ingest_rejections_total{request_kind=\"logs\",status=\"429\",reason=\"runtime_memory_full\"} 1"
+            "canardstack_ingest_requests_total{request_kind=\"logs\",status=\"429\",reason=\"runtime_memory_full\"} 1"
         ),
         "{metrics}"
     );
@@ -997,7 +1055,7 @@ fn runtime_memory_pressure_returns_429_before_enqueue() {
 fn serve_roles_partition_ingest_and_query_routes() {
     let dir = tempdir().unwrap();
     let mut ingest_config = Config::test(dir.path().join("ingest.duckdb"));
-    ingest_config.serve_role = ServeRole::Ingest;
+    ingest_config.operator.serve_role = ServeRole::Ingest;
     let ingest_state = AppState::new(ingest_config).unwrap();
     let query = http::route(
         "GET",
@@ -1020,7 +1078,7 @@ fn serve_roles_partition_ingest_and_query_routes() {
 
     let dir = tempdir().unwrap();
     let mut query_config = Config::test(dir.path().join("query.duckdb"));
-    query_config.serve_role = ServeRole::Query;
+    query_config.operator.serve_role = ServeRole::Query;
     let query_state = AppState::new(query_config).unwrap();
     let body = log_fixture(Utc::now().timestamp_nanos_opt().unwrap()).to_string();
     let ingest = http::route(
@@ -1084,16 +1142,40 @@ fn ingest_stage_metrics_separate_transform_enqueue_and_storage_visibility() {
         "{metrics}"
     );
     assert!(
-        metrics.contains(
-            "canardstack_immutable_segments_sealed_rows_total{storage_signal=\"logs\"} 1"
-        ),
+        metrics.contains("canardstack_duckdb_arrow_appended_rows_total{storage_signal=\"logs\"} 1"),
         "{metrics}"
     );
     assert!(
-        metrics.contains(
-            "canardstack_immutable_segments_sealed_files_total{storage_signal=\"logs\"} 1"
-        ),
+        metrics.contains("canardstack_arrow_flush_rows_total{storage_signal=\"logs\"} 1"),
         "{metrics}"
+    );
+
+    // The durable-boundary counters track this same path end to end (the contract
+    // behind the test name). Pin the WHOLE happy-path funnel: every per-request
+    // boundary from admission through to the Arrow buffer, then the seal
+    // boundaries from commit through checkpoint.
+    let metrics = metrics_text(&state);
+    for stage in ["accepted", "spooled", "transformed", "buffered"] {
+        assert!(
+            metrics.contains(&format!(
+                "canardstack_ingest_stage_total{{request_kind=\"logs\",stage=\"{stage}\"}} 1"
+            )),
+            "missing ingest stage {stage}: {metrics}"
+        );
+    }
+    for stage in ["committed", "checkpointed"] {
+        assert!(
+            metrics.contains(&format!(
+                "canardstack_ingest_seal_stage_total{{stage=\"{stage}\"}} 1"
+            )),
+            "missing seal stage {stage}: {metrics}"
+        );
+    }
+    // The happy path commits AND checkpoints, so the at-least-once duplicate-risk
+    // hazard marker must be absent.
+    assert!(
+        !metrics.contains("canardstack_ingest_seal_stage_total{stage=\"duplicate_risk\"}"),
+        "unexpected duplicate_risk on the happy seal path: {metrics}"
     );
 }
 
@@ -1101,9 +1183,9 @@ fn ingest_stage_metrics_separate_transform_enqueue_and_storage_visibility() {
 fn ingest_workers_return_202_after_raw_spool_and_handoff() {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
-    config.local_storage_dir = dir.path().join("storage");
-    config.ingest_workers = 1;
-    config.ingest_buffer_capacity = 4;
+    config.operator.local_storage_dir = dir.path().join("storage");
+    config.mechanics.ingest_workers = 1;
+    config.test_overrides.ingest_worker_channel_capacity = 4;
     let state = AppState::new(config).unwrap();
     let body = log_fixture(Utc::now().timestamp_nanos_opt().unwrap()).to_string();
     let response = http::route(
@@ -1122,13 +1204,13 @@ fn ingest_workers_return_202_after_raw_spool_and_handoff() {
     let metrics = metrics_text(&state);
     assert!(
         metrics.contains(
-            "canardstack_ingest_requests_queued_total{request_kind=\"logs\",status=\"queued\"} 1"
+            "canardstack_ingest_worker_dispatch_total{request_kind=\"logs\",outcome=\"queued\"} 1"
         ),
         "{metrics}"
     );
     assert!(
         metrics.contains(
-            "canardstack_ingest_worker_completed_total{request_kind=\"logs\",status=\"ok\"} 1"
+            "canardstack_ingest_worker_completed_total{request_kind=\"logs\",status=\"buffered\"} 1"
         ),
         "{metrics}"
     );
@@ -1138,10 +1220,10 @@ fn ingest_workers_return_202_after_raw_spool_and_handoff() {
 fn ingest_workers_buffer_storage_rows_and_checkpoint_spool() {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
-    config.local_storage_dir = dir.path().join("storage");
-    config.raw_spool_dir = dir.path().join("raw-spool");
-    config.ingest_workers = 1;
-    config.ingest_buffer_capacity = 4;
+    config.operator.local_storage_dir = dir.path().join("storage");
+    config.mechanics.raw_spool_dir = dir.path().join("raw-spool");
+    config.mechanics.ingest_workers = 1;
+    config.test_overrides.ingest_worker_channel_capacity = 4;
     let state = AppState::new(config).unwrap();
     let body = log_fixture(Utc::now().timestamp_nanos_opt().unwrap()).to_string();
     let response = http::route(
@@ -1180,7 +1262,7 @@ fn ingest_workers_buffer_storage_rows_and_checkpoint_spool() {
 fn raw_spool_acknowledges_local_spool_write_before_storage_commit() {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
-    config.raw_spool_dir = dir.path().join("raw-spool");
+    config.mechanics.raw_spool_dir = dir.path().join("raw-spool");
     let state = AppState::new(config).unwrap();
     let body = log_fixture(Utc::now().timestamp_nanos_opt().unwrap()).to_string();
     let response = http::route(
@@ -1197,7 +1279,7 @@ fn raw_spool_acknowledges_local_spool_write_before_storage_commit() {
     let metrics = metrics_text(&state);
     assert!(
         metrics.contains(
-            "canardstack_raw_spool_records_total{spool_lane=\"logs\",status=\"spooled\"} 1"
+            "canardstack_raw_spool_records_total{request_kind=\"logs\",status=\"spooled\"} 1"
         ),
         "{metrics}"
     );
@@ -1211,7 +1293,7 @@ fn raw_spool_acknowledges_local_spool_write_before_storage_commit() {
         "{metrics}"
     );
     assert!(
-        metrics.contains("canardstack_raw_spool_pending_records 0.000000"),
+        metrics.contains("canardstack_raw_spool_pending_records{request_kind=\"logs\"} 0.000000"),
         "{metrics}"
     );
 }
@@ -1220,7 +1302,7 @@ fn raw_spool_acknowledges_local_spool_write_before_storage_commit() {
 fn ingest_fsyncs_raw_spool_before_ack_without_claiming_record_count() {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
-    config.raw_spool_dir = dir.path().join("raw-spool");
+    config.mechanics.raw_spool_dir = dir.path().join("raw-spool");
     let state = AppState::new(config).unwrap();
     let body = log_fixture(Utc::now().timestamp_nanos_opt().unwrap()).to_string();
     let response = http::route(
@@ -1251,7 +1333,7 @@ fn ingest_fsyncs_raw_spool_before_ack_without_claiming_record_count() {
 fn raw_spool_checkpoints_after_seal_commits_multirow_record() {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
-    config.raw_spool_dir = dir.path().join("raw-spool");
+    config.mechanics.raw_spool_dir = dir.path().join("raw-spool");
     let state = AppState::new(config).unwrap();
     let now = Utc::now().timestamp_nanos_opt().unwrap();
     let mut body = log_fixture(now);
@@ -1273,7 +1355,7 @@ fn raw_spool_checkpoints_after_seal_commits_multirow_record() {
     assert_eq!(log_rows(&state), 2);
     let metrics = metrics_text(&state);
     assert!(
-        metrics.contains("canardstack_raw_spool_pending_records 0.000000"),
+        metrics.contains("canardstack_raw_spool_pending_records{request_kind=\"logs\"} 0.000000"),
         "{metrics}"
     );
 }
@@ -1282,18 +1364,19 @@ fn raw_spool_checkpoints_after_seal_commits_multirow_record() {
 fn raw_spool_replays_pending_request_on_startup() {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
-    config.raw_spool_dir = dir.path().join("raw-spool");
+    config.mechanics.raw_spool_dir = dir.path().join("raw-spool");
     let body = log_fixture(Utc::now().timestamp_nanos_opt().unwrap()).to_string();
     {
         let mut spool = Spool::open(Options {
-            dir: config.raw_spool_dir.join(RawSpoolLane::Logs.as_str()),
-            max_segment_bytes: config.raw_spool_max_segment_bytes as u64,
-            max_record_bytes: config.raw_spool_max_record_bytes as u64,
-            max_total_bytes: config.raw_spool_max_total_bytes as u64,
-            append_sync_interval: config.raw_spool_append_sync_interval,
-            append_sync_bytes: config.raw_spool_append_sync_bytes as u64,
-            checkpoint_fsync_records: config.raw_spool_checkpoint_fsync_records,
-            checkpoint_fsync_delay: config.raw_spool_checkpoint_fsync_delay,
+            dir: config
+                .mechanics
+                .raw_spool_dir
+                .join(OtlpRequestKind::Logs.as_str()),
+            max_segment_bytes: config.mechanics.raw_spool_max_segment_bytes as u64,
+            max_record_bytes: config.mechanics.raw_spool_max_record_bytes as u64,
+            max_total_bytes: config.mechanics.raw_spool_max_total_bytes_per_request_kind as u64,
+            checkpoint_fsync_records: 1024,
+            checkpoint_fsync_delay: std::time::Duration::from_millis(1000),
         })
         .unwrap();
         spool
@@ -1321,7 +1404,7 @@ fn raw_spool_replays_pending_request_on_startup() {
     let metrics = metrics_text(&state);
     assert!(
         metrics.contains(
-            "canardstack_raw_spool_replayed_records_total{request_kind=\"logs\",spool_lane=\"logs\",status=\"ok\"} 1"
+            "canardstack_raw_spool_replayed_records_total{request_kind=\"logs\",status=\"ok\"} 1"
         ),
         "{metrics}"
     );
@@ -1332,7 +1415,7 @@ fn raw_spool_replays_pending_request_on_startup() {
         "{metrics}"
     );
     assert!(
-        metrics.contains("canardstack_raw_spool_pending_records 0.000000"),
+        metrics.contains("canardstack_raw_spool_pending_records{request_kind=\"logs\"} 0.000000"),
         "{metrics}"
     );
 }
@@ -1341,18 +1424,19 @@ fn raw_spool_replays_pending_request_on_startup() {
 fn raw_spool_replays_one_metrics_request_into_gauge_and_sum_tables() {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
-    config.raw_spool_dir = dir.path().join("raw-spool");
+    config.mechanics.raw_spool_dir = dir.path().join("raw-spool");
     let body = metric_fixture(Utc::now().timestamp_nanos_opt().unwrap()).to_string();
     {
         let mut spool = Spool::open(Options {
-            dir: config.raw_spool_dir.join(RawSpoolLane::Metrics.as_str()),
-            max_segment_bytes: config.raw_spool_max_segment_bytes as u64,
-            max_record_bytes: config.raw_spool_max_record_bytes as u64,
-            max_total_bytes: config.raw_spool_max_total_bytes as u64,
-            append_sync_interval: config.raw_spool_append_sync_interval,
-            append_sync_bytes: config.raw_spool_append_sync_bytes as u64,
-            checkpoint_fsync_records: config.raw_spool_checkpoint_fsync_records,
-            checkpoint_fsync_delay: config.raw_spool_checkpoint_fsync_delay,
+            dir: config
+                .mechanics
+                .raw_spool_dir
+                .join(OtlpRequestKind::Metrics.as_str()),
+            max_segment_bytes: config.mechanics.raw_spool_max_segment_bytes as u64,
+            max_record_bytes: config.mechanics.raw_spool_max_record_bytes as u64,
+            max_total_bytes: config.mechanics.raw_spool_max_total_bytes_per_request_kind as u64,
+            checkpoint_fsync_records: 1024,
+            checkpoint_fsync_delay: std::time::Duration::from_millis(1000),
         })
         .unwrap();
         spool
@@ -1373,7 +1457,7 @@ fn raw_spool_replays_one_metrics_request_into_gauge_and_sum_tables() {
     let metrics = metrics_text(&state);
     assert!(
         metrics.contains(
-            "canardstack_raw_spool_replayed_records_total{request_kind=\"metrics\",spool_lane=\"metrics\",status=\"ok\"} 1"
+            "canardstack_raw_spool_replayed_records_total{request_kind=\"metrics\",status=\"ok\"} 1"
         ),
         "{metrics}"
     );
@@ -1386,21 +1470,85 @@ fn raw_spool_replays_one_metrics_request_into_gauge_and_sum_tables() {
 }
 
 #[test]
+fn metrics_request_fans_out_to_two_storage_signals_but_one_raw_spool_identity() {
+    // Pins the raw-spool partitioning policy on the normal ingest path: the raw
+    // spool is partitioned by OtlpRequestKind (one writer per logs/traces/metrics),
+    // NOT by StorageSignal. A single metrics request fans out to TWO storage
+    // signals (metric_gauge + metric_sum) but is spooled and checkpointed through
+    // exactly ONE request-kind raw-spool identity ("metrics"). So a future storage
+    // signal reuses its request kind's existing writer; only a new request kind
+    // needs a new writer.
+    let dir = tempdir().unwrap();
+    let mut config = Config::test(dir.path().join("canardstack.duckdb"));
+    config.operator.local_storage_dir = dir.path().join("storage");
+    config.mechanics.raw_spool_dir = dir.path().join("raw-spool");
+    let state = AppState::new(config).unwrap();
+
+    let body = metric_fixture(Utc::now().timestamp_nanos_opt().unwrap()).to_string();
+    let response = http::route(
+        "POST",
+        "/v1/metrics",
+        &HashMap::new(),
+        &headers(&state),
+        body.as_bytes(),
+        &state,
+    );
+    assert_eq!(response.status(), 202, "{}", response.json_body());
+
+    // One metrics request = exactly one raw-spool record under the "metrics"
+    // identity (not one record per storage signal).
+    let metrics = metrics_text(&state);
+    assert!(
+        metrics.contains(
+            "canardstack_raw_spool_records_total{request_kind=\"metrics\",status=\"spooled\"} 1"
+        ),
+        "{metrics}"
+    );
+
+    seal_all(&state);
+
+    // Fans out to two storage signals...
+    assert_eq!(metric_gauge_rows(&state), 1);
+    assert_eq!(metric_sum_rows(&state), 1);
+
+    // ...but checkpoints through exactly one request-kind raw-spool identity, and
+    // never touches the logs/traces raw-spool identities.
+    let metrics = metrics_text(&state);
+    assert!(
+        metrics.contains(
+            "canardstack_raw_spool_checkpointed_records_total{request_kind=\"metrics\",reason=\"storage_committed\"} 1"
+        ),
+        "{metrics}"
+    );
+    assert!(
+        !metrics.contains("canardstack_raw_spool_checkpointed_records_total{request_kind=\"logs\""),
+        "{metrics}"
+    );
+    assert!(
+        !metrics
+            .contains("canardstack_raw_spool_checkpointed_records_total{request_kind=\"traces\""),
+        "{metrics}"
+    );
+    assert_eq!(state.ingestor.raw_spool_stats().unwrap().pending_records, 0);
+}
+
+#[test]
 fn raw_spool_replay_failure_does_not_abort_boot() {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
-    config.raw_spool_dir = dir.path().join("raw-spool");
+    config.mechanics.raw_spool_dir = dir.path().join("raw-spool");
     let body = log_fixture(Utc::now().timestamp_nanos_opt().unwrap()).to_string();
     {
         let mut spool = Spool::open(Options {
-            dir: config.raw_spool_dir.join(RawSpoolLane::Logs.as_str()),
-            max_segment_bytes: config.raw_spool_max_segment_bytes as u64,
-            max_record_bytes: config.raw_spool_max_record_bytes as u64,
-            max_total_bytes: config.raw_spool_max_total_bytes as u64,
-            append_sync_interval: config.raw_spool_append_sync_interval,
-            append_sync_bytes: config.raw_spool_append_sync_bytes as u64,
-            checkpoint_fsync_records: config.raw_spool_checkpoint_fsync_records,
-            checkpoint_fsync_delay: config.raw_spool_checkpoint_fsync_delay,
+            dir: config
+                .mechanics
+                .raw_spool_dir
+                .join(OtlpRequestKind::Logs.as_str()),
+            max_segment_bytes: config.mechanics.raw_spool_max_segment_bytes as u64,
+            max_record_bytes: config.mechanics.raw_spool_max_record_bytes as u64,
+            max_total_bytes: config.mechanics.raw_spool_max_total_bytes_per_request_kind as u64,
+            checkpoint_fsync_records: 1024,
+            checkpoint_fsync_delay: std::time::Duration::from_millis(1000),
         })
         .unwrap();
         spool
@@ -1423,7 +1571,7 @@ fn raw_spool_replay_failure_does_not_abort_boot() {
     let metrics = metrics_text(&state);
     assert!(
         metrics.contains(
-            "canardstack_raw_spool_replayed_records_total{request_kind=\"logs\",spool_lane=\"logs\",status=\"failed\"} 1"
+            "canardstack_raw_spool_replayed_records_total{request_kind=\"logs\",status=\"failed\"} 1"
         ),
         "{metrics}"
     );
@@ -1432,10 +1580,10 @@ fn raw_spool_replay_failure_does_not_abort_boot() {
 }
 
 #[test]
-fn raw_spool_replays_accepted_unsealed_request_after_restart() {
+fn raw_spool_replays_accepted_uncommitted_request_after_restart() {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
-    config.raw_spool_dir = dir.path().join("raw-spool");
+    config.mechanics.raw_spool_dir = dir.path().join("raw-spool");
     let body = log_fixture(Utc::now().timestamp_nanos_opt().unwrap()).to_string();
     {
         let state = AppState::new(config.clone()).unwrap();
@@ -1457,7 +1605,7 @@ fn raw_spool_replays_accepted_unsealed_request_after_restart() {
     assert_eq!(log_rows(&restarted), 1);
     let metrics = metrics_text(&restarted);
     assert!(
-        metrics.contains("canardstack_raw_spool_pending_records 0.000000"),
+        metrics.contains("canardstack_raw_spool_pending_records{request_kind=\"logs\"} 0.000000"),
         "{metrics}"
     );
 }
@@ -1466,10 +1614,10 @@ fn raw_spool_replays_accepted_unsealed_request_after_restart() {
 fn raw_spool_full_returns_429_before_transform() {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
-    config.raw_spool_dir = dir.path().join("raw-spool");
-    config.raw_spool_max_segment_bytes = 16 * 1024;
-    config.raw_spool_max_record_bytes = 16 * 1024;
-    config.raw_spool_max_total_bytes = 1;
+    config.mechanics.raw_spool_dir = dir.path().join("raw-spool");
+    config.mechanics.raw_spool_max_segment_bytes = 16 * 1024;
+    config.mechanics.raw_spool_max_record_bytes = 16 * 1024;
+    config.mechanics.raw_spool_max_total_bytes_per_request_kind = 1;
     let state = AppState::new(config).unwrap();
     let body = log_fixture(Utc::now().timestamp_nanos_opt().unwrap()).to_string();
 
@@ -1490,13 +1638,14 @@ fn raw_spool_full_returns_429_before_transform() {
     );
     let metrics = state.metrics.render_prometheus();
     assert!(
-        metrics
-            .contains("canardstack_raw_spool_records_total{spool_lane=\"logs\",status=\"full\"} 1"),
+        metrics.contains(
+            "canardstack_raw_spool_records_total{request_kind=\"logs\",status=\"full\"} 1"
+        ),
         "{metrics}"
     );
     assert!(
         metrics.contains(
-            "canardstack_ingest_rejections_total{request_kind=\"logs\",status=\"429\",reason=\"raw_spool_full\"} 1"
+            "canardstack_ingest_requests_total{request_kind=\"logs\",status=\"429\",reason=\"raw_spool_full\"} 1"
         ),
         "{metrics}"
     );
@@ -1507,7 +1656,7 @@ fn raw_spool_full_returns_429_before_transform() {
 fn ingest_workers_unavailable_rejects_before_raw_spool_append() {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
-    config.raw_spool_dir = dir.path().join("raw-spool");
+    config.mechanics.raw_spool_dir = dir.path().join("raw-spool");
     let storage = Storage::open(&config).unwrap();
     let admission = AdmissionController::new(&config);
     let metrics = Arc::new(Metrics::default());
@@ -1847,8 +1996,8 @@ fn prometheus_query_range_supports_explicit_grouping_over_promoted_labels() {
 fn metric_seal_drains_oversized_batch_and_preserves_queue_accounting() {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
-    config.local_storage_dir = dir.path().join("storage");
-    config.seal_rate_seed_bytes = 10 * 1024 * 1024;
+    config.operator.local_storage_dir = dir.path().join("storage");
+    config.test_overrides.seal_rate_seed_bytes = 10 * 1024 * 1024;
     let state = AppState::new(config).unwrap();
     let body = gauge_payload(Utc::now().timestamp_nanos_opt().unwrap(), 5).to_string();
 
@@ -1872,8 +2021,8 @@ fn metric_seal_drains_oversized_batch_and_preserves_queue_accounting() {
 fn metric_due_seal_preserves_gauge_sum_pairing() {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
-    config.local_storage_dir = dir.path().join("storage");
-    config.seal_rate_seed_bytes = 10_000_000;
+    config.operator.local_storage_dir = dir.path().join("storage");
+    config.test_overrides.seal_rate_seed_bytes = 10_000_000;
     let state = AppState::new(config).unwrap();
     let body = metric_fixture(Utc::now().timestamp_nanos_opt().unwrap()).to_string();
 
@@ -2655,18 +2804,18 @@ fn ingest_seal_and_query_vertical_slice() {
 fn remote_ducklake_attach_uri_smoke() {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
-    config.local_storage_dir = dir.path().join("storage");
-    config.ducklake_attach_uri = Some(
+    config.operator.local_storage_dir = dir.path().join("storage");
+    config.operator.ducklake_attach_uri = Some(
         env::var("CANARDSTACK_DUCKLAKE_ATTACH_URI")
             .unwrap_or_else(|_| "md:test-ducklake".to_string()),
     );
     if let Ok(extension_dir) = env::var("CANARDSTACK_DUCKDB_EXTENSION_DIR") {
-        config.duckdb_extension_dir = Some(extension_dir.into());
+        config.operator.duckdb_extension_dir = Some(extension_dir.into());
     }
 
     let state = AppState::new(config).unwrap();
     let health = state.storage.health();
-    assert!(health.mode.ends_with("_immutable_segments"));
+    assert!(health.mode.ends_with("_arrow_append"));
     assert!(health.ducklake_available);
     assert!(health.capabilities.insert);
 
@@ -2759,8 +2908,8 @@ fn seal_before_raw_spool_checkpoint_survives_restart() {
 fn scheduler_health_excludes_ingest_visibility_jobs() {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
-    config.local_storage_dir = dir.path().join("storage");
-    config.scheduler_enabled = true;
+    config.operator.local_storage_dir = dir.path().join("storage");
+    config.operator.scheduler_enabled = true;
     let state = Arc::new(AppState::new(config).unwrap());
     let scheduler = Scheduler::spawn(state.clone());
 
@@ -2789,11 +2938,11 @@ fn scheduler_health_excludes_ingest_visibility_jobs() {
 fn scheduler_seals_threshold_ingest_into_visible_rows() {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
-    config.local_storage_dir = dir.path().join("storage");
-    config.scheduler_enabled = true;
-    config.scheduler_seal_interval = StdDuration::from_millis(20);
-    config.immutable_segment_max_age = StdDuration::from_millis(10);
-    config.immutable_segment_target_bytes = 1;
+    config.operator.local_storage_dir = dir.path().join("storage");
+    config.operator.scheduler_enabled = true;
+    config.mechanics.scheduler_seal_interval = StdDuration::from_millis(20);
+    config.mechanics.arrow_write_buffer_max_age = StdDuration::from_millis(10);
+    config.mechanics.arrow_write_buffer_target_bytes = 1;
 
     let state = Arc::new(AppState::new(config).unwrap());
     let scheduler = Scheduler::spawn(state.clone());
@@ -2838,10 +2987,10 @@ fn scheduler_seals_threshold_ingest_into_visible_rows() {
 fn disabled_scheduler_requires_manual_seal_for_visibility() {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
-    config.local_storage_dir = dir.path().join("storage");
-    config.scheduler_enabled = false;
-    config.seal_rate_seed_window = StdDuration::from_secs(60);
-    config.seal_rate_seed_bytes = 10_000_000;
+    config.operator.local_storage_dir = dir.path().join("storage");
+    config.operator.scheduler_enabled = false;
+    config.test_overrides.seal_rate_seed_window = StdDuration::from_secs(60);
+    config.test_overrides.seal_rate_seed_bytes = 10_000_000;
 
     let state = AppState::new(config).unwrap();
     let body = log_fixture(Utc::now().timestamp_nanos_opt().unwrap()).to_string();
@@ -2862,8 +3011,8 @@ fn disabled_scheduler_requires_manual_seal_for_visibility() {
 fn retention_run_deletes_whole_day_eligible_rows() {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
-    config.local_storage_dir = dir.path().join("storage");
-    config.logs_retention_days = 1;
+    config.operator.local_storage_dir = dir.path().join("storage");
+    config.operator.logs_retention_days = 1;
     let state = AppState::new(config).unwrap();
     let old_ms = (Utc::now() - Duration::days(3)).timestamp_millis();
     let fresh_ms = Utc::now().timestamp_millis();
@@ -3054,12 +3203,15 @@ fn admin_endpoints_reject_data_key_and_unauthenticated_requests() {
 
     let data_bearer = HashMap::from([(
         "authorization".to_string(),
-        format!("Bearer {}", state.config.api_key),
+        format!("Bearer {}", state.config.operator.api_key),
     )]);
-    let data_xapi = HashMap::from([("x-api-key".to_string(), state.config.api_key.clone())]);
+    let data_xapi = HashMap::from([(
+        "x-api-key".to_string(),
+        state.config.operator.api_key.clone(),
+    )]);
     let admin_bearer = HashMap::from([(
         "authorization".to_string(),
-        format!("Bearer {}", state.config.admin_api_key),
+        format!("Bearer {}", state.config.operator.admin_api_key),
     )]);
 
     for (method, path) in admin_routes {
@@ -3106,7 +3258,7 @@ fn admin_endpoints_reject_data_key_and_unauthenticated_requests() {
 fn loki_query_range_backward_uses_standard_log_query() {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
-    config.local_storage_dir = dir.path().join("storage");
+    config.operator.local_storage_dir = dir.path().join("storage");
     let state = AppState::new(config).unwrap();
     let headers = headers(&state);
     let now = Utc::now();
@@ -3191,7 +3343,7 @@ fn empty_configured_api_key_fails_closed() {
     // Simulate the misconfiguration: a deployment that wiped api_key without
     // realizing it. The runtime must refuse to authorize *any* request, even
     // one whose Authorization header strips down to an empty bearer token.
-    state.config.api_key = String::new();
+    state.config.operator.api_key = String::new();
     let unauth_headers = HashMap::from([
         ("authorization".to_string(), "Bearer ".to_string()),
         ("content-type".to_string(), "application/json".to_string()),
@@ -3213,23 +3365,23 @@ fn config_validate_rejects_empty_keys_and_collisions() {
     let dir = tempdir().unwrap();
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
 
-    config.api_key = String::new();
+    config.operator.api_key = String::new();
     assert!(config.validate().is_err(), "empty api_key must fail");
 
-    config.api_key = "data-key".to_string();
-    config.admin_api_key = String::new();
+    config.operator.api_key = "data-key".to_string();
+    config.operator.admin_api_key = String::new();
     assert!(config.validate().is_err(), "empty admin_api_key must fail");
 
-    config.admin_api_key = "data-key".to_string();
+    config.operator.admin_api_key = "data-key".to_string();
     assert!(
         config.validate().is_err(),
         "api_key == admin_api_key must fail to keep the admin gate meaningful"
     );
 
-    config.admin_api_key = "admin-key".to_string();
+    config.operator.admin_api_key = "admin-key".to_string();
     assert!(config.validate().is_ok());
 
-    config.query_interactive.concurrency = 0;
+    config.operator.query_interactive.concurrency = 0;
     assert!(
         config.validate().is_err(),
         "zero query concurrency must fail"
@@ -3246,10 +3398,10 @@ fn config_validate_rejects_zero_scheduler_intervals() {
     );
 
     let mutations: [fn(&mut Config); 4] = [
-        |c| c.scheduler_seal_interval = std::time::Duration::ZERO,
-        |c| c.scheduler_metadata_interval = std::time::Duration::ZERO,
-        |c| c.scheduler_metrics_interval = std::time::Duration::ZERO,
-        |c| c.scheduler_retention_interval = std::time::Duration::ZERO,
+        |c| c.mechanics.scheduler_seal_interval = std::time::Duration::ZERO,
+        |c| c.mechanics.scheduler_metadata_interval = std::time::Duration::ZERO,
+        |c| c.mechanics.scheduler_metrics_interval = std::time::Duration::ZERO,
+        |c| c.mechanics.scheduler_retention_interval = std::time::Duration::ZERO,
     ];
     for mutate in mutations {
         let mut config = Config::test(path.clone());
@@ -3271,8 +3423,8 @@ fn config_validate_rejects_zero_seal_freshness_ages() {
     );
 
     let mutations: [fn(&mut Config); 2] = [
-        |c| c.seal_rate_seed_window = std::time::Duration::ZERO,
-        |c| c.immutable_segment_max_age = std::time::Duration::ZERO,
+        |c| c.test_overrides.seal_rate_seed_window = std::time::Duration::ZERO,
+        |c| c.mechanics.arrow_write_buffer_max_age = std::time::Duration::ZERO,
     ];
     for mutate in mutations {
         let mut config = Config::test(path.clone());
@@ -3293,18 +3445,15 @@ fn config_validate_rejects_invalid_raw_spool_limits() {
         "baseline test config must validate"
     );
 
-    let mutations: [fn(&mut Config); 11] = [
-        |c| c.raw_spool_max_segment_bytes = 0,
-        |c| c.raw_spool_max_record_bytes = 0,
-        |c| c.raw_spool_max_total_bytes = 0,
-        |c| c.raw_spool_writer_queue_capacity = 0,
-        |c| c.raw_spool_group_commit_records = 0,
-        |c| c.raw_spool_group_commit_delay = std::time::Duration::ZERO,
-        |c| c.raw_spool_append_sync_interval = std::time::Duration::ZERO,
-        |c| c.raw_spool_append_sync_bytes = 0,
-        |c| c.raw_spool_checkpoint_fsync_records = 0,
-        |c| c.raw_spool_checkpoint_fsync_delay = std::time::Duration::ZERO,
-        |c| c.raw_spool_max_record_bytes = c.raw_spool_max_total_bytes + 1,
+    let mutations: [fn(&mut Config); 5] = [
+        |c| c.mechanics.raw_spool_max_segment_bytes = 0,
+        |c| c.mechanics.raw_spool_max_record_bytes = 0,
+        |c| c.mechanics.raw_spool_max_total_bytes_per_request_kind = 0,
+        |c| c.mechanics.raw_spool_group_commit_delay = std::time::Duration::ZERO,
+        |c| {
+            c.mechanics.raw_spool_max_record_bytes =
+                c.mechanics.raw_spool_max_total_bytes_per_request_kind + 1
+        },
     ];
     for mutate in mutations {
         let mut config = Config::test(path.clone());
@@ -3325,8 +3474,10 @@ fn config_validate_rejects_invalid_ingest_workers_capacities() {
         "baseline test config must validate"
     );
 
-    let mutations: [fn(&mut Config); 2] =
-        [|c| c.ingest_workers = 0, |c| c.ingest_buffer_capacity = 0];
+    let mutations: [fn(&mut Config); 2] = [
+        |c| c.mechanics.ingest_workers = 0,
+        |c| c.test_overrides.ingest_worker_channel_capacity = 0,
+    ];
     for mutate in mutations {
         let mut config = Config::test(path.clone());
         mutate(&mut config);
