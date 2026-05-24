@@ -33,7 +33,8 @@ oversights. Each is documented in full in its own section below.
 - Physical file compaction — disabled until proven stable. DuckLake
   `ducklake_merge_adjacent_files` is intentionally not called; v0 tolerates many
   small Parquet segment files, with the Arrow write buffer's size/age coalescing
-  as the only file-count mitigation. See [Retention](#retention).
+  as the only file-count mitigation. See [Compaction & small files — roadmap /
+  when to revisit](#compaction--small-files--roadmap--when-to-revisit).
 - Online schema evolution — the storage schema is static. Columns are fixed
   const lists created with `CREATE TABLE IF NOT EXISTS`; there is no migration
   tool or `ALTER ... ADD COLUMN` path. Changing columns requires a coordinated
@@ -453,6 +454,38 @@ The current implementation uses bounded table deletes plus DuckLake snapshot
 expiration/cleanup hooks where available. Physical file compaction is not
 enabled until DuckLake `ducklake_merge_adjacent_files` is proven stable for this
 write pattern. Physical day-table layouts are not part of the current MVP.
+
+### Compaction & small files — roadmap / when to revisit
+
+Small-batch streaming ingest produces many small Parquet segment files, which is
+the opposite of what columnar storage prefers; merging them back into larger
+files is real but deliberately deferred. This is the central deferred difficulty
+of this write pattern, so it is tracked here as an explicit roadmap entry rather
+than left as an inline "disabled" flag.
+
+- **What is punted.** Physical Parquet file compaction stays disabled: DuckLake
+  `ducklake_merge_adjacent_files` is intentionally not called, and v0 tolerates
+  many small segment files. The only current mitigation is the Arrow write
+  buffer's size/age coalescing, which keeps one seal producing one segment per
+  storage signal — there is no second pass that rewrites already-sealed files.
+- **Why.** Compaction is unproven-stable for this append/seal write pattern, and
+  rewriting sealed files introduces write amplification (re-reading and
+  re-writing data already on disk) that competes with the seal path for the
+  single writer.
+- **When to revisit.** Treat this as triggered when the small-file ratio or
+  per-signal segment count grows unbounded under steady ingest, or when query
+  latency degrades from physical-file fan-out (too many files scanned per range).
+  Those are the signals that the no-compaction tolerance has stopped paying off.
+- **What it will touch when implemented.** Compaction must reuse the single seal
+  owner / single DuckDB writer rather than adding a parallel write path. Expect
+  to coordinate the seal path (`src/seal.rs`), retention (`src/maintenance.rs`
+  and `src/storage/maintenance.rs`), the single writer lock (`src/storage`), and
+  metadata refresh so compacted membership stays consistent. The inline non-goal
+  flag lives in `Maintenance::retention` (`src/maintenance.rs`).
+
+Online schema evolution under continuous arrival is a separate but related v0
+punt (the storage schema is static); see [Punts / Non-Goals
+(v0)](#punts--non-goals-v0) and [Storage](#storage).
 
 ## Compatibility Surface
 

@@ -137,7 +137,9 @@ impl Maintenance {
             // v0 therefore tolerates many small Parquet segment files; the Arrow
             // write buffer's size/age coalescing (one seal -> one segment per
             // signal) is the only file-count mitigation. Do not add a compaction
-            // code path here without revisiting that decision.
+            // code path here without revisiting that decision: trigger conditions
+            // and what it must touch are tracked as an explicit roadmap entry in
+            // docs/architecture/v0-architecture.md#compaction--small-files--roadmap--when-to-revisit.
             "physical_file_compaction": {
                 "supported": false,
                 "enabled": false,
