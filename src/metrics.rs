@@ -105,12 +105,17 @@ impl MetricSample {
     }
 }
 
+/// Storage routing for rendered operator metric samples. Counters are written as
+/// OTLP sums; gauges are written as OTLP gauges.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MetricKind {
     Counter,
     Gauge,
 }
 
+/// Registry-time shape of an emitted metric name. Observations render as the
+/// Prometheus `_count` counter plus `_sum` gauge pair, so this is distinct from
+/// [`MetricKind`]'s storage routing role.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MetricShape {
     Counter,
@@ -198,6 +203,7 @@ pub enum MetricName {
 }
 
 impl MetricName {
+    #[cfg(test)]
     const ALL: &'static [Self] = &[
         Self::AdmissionCapacity,
         Self::AdmissionInUse,
@@ -484,6 +490,8 @@ impl MetricName {
                 "storage_signal",
                 "phase",
                 "reason",
+                "status",
+                "path",
             ],
             Self::QueryDurationSeconds | Self::QueryTimeoutsTotal => &["route_template"],
             Self::QueryRequestsTotal => &["route_template", "status", "reason"],
@@ -503,13 +511,6 @@ impl MetricName {
             | Self::SealEwmaBytesPerSecond => &[],
         }
     }
-
-    fn from_str(name: &str) -> Option<Self> {
-        Self::ALL
-            .iter()
-            .copied()
-            .find(|metric| metric.as_str() == name)
-    }
 }
 
 impl Metrics {
@@ -526,13 +527,8 @@ impl Metrics {
         &self.shards[(hash as usize) & (METRICS_SHARDS - 1)]
     }
 
-    pub fn inc_metric(&self, name: MetricName, labels: &[(&str, &str)], by: u64) {
+    pub fn inc(&self, name: MetricName, labels: &[(&str, &str)], by: u64) {
         assert_eq!(name.shape(), MetricShape::Counter);
-        self.inc_registered(name, labels, by);
-    }
-
-    pub fn inc(&self, name: &str, labels: &[(&str, &str)], by: u64) {
-        let name = registered_metric_name(name, MetricShape::Counter, labels);
         self.inc_registered(name, labels, by);
     }
 
@@ -543,13 +539,8 @@ impl Metrics {
         *inner.counters.entry(metric_id).or_default() += by;
     }
 
-    pub fn set_counter_metric(&self, name: MetricName, labels: &[(&str, &str)], value: u64) {
+    pub fn set_counter(&self, name: MetricName, labels: &[(&str, &str)], value: u64) {
         assert_eq!(name.shape(), MetricShape::Counter);
-        self.set_counter_registered(name, labels, value);
-    }
-
-    pub fn set_counter(&self, name: &str, labels: &[(&str, &str)], value: u64) {
-        let name = registered_metric_name(name, MetricShape::Counter, labels);
         self.set_counter_registered(name, labels, value);
     }
 
@@ -562,13 +553,8 @@ impl Metrics {
             .insert(metric_id, value);
     }
 
-    pub fn gauge_metric(&self, name: MetricName, labels: &[(&str, &str)], value: f64) {
+    pub fn gauge(&self, name: MetricName, labels: &[(&str, &str)], value: f64) {
         assert_eq!(name.shape(), MetricShape::Gauge);
-        self.gauge_registered(name, labels, value);
-    }
-
-    pub fn gauge(&self, name: &str, labels: &[(&str, &str)], value: f64) {
-        let name = registered_metric_name(name, MetricShape::Gauge, labels);
         self.gauge_registered(name, labels, value);
     }
 
@@ -581,15 +567,11 @@ impl Metrics {
             .insert(metric_id, value);
     }
 
-    pub fn observe_seconds(&self, name: &str, labels: &[(&str, &str)], seconds: f64) {
+    pub fn observe_seconds(&self, name: MetricName, labels: &[(&str, &str)], seconds: f64) {
         self.observe_seconds_n(name, labels, 1, seconds);
     }
 
-    pub fn observe_seconds_metric(&self, name: MetricName, labels: &[(&str, &str)], seconds: f64) {
-        self.observe_seconds_n_metric(name, labels, 1, seconds);
-    }
-
-    pub fn observe_seconds_n_metric(
+    pub fn observe_seconds_n(
         &self,
         name: MetricName,
         labels: &[(&str, &str)],
@@ -597,11 +579,6 @@ impl Metrics {
         seconds: f64,
     ) {
         assert_eq!(name.shape(), MetricShape::Observation);
-        self.observe_seconds_n_registered(name, labels, count, seconds);
-    }
-
-    pub fn observe_seconds_n(&self, name: &str, labels: &[(&str, &str)], count: u64, seconds: f64) {
-        let name = registered_metric_name(name, MetricShape::Observation, labels);
         self.observe_seconds_n_registered(name, labels, count, seconds);
     }
 
@@ -627,8 +604,14 @@ impl Metrics {
         inner.gauges.insert(sum_id, current + seconds);
     }
 
-    pub fn set_observation(&self, name: &str, labels: &[(&str, &str)], count: u64, seconds: f64) {
-        let name = registered_metric_name(name, MetricShape::Observation, labels);
+    pub fn set_observation(
+        &self,
+        name: MetricName,
+        labels: &[(&str, &str)],
+        count: u64,
+        seconds: f64,
+    ) {
+        assert_eq!(name.shape(), MetricShape::Observation);
         validate_metric_labels(name, labels);
         let count_id = MetricId::new(&format!("{}_count", name.as_str()), labels);
         let sum_id = MetricId::new(&format!("{}_sum", name.as_str()), labels);
@@ -694,7 +677,7 @@ impl Metrics {
         phase_labels.extend_from_slice(labels);
         phase_labels.push(("phase", phase));
         self.observe_seconds_n(
-            "canardstack_phase_duration_seconds",
+            MetricName::PhaseDurationSeconds,
             &phase_labels,
             count,
             seconds,
@@ -704,7 +687,7 @@ impl Metrics {
     pub fn ingest_request(&self, request_kind: &str, status: u16, reason: &str) {
         let status = status_label(status);
         self.inc(
-            "canardstack_ingest_requests_total",
+            MetricName::IngestRequestsTotal,
             &[
                 ("request_kind", request_kind),
                 ("status", status.as_ref()),
@@ -717,7 +700,7 @@ impl Metrics {
     pub fn query_request(&self, route_template: &str, status: u16, reason: &str, seconds: f64) {
         let status = status_label(status);
         self.inc(
-            "canardstack_query_requests_total",
+            MetricName::QueryRequestsTotal,
             &[
                 ("route_template", route_template),
                 ("status", status.as_ref()),
@@ -726,13 +709,13 @@ impl Metrics {
             1,
         );
         self.observe_seconds(
-            "canardstack_query_duration_seconds",
+            MetricName::QueryDurationSeconds,
             &[("route_template", route_template)],
             seconds,
         );
         if reason == "query_timeout" {
             self.inc(
-                "canardstack_query_timeouts_total",
+                MetricName::QueryTimeoutsTotal,
                 &[("route_template", route_template)],
                 1,
             );
@@ -741,12 +724,12 @@ impl Metrics {
 
     pub fn maintenance_run(&self, job: &str, status: &str, reason: &str, seconds: f64) {
         self.inc(
-            "canardstack_maintenance_runs_total",
+            MetricName::MaintenanceRunsTotal,
             &[("job", job), ("status", status), ("reason", reason)],
             1,
         );
         self.observe_seconds(
-            "canardstack_maintenance_duration_seconds",
+            MetricName::MaintenanceDurationSeconds,
             &[("job", job), ("storage_signal", "all")],
             seconds,
         );
@@ -870,23 +853,6 @@ fn status_label(status: u16) -> Cow<'static, str> {
         503 => Cow::Borrowed("503"),
         other => Cow::Owned(other.to_string()),
     }
-}
-
-fn registered_metric_name(
-    name: &str,
-    expected_shape: MetricShape,
-    labels: &[(&str, &str)],
-) -> MetricName {
-    let metric = MetricName::from_str(name)
-        .unwrap_or_else(|| panic!("metric `{name}` is not registered in MetricName"));
-    assert_eq!(
-        metric.shape(),
-        expected_shape,
-        "metric `{name}` was emitted as {expected_shape:?}, but registry defines it as {:?}",
-        metric.shape()
-    );
-    validate_metric_labels(metric, labels);
-    metric
 }
 
 fn validate_metric_labels(name: MetricName, labels: &[(&str, &str)]) {
@@ -1051,59 +1017,59 @@ mod snapshot_tests {
 
         // Worker dispatch + worker completion + storage insert.
         metrics.inc(
-            "canardstack_ingest_worker_dispatch_total",
+            MetricName::IngestWorkerDispatchTotal,
             &[("request_kind", "logs"), ("outcome", "queued")],
             1,
         );
         metrics.inc(
-            "canardstack_ingest_worker_completed_total",
+            MetricName::IngestWorkerCompletedTotal,
             &[("request_kind", "logs"), ("status", "buffered")],
             1,
         );
         metrics.inc(
-            "canardstack_ingest_storage_insert_total",
+            MetricName::IngestStorageInsertTotal,
             &[("request_kind", "logs"), ("status", "ok")],
             1,
         );
         metrics.gauge(
-            "canardstack_ingest_worker_queue_capacity",
+            MetricName::IngestWorkerQueueCapacity,
             &[("state", "capacity")],
             1024.0,
         );
 
         // Accepted-body + transform + buffered counters.
         metrics.inc(
-            "canardstack_ingest_request_bytes_total",
+            MetricName::IngestRequestBytesTotal,
             &[("request_kind", "logs"), ("encoding", "identity")],
             10,
         );
         metrics.inc(
-            "canardstack_ingest_decoded_bytes_total",
+            MetricName::IngestDecodedBytesTotal,
             &[("request_kind", "logs"), ("encoding", "identity")],
             10,
         );
         metrics.inc(
-            "canardstack_ingest_records_total",
+            MetricName::IngestRecordsTotal,
             &[("request_kind", "logs")],
             1,
         );
         metrics.inc(
-            "canardstack_ingest_transformed_rows_total",
+            MetricName::IngestTransformedRowsTotal,
             &[("storage_signal", "logs"), ("request_kind", "logs")],
             1,
         );
         metrics.inc(
-            "canardstack_ingest_unsupported_histograms_total",
+            MetricName::IngestUnsupportedHistogramsTotal,
             &[("request_kind", "metrics")],
             1,
         );
         metrics.inc(
-            "canardstack_ingest_buffered_rows_total",
+            MetricName::IngestBufferedRowsTotal,
             &[("storage_signal", "logs")],
             1,
         );
         metrics.inc(
-            "canardstack_ingest_buffered_bytes_total",
+            MetricName::IngestBufferedBytesTotal,
             &[("storage_signal", "logs")],
             10,
         );
@@ -1111,12 +1077,12 @@ mod snapshot_tests {
         // Ingest durable-boundary funnel (per request) and seal-boundary funnel
         // (per seal operation).
         metrics.inc(
-            "canardstack_ingest_stage_total",
+            MetricName::IngestStageTotal,
             &[("request_kind", "logs"), ("stage", "spooled")],
             1,
         );
         metrics.inc(
-            "canardstack_ingest_seal_stage_total",
+            MetricName::IngestSealStageTotal,
             &[("stage", "committed")],
             1,
         );
@@ -1124,95 +1090,95 @@ mod snapshot_tests {
         // In-flight gauge (the `_max`, `_pressure`, and `_capacity_bytes`
         // derivatives were dropped).
         metrics.gauge(
-            "canardstack_ingest_inflight_bytes",
+            MetricName::IngestInflightBytes,
             &[("storage_signal", "logs")],
             0.0,
         );
 
         // Runtime memory.
-        metrics.gauge("canardstack_runtime_rss_bytes", &[], 1.0);
-        metrics.gauge("canardstack_runtime_memory_limit_bytes", &[], 1.0);
+        metrics.gauge(MetricName::RuntimeRssBytes, &[], 1.0);
+        metrics.gauge(MetricName::RuntimeMemoryLimitBytes, &[], 1.0);
         metrics.inc(
-            "canardstack_ingest_runtime_memory_unknown_total",
+            MetricName::IngestRuntimeMemoryUnknownTotal,
             &[("request_kind", "logs")],
             1,
         );
 
         // Raw spool per-`request_kind` surface (aggregate no-label copies dropped).
         metrics.inc(
-            "canardstack_raw_spool_records_total",
+            MetricName::RawSpoolRecordsTotal,
             &[("request_kind", "logs"), ("status", "spooled")],
             1,
         );
         metrics.inc(
-            "canardstack_raw_spool_bytes_total",
+            MetricName::RawSpoolBytesTotal,
             &[("request_kind", "logs")],
             10,
         );
         metrics.inc(
-            "canardstack_raw_spool_append_batches_total",
+            MetricName::RawSpoolAppendBatchesTotal,
             &[("request_kind", "logs")],
             1,
         );
         metrics.inc(
-            "canardstack_raw_spool_append_batch_records_total",
+            MetricName::RawSpoolAppendBatchRecordsTotal,
             &[("request_kind", "logs")],
             1,
         );
         metrics.inc(
-            "canardstack_raw_spool_append_batch_encoded_bytes_total",
+            MetricName::RawSpoolAppendBatchEncodedBytesTotal,
             &[("request_kind", "logs")],
             10,
         );
         metrics.set_counter(
-            "canardstack_raw_spool_append_syncs_total",
+            MetricName::RawSpoolAppendSyncsTotal,
             &[("request_kind", "logs")],
             1,
         );
         metrics.set_counter(
-            "canardstack_raw_spool_append_sync_failures_total",
+            MetricName::RawSpoolAppendSyncFailuresTotal,
             &[("request_kind", "logs")],
             0,
         );
         metrics.set_counter(
-            "canardstack_raw_spool_append_file_fsyncs_total",
+            MetricName::RawSpoolAppendFileFsyncsTotal,
             &[("request_kind", "logs")],
             1,
         );
         metrics.inc(
-            "canardstack_raw_spool_checkpoint_batches_total",
+            MetricName::RawSpoolCheckpointBatchesTotal,
             &[("request_kind", "logs")],
             1,
         );
         metrics.inc(
-            "canardstack_raw_spool_checkpoint_batch_records_total",
+            MetricName::RawSpoolCheckpointBatchRecordsTotal,
             &[("request_kind", "logs")],
             1,
         );
         metrics.inc(
-            "canardstack_raw_spool_checkpoint_batch_commands_total",
+            MetricName::RawSpoolCheckpointBatchCommandsTotal,
             &[("request_kind", "logs")],
             1,
         );
         metrics.inc(
-            "canardstack_raw_spool_replayed_records_total",
+            MetricName::RawSpoolReplayedRecordsTotal,
             &[("request_kind", "logs"), ("status", "ok")],
             1,
         );
         metrics.inc(
-            "canardstack_raw_spool_checkpointed_records_total",
+            MetricName::RawSpoolCheckpointedRecordsTotal,
             &[("request_kind", "logs"), ("reason", "storage_committed")],
             1,
         );
         for name in [
-            "canardstack_raw_spool_segment_bytes",
-            "canardstack_raw_spool_segments",
-            "canardstack_raw_spool_pending_records",
-            "canardstack_raw_spool_pending_bytes",
-            "canardstack_raw_spool_unsynced_records",
-            "canardstack_raw_spool_unsynced_bytes",
-            "canardstack_raw_spool_unsynced_age_seconds",
-            "canardstack_raw_spool_healthy",
+            MetricName::RawSpoolSegmentBytes,
+            MetricName::RawSpoolSegments,
+            MetricName::RawSpoolPendingRecords,
+            MetricName::RawSpoolPendingBytes,
+            MetricName::RawSpoolUnsyncedRecords,
+            MetricName::RawSpoolUnsyncedBytes,
+            MetricName::RawSpoolUnsyncedAgeSeconds,
+            MetricName::RawSpoolHealthy,
         ] {
             metrics.gauge(name, &[("request_kind", "logs")], 0.0);
         }
@@ -1241,7 +1207,7 @@ mod snapshot_tests {
         }
         // The coarse batch-checkpoint phase is emitted once, label-free.
         metrics.observe_seconds(
-            "canardstack_phase_duration_seconds",
+            MetricName::PhaseDurationSeconds,
             &[("phase", "raw_spool_checkpoint")],
             0.001,
         );
@@ -1262,127 +1228,119 @@ mod snapshot_tests {
 
         // DuckDB / Arrow flush counters.
         metrics.inc(
-            "canardstack_duckdb_arrow_appends_total",
+            MetricName::DuckdbArrowAppendsTotal,
             &[("storage_signal", "logs")],
             1,
         );
         metrics.inc(
-            "canardstack_duckdb_arrow_appended_rows_total",
+            MetricName::DuckdbArrowAppendedRowsTotal,
             &[("storage_signal", "logs")],
             1,
         );
         metrics.inc(
-            "canardstack_arrow_flushes_total",
+            MetricName::ArrowFlushesTotal,
             &[("storage_signal", "logs")],
             1,
         );
         metrics.inc(
-            "canardstack_arrow_flush_rows_total",
+            MetricName::ArrowFlushRowsTotal,
             &[("storage_signal", "logs")],
             1,
         );
 
         // Admission surface (the per-kind rejection/reduction snapshot counters
         // were consolidated into the live inc-counter + one reductions counter).
-        metrics.gauge(
-            "canardstack_admission_capacity",
-            &[("admission", "seal")],
-            1.0,
-        );
-        metrics.gauge(
-            "canardstack_admission_in_use",
-            &[("admission", "seal")],
-            0.0,
-        );
+        metrics.gauge(MetricName::AdmissionCapacity, &[("admission", "seal")], 1.0);
+        metrics.gauge(MetricName::AdmissionInUse, &[("admission", "seal")], 0.0);
         metrics.inc(
-            "canardstack_admission_rejections_total",
+            MetricName::AdmissionRejectionsTotal,
             &[("admission", "query"), ("reason", "freshness_debt")],
             1,
         );
-        metrics.set_counter("canardstack_admission_reductions_total", &[], 1);
-        metrics.gauge("canardstack_seal_ewma_bytes_per_second", &[], 1.0);
-        metrics.gauge("canardstack_projected_seal_seconds", &[], 0.0);
-        metrics.gauge("canardstack_projected_buffer_seconds", &[], 0.0);
-        metrics.gauge("canardstack_projected_visibility_seconds", &[], 0.0);
-        metrics.gauge("canardstack_observed_freshness_lag_seconds", &[], 0.0);
-        metrics.gauge("canardstack_ingest_inflight_memory_bound_bytes", &[], 1.0);
+        metrics.set_counter(MetricName::AdmissionReductionsTotal, &[], 1);
+        metrics.gauge(MetricName::SealEwmaBytesPerSecond, &[], 1.0);
+        metrics.gauge(MetricName::ProjectedSealSeconds, &[], 0.0);
+        metrics.gauge(MetricName::ProjectedBufferSeconds, &[], 0.0);
+        metrics.gauge(MetricName::ProjectedVisibilitySeconds, &[], 0.0);
+        metrics.gauge(MetricName::ObservedFreshnessLagSeconds, &[], 0.0);
+        metrics.gauge(MetricName::IngestInflightMemoryBoundBytes, &[], 1.0);
 
         // Maintenance.
         metrics.maintenance_run("seal", "ok", "ok", 0.01);
         metrics.inc(
-            "canardstack_maintenance_failures_total",
+            MetricName::MaintenanceFailuresTotal,
             &[("job", "seal"), ("reason", "seal_failed")],
             1,
         );
         metrics.gauge(
-            "canardstack_maintenance_consecutive_failures",
+            MetricName::MaintenanceConsecutiveFailures,
             &[("job", "seal")],
             0.0,
         );
-        metrics.gauge("canardstack_maintenance_paused", &[], 0.0);
+        metrics.gauge(MetricName::MaintenancePaused, &[], 0.0);
 
         // Arrow write buffer operator gauges.
         metrics.gauge(
-            "canardstack_arrow_write_buffer_rows",
+            MetricName::ArrowWriteBufferRows,
             &[("storage_signal", "logs")],
             0.0,
         );
         metrics.gauge(
-            "canardstack_arrow_write_buffer_bytes",
+            MetricName::ArrowWriteBufferBytes,
             &[("storage_signal", "logs")],
             0.0,
         );
         metrics.gauge(
-            "canardstack_arrow_write_buffer_age_seconds",
+            MetricName::ArrowWriteBufferAgeSeconds,
             &[("storage_signal", "logs")],
             0.0,
         );
 
         // Storage / freshness operator gauges.
         metrics.gauge(
-            "canardstack_storage_physical_bytes",
+            MetricName::StoragePhysicalBytes,
             &[("storage_signal", "all")],
             0.0,
         );
         metrics.gauge(
-            "canardstack_storage_logical_rows",
+            MetricName::StorageLogicalRows,
             &[("storage_signal", "logs")],
             0.0,
         );
         metrics.gauge(
-            "canardstack_ducklake_active_data_files",
+            MetricName::DucklakeActiveDataFiles,
             &[("storage_signal", "logs")],
             0.0,
         );
         metrics.gauge(
-            "canardstack_ducklake_active_data_file_rows",
+            MetricName::DucklakeActiveDataFileRows,
             &[("storage_signal", "logs")],
             0.0,
         );
         metrics.gauge(
-            "canardstack_freshness_watermark_timestamp",
+            MetricName::FreshnessWatermarkTimestamp,
             &[("storage_signal", "logs")],
             0.0,
         );
         metrics.gauge(
-            "canardstack_ingest_to_query_lag_seconds",
+            MetricName::IngestToQueryLagSeconds,
             &[("storage_signal", "logs")],
             0.0,
         );
 
         // HTTP connection counters.
         metrics.inc(
-            "canardstack_http_connection_requests_total",
+            MetricName::HttpConnectionRequestsTotal,
             &[("mode", "keep_alive")],
             1,
         );
         metrics.inc(
-            "canardstack_http_connection_closes_total",
+            MetricName::HttpConnectionClosesTotal,
             &[("reason", "client")],
             1,
         );
         metrics.inc(
-            "canardstack_http_connection_errors_total",
+            MetricName::HttpConnectionErrorsTotal,
             &[("reason", "io_error")],
             1,
         );

@@ -56,7 +56,7 @@
 //! `runtime_memory_limit_bytes`.
 
 use crate::config::Config;
-use crate::metrics::Metrics;
+use crate::metrics::{MetricName, Metrics};
 use crate::validation::{ApiError, ApiResult};
 use crate::LockExt;
 use serde::Serialize;
@@ -325,7 +325,7 @@ impl AdmissionController {
         let mut state = self.inner.lock_or_poisoned();
         if state.seal_active >= self.seal_capacity {
             metrics.inc(
-                "canardstack_admission_rejections_total",
+                MetricName::AdmissionRejectionsTotal,
                 &[("admission", "seal"), ("reason", "seal_admission_full")],
                 1,
             );
@@ -383,7 +383,7 @@ impl AdmissionController {
         let result = if !accepted {
             state.query_rejections_total += 1;
             metrics.inc(
-                "canardstack_admission_rejections_total",
+                MetricName::AdmissionRejectionsTotal,
                 &[("admission", "query"), ("reason", rejection_reason)],
                 1,
             );
@@ -418,7 +418,7 @@ impl AdmissionController {
             Err(reason) => {
                 state.ingest_freshness_rejections_total += 1;
                 metrics.inc(
-                    "canardstack_admission_rejections_total",
+                    MetricName::AdmissionRejectionsTotal,
                     &[("admission", "freshness_budget"), ("reason", reason)],
                     1,
                 );
@@ -491,57 +491,57 @@ impl AdmissionController {
     /// identical to [`Self::record_metrics`].
     fn emit_admission_gauges(&self, metrics: &Metrics, snapshot: &AdmissionSnapshot) {
         metrics.gauge(
-            "canardstack_admission_capacity",
+            MetricName::AdmissionCapacity,
             &[("admission", "seal")],
             snapshot.seal_capacity as f64,
         );
         metrics.gauge(
-            "canardstack_admission_in_use",
+            MetricName::AdmissionInUse,
             &[("admission", "seal")],
             snapshot.seal_active as f64,
         );
         metrics.gauge(
-            "canardstack_admission_capacity",
+            MetricName::AdmissionCapacity,
             &[("admission", "query_cheap")],
             snapshot.cheap_query_capacity as f64,
         );
         metrics.gauge(
-            "canardstack_admission_in_use",
+            MetricName::AdmissionInUse,
             &[("admission", "query_cheap")],
             snapshot.cheap_query_active as f64,
         );
         metrics.gauge(
-            "canardstack_admission_capacity",
+            MetricName::AdmissionCapacity,
             &[("admission", "query_heavy")],
             snapshot.heavy_query_effective_capacity as f64,
         );
         metrics.gauge(
-            "canardstack_admission_in_use",
+            MetricName::AdmissionInUse,
             &[("admission", "query_heavy")],
             snapshot.heavy_query_active as f64,
         );
         metrics.gauge(
-            "canardstack_seal_ewma_bytes_per_second",
+            MetricName::SealEwmaBytesPerSecond,
             &[],
             snapshot.ewma_seal_bytes_per_second,
         );
         metrics.gauge(
-            "canardstack_projected_seal_seconds",
+            MetricName::ProjectedSealSeconds,
             &[],
             snapshot.projected_seal_seconds,
         );
         metrics.gauge(
-            "canardstack_projected_buffer_seconds",
+            MetricName::ProjectedBufferSeconds,
             &[],
             snapshot.projected_buffer_seconds,
         );
         metrics.gauge(
-            "canardstack_projected_visibility_seconds",
+            MetricName::ProjectedVisibilitySeconds,
             &[],
             snapshot.projected_visibility_seconds,
         );
         metrics.gauge(
-            "canardstack_observed_freshness_lag_seconds",
+            MetricName::ObservedFreshnessLagSeconds,
             &[],
             snapshot.observed_freshness_lag_seconds,
         );
@@ -553,14 +553,14 @@ impl AdmissionController {
         // tightens it to 0.90. During EWMA warm-up this rides on the seal-rate
         // seed until measured seal throughput takes over.
         metrics.gauge(
-            "canardstack_ingest_inflight_memory_bound_bytes",
+            MetricName::IngestInflightMemoryBoundBytes,
             &[],
             FreshnessModel::INGEST_FRESHNESS_BUDGET_FRACTION
                 * snapshot.freshness_budget_sla_seconds
                 * snapshot.ewma_seal_bytes_per_second,
         );
         metrics.set_counter(
-            "canardstack_admission_reductions_total",
+            MetricName::AdmissionReductionsTotal,
             &[],
             snapshot.heavy_query_reductions_total,
         );

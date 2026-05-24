@@ -1,4 +1,5 @@
 use super::{IngestPipeline, Ingestor, SpooledIngestWork};
+use crate::metrics::MetricName;
 use crate::storage::Storage;
 use crate::LockExt;
 use anyhow::{Context, Result};
@@ -97,7 +98,7 @@ fn run_ingest_worker(
         match ingestor.process_spooled_ingest(work, &storage) {
             Ok(disposition) => {
                 metrics.inc(
-                    "canardstack_ingest_worker_completed_total",
+                    MetricName::IngestWorkerCompletedTotal,
                     &[
                         ("request_kind", route.as_str()),
                         ("status", disposition.as_str()),
@@ -105,7 +106,7 @@ fn run_ingest_worker(
                     1,
                 );
                 metrics.observe_seconds(
-                    "canardstack_phase_duration_seconds",
+                    MetricName::PhaseDurationSeconds,
                     &[
                         ("request_kind", route.as_str()),
                         ("phase", "ingest_worker"),
@@ -116,7 +117,7 @@ fn run_ingest_worker(
             }
             Err(err) => {
                 metrics.inc(
-                    "canardstack_ingest_worker_completed_total",
+                    MetricName::IngestWorkerCompletedTotal,
                     &[
                         ("request_kind", route.as_str()),
                         ("status", err.disposition.as_str()),
@@ -124,7 +125,7 @@ fn run_ingest_worker(
                     1,
                 );
                 metrics.observe_seconds(
-                    "canardstack_phase_duration_seconds",
+                    MetricName::PhaseDurationSeconds,
                     &[
                         ("request_kind", route.as_str()),
                         ("phase", "ingest_worker"),

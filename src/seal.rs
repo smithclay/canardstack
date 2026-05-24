@@ -1,7 +1,7 @@
 use crate::app::AppState;
 use crate::config::Config;
 use crate::ingest::{lifecycle, Ingestor, SealStage};
-use crate::metrics::Metrics;
+use crate::metrics::{MetricName, Metrics};
 use crate::storage::{ArrowFlushOutcome, Storage, TimingPhase};
 use crate::validation::{ApiError, ApiResult};
 use serde_json::{json, Value};
@@ -183,23 +183,23 @@ fn observe_arrow_flush(metrics: &Metrics, outcome: &ArrowFlushOutcome) {
     for timing in &outcome.timings {
         if timing.phase == TimingPhase::DuckdbArrowAppend {
             metrics.inc(
-                "canardstack_duckdb_arrow_appends_total",
+                MetricName::DuckdbArrowAppendsTotal,
                 &[("storage_signal", timing.storage_signal.as_str())],
                 1,
             );
             metrics.inc(
-                "canardstack_duckdb_arrow_appended_rows_total",
+                MetricName::DuckdbArrowAppendedRowsTotal,
                 &[("storage_signal", timing.storage_signal.as_str())],
                 timing.rows as u64,
             );
         } else if timing.phase == TimingPhase::DucklakeCommit {
             metrics.inc(
-                "canardstack_arrow_flush_rows_total",
+                MetricName::ArrowFlushRowsTotal,
                 &[("storage_signal", timing.storage_signal.as_str())],
                 timing.rows as u64,
             );
             metrics.inc(
-                "canardstack_arrow_flushes_total",
+                MetricName::ArrowFlushesTotal,
                 &[("storage_signal", timing.storage_signal.as_str())],
                 1,
             );

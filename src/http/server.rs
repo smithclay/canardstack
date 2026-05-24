@@ -1,3 +1,4 @@
+use crate::metrics::MetricName;
 use crate::validation::ApiError;
 use crate::AppState;
 use serde_json::json;
@@ -73,7 +74,7 @@ pub fn serve_until(state: Arc<AppState>, shutdown: &AtomicBool) -> anyhow::Resul
         if prev >= max_conns {
             active.fetch_sub(1, Ordering::SeqCst);
             state.metrics.inc(
-                "canardstack_http_connection_errors_total",
+                MetricName::HttpConnectionErrorsTotal,
                 &[("reason", "max_connections_exceeded")],
                 1,
             );
@@ -101,7 +102,7 @@ pub fn serve_until(state: Arc<AppState>, shutdown: &AtomicBool) -> anyhow::Resul
             if let Err(err) = handle_stream(stream, state.clone()) {
                 let reason = classify_io_error(&err);
                 state.metrics.inc(
-                    "canardstack_http_connection_errors_total",
+                    MetricName::HttpConnectionErrorsTotal,
                     &[("reason", reason)],
                     1,
                 );
@@ -179,7 +180,7 @@ fn handle_stream(mut stream: TcpStream, state: Arc<AppState>) -> anyhow::Result<
             }
             Err(err) if requests > 0 && is_socket_timeout(&err) => {
                 state.metrics.inc(
-                    "canardstack_http_connection_closes_total",
+                    MetricName::HttpConnectionClosesTotal,
                     &[("reason", "keepalive_idle_timeout")],
                     1,
                 );
@@ -263,7 +264,7 @@ fn handle_stream(mut stream: TcpStream, state: Arc<AppState>) -> anyhow::Result<
         let keep_alive =
             should_keep_connection_alive(keepalive_enabled, client_requested_close, requests);
         state.metrics.inc(
-            "canardstack_http_connection_requests_total",
+            MetricName::HttpConnectionRequestsTotal,
             &[(
                 "mode",
                 if keep_alive {
@@ -278,7 +279,7 @@ fn handle_stream(mut stream: TcpStream, state: Arc<AppState>) -> anyhow::Result<
         if !keep_alive {
             if reached_request_limit {
                 state.metrics.inc(
-                    "canardstack_http_connection_closes_total",
+                    MetricName::HttpConnectionClosesTotal,
                     &[("reason", "keepalive_request_limit")],
                     1,
                 );

@@ -1,7 +1,7 @@
 use crate::admission_control::{AdmissionController, FreshnessBudgetInputs};
 use crate::config::Config;
 use crate::ingest::raw_spool::{RawSpool, RawSpoolAppendRef};
-use crate::metrics::Metrics;
+use crate::metrics::{MetricName, Metrics};
 use crate::otlp::{self, Transformed};
 use crate::signal::StorageSignal;
 use crate::storage::{
@@ -329,7 +329,7 @@ impl IngestPipeline {
         for pending in self.raw_spool.recover_pending()? {
             let request_kind = pending.request_kind;
             metrics.inc(
-                "canardstack_raw_spool_replayed_records_total",
+                MetricName::RawSpoolReplayedRecordsTotal,
                 &[
                     ("request_kind", request_kind.as_str()),
                     ("status", "attempted"),
@@ -340,14 +340,14 @@ impl IngestPipeline {
                 Ok(()) => {
                     replayed += 1;
                     metrics.inc(
-                        "canardstack_raw_spool_replayed_records_total",
+                        MetricName::RawSpoolReplayedRecordsTotal,
                         &[("request_kind", request_kind.as_str()), ("status", "ok")],
                         1,
                     );
                 }
                 Err(err) => {
                     metrics.inc(
-                        "canardstack_raw_spool_replayed_records_total",
+                        MetricName::RawSpoolReplayedRecordsTotal,
                         &[
                             ("request_kind", err.request_kind.as_str()),
                             ("status", "failed"),
@@ -552,8 +552,7 @@ impl IngestPipeline {
         );
 
         // spooled -> decoded: decompress and re-check the decoded body size.
-        let body =
-            self.decode_spooled_body(&headers, &compressed_body, raw_spool_ref, route, metrics)?;
+        let body = self.decode_spooled_body(&headers, &compressed_body, request_context)?;
         let decoded_body_materialized_bytes = match &body {
             std::borrow::Cow::Borrowed(_) => 0,
             std::borrow::Cow::Owned(bytes) => bytes.len(),
@@ -561,14 +560,13 @@ impl IngestPipeline {
         let decoded_body_len = body.len();
 
         // decoded -> transformed: OTLP -> Arrow batches, then timestamp-skew gate.
-        let transformed =
-            self.transform_spooled_body(route, &headers, &body, raw_spool_ref, metrics)?;
+        let transformed = self.transform_spooled_body(&headers, &body, request_context)?;
         lifecycle::record(metrics, route, IngestStage::Transformed);
         let unsupported_histograms = transformed.unsupported_histograms;
-        self.validate_spooled_skew(&transformed, raw_spool_ref, route, metrics)?;
+        self.validate_spooled_skew(&transformed, request_context)?;
         for (output_signal, rows) in transformed_rows_by_signal(&transformed) {
             metrics.inc(
-                "canardstack_ingest_transformed_rows_total",
+                MetricName::IngestTransformedRowsTotal,
                 &[
                     ("storage_signal", output_signal.as_str()),
                     ("request_kind", route.as_str()),
@@ -593,10 +591,10 @@ impl IngestPipeline {
             // Nothing to buffer (e.g. all rows were unsupported): terminally
             // dispose so the spooled record will not replay.
             return match self.raw_spool.checkpoint_terminal(
-                raw_spool_ref,
-                route,
+                request_context.raw_spool_ref,
+                request_context.route,
                 "transform_empty",
-                metrics,
+                request_context.metrics,
             ) {
                 Ok(()) => Ok(SpooledIngestDisposition::TerminallyDisposed),
                 Err(checkpoint_err) => Err(SpooledIngestError::pending_replay(checkpoint_err)),
@@ -604,14 +602,13 @@ impl IngestPipeline {
         }
 
         // accounted -> buffered: append replay-backed rows to the write buffer.
-        let buffered =
-            self.buffer_spooled_batches(storage, &batches, raw_spool_ref, route, metrics)?;
+        let buffered = self.buffer_spooled_batches(storage, &batches, request_context)?;
         // Rows reached the Arrow write buffer; the per-request phase terminus.
         // See `crate::ingest::lifecycle`.
         lifecycle::record(metrics, route, IngestStage::Buffered);
         observe_storage_timings(metrics, &buffered.timings);
         metrics.inc(
-            "canardstack_ingest_storage_insert_total",
+            MetricName::IngestStorageInsertTotal,
             &[("request_kind", route.as_str()), ("status", "ok")],
             1,
         );
@@ -634,25 +631,25 @@ impl IngestPipeline {
             metrics,
         );
         metrics.inc(
-            "canardstack_ingest_records_total",
+            MetricName::IngestRecordsTotal,
             &[("request_kind", route.as_str())],
             accepted as u64,
         );
         if unsupported_histograms > 0 {
             metrics.inc(
-                "canardstack_ingest_unsupported_histograms_total",
+                MetricName::IngestUnsupportedHistogramsTotal,
                 &[("request_kind", route.as_str())],
                 unsupported_histograms as u64,
             );
         }
         for (output_signal, (rows, bytes)) in buffered_totals {
             metrics.inc(
-                "canardstack_ingest_buffered_rows_total",
+                MetricName::IngestBufferedRowsTotal,
                 &[("storage_signal", output_signal.as_str())],
                 rows as u64,
             );
             metrics.inc(
-                "canardstack_ingest_buffered_bytes_total",
+                MetricName::IngestBufferedBytesTotal,
                 &[("storage_signal", output_signal.as_str())],
                 bytes as u64,
             );
@@ -690,9 +687,7 @@ impl IngestPipeline {
         &self,
         headers: &HashMap<String, String>,
         compressed_body: &'b [u8],
-        raw_spool_ref: RawSpoolAppendRef,
-        route: OtlpRequestKind,
-        metrics: &Metrics,
+        context: SpooledRequestContext<'_>,
     ) -> std::result::Result<std::borrow::Cow<'b, [u8]>, SpooledIngestError> {
         let started = Instant::now();
         let body_result = otlp::decompress_if_needed(
@@ -700,8 +695,8 @@ impl IngestPipeline {
             compressed_body,
             self.config.operator.max_body_bytes,
         );
-        metrics.observe_request_phase_seconds(
-            route.as_str(),
+        context.metrics.observe_request_phase_seconds(
+            context.route.as_str(),
             "decompress",
             started.elapsed().as_secs_f64(),
         );
@@ -711,15 +706,21 @@ impl IngestPipeline {
             } else {
                 "decode_failed"
             };
-            self.dispose_terminal(raw_spool_ref, route, reason, err, metrics)
+            self.dispose_terminal(
+                context.raw_spool_ref,
+                context.route,
+                reason,
+                err,
+                context.metrics,
+            )
         })?;
         if let Err(err) = validation::validate_body_size(body.len(), &self.config) {
             return Err(self.dispose_terminal(
-                raw_spool_ref,
-                route,
+                context.raw_spool_ref,
+                context.route,
                 "body_size_invalid",
                 err,
-                metrics,
+                context.metrics,
             ));
         }
         Ok(body)
@@ -729,24 +730,29 @@ impl IngestPipeline {
     /// a terminal disposition for a payload that cannot be transformed.
     fn transform_spooled_body(
         &self,
-        route: OtlpRequestKind,
         headers: &HashMap<String, String>,
         body: &[u8],
-        raw_spool_ref: RawSpoolAppendRef,
-        metrics: &Metrics,
+        context: SpooledRequestContext<'_>,
     ) -> std::result::Result<Transformed, SpooledIngestError> {
         let started = Instant::now();
         #[cfg(feature = "otlp2records-observer")]
-        let transformed_result = otlp::transform_observed(route, headers, body, metrics);
+        let transformed_result =
+            otlp::transform_observed(context.route, headers, body, context.metrics);
         #[cfg(not(feature = "otlp2records-observer"))]
-        let transformed_result = otlp::transform(route, headers, body);
-        metrics.observe_request_phase_seconds(
-            route.as_str(),
+        let transformed_result = otlp::transform(context.route, headers, body);
+        context.metrics.observe_request_phase_seconds(
+            context.route.as_str(),
             "otlp_transform",
             started.elapsed().as_secs_f64(),
         );
         transformed_result.map_err(|err| {
-            self.dispose_terminal(raw_spool_ref, route, "transform_failed", err, metrics)
+            self.dispose_terminal(
+                context.raw_spool_ref,
+                context.route,
+                "transform_failed",
+                err,
+                context.metrics,
+            )
         })
     }
 
@@ -755,19 +761,23 @@ impl IngestPipeline {
     fn validate_spooled_skew(
         &self,
         transformed: &Transformed,
-        raw_spool_ref: RawSpoolAppendRef,
-        route: OtlpRequestKind,
-        metrics: &Metrics,
+        context: SpooledRequestContext<'_>,
     ) -> std::result::Result<(), SpooledIngestError> {
         let started = Instant::now();
         let skew_result = self.validate_skew(transformed);
-        metrics.observe_request_phase_seconds(
-            route.as_str(),
+        context.metrics.observe_request_phase_seconds(
+            context.route.as_str(),
             "timestamp_validation",
             started.elapsed().as_secs_f64(),
         );
         skew_result.map_err(|err| {
-            self.dispose_terminal(raw_spool_ref, route, "timestamp_rejected", err, metrics)
+            self.dispose_terminal(
+                context.raw_spool_ref,
+                context.route,
+                "timestamp_rejected",
+                err,
+                context.metrics,
+            )
         })
     }
 
@@ -810,11 +820,9 @@ impl IngestPipeline {
         &self,
         storage: &Storage,
         batches: &[batches::PendingBatch],
-        raw_spool_ref: RawSpoolAppendRef,
-        route: OtlpRequestKind,
-        metrics: &Metrics,
+        context: SpooledRequestContext<'_>,
     ) -> std::result::Result<ArrowBatchBufferResult, SpooledIngestError> {
-        let replay_ref = ReplayBackedRecordRef::new(raw_spool_ref);
+        let replay_ref = ReplayBackedRecordRef::new(context.raw_spool_ref);
         let buffers = batches
             .iter()
             .filter(|batch| batch.batch.num_rows() > 0)
@@ -827,8 +835,8 @@ impl IngestPipeline {
             .collect::<Vec<_>>();
         let buffer_started = Instant::now();
         let buffer_result = storage.buffer_replay_backed_arrow_batches(&buffers);
-        metrics.observe_request_phase_seconds(
-            route.as_str(),
+        context.metrics.observe_request_phase_seconds(
+            context.route.as_str(),
             "storage_buffer",
             buffer_started.elapsed().as_secs_f64(),
         );
@@ -837,14 +845,17 @@ impl IngestPipeline {
             // record was not tracked, so it stays pending and replays on a future
             // restart (at-least-once). Surface a retryable dependency error; the
             // admission credit drops with this scope.
-            metrics.inc(
-                "canardstack_ingest_storage_insert_total",
-                &[("request_kind", route.as_str()), ("status", "error")],
+            context.metrics.inc(
+                MetricName::IngestStorageInsertTotal,
+                &[
+                    ("request_kind", context.route.as_str()),
+                    ("status", "error"),
+                ],
                 1,
             );
             tracing::warn!(
                 event = "ingest_storage_insert_failed",
-                request_kind = route.as_str(),
+                request_kind = context.route.as_str(),
                 error = %err
             );
             SpooledIngestError::pending_replay(
@@ -885,7 +896,7 @@ impl IngestPipeline {
                                 metrics.ingest_request(route.as_str(), 202, "accepted");
                                 self.record_worker_queue_metrics(metrics);
                                 metrics.inc(
-                                    "canardstack_ingest_worker_dispatch_total",
+                                    MetricName::IngestWorkerDispatchTotal,
                                     &[("request_kind", route.as_str()), ("outcome", "queued")],
                                     1,
                                 );
@@ -909,7 +920,7 @@ impl IngestPipeline {
         // buffer now, not only after the next process restart) and applies
         // natural backpressure: request latency rises under worker saturation.
         metrics.inc(
-            "canardstack_ingest_worker_dispatch_total",
+            MetricName::IngestWorkerDispatchTotal,
             &[
                 ("request_kind", route.as_str()),
                 ("outcome", "processed_inline"),
@@ -982,7 +993,7 @@ impl IngestPipeline {
             let pool = self.ingest_workers.lock_or_poisoned();
             let Some(dispatcher) = pool.as_ref() else {
                 metrics.inc(
-                    "canardstack_ingest_worker_dispatch_total",
+                    MetricName::IngestWorkerDispatchTotal,
                     &[
                         ("request_kind", route.as_str()),
                         ("outcome", "workers_unavailable"),
@@ -998,7 +1009,7 @@ impl IngestPipeline {
             };
             if dispatcher.commands.is_empty() {
                 metrics.inc(
-                    "canardstack_ingest_worker_dispatch_total",
+                    MetricName::IngestWorkerDispatchTotal,
                     &[
                         ("request_kind", route.as_str()),
                         ("outcome", "workers_unavailable"),
@@ -1081,7 +1092,7 @@ impl IngestPipeline {
     pub fn record_inflight_metrics(&self, metrics: &Metrics) {
         for snapshot in self.snapshots() {
             metrics.gauge(
-                "canardstack_ingest_inflight_bytes",
+                MetricName::IngestInflightBytes,
                 &[("storage_signal", snapshot.storage_signal)],
                 snapshot.inflight_bytes as f64,
             );
@@ -1090,7 +1101,7 @@ impl IngestPipeline {
 
     pub fn record_worker_queue_metrics(&self, metrics: &Metrics) {
         metrics.gauge(
-            "canardstack_ingest_worker_queue_capacity",
+            MetricName::IngestWorkerQueueCapacity,
             &[("state", "capacity")],
             self.config.test_overrides.ingest_worker_channel_capacity as f64,
         );
@@ -1129,12 +1140,12 @@ impl IngestPipeline {
             .map(String::as_str)
             .unwrap_or("identity");
         metrics.inc(
-            "canardstack_ingest_request_bytes_total",
+            MetricName::IngestRequestBytesTotal,
             &[("request_kind", route), ("encoding", encoding)],
             request_bytes as u64,
         );
         metrics.inc(
-            "canardstack_ingest_decoded_bytes_total",
+            MetricName::IngestDecodedBytesTotal,
             &[("request_kind", route), ("encoding", encoding)],
             decoded_bytes as u64,
         );

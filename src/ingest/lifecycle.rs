@@ -12,7 +12,7 @@
 //! pipeline does, only how the funnel is described in metrics.
 
 use crate::ingest::OtlpRequestKind;
-use crate::metrics::Metrics;
+use crate::metrics::{MetricName, Metrics};
 
 /// Per-request durable-boundary stage. Emitted as the `stage` label on
 /// `canardstack_ingest_stage_total{request_kind, stage}` via [`record`].
@@ -75,7 +75,7 @@ pub(in crate::ingest) fn record(
     stage: IngestStage,
 ) {
     metrics.inc(
-        "canardstack_ingest_stage_total",
+        MetricName::IngestStageTotal,
         &[
             ("request_kind", request_kind.as_str()),
             ("stage", stage.as_str()),
@@ -88,7 +88,7 @@ pub(in crate::ingest) fn record(
 /// counter is emitted.
 pub(crate) fn record_seal(metrics: &Metrics, stage: SealStage) {
     metrics.inc(
-        "canardstack_ingest_seal_stage_total",
+        MetricName::IngestSealStageTotal,
         &[("stage", stage.as_str())],
         1,
     );
