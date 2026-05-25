@@ -26,15 +26,22 @@ Parameters:
   CatalogImage:
     Type: String
     Description: Public GHCR DuckDB/Quack catalog image. The image must serve Quack and persist its DuckDB catalog at DUCKDB_DATABASE.
-  VpcId:
-    Type: AWS::EC2::VPC::Id
-  SubnetIds:
-    Type: List<AWS::EC2::Subnet::Id>
+  VpcCidr:
+    Type: String
+    Default: 10.78.0.0/16
+  PublicSubnetOneCidr:
+    Type: String
+    Default: 10.78.0.0/24
+  PublicSubnetTwoCidr:
+    Type: String
+    Default: 10.78.1.0/24
   AllowedIngressCidr:
     Type: String
     Default: 0.0.0.0/0
   S3BucketName:
     Type: String
+    Default: ""
+    Description: Optional S3 bucket name for DuckLake data files. Leave empty to generate one.
   S3DataPrefix:
     Type: String
     Default: ducklake-data
@@ -83,7 +90,88 @@ Parameters:
     Type: Number
     Default: 3221225472
 
+Conditions:
+  HasS3BucketName:
+    Fn::Not:
+      - Fn::Equals:
+          - !Ref S3BucketName
+          - ""
+
 Resources:
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-vpc
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-igw
+
+  VpcGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnetOne:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PublicSubnetOneCidr
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-public-a
+
+  PublicSubnetTwo:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PublicSubnetTwoCidr
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-public-b
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-public
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn:
+      - VpcGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetOneRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetOne
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnetTwoRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetTwo
+      RouteTableId: !Ref PublicRouteTable
+
   Cluster:
     Type: AWS::ECS::Cluster
     Properties:
@@ -104,7 +192,11 @@ Resources:
   DuckLakeBucket:
     Type: AWS::S3::Bucket
     Properties:
-      BucketName: !Ref S3BucketName
+      BucketName:
+        Fn::If:
+          - HasS3BucketName
+          - !Ref S3BucketName
+          - !Ref AWS::NoValue
       PublicAccessBlockConfiguration:
         BlockPublicAcls: true
         BlockPublicPolicy: true
@@ -203,7 +295,7 @@ Resources:
     Type: AWS::EC2::SecurityGroup
     Properties:
       GroupDescription: canardstack load balancer
-      VpcId: !Ref VpcId
+      VpcId: !Ref Vpc
       SecurityGroupIngress:
         - IpProtocol: tcp
           FromPort: 80
@@ -217,7 +309,7 @@ Resources:
     Type: AWS::EC2::SecurityGroup
     Properties:
       GroupDescription: canardstack app
-      VpcId: !Ref VpcId
+      VpcId: !Ref Vpc
       SecurityGroupIngress:
         - IpProtocol: tcp
           FromPort: 4318
@@ -231,7 +323,7 @@ Resources:
     Type: AWS::EC2::SecurityGroup
     Properties:
       GroupDescription: canardstack DuckDB Quack catalog
-      VpcId: !Ref VpcId
+      VpcId: !Ref Vpc
       SecurityGroupIngress:
         - IpProtocol: tcp
           FromPort: !Ref CatalogPort
@@ -248,12 +340,14 @@ Resources:
       Scheme: internet-facing
       SecurityGroups:
         - !Ref LoadBalancerSecurityGroup
-      Subnets: !Ref SubnetIds
+      Subnets:
+        - !Ref PublicSubnetOne
+        - !Ref PublicSubnetTwo
 
   TargetGroup:
     Type: AWS::ElasticLoadBalancingV2::TargetGroup
     Properties:
-      VpcId: !Ref VpcId
+      VpcId: !Ref Vpc
       Protocol: HTTP
       Port: 4318
       TargetType: ip
@@ -277,7 +371,7 @@ Resources:
     Type: AWS::ServiceDiscovery::PrivateDnsNamespace
     Properties:
       Name: !Ref ServiceDiscoveryNamespaceName
-      Vpc: !Ref VpcId
+      Vpc: !Ref Vpc
 
   CatalogDiscoveryService:
     Type: AWS::ServiceDiscovery::Service
@@ -328,7 +422,7 @@ Resources:
             - Name: CANARDSTACK_DUCKLAKE_ATTACH_URI
               Value: !Sub ducklake:quack:${CatalogServiceDiscoveryName}.${ServiceDiscoveryNamespaceName}:${CatalogPort}
             - Name: CANARDSTACK_DUCKLAKE_DATA_PATH
-              Value: !Sub s3://${S3BucketName}/${S3DataPrefix}/
+              Value: !Sub s3://${DuckLakeBucket}/${S3DataPrefix}/
             - Name: CANARDSTACK_DUCKLAKE_MAINTENANCE_ENABLED
               Value: "true"
             - Name: CANARDSTACK_PROCESS_MEMORY_LIMIT_BYTES
@@ -424,7 +518,9 @@ Resources:
           AssignPublicIp: ENABLED
           SecurityGroups:
             - !Ref CatalogSecurityGroup
-          Subnets: !Ref SubnetIds
+          Subnets:
+            - !Ref PublicSubnetOne
+            - !Ref PublicSubnetTwo
       VolumeConfigurations:
         - Name: duckdb-catalog
           ManagedEBSVolume:
@@ -463,7 +559,9 @@ Resources:
           AssignPublicIp: ENABLED
           SecurityGroups:
             - !Ref AppSecurityGroup
-          Subnets: !Ref SubnetIds
+          Subnets:
+            - !Ref PublicSubnetOne
+            - !Ref PublicSubnetTwo
       VolumeConfigurations:
         - Name: canardstack-data
           ManagedEBSVolume:
@@ -485,7 +583,7 @@ Outputs:
   DuckLakeAttachUri:
     Value: !Sub ducklake:quack:${CatalogServiceDiscoveryName}.${ServiceDiscoveryNamespaceName}:${CatalogPort}
   DuckLakeDataPath:
-    Value: !Sub s3://${S3BucketName}/${S3DataPrefix}/
+    Value: !Sub s3://${DuckLakeBucket}/${S3DataPrefix}/
   ApiKeySecretArn:
     Value: !Ref ApiKeySecret
   AdminApiKeySecretArn:

@@ -23,6 +23,11 @@ output "catalog_service_account_email" {
   value       = google_service_account.catalog.email
 }
 
+output "bucket_name" {
+  description = "GCS bucket created for canardstack deployment state and DuckLake data files."
+  value       = google_storage_bucket.ducklake.name
+}
+
 output "ducklake_data_path" {
   description = "DuckLake DATA_PATH configured for canardstack."
   value       = "gcs://${google_storage_bucket.ducklake.name}/${trimsuffix(var.data_prefix, "/")}/"

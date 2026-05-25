@@ -70,6 +70,8 @@ flowchart TB
 Available examples:
 
 - `gcp/cloud-run/` - Terraform for Google Cloud Infrastructure Manager, Cloud
-  Run, GCS DuckLake data files, and an internal Cloud Run Quack catalog service.
+  Run, a generated GCS bucket for deployment state and DuckLake data files, and
+  an internal Cloud Run Quack catalog service.
 - `aws/ecs-express/` - CloudFormation for ECS/Fargate, S3 DuckLake data files,
-  Cloud Map service discovery, and an internal Quack catalog service with EBS.
+  generated VPC/subnets/security groups, Cloud Map service discovery, and an
+  internal Quack catalog service with EBS.

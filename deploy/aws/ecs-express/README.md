@@ -1,13 +1,15 @@
 # ECS Express Mode
 
-`template.yaml` creates an ECS/Fargate deployment from CloudFormation:
+`template.yaml` creates a push-button ECS/Fargate deployment from
+CloudFormation:
 
 - A public-facing canardstack ECS service behind an Application Load Balancer.
   The container runs `canardstack serve`, so ingest and query APIs are available
   from one service.
 - A private DuckDB/Quack ECS service registered in Cloud Map. This service owns
   the DuckDB-backed DuckLake metadata catalog file.
-- An S3 bucket/prefix for DuckLake data files.
+- A VPC with two public subnets, internet routing, security groups, and an S3
+  bucket/prefix for DuckLake data files.
 - A service-managed EBS volume mounted at `/var/lib/canardstack` for
   `CANARDSTACK_DATA_DIR`, including the durable raw spool.
 - Secrets Manager secrets for the canardstack API keys and the Quack token.
@@ -29,6 +31,10 @@ property in the `AWS::ECS::Service` resource schema. The template sticks to the
 underlying resources that ECS Express Mode creates and manages: ECS services,
 Fargate task definitions, network security groups, service-managed EBS volume,
 Cloud Map, CloudWatch logs, Secrets Manager secrets, S3, and IAM roles.
+CloudFormation now also exposes `AWS::ECS::ExpressGatewayService`, but that
+resource only models the primary web container surface and does not cover the
+service-managed EBS mounts this deployment needs for the canardstack raw spool
+and the DuckDB/Quack catalog metadata file.
 
 Example deployment:
 
@@ -40,9 +46,6 @@ aws cloudformation deploy \
   --parameter-overrides \
     Image=ghcr.io/<owner>/canardstack:<version> \
     CatalogImage=ghcr.io/<owner>/duckdb-quack:<version> \
-    VpcId=vpc-aaa \
-    SubnetIds=subnet-aaa,subnet-bbb \
-    S3BucketName=my-canardstack-ducklake \
     ApiKey=replace-with-a-long-random-value \
     AdminApiKey=replace-with-a-different-long-random-value \
     QuackToken=replace-with-a-third-long-random-value

@@ -10,6 +10,10 @@ terraform {
       source  = "hashicorp/google-beta"
       version = ">= 5.17.0"
     }
+    random = {
+      source  = "hashicorp/random"
+      version = ">= 3.6.0"
+    }
   }
 }
 
@@ -26,6 +30,7 @@ provider "google-beta" {
 locals {
   app_service_account_id     = substr(var.service_name, 0, 30)
   catalog_service_account_id = substr(var.catalog_service_name, 0, 30)
+  bucket_name                = var.bucket_name != "" ? var.bucket_name : "${var.bucket_name_prefix}-${random_id.bucket.hex}"
   catalog_host               = replace(google_cloud_run_v2_service.catalog.uri, "https://", "")
   catalog_mount_options = [
     "only-dir=${var.catalog_prefix}",
@@ -41,6 +46,10 @@ locals {
   ]
   app_invoker_members     = toset(var.invoker_members)
   catalog_invoker_members = toset(var.catalog_invoker_members)
+}
+
+resource "random_id" "bucket" {
+  byte_length = 4
 }
 
 resource "google_project_service" "required" {
@@ -72,7 +81,7 @@ resource "google_service_account" "catalog" {
 }
 
 resource "google_storage_bucket" "ducklake" {
-  name                        = var.bucket_name
+  name                        = local.bucket_name
   location                    = var.bucket_location
   uniform_bucket_level_access = true
   public_access_prevention    = "enforced"

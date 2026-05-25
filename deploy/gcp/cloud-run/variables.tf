@@ -44,8 +44,15 @@ variable "catalog_args" {
 }
 
 variable "bucket_name" {
-  description = "GCS bucket for the Quack catalog metadata file and DuckLake data files."
+  description = "Optional GCS bucket name for the Quack catalog metadata file and DuckLake data files. Leave empty to generate one."
   type        = string
+  default     = ""
+}
+
+variable "bucket_name_prefix" {
+  description = "Prefix used when generating the GCS bucket name."
+  type        = string
+  default     = "canardstack-ducklake"
 }
 
 variable "bucket_location" {
