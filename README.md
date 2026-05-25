@@ -125,55 +125,10 @@ metrics through the demo collector. The checked-in extras file adds an
 `otlphttp/canardstack` exporter to the demo's logs, traces, and metrics
 pipelines, using OTLP/HTTP protobuf to `http://host.docker.internal:4318`.
 
-Check that canardstack is receiving the demo:
-
-```bash
-curl -sS -H 'x-api-key: dev-canardstack-key' http://127.0.0.1:4318/metrics \
-  | grep 'canardstack_ingest_requests_total'
-```
-
-You should see accepted `logs`, `traces`, and `metrics` counters climbing. Gauge
-and sum metrics are stored; histogram and exponential histogram datapoints are
-intentionally rejected in v0, so `canardstack_ingest_unsupported_histograms_total`
-is expected to increase during the demo.
-
-Useful query checks after the scheduler has sealed a few batches:
-
-```bash
-curl -sS -H 'x-api-key: dev-canardstack-key' \
-  http://127.0.0.1:4318/loki/api/v1/label/service_name/values
-
-curl -sS -H 'x-api-key: dev-canardstack-key' \
-  http://127.0.0.1:4318/api/search/tags
-```
-
-Open the canardstack Grafana dashboard:
+Open the canardstack Grafana dashboard to see the data:
 
 ```text
 http://localhost:3000/d/canardstack-overview/canardstack-overview
-```
-
-If you only want the smaller built-in smoke workload instead of the full
-OpenTelemetry demo, run the deterministic smoke check from the canardstack
-checkout:
-
-```bash
-cd ../canardstack
-docker compose run --rm smoke
-```
-
-The smoke command sends logs, a multi-span trace, gauge samples, and cumulative
-sum samples over OTLP/HTTP, then checks storage health plus the Prometheus,
-Loki, and Tempo-compatible query paths.
-
-To stop the demo and canardstack:
-
-```bash
-cd ../opentelemetry-demo
-docker compose down
-
-cd ../canardstack
-docker compose down
 ```
 
 Notes:
@@ -243,34 +198,15 @@ docker compose run --rm smoke
 
 ## Query Data
 
-The v0 query API is a set of bounded compatibility adapters over the stored
-telemetry tables.
-
-- Metrics: Prometheus-shaped endpoints for Grafana and simple API clients.
-- Logs: Loki-shaped endpoints for label discovery, log queries, and Grafana.
-- Traces: Tempo-shaped endpoints for trace lookup and Grafana.
-- SQL: direct DuckDB/MotherDuck access outside the HTTP API.
-
-The compatibility APIs are intentionally limited. They are useful for Grafana
-inspection, not a complete PromQL, LogQL, TraceQL, Prometheus, Loki, or Tempo
-replacement.
-
-Direct SQL is intentionally outside canardstack's HTTP product surface. Use the
-DuckDB CLI, MotherDuck, or another SQL client when you want to work with the
-underlying DuckLake tables.
+- [Query with DuckDB](https://smithclay.github.io/canardstack/query-data/duckdb/)
+- [Query with Grafana](https://smithclay.github.io/canardstack/query-data/grafana/)
 
 ## Deployment
-
-Deployment docs are published on GitHub Pages. The site is the canonical
-operator guide:
 
 - [Deployment overview](https://smithclay.github.io/canardstack/deployment/)
 - [MotherDuck](https://smithclay.github.io/canardstack/deployment/motherduck/)
 - [GCP Cloud Run](https://smithclay.github.io/canardstack/deployment/gcp-cloud-run/)
 - [AWS ECS/Fargate](https://smithclay.github.io/canardstack/deployment/aws-ecs-fargate/)
-
-The deploy artifacts remain under [deploy/](deploy/). Keep walkthrough changes
-in the site docs and keep the deploy READMEs as pointers.
 
 ## Architecture
 
@@ -307,55 +243,6 @@ flowchart LR
     Adapters --> Lake
     Clients -->|queries| Adapters
 ```
-
-### The write path
-
-Every telemetry request crosses a fixed sequence of boundaries on its way to
-queryable storage:
-
-1. **Receive and validate.** Ingest checks auth, content type, body size, and
-   compression on the OTLP/HTTP request.
-2. **Admit.** Freshness-first admission projects how far behind the seal pipeline
-   is, in seconds of expected query-visibility delay. If accepting the request
-   would push that projection past the configured freshness budget, it is
-   rejected with `429` *before anything is written*.
-3. **Spool.** The raw request is appended to a local fsynced raw spool,
-   partitioned by request kind (logs / traces / metrics). Once it is durably on
-   disk, canardstack returns `2xx`. This is the durability point — not commit,
-   not query-visibility.
-4. **Transform.** A pool of worker threads decompresses and normalizes the
-   payload through `otlp2records` into Arrow record batches, one per storage
-   table. A metrics request fans out into both the `metric_gauge` and
-   `metric_sum` tables.
-5. **Buffer.** Batches accumulate in an in-memory Arrow write buffer. Each row
-   keeps a reference back to its raw-spool record so it can be checkpointed once
-   it is safely stored.
-6. **Seal.** A single scheduler thread flushes the buffer on a size or age
-   trigger: it appends the buffered rows and commits one immutable Parquet
-   segment per table through DuckLake, then checkpoints the raw-spool records it
-   just committed.
-
-The commit-then-checkpoint order is deliberate. canardstack commits to DuckLake
-*before* it checkpoints the spool, so a crash in between replays those records on
-restart rather than losing them. Delivery is at-least-once; v0 does not
-deduplicate replayed rows.
-
-### The read path
-
-Grafana, curl, and other clients query through bounded Prometheus-, Loki-, and
-Tempo-shaped adapters that translate into guarded reads over the DuckLake tables.
-Queries use a separate DuckDB connection from the writer, so the read path stays
-responsive while a seal is in flight. For anything the adapters do not cover, the
-same tables are open to direct DuckDB or MotherDuck SQL.
-
-The architecture is intentionally narrow:
-
-- one binary, `canardstack`
-- synchronous std-library HTTP server
-- no async runtime
-- no OTLP/gRPC endpoint
-- no Kafka or separate hot store
-- one scheduler and single writer
 
 ## Operator Notes
 
@@ -407,34 +294,6 @@ Known v0 limits:
 Contributor setup and implementation details live in
 [docs/developer.md](docs/developer.md). Start there when changing canardstack
 itself.
-
-Common local checks:
-
-```bash
-cargo check
-cargo test
-cargo fmt --all -- --check
-cargo clippy --all-targets --all-features --locked -- -D warnings
-```
-
-Host run workflow:
-
-```bash
-cp config/example.env .env
-set -a
-. ./.env
-set +a
-cargo run -- serve
-```
-
-Then run an in-process smoke test:
-
-```bash
-cargo run -- smoke
-```
-
-Keep changes scoped, preserve the synchronous single-binary architecture, and
-add or update tests for behavior changes when practical.
 
 ## Documentation
 
