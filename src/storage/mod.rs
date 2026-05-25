@@ -398,7 +398,7 @@ mod tests {
     }
 
     #[test]
-    fn quack_attach_uri_opts_into_plaintext_with_disable_ssl() {
+    fn quack_attach_uri_insecure_tls_adds_scoped_verify_ssl_secret() {
         let dir = tempdir().unwrap();
         let plan = build_ducklake_attach_plan(
             None,
@@ -412,9 +412,15 @@ mod tests {
         )
         .unwrap();
 
+        // Insecure TLS = a scoped HTTP VERIFY_SSL 0 secret for the catalog URL
+        // (DuckLake rejects DISABLE_SSL; the quack secret has no SSL param).
         assert!(plan.sql.contains(
-            "CREATE OR REPLACE SECRET canardstack_ducklake_quack (TYPE quack, SCOPE 'quack:catalog.internal:9494', TOKEN 'catalog-token', DISABLE_SSL true);"
+            "CREATE OR REPLACE SECRET canardstack_quack_tls (TYPE HTTP, SCOPE 'https://catalog.internal:9494', VERIFY_SSL 0);"
         ));
+        assert!(plan.sql.contains(
+            "CREATE OR REPLACE SECRET canardstack_ducklake_quack (TYPE quack, SCOPE 'quack:catalog.internal:9494', TOKEN 'catalog-token');"
+        ));
+        assert!(!plan.sql.contains("DISABLE_SSL"));
         assert!(plan.needs_quack);
     }
 

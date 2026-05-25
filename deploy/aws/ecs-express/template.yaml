@@ -513,7 +513,10 @@ Resources:
               Value: /usr/local/lib/duckdb/extensions
             - Name: CANARDSTACK_DUCKLAKE_ATTACH_URI
               Value: !Sub ducklake:quack:${CatalogServiceDiscoveryName}.${ServiceDiscoveryNamespaceName}:${CatalogPort}
-            - Name: CANARDSTACK_DUCKLAKE_QUACK_DISABLE_SSL
+            # The catalog terminates TLS with a self-signed cert (no managed TLS
+            # on ECS), so skip cert verification for the catalog URL only; the
+            # Quack token authenticates and TLS encrypts in transit.
+            - Name: CANARDSTACK_DUCKLAKE_QUACK_INSECURE_TLS
               Value: "true"
             - Name: CANARDSTACK_DUCKLAKE_DATA_PATH
               Value: !Sub s3://${DuckLakeBucket}/${S3DataPrefix}/
@@ -585,8 +588,14 @@ Resources:
               Value: /var/lib/canardstack/canardstack.ducklake
             - Name: CANARDSTACK_DUCKDB_EXTENSION_DIR
               Value: /usr/local/lib/duckdb/extensions
+            # Terminate TLS in-binary (ECS has no managed TLS for Cloud Map names):
+            # serve TLS on CatalogPort and forward to a loopback plaintext Quack.
+            - Name: CANARDSTACK_CATALOG_TLS
+              Value: "true"
             - Name: CANARDSTACK_CATALOG_LISTEN
               Value: !Sub 0.0.0.0:${CatalogPort}
+            - Name: CANARDSTACK_CATALOG_QUACK_BACKEND
+              Value: 127.0.0.1:9495
             - Name: CANARDSTACK_CATALOG_HEALTH_BIND
               Value: 0.0.0.0:8080
           Secrets:

@@ -64,10 +64,15 @@ Both tasks run on `CpuArchitecture: ARM64` (Graviton) by default, which is ~20%
 cheaper than X86_64 Fargate; the canardstack image is multi-arch so it runs on
 either. Pass `CpuArchitecture=X86_64` to switch.
 
-The catalog container runs `canardstack serve-catalog`: it opens the DuckLake
-catalog DuckDB file on the EBS mount (`CANARDSTACK_DUCKLAKE_CATALOG_PATH`) and
-serves it over Quack on `CatalogPort` (default 9494), exposing `/healthz` on
-container port 8080 for the ECS health check. Because the Quack server is
-plaintext inside the VPC (no TLS proxy), the app sets
-`CANARDSTACK_DUCKLAKE_QUACK_DISABLE_SSL=true` to reach it. Override `CatalogImage`
-only if you are not using the canardstack image.
+The catalog container runs `canardstack serve-catalog` with
+`CANARDSTACK_CATALOG_TLS=true`: it opens the DuckLake catalog DuckDB file on the
+EBS mount (`CANARDSTACK_DUCKLAKE_CATALOG_PATH`), serves it over Quack, and
+terminates TLS in-binary with a self-signed cert on `CatalogPort` (default 9494),
+forwarding to a loopback plaintext Quack backend. `/healthz` is on container port
+8080 for the ECS health check. ECS has no managed TLS for Cloud Map names and the
+Quack client assumes HTTPS for non-local hosts, so the app sets
+`CANARDSTACK_DUCKLAKE_QUACK_INSECURE_TLS=true` to skip verifying the self-signed
+cert for the catalog URL only (the Quack token authenticates; TLS encrypts in
+transit). The published image is built with the `catalog-tls` cargo feature to
+include the TLS terminator; override `CatalogImage` only if you are not using the
+canardstack image.

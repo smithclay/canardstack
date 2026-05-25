@@ -161,7 +161,7 @@ pub(super) fn ducklake_attach_plan(config: &Config) -> Result<DuckLakeAttachPlan
         config.operator.ducklake_catalog_path.as_deref(),
         config.operator.ducklake_data_path.as_deref(),
         config.operator.ducklake_quack_token.as_deref(),
-        config.operator.ducklake_quack_disable_ssl,
+        config.operator.ducklake_quack_insecure_tls,
         &config.operator.duckdb_path,
         &config.operator.local_storage_dir,
     )
@@ -174,7 +174,7 @@ pub(super) fn build_ducklake_attach_plan(
     catalog_path: Option<&Path>,
     data_path: Option<&str>,
     quack_token: Option<&str>,
-    quack_disable_ssl: bool,
+    quack_insecure_tls: bool,
     duckdb_path: &Path,
     local_storage_dir: &Path,
 ) -> Result<DuckLakeAttachPlan> {
@@ -222,20 +222,26 @@ pub(super) fn build_ducklake_attach_plan(
                     )
                 })?;
             let scope = uri.strip_prefix("ducklake:").unwrap_or(uri);
-            // The Quack server never terminates TLS itself; a non-local client
-            // assumes HTTPS by default, so plaintext intra-VPC links (no TLS
-            // proxy) must opt in to DISABLE_SSL. Off by default to keep
-            // TLS-fronted deployments unchanged.
-            let disable_ssl = if quack_disable_ssl {
-                ", DISABLE_SSL true"
+            // When the catalog is fronted by TLS with a self-signed cert (the
+            // serve-catalog `catalog-tls` shim), the Quack client assumes HTTPS
+            // for the non-local host and would reject the cert. A scoped HTTP
+            // secret with VERIFY_SSL 0 skips verification for the catalog URL only
+            // (S3/other HTTPS still verifies); the Quack token still authenticates.
+            // `DISABLE_SSL` is intentionally not used — DuckLake rejects it, and the
+            // quack secret has no SSL parameter.
+            let insecure_tls_sql = if quack_insecure_tls {
+                let host = scope.strip_prefix("quack:").unwrap_or(scope);
+                format!(
+                    "CREATE OR REPLACE SECRET canardstack_quack_tls (TYPE HTTP, SCOPE 'https://{}', VERIFY_SSL 0); ",
+                    sql_string(host),
+                )
             } else {
-                ""
+                String::new()
             };
             format!(
-                "CREATE OR REPLACE SECRET canardstack_ducklake_quack (TYPE quack, SCOPE '{}', TOKEN '{}'{}); ",
+                "{insecure_tls_sql}CREATE OR REPLACE SECRET canardstack_ducklake_quack (TYPE quack, SCOPE '{}', TOKEN '{}'); ",
                 sql_string(scope),
                 sql_string(token),
-                disable_ssl,
             )
         } else {
             String::new()
