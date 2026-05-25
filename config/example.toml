@@ -7,6 +7,20 @@ max_connections = 1024
 socket_read_timeout_secs = 30
 socket_write_timeout_secs = 30
 
+# Optional in-binary TLS for the public serve endpoint. This requires a build
+# with `--features tls`. File mode follows common observability config shape:
+# cert_file/key_file are PEM files, typically managed by ACME/cert-manager.
+# [server.tls]
+# enabled = true
+# mode = "file"
+# cert_file = "/etc/canardstack/tls/fullchain.pem"
+# key_file = "/etc/canardstack/tls/privkey.pem"
+# backend_bind = "127.0.0.1:4319"
+#
+# Explicit single-binary dev/service-to-service mode. This encrypts traffic but
+# clients must trust the generated cert or skip verification.
+# mode = "ephemeral_self_signed"
+
 [auth]
 api_key = "dev-canardstack-key"
 admin_api_key = "dev-canardstack-admin-key"

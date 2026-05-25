@@ -17,6 +17,8 @@ pub mod seal;
 pub(crate) mod semantic_labels;
 pub mod signal;
 pub mod storage;
+#[cfg(feature = "tls")]
+pub mod tls;
 pub mod validation;
 
 pub use app::AppState;

@@ -1,8 +1,12 @@
 use canardstack::cli::{healthcheck, serve_catalog, smoke, smoke_http};
 use canardstack::config::ServeRole;
+#[cfg(feature = "tls")]
+use canardstack::config::TlsMode;
 use canardstack::{http, init_logging, storage, AppState, Config, Scheduler};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+#[cfg(feature = "tls")]
+use std::thread;
 
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 
@@ -31,6 +35,12 @@ fn main() -> anyhow::Result<()> {
             let mut config = Config::from_env()?;
             config.operator.serve_role = role;
             config.validate()?;
+            #[cfg(feature = "tls")]
+            let tls_frontend = prepare_serve_tls(&mut config)?;
+            #[cfg(not(feature = "tls"))]
+            if config.operator.tls.enabled {
+                anyhow::bail!("CANARDSTACK_TLS_ENABLED=true requires a build with --features tls");
+            }
             let state = Arc::new(AppState::new(config)?);
             if !state.config.operator.scheduler_enabled {
                 tracing::warn!(
@@ -44,6 +54,20 @@ fn main() -> anyhow::Result<()> {
                 .then_some(())
                 .filter(|_| state.config.operator.serve_role.runs_scheduler())
                 .map(|_| Scheduler::spawn(state.clone()));
+            #[cfg(feature = "tls")]
+            if let Some((public, backend, identity)) = tls_frontend {
+                thread::spawn(move || {
+                    if let Err(err) = canardstack::tls::run_tls_terminator(
+                        &public,
+                        backend,
+                        identity,
+                        "serve",
+                        &SHUTDOWN_REQUESTED,
+                    ) {
+                        tracing::error!(event = "serve_tls_terminator_failed", error = %err);
+                    }
+                });
+            }
             http::serve_until(state, &SHUTDOWN_REQUESTED)
         }
         Some(other) => anyhow::bail!("unknown command {other}; use --version, serve, serve-catalog, smoke, smoke-http, healthcheck, or install-ducklake-extension"),
@@ -74,6 +98,44 @@ fn parse_serve_role(mut args: impl Iterator<Item = String>) -> anyhow::Result<Se
         }
     }
     Ok(role)
+}
+
+#[cfg(feature = "tls")]
+fn prepare_serve_tls(
+    config: &mut Config,
+) -> anyhow::Result<Option<(String, String, canardstack::tls::TlsIdentity)>> {
+    if !config.operator.tls.enabled {
+        return Ok(None);
+    }
+    let public = config.operator.bind.clone();
+    let backend = config.operator.tls.backend_bind.clone();
+    let identity = match config.operator.tls.mode {
+        TlsMode::File => canardstack::tls::TlsIdentity::File {
+            cert_file: config
+                .operator
+                .tls
+                .cert_file
+                .clone()
+                .expect("validated TLS cert_file"),
+            key_file: config
+                .operator
+                .tls
+                .key_file
+                .clone()
+                .expect("validated TLS key_file"),
+        },
+        TlsMode::EphemeralSelfSigned => {
+            tracing::warn!(
+                event = "serve_tls_ephemeral_self_signed",
+                "serve TLS is using an ephemeral self-signed certificate; clients must trust it explicitly or skip verification"
+            );
+            canardstack::tls::TlsIdentity::EphemeralSelfSigned {
+                subject_alt_names: vec!["localhost".to_string()],
+            }
+        }
+    };
+    config.operator.bind = backend.clone();
+    Ok(Some((public, backend, identity)))
 }
 
 extern "C" fn request_shutdown(_signal: i32) {

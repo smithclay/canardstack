@@ -55,6 +55,38 @@ pub struct QueryLimits {
     pub memory_limit: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TlsMode {
+    File,
+    EphemeralSelfSigned,
+}
+
+impl TlsMode {
+    pub fn parse(value: &str) -> Result<Self> {
+        match value.trim() {
+            "file" => Ok(Self::File),
+            "ephemeral_self_signed" | "self_signed" => Ok(Self::EphemeralSelfSigned),
+            _ => anyhow::bail!("TLS mode must be file or ephemeral_self_signed"),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::File => "file",
+            Self::EphemeralSelfSigned => "ephemeral_self_signed",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct TlsServerConfig {
+    pub enabled: bool,
+    pub mode: TlsMode,
+    pub cert_file: Option<PathBuf>,
+    pub key_file: Option<PathBuf>,
+    pub backend_bind: String,
+}
+
 /// Process configuration, split by responsibility:
 ///
 /// - [`OperatorConfig`] — the public, supported deployment surface operators
@@ -83,6 +115,7 @@ pub struct Config {
 pub struct OperatorConfig {
     pub serve_role: ServeRole,
     pub bind: String,
+    pub tls: TlsServerConfig,
     pub api_key: String,
     pub admin_api_key: String,
     pub duckdb_path: PathBuf,
@@ -281,12 +314,35 @@ impl OperatorConfig {
             .or(file.bool(&["ducklake", "maintenance_enabled"])?)
             .unwrap_or(true);
         let default_data_inlining_row_limit = if ducklake_maintenance_enabled { 10 } else { 0 };
+        let tls_cert_file = env_path("CANARDSTACK_TLS_CERT_FILE")?.or(file.path(&[
+            "server",
+            "tls",
+            "cert_file",
+        ])?);
+        let tls_key_file =
+            env_path("CANARDSTACK_TLS_KEY_FILE")?.or(file.path(&["server", "tls", "key_file"])?);
+        let tls_mode = env_string("CANARDSTACK_TLS_MODE")?
+            .or(file.string(&["server", "tls", "mode"])?)
+            .map(|value| TlsMode::parse(&value))
+            .transpose()?
+            .unwrap_or(TlsMode::File);
 
         Ok(Self {
             serve_role: ServeRole::All,
             bind: env_string("CANARDSTACK_BIND")?
                 .or(file.string(&["server", "bind"])?)
                 .unwrap_or_else(|| "127.0.0.1:4318".to_string()),
+            tls: TlsServerConfig {
+                enabled: env_bool("CANARDSTACK_TLS_ENABLED")?
+                    .or(file.bool(&["server", "tls", "enabled"])?)
+                    .unwrap_or(false),
+                mode: tls_mode,
+                cert_file: tls_cert_file,
+                key_file: tls_key_file,
+                backend_bind: env_string("CANARDSTACK_TLS_BACKEND_BIND")?
+                    .or(file.string(&["server", "tls", "backend_bind"])?)
+                    .unwrap_or_else(|| "127.0.0.1:4319".to_string()),
+            },
             api_key: env_string("CANARDSTACK_API_KEY")?
                 .or(file.string(&["auth", "api_key"])?)
                 .unwrap_or_else(|| "dev-canardstack-key".to_string()),
@@ -400,6 +456,13 @@ impl OperatorConfig {
         Self {
             serve_role: ServeRole::All,
             bind: "127.0.0.1:0".to_string(),
+            tls: TlsServerConfig {
+                enabled: false,
+                mode: TlsMode::File,
+                cert_file: None,
+                key_file: None,
+                backend_bind: "127.0.0.1:0".to_string(),
+            },
             api_key: "test-key".to_string(),
             admin_api_key: "test-admin-key".to_string(),
             duckdb_path,
@@ -445,6 +508,28 @@ impl OperatorConfig {
     fn validate(&self) -> anyhow::Result<()> {
         if self.api_key.trim().is_empty() {
             anyhow::bail!("CANARDSTACK_API_KEY must not be empty");
+        }
+        if self.tls.enabled {
+            if self.tls.backend_bind.trim().is_empty() {
+                anyhow::bail!("CANARDSTACK_TLS_BACKEND_BIND must not be empty when TLS is enabled");
+            }
+            if self.tls.backend_bind == self.bind {
+                anyhow::bail!(
+                    "CANARDSTACK_TLS_BACKEND_BIND must differ from CANARDSTACK_BIND when TLS is enabled"
+                );
+            }
+            if self.tls.mode == TlsMode::File {
+                if self.tls.cert_file.is_none() {
+                    anyhow::bail!(
+                        "CANARDSTACK_TLS_CERT_FILE must be set when CANARDSTACK_TLS_ENABLED=true and CANARDSTACK_TLS_MODE=file"
+                    );
+                }
+                if self.tls.key_file.is_none() {
+                    anyhow::bail!(
+                        "CANARDSTACK_TLS_KEY_FILE must be set when CANARDSTACK_TLS_ENABLED=true and CANARDSTACK_TLS_MODE=file"
+                    );
+                }
+            }
         }
         if self.admin_api_key.trim().is_empty() {
             anyhow::bail!("CANARDSTACK_ADMIN_API_KEY must not be empty");
@@ -853,6 +938,11 @@ mod tests {
     const CONFIG_ENV_VARS: &[&str] = &[
         CONFIG_PATH_ENV,
         "CANARDSTACK_BIND",
+        "CANARDSTACK_TLS_ENABLED",
+        "CANARDSTACK_TLS_MODE",
+        "CANARDSTACK_TLS_CERT_FILE",
+        "CANARDSTACK_TLS_KEY_FILE",
+        "CANARDSTACK_TLS_BACKEND_BIND",
         "CANARDSTACK_API_KEY",
         "CANARDSTACK_ADMIN_API_KEY",
         "CANARDSTACK_DATA_DIR",
@@ -946,6 +1036,11 @@ mod tests {
 bind = "0.0.0.0:9999"
 max_connections = 42
 
+[server.tls]
+enabled = true
+mode = "ephemeral_self_signed"
+backend_bind = "127.0.0.1:9443"
+
 [auth]
 api_key = "file-api-key"
 admin_api_key = "file-admin-api-key"
@@ -1009,6 +1104,7 @@ group_commit_ms = 3
         unsafe {
             env::set_var(CONFIG_PATH_ENV, &config_path);
             env::set_var("CANARDSTACK_BIND", "127.0.0.1:4319");
+            env::set_var("CANARDSTACK_TLS_BACKEND_BIND", "127.0.0.1:9444");
             env::set_var("CANARDSTACK_DUCKLAKE_ATTACH_URI", "");
             env::set_var("CANARDSTACK_DUCKLAKE_CATALOG_PATH", "/env/catalog.ducklake");
             env::set_var(
@@ -1020,6 +1116,9 @@ group_commit_ms = 3
 
         let config = Config::from_env().unwrap();
         assert_eq!(config.operator.bind, "127.0.0.1:4319");
+        assert!(config.operator.tls.enabled);
+        assert_eq!(config.operator.tls.mode, TlsMode::EphemeralSelfSigned);
+        assert_eq!(config.operator.tls.backend_bind, "127.0.0.1:9444");
         assert_eq!(config.operator.api_key, "file-api-key");
         assert_eq!(config.operator.admin_api_key, "file-admin-api-key");
         assert_eq!(
@@ -1129,6 +1228,25 @@ group_commit_ms = 3
         let config = Config::from_env().unwrap();
 
         assert!(config.test_overrides.bench_http_keepalive);
+    }
+
+    #[test]
+    fn tls_file_mode_requires_cert_and_key() {
+        let _guard = env_lock().lock_or_poisoned();
+        let _snapshot = EnvSnapshot::capture_and_clear();
+
+        unsafe {
+            env::set_var("CANARDSTACK_TLS_ENABLED", "true");
+            env::set_var("CANARDSTACK_TLS_MODE", "file");
+            env::set_var("CANARDSTACK_TLS_CERT_FILE", "/tmp/cert.pem");
+        }
+
+        let err = Config::from_env().unwrap().validate().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("CANARDSTACK_TLS_KEY_FILE must be set"),
+            "{err}"
+        );
     }
 
     #[test]
