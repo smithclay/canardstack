@@ -95,6 +95,13 @@ Parameters:
   ProcessMemoryLimitBytes:
     Type: Number
     Default: 3221225472
+  CpuArchitecture:
+    Type: String
+    Default: ARM64
+    AllowedValues:
+      - ARM64
+      - X86_64
+    Description: Fargate CPU architecture for both tasks. ARM64 (Graviton) is ~20% cheaper; the canardstack image is multi-arch so it runs on either.
 
 Conditions:
   HasS3BucketName:
@@ -441,6 +448,9 @@ Resources:
       NetworkMode: awsvpc
       RequiresCompatibilities:
         - FARGATE
+      RuntimePlatform:
+        CpuArchitecture: !Ref CpuArchitecture
+        OperatingSystemFamily: LINUX
       Cpu: !Ref Cpu
       Memory: !Ref Memory
       ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
@@ -513,6 +523,9 @@ Resources:
       NetworkMode: awsvpc
       RequiresCompatibilities:
         - FARGATE
+      RuntimePlatform:
+        CpuArchitecture: !Ref CpuArchitecture
+        OperatingSystemFamily: LINUX
       Cpu: !Ref CatalogCpu
       Memory: !Ref CatalogMemory
       ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn

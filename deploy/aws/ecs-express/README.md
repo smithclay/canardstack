@@ -60,6 +60,10 @@ aws cloudformation describe-stacks --stack-name canardstack \
 Pin explicit values by passing them as `--parameter-overrides` (`ApiKey=...`,
 `AdminApiKey=...`, `QuackToken=...`, or a different `CatalogImage=...`).
 
+Both tasks run on `CpuArchitecture: ARM64` (Graviton) by default, which is ~20%
+cheaper than X86_64 Fargate; the canardstack image is multi-arch so it runs on
+either. Pass `CpuArchitecture=X86_64` to switch.
+
 The catalog container runs `canardstack serve-catalog`: it opens the DuckLake
 catalog DuckDB file on the EBS mount (`CANARDSTACK_DUCKLAKE_CATALOG_PATH`) and
 serves it over Quack on `CatalogPort` (default 9494), exposing `/healthz` on
