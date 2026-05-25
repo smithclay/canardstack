@@ -98,9 +98,9 @@ time the image is built. At runtime, startup first attempts to load the packaged
 extensions. If one is missing, startup fails loudly with guidance to fix the
 extension path or catalog configuration.
 
-`develop.watch` is intentionally not enabled. The Docker quickstart evaluates
-the packaged binary path; Rust source edits should rebuild the image or use the
-host workflow below.
+`develop.watch` is intentionally not enabled. The Docker quickstart pulls the
+published GHCR image by default. Rust source edits should use the build override
+or the host workflow below.
 
 ## Remote DuckLake
 
@@ -110,7 +110,7 @@ URI or another `ducklake:` URI instead of the default local DuckLake path:
 ```bash
 export MOTHERDUCK_TOKEN='<your-motherduck-token>'
 export CANARDSTACK_DUCKLAKE_ATTACH_URI='md:test-ducklake'
-docker compose up --build
+docker compose up
 ```
 
 The attach URI must be the URI only, not a full SQL statement. For example, use
@@ -302,7 +302,7 @@ Docker-local checks are intentionally outside normal `cargo test`:
 
 ```bash
 docker compose config
-docker compose build
+docker compose -f compose.yaml -f compose.build.yaml build
 scripts/smoke-docker-local.sh
 ```
 

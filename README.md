@@ -84,11 +84,18 @@ datasources:
 
 ```bash
 cd canardstack
-docker compose up --build canardstack grafana
+docker compose up canardstack grafana
 ```
 
 This publishes canardstack on `http://localhost:4318` with the default demo key
 `dev-canardstack-key`. Grafana is available on `http://localhost:3000`.
+By default, Compose pulls `ghcr.io/smithclay/canardstack:latest`.
+
+To build canardstack from this checkout instead, add the build override:
+
+```bash
+docker compose -f compose.yaml -f compose.build.yaml up --build canardstack grafana
+```
 
 In a separate checkout, start the full OpenTelemetry demo and mount the
 canardstack collector extras file:
@@ -280,7 +287,7 @@ export CANARDSTACK_DUCKLAKE_ATTACH_URI='md:test-ducklake'
 Then start canardstack and Grafana:
 
 ```bash
-docker compose up --build
+docker compose up
 ```
 
 The canardstack container uses your `CANARDSTACK_DUCKLAKE_ATTACH_URI` and

@@ -1,0 +1,15 @@
+services:
+  canardstack:
+    build:
+      context: .
+    image: ${LOCAL_CANARDSTACK_IMAGE:-canardstack:local}
+
+  smoke:
+    build:
+      context: .
+    image: ${LOCAL_CANARDSTACK_IMAGE:-canardstack:local}
+
+  canardstack-bench:
+    build:
+      context: .
+    image: ${LOCAL_CANARDSTACK_IMAGE:-canardstack:local}
