@@ -3,25 +3,28 @@
 This directory contains push-button examples for running canardstack from public
 GitHub Container Registry images.
 
-Set images to release tags:
+Set the image to a release tag:
 
 ```bash
 export CANARDSTACK_IMAGE=ghcr.io/smithclay/canardstack:latest
-export DUCKDB_QUACK_IMAGE=ghcr.io/<owner>/duckdb-quack:<version>
 ```
 
-The examples follow the AzQuack-style shape: one canardstack container serves
-both ingest and query APIs, while a separate plain DuckDB/Quack container owns
-the DuckLake metadata catalog file. canardstack attaches to that catalog over
-Quack and writes DuckLake data files to object storage.
+The examples run the **same canardstack image** in two roles: one container
+serves the ingest and query APIs (`canardstack serve`), while a second container
+serves the DuckLake metadata catalog over the Quack protocol
+(`canardstack serve-catalog`). The app attaches to that catalog over Quack and
+writes DuckLake data files to object storage.
 
 - `CANARDSTACK_DUCKLAKE_ATTACH_URI` points at the private Quack endpoint, for
   example `ducklake:quack:catalog.internal:443`.
 - `CANARDSTACK_DUCKLAKE_QUACK_TOKEN` is the token canardstack uses with Quack.
 - `CANARDSTACK_DUCKLAKE_DATA_PATH` points at object storage, such as
   `gcs://bucket/prefix/` or `s3://bucket/prefix/`.
-- `CANARDSTACK_DUCKLAKE_CATALOG_PATH` is not set on canardstack in these
-  examples. The catalog file belongs to the DuckDB/Quack container.
+- `CANARDSTACK_DUCKLAKE_CATALOG_PATH` is not set on the app in these examples;
+  it is set on the `serve-catalog` container, which owns the catalog file.
+- `CANARDSTACK_DUCKLAKE_QUACK_DISABLE_SSL` is set on the app only where the Quack
+  link is plaintext (AWS intra-VPC). On Cloud Run the catalog is fronted by
+  managed TLS, so it stays unset.
 - `CANARDSTACK_POSTGRES_DSN` stays unset.
 
 ## Service Topology
@@ -31,7 +34,7 @@ flowchart TB
   subgraph GCP["GCP Cloud Run"]
     ClientG["OTel producers / Grafana clients"]
     AppG["Cloud Run service: canardstack\ncontainer: canardstack\nserve\nmin=1 max=1"]
-    CatalogG["Cloud Run service: DuckDB + Quack\ncontainer: duckdb-quack\ninternal ingress\nmin=1 max=1"]
+    CatalogG["Cloud Run service: catalog\ncontainer: canardstack\nserve-catalog\ninternal ingress\nmin=1 max=1"]
     AppDataG["GCS-mounted app data volume\nCANARDSTACK_DATA_DIR\nraw spool + local DuckDB state"]
     CatalogFileG["GCS-mounted catalog volume\ncanardstack.ducklake metadata file"]
     DataG["GCS prefix\nDuckLake Parquet data files"]
@@ -50,7 +53,7 @@ flowchart TB
     ClientA["OTel producers / Grafana clients"]
     Alb["Application Load Balancer\nHTTP :80"]
     AppA["ECS service: canardstack\ncontainer: canardstack\nserve\ndesired=1"]
-    CatalogA["ECS service: DuckDB + Quack\ncontainer: duckdb-quack\nprivate Cloud Map name\ndesired=1"]
+    CatalogA["ECS service: catalog\ncontainer: canardstack\nserve-catalog\nprivate Cloud Map name\ndesired=1"]
     AppDataA["service-managed EBS volume\nCANARDSTACK_DATA_DIR\nraw spool + local DuckDB state"]
     CatalogFileA["service-managed EBS volume\ncanardstack.ducklake metadata file"]
     DataA["S3 prefix\nDuckLake Parquet data files"]

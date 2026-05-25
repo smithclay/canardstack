@@ -1,4 +1,4 @@
-use canardstack::cli::{healthcheck, smoke, smoke_http};
+use canardstack::cli::{healthcheck, serve_catalog, smoke, smoke_http};
 use canardstack::config::ServeRole;
 use canardstack::{http, init_logging, storage, AppState, Config, Scheduler};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -21,6 +21,10 @@ fn main() -> anyhow::Result<()> {
             let config = Config::from_env()?;
             storage::install_ducklake_extension(config.operator.duckdb_extension_dir.as_deref())
         }
+        Some("serve-catalog") => {
+            install_shutdown_signal_handlers();
+            serve_catalog::run(args, &SHUTDOWN_REQUESTED)
+        }
         Some("serve") | None => {
             install_shutdown_signal_handlers();
             let role = parse_serve_role(args)?;
@@ -42,7 +46,7 @@ fn main() -> anyhow::Result<()> {
                 .map(|_| Scheduler::spawn(state.clone()));
             http::serve_until(state, &SHUTDOWN_REQUESTED)
         }
-        Some(other) => anyhow::bail!("unknown command {other}; use --version, serve, smoke, smoke-http, healthcheck, or install-ducklake-extension"),
+        Some(other) => anyhow::bail!("unknown command {other}; use --version, serve, serve-catalog, smoke, smoke-http, healthcheck, or install-ducklake-extension"),
     }
 }
 

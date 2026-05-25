@@ -1,7 +1,8 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >
-  canardstack on ECS/Fargate with a public GHCR canardstack image, an internal
-  DuckDB/Quack catalog service, S3 DuckLake data files, and a service-managed
+  canardstack on ECS/Fargate. The same canardstack image runs the public app
+  (canardstack serve) and an internal DuckLake/Quack catalog service
+  (canardstack serve-catalog), with S3 DuckLake data files and a service-managed
   EBS volume for the DuckDB-backed DuckLake catalog metadata file.
 
 Parameters:
@@ -26,7 +27,8 @@ Parameters:
     Description: Public GHCR canardstack image.
   CatalogImage:
     Type: String
-    Description: Public GHCR DuckDB/Quack catalog image. The image must serve Quack and persist its DuckDB catalog at DUCKDB_DATABASE.
+    Default: ghcr.io/smithclay/canardstack:latest
+    Description: Catalog image. Defaults to the same canardstack image as the app; the catalog container runs `canardstack serve-catalog`, which serves the DuckLake catalog DuckDB file over the Quack protocol.
   VpcCidr:
     Type: String
     Default: 10.78.0.0/16
@@ -49,15 +51,18 @@ Parameters:
   ApiKey:
     Type: String
     NoEcho: true
-    MinLength: 16
+    Default: ""
+    Description: Ingest API key. Leave empty to auto-generate a random 40-char key in Secrets Manager; fetch it via the stack outputs after deploy.
   AdminApiKey:
     Type: String
     NoEcho: true
-    MinLength: 16
+    Default: ""
+    Description: Admin/operator API key. Leave empty to auto-generate a random 40-char key in Secrets Manager; fetch it via the stack outputs after deploy.
   QuackToken:
     Type: String
     NoEcho: true
-    MinLength: 16
+    Default: ""
+    Description: Shared token between canardstack and the Quack catalog. Leave empty to auto-generate a random 40-char token in Secrets Manager; fetch it via the stack outputs after deploy.
   Cpu:
     Type: String
     Default: "2048"
@@ -72,7 +77,7 @@ Parameters:
     Default: "2048"
   CatalogPort:
     Type: Number
-    Default: 8080
+    Default: 9494
   AppContainerUser:
     Type: String
     Default: "0"
@@ -97,6 +102,18 @@ Conditions:
       - Fn::Equals:
           - !Ref S3BucketName
           - ""
+  GenerateApiKey:
+    Fn::Equals:
+      - !Ref ApiKey
+      - ""
+  GenerateAdminApiKey:
+    Fn::Equals:
+      - !Ref AdminApiKey
+      - ""
+  GenerateQuackToken:
+    Fn::Equals:
+      - !Ref QuackToken
+      - ""
 
 Resources:
   Vpc:
@@ -210,19 +227,49 @@ Resources:
     Type: AWS::SecretsManager::Secret
     Properties:
       Name: !Sub ${ServiceName}/api-key
-      SecretString: !Ref ApiKey
+      SecretString:
+        Fn::If:
+          - GenerateApiKey
+          - !Ref AWS::NoValue
+          - !Ref ApiKey
+      GenerateSecretString:
+        Fn::If:
+          - GenerateApiKey
+          - PasswordLength: 40
+            ExcludePunctuation: true
+          - !Ref AWS::NoValue
 
   AdminApiKeySecret:
     Type: AWS::SecretsManager::Secret
     Properties:
       Name: !Sub ${ServiceName}/admin-api-key
-      SecretString: !Ref AdminApiKey
+      SecretString:
+        Fn::If:
+          - GenerateAdminApiKey
+          - !Ref AWS::NoValue
+          - !Ref AdminApiKey
+      GenerateSecretString:
+        Fn::If:
+          - GenerateAdminApiKey
+          - PasswordLength: 40
+            ExcludePunctuation: true
+          - !Ref AWS::NoValue
 
   QuackTokenSecret:
     Type: AWS::SecretsManager::Secret
     Properties:
       Name: !Sub ${CatalogServiceName}/quack-token
-      SecretString: !Ref QuackToken
+      SecretString:
+        Fn::If:
+          - GenerateQuackToken
+          - !Ref AWS::NoValue
+          - !Ref QuackToken
+      GenerateSecretString:
+        Fn::If:
+          - GenerateQuackToken
+          - PasswordLength: 40
+            ExcludePunctuation: true
+          - !Ref AWS::NoValue
 
   TaskExecutionRole:
     Type: AWS::IAM::Role
@@ -422,8 +469,14 @@ Resources:
               Value: /usr/local/lib/duckdb/extensions
             - Name: CANARDSTACK_DUCKLAKE_ATTACH_URI
               Value: !Sub ducklake:quack:${CatalogServiceDiscoveryName}.${ServiceDiscoveryNamespaceName}:${CatalogPort}
+            - Name: CANARDSTACK_DUCKLAKE_QUACK_DISABLE_SSL
+              Value: "true"
             - Name: CANARDSTACK_DUCKLAKE_DATA_PATH
               Value: !Sub s3://${DuckLakeBucket}/${S3DataPrefix}/
+            # Region for the DuckDB S3 credential_chain secret and the AWS SDK
+            # chain that resolves the task role; the DuckLake bucket lives here.
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
             - Name: CANARDSTACK_DUCKLAKE_MAINTENANCE_ENABLED
               Value: "true"
             - Name: CANARDSTACK_PROCESS_MEMORY_LIMIT_BYTES
@@ -467,32 +520,47 @@ Resources:
         - Name: duckdb-catalog
           ConfiguredAtLaunch: true
       ContainerDefinitions:
-        - Name: duckdb-quack
+        - Name: canardstack-catalog
           Image: !Ref CatalogImage
           Essential: true
           User: !Ref CatalogContainerUser
+          Command:
+            - canardstack
+            - serve-catalog
           PortMappings:
             - ContainerPort: !Ref CatalogPort
               Protocol: tcp
           Environment:
-            - Name: DUCKDB_DATABASE
-              Value: /var/lib/duckdb/catalog/canardstack.ducklake
-            - Name: QUACK_HOST
-              Value: 0.0.0.0
-            - Name: QUACK_PORT
-              Value: !Sub ${CatalogPort}
+            - Name: CANARDSTACK_DATA_DIR
+              Value: /var/lib/canardstack
+            - Name: CANARDSTACK_DUCKLAKE_CATALOG_PATH
+              Value: /var/lib/canardstack/canardstack.ducklake
+            - Name: CANARDSTACK_DUCKDB_EXTENSION_DIR
+              Value: /usr/local/lib/duckdb/extensions
+            - Name: CANARDSTACK_CATALOG_LISTEN
+              Value: !Sub 0.0.0.0:${CatalogPort}
+            - Name: CANARDSTACK_CATALOG_HEALTH_BIND
+              Value: 0.0.0.0:8080
           Secrets:
-            - Name: QUACK_TOKEN
+            - Name: CANARDSTACK_DUCKLAKE_QUACK_TOKEN
               ValueFrom: !Ref QuackTokenSecret
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - canardstack healthcheck http://127.0.0.1:8080/healthz
+            Interval: 10
+            Timeout: 5
+            Retries: 6
+            StartPeriod: 30
           MountPoints:
             - SourceVolume: duckdb-catalog
-              ContainerPath: /var/lib/duckdb/catalog
+              ContainerPath: /var/lib/canardstack
           LogConfiguration:
             LogDriver: awslogs
             Options:
               awslogs-group: !Ref CatalogLogGroup
               awslogs-region: !Ref AWS::Region
-              awslogs-stream-prefix: duckdb-quack
+              awslogs-stream-prefix: canardstack-catalog
 
   CatalogService:
     Type: AWS::ECS::Service
@@ -513,7 +581,7 @@ Resources:
           Rollback: true
       ServiceRegistries:
         - RegistryArn: !GetAtt CatalogDiscoveryService.Arn
-          ContainerName: duckdb-quack
+          ContainerName: canardstack-catalog
       NetworkConfiguration:
         AwsvpcConfiguration:
           AssignPublicIp: ENABLED
@@ -591,3 +659,12 @@ Outputs:
     Value: !Ref AdminApiKeySecret
   QuackTokenSecretArn:
     Value: !Ref QuackTokenSecret
+  ApiKeyRetrieveCommand:
+    Description: Fetch the (possibly auto-generated) ingest API key from Secrets Manager.
+    Value: !Sub "aws secretsmanager get-secret-value --secret-id ${ApiKeySecret} --query SecretString --output text"
+  AdminApiKeyRetrieveCommand:
+    Description: Fetch the (possibly auto-generated) admin API key from Secrets Manager.
+    Value: !Sub "aws secretsmanager get-secret-value --secret-id ${AdminApiKeySecret} --query SecretString --output text"
+  QuackTokenRetrieveCommand:
+    Description: Fetch the (possibly auto-generated) Quack token from Secrets Manager.
+    Value: !Sub "aws secretsmanager get-secret-value --secret-id ${QuackTokenSecret} --query SecretString --output text"

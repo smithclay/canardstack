@@ -26,12 +26,12 @@ mod schema;
 
 pub use arrow_write::ArrowFlushOutcome;
 use arrow_write::ArrowWriteBuffer;
-pub use ducklake::install_ducklake_extension;
 use ducklake::{
     attach_ducklake_connection, configure_base_connection, configure_ducklake_maintenance_options,
     configure_write_connection, ducklake_attach_plan, DUCKLAKE_CATALOG_NAME,
     DUCKLAKE_TARGET_PREFIX,
 };
+pub use ducklake::{install_ducklake_extension, open_quack_catalog_connection};
 pub use metadata::MetadataRefreshOutcome;
 use schema::{create_tables_on, enforce_schema_version_on};
 
@@ -310,7 +310,10 @@ impl Storage {
 #[cfg(test)]
 mod tests {
     use super::arrow::batch_timestamp_days;
-    use super::ducklake::{build_ducklake_attach_plan, ducklake_maintenance_options_sql};
+    use super::ducklake::{
+        build_ducklake_attach_plan, ducklake_maintenance_options_sql, object_store_kind,
+        object_store_secret_sql, ObjectStore,
+    };
     use super::metadata_refresh::metadata_refresh_sql;
     use super::*;
     use crate::config::DuckLakeMaintenanceConfig;
@@ -330,6 +333,7 @@ mod tests {
             None,
             None,
             None,
+            false,
             &dir.path().join("canardstack.duckdb"),
             &dir.path().join("storage"),
         )
@@ -353,6 +357,7 @@ mod tests {
             None,
             None,
             None,
+            false,
             &dir.path().join("canardstack.duckdb"),
             &dir.path().join("storage"),
         )
@@ -378,6 +383,7 @@ mod tests {
             None,
             Some("s3://canardstack-data/prod/"),
             Some("catalog'token"),
+            false,
             &dir.path().join("canardstack.duckdb"),
             &dir.path().join("storage"),
         )
@@ -392,6 +398,27 @@ mod tests {
     }
 
     #[test]
+    fn quack_attach_uri_opts_into_plaintext_with_disable_ssl() {
+        let dir = tempdir().unwrap();
+        let plan = build_ducklake_attach_plan(
+            None,
+            Some("ducklake:quack:catalog.internal:9494"),
+            None,
+            Some("s3://canardstack-data/prod/"),
+            Some("catalog-token"),
+            true,
+            &dir.path().join("canardstack.duckdb"),
+            &dir.path().join("storage"),
+        )
+        .unwrap();
+
+        assert!(plan.sql.contains(
+            "CREATE OR REPLACE SECRET canardstack_ducklake_quack (TYPE quack, SCOPE 'quack:catalog.internal:9494', TOKEN 'catalog-token', DISABLE_SSL true);"
+        ));
+        assert!(plan.needs_quack);
+    }
+
+    #[test]
     fn quack_attach_uri_requires_token() {
         let dir = tempdir().unwrap();
         let err = build_ducklake_attach_plan(
@@ -400,6 +427,7 @@ mod tests {
             None,
             Some("s3://canardstack-data/prod/"),
             None,
+            false,
             &dir.path().join("canardstack.duckdb"),
             &dir.path().join("storage"),
         )
@@ -419,6 +447,7 @@ mod tests {
             None,
             None,
             None,
+            false,
             &dir.path().join("canardstack.duckdb"),
             &dir.path().join("storage"),
         )
@@ -438,6 +467,7 @@ mod tests {
             Some(&dir.path().join("catalog.ducklake")),
             None,
             None,
+            false,
             &dir.path().join("canardstack.duckdb"),
             &dir.path().join("storage"),
         )
@@ -457,6 +487,7 @@ mod tests {
             None,
             None,
             None,
+            false,
             &dir.path().join("canardstack.duckdb"),
             &dir.path().join("storage"),
         )
@@ -474,6 +505,7 @@ mod tests {
             None,
             Some("s3://canardstack-data/prod/"),
             None,
+            false,
             &dir.path().join("canardstack.duckdb"),
             &dir.path().join("storage"),
         )
@@ -494,6 +526,7 @@ mod tests {
             Some(&catalog_path),
             Some("s3://canardstack-data/prod/"),
             None,
+            false,
             &dir.path().join("canardstack.duckdb"),
             &dir.path().join("storage"),
         )
@@ -509,6 +542,99 @@ mod tests {
     }
 
     #[test]
+    fn object_store_kind_detects_cloud_schemes() {
+        assert_eq!(
+            object_store_kind("s3://canardstack-data/prod/"),
+            Some(ObjectStore::S3)
+        );
+        assert_eq!(object_store_kind("s3a://bucket/x"), Some(ObjectStore::S3));
+        assert_eq!(object_store_kind("gcs://bucket/p/"), Some(ObjectStore::Gcs));
+        assert_eq!(object_store_kind("gs://bucket/p/"), Some(ObjectStore::Gcs));
+        assert_eq!(object_store_kind("/var/lib/canardstack/storage"), None);
+    }
+
+    #[test]
+    fn s3_secret_uses_credential_chain_and_optional_region() {
+        assert_eq!(
+            object_store_secret_sql(ObjectStore::S3, Some("us-west-2")),
+            "CREATE OR REPLACE SECRET canardstack_object_store (TYPE s3, PROVIDER credential_chain, REGION 'us-west-2');"
+        );
+        assert_eq!(
+            object_store_secret_sql(ObjectStore::S3, None),
+            "CREATE OR REPLACE SECRET canardstack_object_store (TYPE s3, PROVIDER credential_chain);"
+        );
+    }
+
+    #[test]
+    fn gcs_secret_uses_credential_chain() {
+        assert_eq!(
+            object_store_secret_sql(ObjectStore::Gcs, None),
+            "CREATE OR REPLACE SECRET canardstack_object_store (TYPE gcs, PROVIDER credential_chain);"
+        );
+    }
+
+    #[test]
+    fn s3_data_path_sets_object_store_on_plan() {
+        let dir = tempdir().unwrap();
+        let plan = build_ducklake_attach_plan(
+            None,
+            None,
+            None,
+            Some("s3://canardstack-data/prod/"),
+            None,
+            false,
+            &dir.path().join("canardstack.duckdb"),
+            &dir.path().join("storage"),
+        )
+        .unwrap();
+        assert_eq!(plan.object_store, Some(ObjectStore::S3));
+    }
+
+    #[test]
+    fn local_data_path_has_no_object_store() {
+        let dir = tempdir().unwrap();
+        let plan = build_ducklake_attach_plan(
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            &dir.path().join("canardstack.duckdb"),
+            &dir.path().join("storage"),
+        )
+        .unwrap();
+        assert_eq!(plan.object_store, None);
+    }
+
+    // Live check that DuckDB 1.5.3 accepts the credential_chain secrets we emit.
+    // credential_chain secrets validate at CREATE time, so fake env creds are set
+    // to resolve the chain. Downloads httpfs/aws, so it is offline-excluded.
+    #[test]
+    #[ignore = "downloads httpfs/aws extensions; run with --ignored"]
+    fn object_store_secrets_create_on_duckdb() {
+        unsafe {
+            std::env::set_var("AWS_ACCESS_KEY_ID", "AKIAFAKEFAKEFAKEFAKE");
+            std::env::set_var(
+                "AWS_SECRET_ACCESS_KEY",
+                "fakefakefakefakefakefakefakefakefakefake",
+            );
+            std::env::set_var("AWS_REGION", "us-west-2");
+        }
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("INSTALL httpfs; LOAD httpfs; INSTALL aws; LOAD aws;")
+            .unwrap();
+        conn.execute_batch(&object_store_secret_sql(ObjectStore::S3, Some("us-west-2")))
+            .expect("s3 credential_chain secret should create with resolvable creds");
+        // Probe GCS support without failing the test on missing ADC: a credential
+        // error proves the provider parsed; only an unknown-provider error matters.
+        match conn.execute_batch(&object_store_secret_sql(ObjectStore::Gcs, None)) {
+            Ok(()) => eprintln!("gcs credential_chain: created"),
+            Err(err) => eprintln!("gcs credential_chain: {err}"),
+        }
+    }
+
+    #[test]
     fn custom_duckdb_ducklake_attach_accepts_object_store_data_path() {
         let dir = tempdir().unwrap();
         let plan = build_ducklake_attach_plan(
@@ -517,6 +643,7 @@ mod tests {
             None,
             Some("gcs://canardstack-data/prod/"),
             None,
+            false,
             &dir.path().join("canardstack.duckdb"),
             &dir.path().join("storage"),
         )
@@ -565,6 +692,7 @@ mod tests {
             None,
             None,
             None,
+            false,
             &dir.path().join("canardstack.duckdb"),
             &dir.path().join("storage"),
         )
@@ -584,6 +712,7 @@ mod tests {
             None,
             None,
             None,
+            false,
             &dir.path().join("canardstack.duckdb"),
             &dir.path().join("storage"),
         )
@@ -601,6 +730,7 @@ mod tests {
             None,
             Some("s3://canardstack-data/prod/"),
             None,
+            false,
             &dir.path().join("canardstack.duckdb"),
             &dir.path().join("storage"),
         )

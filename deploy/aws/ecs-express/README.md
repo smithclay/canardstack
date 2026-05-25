@@ -6,12 +6,13 @@ CloudFormation:
 - A public-facing canardstack ECS service behind an Application Load Balancer.
   The container runs `canardstack serve`, so ingest and query APIs are available
   from one service.
-- A private DuckDB/Quack ECS service registered in Cloud Map. This service owns
-  the DuckDB-backed DuckLake metadata catalog file.
+- A private catalog ECS service running the **same canardstack image** as
+  `canardstack serve-catalog`, registered in Cloud Map. It serves the
+  DuckDB-backed DuckLake metadata catalog file over the Quack protocol.
 - A VPC with two public subnets, internet routing, security groups, and an S3
   bucket/prefix for DuckLake data files.
-- A service-managed EBS volume mounted at `/var/lib/canardstack` for
-  `CANARDSTACK_DATA_DIR`, including the durable raw spool.
+- A service-managed EBS volume mounted at `/var/lib/canardstack` on each service:
+  the app's durable raw spool, and the catalog's DuckLake metadata DuckDB file.
 - Secrets Manager secrets for the canardstack API keys and the Quack token.
 
 S3 Files is intentionally not used for the DuckDB catalog file. The catalog
@@ -36,21 +37,33 @@ resource only models the primary web container surface and does not cover the
 service-managed EBS mounts this deployment needs for the canardstack raw spool
 and the DuckDB/Quack catalog metadata file.
 
-Example deployment:
+Example deployment. `CatalogImage` defaults to the same canardstack image as the
+app, and `ApiKey`/`AdminApiKey`/`QuackToken` auto-generate when omitted, so the
+minimal deploy is:
 
 ```bash
 aws cloudformation deploy \
   --stack-name canardstack \
   --template-file deploy/aws/ecs-express/template.yaml \
-  --capabilities CAPABILITY_IAM \
-  --parameter-overrides \
-    CatalogImage=ghcr.io/<owner>/duckdb-quack:<version> \
-    ApiKey=replace-with-a-long-random-value \
-    AdminApiKey=replace-with-a-different-long-random-value \
-    QuackToken=replace-with-a-third-long-random-value
+  --capabilities CAPABILITY_IAM
 ```
 
-The catalog image is expected to listen on `QUACK_HOST`/`QUACK_PORT`, persist its
-DuckDB database at `DUCKDB_DATABASE`, and enforce `QUACK_TOKEN`. If the selected
-image uses different names, adjust the catalog container environment in
-`template.yaml`.
+Retrieve the (possibly auto-generated) keys from the stack outputs after deploy:
+
+```bash
+aws cloudformation describe-stacks --stack-name canardstack \
+  --query "Stacks[0].Outputs[?ends_with(OutputKey, 'RetrieveCommand')].OutputValue" \
+  --output text
+# run each printed `aws secretsmanager get-secret-value ...` to read a key
+```
+
+Pin explicit values by passing them as `--parameter-overrides` (`ApiKey=...`,
+`AdminApiKey=...`, `QuackToken=...`, or a different `CatalogImage=...`).
+
+The catalog container runs `canardstack serve-catalog`: it opens the DuckLake
+catalog DuckDB file on the EBS mount (`CANARDSTACK_DUCKLAKE_CATALOG_PATH`) and
+serves it over Quack on `CatalogPort` (default 9494), exposing `/healthz` on
+container port 8080 for the ECS health check. Because the Quack server is
+plaintext inside the VPC (no TLS proxy), the app sets
+`CANARDSTACK_DUCKLAKE_QUACK_DISABLE_SSL=true` to reach it. Override `CatalogImage`
+only if you are not using the canardstack image.

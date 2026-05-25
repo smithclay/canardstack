@@ -93,6 +93,7 @@ pub struct OperatorConfig {
     pub ducklake_catalog_path: Option<PathBuf>,
     pub ducklake_data_path: Option<String>,
     pub ducklake_quack_token: Option<String>,
+    pub ducklake_quack_disable_ssl: bool,
     pub ducklake_maintenance: DuckLakeMaintenanceConfig,
     pub max_body_bytes: usize,
     pub runtime_memory_limit_bytes: Option<usize>,
@@ -318,6 +319,9 @@ impl OperatorConfig {
                 Some(value) => value,
                 None => file.optional_string(&["ducklake", "quack_token"])?,
             },
+            ducklake_quack_disable_ssl: env_bool("CANARDSTACK_DUCKLAKE_QUACK_DISABLE_SSL")?
+                .or(file.bool(&["ducklake", "quack_disable_ssl"])?)
+                .unwrap_or(false),
             ducklake_maintenance: DuckLakeMaintenanceConfig {
                 enabled: ducklake_maintenance_enabled,
                 data_inlining_row_limit: env_usize("CANARDSTACK_DUCKLAKE_DATA_INLINING_ROW_LIMIT")?
@@ -406,6 +410,7 @@ impl OperatorConfig {
             ducklake_catalog_path: None,
             ducklake_data_path: None,
             ducklake_quack_token: None,
+            ducklake_quack_disable_ssl: false,
             ducklake_maintenance: DuckLakeMaintenanceConfig {
                 enabled: true,
                 data_inlining_row_limit: 10,
@@ -857,6 +862,7 @@ mod tests {
         "CANARDSTACK_DUCKLAKE_CATALOG_PATH",
         "CANARDSTACK_DUCKLAKE_DATA_PATH",
         "CANARDSTACK_DUCKLAKE_QUACK_TOKEN",
+        "CANARDSTACK_DUCKLAKE_QUACK_DISABLE_SSL",
         "CANARDSTACK_DUCKLAKE_MAINTENANCE_ENABLED",
         "CANARDSTACK_DUCKLAKE_DATA_INLINING_ROW_LIMIT",
         "CANARDSTACK_DUCKLAKE_EXPIRE_OLDER_THAN_DAYS",

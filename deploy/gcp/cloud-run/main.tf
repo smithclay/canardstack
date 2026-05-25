@@ -211,10 +211,10 @@ resource "google_cloud_run_v2_service" "catalog" {
     }
 
     containers {
-      name    = "duckdb-quack"
+      name    = "canardstack-catalog"
       image   = var.catalog_image
-      command = length(var.catalog_command) == 0 ? null : var.catalog_command
-      args    = length(var.catalog_args) == 0 ? null : var.catalog_args
+      command = length(var.catalog_command) == 0 ? ["canardstack"] : var.catalog_command
+      args    = length(var.catalog_args) == 0 ? ["serve-catalog"] : var.catalog_args
 
       ports {
         container_port = var.catalog_port
@@ -228,22 +228,30 @@ resource "google_cloud_run_v2_service" "catalog" {
       }
 
       env {
-        name  = "DUCKDB_DATABASE"
+        name  = "CANARDSTACK_DUCKLAKE_CATALOG_PATH"
         value = "/catalog/canardstack.ducklake"
       }
 
       env {
-        name  = "QUACK_HOST"
-        value = "0.0.0.0"
+        name  = "CANARDSTACK_DUCKDB_EXTENSION_DIR"
+        value = "/usr/local/lib/duckdb/extensions"
+      }
+
+      # Quack listens on the Cloud Run container port; Cloud Run terminates TLS
+      # in front of it, so the app connects over HTTPS (:443) with no DISABLE_SSL.
+      env {
+        name  = "CANARDSTACK_CATALOG_LISTEN"
+        value = "0.0.0.0:${var.catalog_port}"
+      }
+
+      # Liveness endpoint is loopback-only; Cloud Run probes the container port.
+      env {
+        name  = "CANARDSTACK_CATALOG_HEALTH_BIND"
+        value = "127.0.0.1:8080"
       }
 
       env {
-        name  = "QUACK_PORT"
-        value = tostring(var.catalog_port)
-      }
-
-      env {
-        name = "QUACK_TOKEN"
+        name = "CANARDSTACK_DUCKLAKE_QUACK_TOKEN"
         value_source {
           secret_key_ref {
             secret  = google_secret_manager_secret.quack_token.secret_id

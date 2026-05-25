@@ -5,8 +5,9 @@ This Terraform module creates two Cloud Run services:
 - `canardstack`: the public or IAM-gated app container. It runs `canardstack
   serve`, so ingest and query compatibility APIs are available from one
   container.
-- `canardstack-catalog`: an internal DuckDB/Quack catalog container. It owns the
-  DuckDB-backed DuckLake metadata file and is fixed at one instance.
+- `canardstack-catalog`: an internal catalog container running the **same
+  canardstack image** as `canardstack serve-catalog`. It serves the DuckDB-backed
+  DuckLake metadata file over Quack and is fixed at one instance.
 
 DuckLake data files live in a GCS prefix. The canardstack service mounts a
 dedicated GCS prefix at `/var/lib/canardstack` for `CANARDSTACK_DATA_DIR`,
@@ -15,10 +16,15 @@ prefix at `/catalog` for `canardstack.ducklake`, matching the simplified
 AzQuack-style layout. Cloud Run also supports NFS volumes; for strict POSIX
 filesystem and fsync behavior, prefer Filestore/NFS over Cloud Storage FUSE.
 
-The catalog service defaults to internal ingress. `catalog_invoker_members`
-defaults to `["allUsers"]` because Quack clients usually authenticate with a
-Quack token rather than a Google identity token; the service is still restricted
-to internal ingress and the catalog image should enforce `QUACK_TOKEN`.
+The catalog service defaults to `INGRESS_TRAFFIC_ALL` so the app can reach it
+over Cloud Run-managed TLS. Access is gated by the shared Quack token
+(`CANARDSTACK_DUCKLAKE_QUACK_TOKEN`) that `serve-catalog` enforces, and
+`catalog_invoker_members` defaults to `["allUsers"]` because Quack authenticates
+with that token rather than a Google identity token. Because Cloud Run terminates
+TLS, the app connects over HTTPS and needs no `DISABLE_SSL`. To keep the catalog
+private instead, set `catalog_ingress = "INGRESS_TRAFFIC_INTERNAL_ONLY"` and give
+the app VPC egress (Direct VPC egress or a Serverless VPC Access connector) so it
+can route to the catalog internally.
 
 Local Terraform example:
 
@@ -38,7 +44,7 @@ gcloud infra-manager deployments apply projects/PROJECT_ID/locations/us-central1
   --git-source-repo=https://github.com/<owner>/<repo>.git \
   --git-source-directory=deploy/gcp/cloud-run \
   --git-source-ref=main \
-  --input-values=project_id=PROJECT_ID,region=us-central1,catalog_image=ghcr.io/<owner>/duckdb-quack:<version>,api_key=REPLACE_ME,admin_api_key=REPLACE_ME_TOO,quack_token=REPLACE_ME_THREE
+  --input-values=project_id=PROJECT_ID,region=us-central1,api_key=REPLACE_ME,admin_api_key=REPLACE_ME_TOO,quack_token=REPLACE_ME_THREE
 ```
 
 By default, the canardstack service has no public invoker binding. Set

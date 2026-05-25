@@ -2,7 +2,9 @@ project_id           = "my-project"
 region               = "us-central1"
 service_name         = "canardstack"
 catalog_service_name = "canardstack-catalog"
-catalog_image        = "ghcr.io/<owner>/duckdb-quack:<version>"
+# catalog_image defaults to the app image (runs `canardstack serve-catalog`);
+# set it only to pin a different catalog build.
+# catalog_image      = "ghcr.io/smithclay/canardstack:latest"
 api_key              = "replace-with-a-long-random-value"
 admin_api_key        = "replace-with-a-different-long-random-value"
 quack_token          = "replace-with-a-third-long-random-value"
@@ -14,6 +16,8 @@ bucket_name_prefix = "canardstack-ducklake"
 # protected by CANARDSTACK_API_KEY and CANARDSTACK_ADMIN_API_KEY.
 invoker_members = []
 
-# The catalog service uses internal ingress. Quack authentication is handled by
-# the catalog image's QUACK_TOKEN.
+# The catalog service defaults to public ingress over Cloud Run-managed TLS,
+# gated by the shared quack_token (CANARDSTACK_DUCKLAKE_QUACK_TOKEN). For a
+# private catalog, set catalog_ingress = "INGRESS_TRAFFIC_INTERNAL_ONLY" and give
+# the app VPC egress.
 catalog_invoker_members = ["allUsers"]

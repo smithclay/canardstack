@@ -28,18 +28,19 @@ variable "image" {
 }
 
 variable "catalog_image" {
-  description = "Public GHCR DuckDB/Quack catalog image. The image must serve Quack and persist its DuckDB catalog at DUCKDB_DATABASE."
+  description = "Catalog image. Defaults to the same canardstack image as the app; the catalog runs `canardstack serve-catalog` to serve the DuckLake catalog DuckDB file over Quack."
   type        = string
+  default     = "ghcr.io/smithclay/canardstack:latest"
 }
 
 variable "catalog_command" {
-  description = "Optional command override for the DuckDB/Quack catalog image."
+  description = "Entrypoint override for the catalog container (defaults to [\"canardstack\"])."
   type        = list(string)
   default     = []
 }
 
 variable "catalog_args" {
-  description = "Optional args override for the DuckDB/Quack catalog image."
+  description = "Args override for the catalog container (defaults to [\"serve-catalog\"])."
   type        = list(string)
   default     = []
 }
@@ -117,9 +118,9 @@ variable "ingress" {
 }
 
 variable "catalog_ingress" {
-  description = "Cloud Run ingress setting for the Quack catalog service."
+  description = "Cloud Run ingress for the Quack catalog. Defaults to INGRESS_TRAFFIC_ALL so the app reaches it over Cloud Run-managed TLS, gated by the Quack token. Set INGRESS_TRAFFIC_INTERNAL_ONLY only if the app has VPC egress to the catalog (Direct VPC egress or a Serverless VPC Access connector)."
   type        = string
-  default     = "INGRESS_TRAFFIC_INTERNAL_ONLY"
+  default     = "INGRESS_TRAFFIC_ALL"
 }
 
 variable "cpu" {
@@ -147,9 +148,9 @@ variable "catalog_memory" {
 }
 
 variable "catalog_port" {
-  description = "Container port the DuckDB/Quack image listens on."
+  description = "Container port the catalog serves Quack on (Cloud Run terminates TLS in front of it)."
   type        = number
-  default     = 8080
+  default     = 9494
 }
 
 variable "process_memory_limit_bytes" {
