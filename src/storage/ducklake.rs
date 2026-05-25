@@ -136,6 +136,31 @@ fn object_store_region() -> Option<String> {
     .filter(|value| !value.is_empty())
 }
 
+/// Configure object-store credentials on a standalone connection (e.g. the
+/// `serve-catalog` Quack server) from the DuckLake `DATA_PATH`.
+///
+/// DuckLake CHECKPOINT over a Quack catalog runs its file-deletion scan as
+/// catalog-side SQL (`read_blob` over the data path) on the Quack server, so that
+/// connection must authenticate to the object store just like the ingest/query
+/// writer does -- otherwise the scan reaches S3 unsigned and the catalog node's
+/// IAM role denies it, aborting CHECKPOINT before any compaction or cleanup runs.
+/// Returns the configured store scheme, or `None` for a local data path.
+pub fn configure_object_store_for_data_path(
+    conn: &Connection,
+    data_path: &str,
+) -> Result<Option<&'static str>> {
+    match object_store_kind(data_path) {
+        Some(kind) => {
+            configure_object_store_credentials(conn, kind)?;
+            Ok(Some(match kind {
+                ObjectStore::S3 => "s3",
+                ObjectStore::Gcs => "gcs",
+            }))
+        }
+        None => Ok(None),
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct DuckLakeAttachPlan {
     pub(super) sql: String,
@@ -223,7 +248,7 @@ pub(super) fn build_ducklake_attach_plan(
                 })?;
             let scope = uri.strip_prefix("ducklake:").unwrap_or(uri);
             // When the catalog is fronted by TLS with a self-signed cert (the
-            // serve-catalog `catalog-tls` shim), the Quack client assumes HTTPS
+            // serve-catalog `tls` shim), the Quack client assumes HTTPS
             // for the non-local host and would reject the cert. A scoped HTTP
             // secret with VERIFY_SSL 0 skips verification for the catalog URL only
             // (S3/other HTTPS still verifies); the Quack token still authenticates.

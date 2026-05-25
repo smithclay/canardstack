@@ -79,6 +79,29 @@ pub fn run(mut args: impl Iterator<Item = String>, shutdown: &'static AtomicBool
         &catalog_path,
         config.operator.duckdb_extension_dir.as_deref(),
     )?;
+    // DuckLake CHECKPOINT over a Quack catalog runs its file-deletion scan as
+    // catalog-side SQL (read_blob over the data path) on this server, so the
+    // Quack connection needs object-store credentials when DATA_PATH is a cloud
+    // store; otherwise that scan reaches S3 unsigned and CHECKPOINT fails.
+    if let Some(data_path) = config
+        .operator
+        .ducklake_data_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+    {
+        match storage::configure_object_store_for_data_path(&conn, data_path)? {
+            Some(scheme) => tracing::info!(
+                event = "catalog_object_store_configured",
+                scheme,
+                "configured object-store credentials for catalog-side DuckLake maintenance"
+            ),
+            None => tracing::debug!(
+                event = "catalog_object_store_skipped",
+                "DATA_PATH is local; no object-store credentials needed"
+            ),
+        }
+    }
     conn.execute_batch(&quack_serve_sql(
         &quack_listen,
         &token,

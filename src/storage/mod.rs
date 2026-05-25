@@ -31,7 +31,9 @@ use ducklake::{
     configure_write_connection, ducklake_attach_plan, DUCKLAKE_CATALOG_NAME,
     DUCKLAKE_TARGET_PREFIX,
 };
-pub use ducklake::{install_ducklake_extension, open_quack_catalog_connection};
+pub use ducklake::{
+    configure_object_store_for_data_path, install_ducklake_extension, open_quack_catalog_connection,
+};
 pub use metadata::MetadataRefreshOutcome;
 use schema::{create_tables_on, enforce_schema_version_on};
 
@@ -557,6 +559,19 @@ mod tests {
         assert_eq!(object_store_kind("gcs://bucket/p/"), Some(ObjectStore::Gcs));
         assert_eq!(object_store_kind("gs://bucket/p/"), Some(ObjectStore::Gcs));
         assert_eq!(object_store_kind("/var/lib/canardstack/storage"), None);
+    }
+
+    #[test]
+    fn configure_object_store_for_data_path_skips_local() {
+        // A local data path needs no object-store secret, so the helper is a
+        // no-op (returns None) without loading httpfs/aws -- this keeps the
+        // serve-catalog server offline-safe when DATA_PATH is a local directory.
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        assert_eq!(
+            super::configure_object_store_for_data_path(&conn, "/var/lib/canardstack/storage")
+                .unwrap(),
+            None
+        );
     }
 
     #[test]
