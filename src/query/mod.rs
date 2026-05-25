@@ -5,38 +5,20 @@ pub mod trace;
 
 use crate::config::Config;
 use crate::db::sql::{
-    logs_deployment_environment_expr, logs_http_method_expr, logs_http_route_expr,
-    logs_http_status_code_expr, metrics_deployment_environment_expr, quote as sql_quote,
-    spans_http_route_expr, time_predicate,
+    json_attr, logs_deployment_environment_expr, logs_http_method_expr, logs_http_route_expr,
+    logs_http_status_code_expr, quote as sql_quote, time_predicate,
 };
 use crate::metrics::Timer;
 use crate::query::plan::{
-    FieldMatcher, LogPlan, MetricAggregation, MetricPlan, MetricSignal, TextFilter, TracePlan,
-    TraceSort,
+    FieldMatcher, LogPlan, MatchOp, MetricAggregation, MetricPlan, MetricSignal, TextFilter,
+    TracePlan, TraceSort,
 };
+use crate::semantic_labels::{self, LabelScope};
 use crate::storage::{QueryTimeoutError, Storage};
 use crate::validation::{ApiError, ApiResult};
 use duckdb::Row;
 use serde_json::{json, Value};
 use std::time::Duration;
-
-const LOG_COLUMNS: &[&str] = &[
-    "service_name",
-    "deployment_environment",
-    "trace_id",
-    "span_id",
-    "http_route",
-    "http_method",
-    "severity_text",
-];
-const METRIC_COLUMNS: &[&str] = &["service_name", "deployment_environment"];
-const TRACE_COLUMNS: &[&str] = &[
-    "service_name",
-    "span_name",
-    "http_route",
-    "status_code",
-    "trace_id",
-];
 
 pub struct QueryEngine {
     interactive_timeout: Duration,
@@ -106,7 +88,7 @@ impl QueryEngine {
             push_matcher(
                 &mut where_sql,
                 matcher,
-                trace_label_expr,
+                LabelScope::Spans,
                 "unsupported_selector",
             )?;
         }
@@ -176,14 +158,17 @@ impl QueryEngine {
             push_matcher(
                 &mut where_sql,
                 matcher,
-                metric_label_expr,
+                LabelScope::Metrics,
                 "unsupported_promql",
             )?;
         }
         let group_by = &plan.group_by;
         let group_selects = group_by
             .iter()
-            .filter_map(|label| metric_label_expr(label).map(|expr| (label.as_str(), expr)))
+            .filter_map(|label| {
+                semantic_labels::label_expr(LabelScope::Metrics, label)
+                    .map(|expr| (label.as_str(), expr))
+            })
             .collect::<Vec<_>>();
         let group_select_clause = if group_selects.is_empty() {
             String::new()
@@ -249,6 +234,10 @@ fn log_row(row: &Row<'_>) -> duckdb::Result<Value> {
         "http_method": row.get::<_, Option<String>>(8)?,
         "http_status_code": row.get::<_, Option<i32>>(9)?,
         "http_route": row.get::<_, Option<String>>(10)?,
+        "service_namespace": row.get::<_, Option<String>>(11)?,
+        "service_instance_id": row.get::<_, Option<String>>(12)?,
+        "host_name": row.get::<_, Option<String>>(13)?,
+        "scope_name": row.get::<_, Option<String>>(14)?,
     }))
 }
 
@@ -258,13 +247,17 @@ fn log_where_sql(plan: &LogPlan) -> ApiResult<Vec<String>> {
         push_matcher(
             &mut where_sql,
             matcher,
-            log_label_expr,
+            LabelScope::Logs,
             "unsupported_selector",
         )?;
     }
     for filter in &plan.selector.text_filters {
         match filter {
             TextFilter::BodyContains(text) => where_sql.push(text_terms("body", text)?),
+            TextFilter::BodyRegex(pattern) => where_sql.push(format!(
+                "regexp_matches(coalesce(body, ''), {})",
+                sql_quote(pattern)
+            )),
         }
     }
     Ok(where_sql)
@@ -272,11 +265,12 @@ fn log_where_sql(plan: &LogPlan) -> ApiResult<Vec<String>> {
 
 fn log_select_sql(source: &str, where_sql: &[String], direction: &str, limit: usize) -> String {
     format!(
-        "SELECT timestamp::VARCHAR, ingested_at::VARCHAR, trace_id, span_id, service_name, severity_text, body, {} AS deployment_environment, {} AS http_method, {} AS http_status_code, {} AS http_route FROM {source} WHERE {} ORDER BY timestamp {direction} LIMIT {limit}",
+        "SELECT timestamp::VARCHAR, ingested_at::VARCHAR, trace_id, span_id, service_name, severity_text, body, {} AS deployment_environment, {} AS http_method, {} AS http_status_code, {} AS http_route, service_namespace, service_instance_id, {} AS host_name, scope_name FROM {source} WHERE {} ORDER BY timestamp {direction} LIMIT {limit}",
         logs_deployment_environment_expr(),
         logs_http_method_expr(),
         logs_http_status_code_expr(),
         logs_http_route_expr(),
+        json_attr("resource_attributes", "host.name"),
         where_sql.join(" AND ")
     )
 }
@@ -302,50 +296,32 @@ fn wrap_rows(mut rows: Vec<Value>, limit: usize, query_duration_ms: u128) -> Val
 fn push_matcher(
     where_sql: &mut Vec<String>,
     matcher: &FieldMatcher,
-    label_expr: fn(&str) -> Option<String>,
+    scope: LabelScope,
     reason: &'static str,
 ) -> ApiResult<()> {
-    let expr = label_expr(&matcher.field).ok_or_else(|| {
+    let expr = semantic_labels::label_expr(scope, &matcher.field).ok_or_else(|| {
         ApiError::new(
             400,
             reason,
             format!("unsupported label {} in v0 selector", matcher.field),
         )
     })?;
-    where_sql.push(format!("{expr} = {}", sql_quote(&matcher.value)));
+    let value_expr = format!("coalesce(cast({expr} AS VARCHAR), '')");
+    match matcher.op {
+        MatchOp::Eq => where_sql.push(format!("{value_expr} = {}", sql_quote(&matcher.value))),
+        MatchOp::NotEq => where_sql.push(format!("{value_expr} != {}", sql_quote(&matcher.value))),
+        MatchOp::Regex if matcher.value == ".*" => {}
+        MatchOp::Regex => where_sql.push(format!(
+            "regexp_matches({value_expr}, {})",
+            sql_quote(&matcher.value)
+        )),
+        MatchOp::NotRegex if matcher.value == ".*" => where_sql.push("FALSE".to_string()),
+        MatchOp::NotRegex => where_sql.push(format!(
+            "NOT regexp_matches({value_expr}, {})",
+            sql_quote(&matcher.value)
+        )),
+    }
     Ok(())
-}
-
-fn log_label_expr(label: &str) -> Option<String> {
-    if !LOG_COLUMNS.contains(&label) {
-        return None;
-    }
-    Some(match label {
-        "deployment_environment" => logs_deployment_environment_expr(),
-        "http_route" => logs_http_route_expr(),
-        "http_method" => logs_http_method_expr(),
-        direct => direct.to_string(),
-    })
-}
-
-fn metric_label_expr(label: &str) -> Option<String> {
-    if !METRIC_COLUMNS.contains(&label) {
-        return None;
-    }
-    Some(match label {
-        "deployment_environment" => metrics_deployment_environment_expr(),
-        direct => direct.to_string(),
-    })
-}
-
-fn trace_label_expr(label: &str) -> Option<String> {
-    if !TRACE_COLUMNS.contains(&label) {
-        return None;
-    }
-    Some(match label {
-        "http_route" => spans_http_route_expr(),
-        direct => direct.to_string(),
-    })
 }
 
 fn text_terms(column: &str, query: &str) -> ApiResult<String> {

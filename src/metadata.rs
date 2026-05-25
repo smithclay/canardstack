@@ -15,6 +15,7 @@
 
 use crate::db::sql::quote as sql_quote;
 use crate::query::QueryEngine;
+use crate::semantic_labels::{self, LabelScope};
 use crate::signal::StorageSignal;
 use crate::storage::Storage;
 use crate::validation::ApiResult;
@@ -52,17 +53,29 @@ impl Metadata {
         from: DateTime<Utc>,
         to: DateTime<Utc>,
     ) -> ApiResult<Vec<String>> {
-        if !matches!(name, "__name__" | "service_name" | "deployment_environment") {
+        let metadata_name = if name == "__name__" {
+            "__name__"
+        } else if let Some(canonical) =
+            semantic_labels::canonical_for_alias(LabelScope::Metrics, name)
+        {
+            canonical
+        } else {
             return Ok(Vec::new());
-        }
-        let key = CacheKey::window(Api::Prometheus, Discovery::LabelValue, name, from, to);
+        };
+        let key = CacheKey::window(
+            Api::Prometheus,
+            Discovery::LabelValue,
+            metadata_name,
+            from,
+            to,
+        );
         let value = self.cached(storage, key, || {
             label_values(
                 queries,
                 storage,
                 &[StorageSignal::MetricGauge, StorageSignal::MetricSum],
                 "label_value",
-                name,
+                metadata_name,
                 from,
                 to,
             )
@@ -177,26 +190,18 @@ impl Metadata {
         from: DateTime<Utc>,
         to: DateTime<Utc>,
     ) -> ApiResult<Vec<String>> {
-        if !matches!(
-            name,
-            "service_name"
-                | "deployment_environment"
-                | "severity_text"
-                | "trace_id"
-                | "span_id"
-                | "http_route"
-                | "http_method"
-        ) {
+        let Some(metadata_name) = semantic_labels::canonical_for_alias(LabelScope::Logs, name)
+        else {
             return Ok(Vec::new());
-        }
-        let key = CacheKey::window(Api::Loki, Discovery::LabelValue, name, from, to);
+        };
+        let key = CacheKey::window(Api::Loki, Discovery::LabelValue, metadata_name, from, to);
         let value = self.cached(storage, key, || {
             label_values(
                 queries,
                 storage,
                 &[StorageSignal::Logs],
                 "label_value",
-                name,
+                metadata_name,
                 from,
                 to,
             )
@@ -490,13 +495,5 @@ fn insert_opt(labels: &mut Map<String, Value>, name: &str, value: Option<String>
 }
 
 fn tempo_tag_name(tag: &str) -> Option<&'static str> {
-    match tag {
-        "service.name" | "service_name" | "service-name" => Some("service.name"),
-        "name" | "span.name" | "span_name" | "span-name" => Some("span.name"),
-        "http.route" | "http_route" | "http-route" => Some("http.route"),
-        "status" => Some("status"),
-        "status.code" | "status_code" | "status-code" => Some("status.code"),
-        "traceID" | "trace_id" => Some("traceID"),
-        _ => None,
-    }
+    semantic_labels::tempo_tag_name(tag)
 }

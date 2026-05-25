@@ -1,58 +1,37 @@
 use crate::query::plan::{
-    matchers_from_labels, normalize_labels, SelectorPlan, TimeBounds, TracePlan, TraceSort,
+    normalize_matchers, FieldMatcher, MatchOp, SelectorPlan, TimeBounds, TracePlan, TraceSort,
 };
+use crate::semantic_labels::{self, LabelScope};
 use crate::validation::ApiResult;
-use std::collections::{BTreeMap, HashMap};
-
-const TEMPO_ALIASES: &[(&str, &str)] = &[
-    ("resource.service.name", "service_name"),
-    ("service.name", "service_name"),
-    ("service_name", "service_name"),
-    ("serviceName", "service_name"),
-    ("service-name", "service_name"),
-    ("name", "span_name"),
-    ("span_name", "span_name"),
-    ("span.name", "span_name"),
-    ("span-name", "span_name"),
-    ("http.route", "http_route"),
-    ("http-route", "http_route"),
-    ("status.code", "status_code"),
-    ("status_code", "status_code"),
-    ("status", "status_code"),
-];
-
-const TEMPO_QUERY_ALIASES: &[(&str, &str)] = &[
-    ("resource.service.name", "service_name"),
-    ("service.name", "service_name"),
-    ("span.name", "span_name"),
-    ("name", "span_name"),
-    ("http.route", "http_route"),
-    ("status.code", "status_code"),
-    ("status", "status_code"),
-];
+use std::collections::HashMap;
 
 pub fn plan_tempo_search(
     params: &HashMap<String, String>,
     time_bounds: TimeBounds,
     limit: usize,
 ) -> ApiResult<TracePlan> {
-    let mut labels = BTreeMap::new();
-    for (param, _) in TEMPO_ALIASES {
+    let mut matchers = Vec::new();
+    let aliases = semantic_labels::alias_pairs(LabelScope::Spans);
+    for (param, _) in &aliases {
         if let Some(value) = params.get(*param).filter(|v| !v.is_empty()) {
-            labels.insert((*param).to_string(), value.to_string());
+            matchers.push(FieldMatcher {
+                field: (*param).to_string(),
+                value: value.to_string(),
+                op: MatchOp::Eq,
+            });
         }
     }
     if let Some(q) = params.get("q").or_else(|| params.get("query")) {
-        extract_traceql_labels(q, &mut labels);
+        extract_traceql_matchers(q, &mut matchers);
     }
     if let Some(tags) = params.get("tags") {
-        extract_traceql_labels(tags, &mut labels);
+        extract_traceql_matchers(tags, &mut matchers);
     }
-    let labels = normalize_labels(labels, TEMPO_ALIASES, "unsupported_selector")?;
+    let matchers = normalize_matchers(matchers, &aliases, "unsupported_selector")?;
     Ok(TracePlan {
         selector: SelectorPlan {
             resource: None,
-            matchers: matchers_from_labels(labels),
+            matchers,
             text_filters: Vec::new(),
         },
         time_bounds,
@@ -61,15 +40,19 @@ pub fn plan_tempo_search(
     })
 }
 
-fn extract_traceql_labels(raw: &str, labels: &mut BTreeMap<String, String>) {
-    for (tag, _) in TEMPO_QUERY_ALIASES {
-        if let Some(value) = extract_quoted_tag(raw, tag) {
-            labels.insert((*tag).to_string(), value);
+fn extract_traceql_matchers(raw: &str, labels: &mut Vec<FieldMatcher>) {
+    for (tag, _) in semantic_labels::alias_pairs(LabelScope::Spans) {
+        if let Some((op, value)) = extract_tag_matcher(raw, tag) {
+            labels.push(FieldMatcher {
+                field: tag.to_string(),
+                value,
+                op,
+            });
         }
     }
 }
 
-fn extract_quoted_tag(raw: &str, tag: &str) -> Option<String> {
+fn extract_tag_matcher(raw: &str, tag: &str) -> Option<(MatchOp, String)> {
     let marker_start = raw.match_indices(tag).find_map(|(index, _)| {
         let is_tag_boundary = raw[..index]
             .chars()
@@ -77,21 +60,33 @@ fn extract_quoted_tag(raw: &str, tag: &str) -> Option<String> {
             .map(|c| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')))
             .unwrap_or(true);
         let rest = raw[index + tag.len()..].trim_start();
-        (is_tag_boundary && rest.starts_with('=')).then_some(index)
+        (is_tag_boundary
+            && (rest.starts_with('=')
+                || rest.starts_with("!=")
+                || rest.starts_with("=~")
+                || rest.starts_with("!~")))
+        .then_some(index)
     })?;
-    let rest = raw[marker_start + tag.len()..]
-        .trim_start()
-        .strip_prefix('=')?
-        .trim_start();
+    let rest = raw[marker_start + tag.len()..].trim_start();
+    let (op, rest) = if let Some(rest) = rest.strip_prefix("!=") {
+        (MatchOp::NotEq, rest)
+    } else if let Some(rest) = rest.strip_prefix("=~") {
+        (MatchOp::Regex, rest)
+    } else if let Some(rest) = rest.strip_prefix("!~") {
+        (MatchOp::NotRegex, rest)
+    } else {
+        (MatchOp::Eq, rest.strip_prefix('=')?)
+    };
+    let rest = rest.trim_start();
     if let Some(rest) = rest.strip_prefix('"') {
         let end = rest.find('"')?;
-        Some(rest[..end].to_string())
+        Some((op, rest[..end].to_string()))
     } else {
         let end = rest
-            .find(|c: char| c.is_whitespace() || c == ',' || c == '}')
+            .find(|c: char| c.is_whitespace() || matches!(c, ',' | '}' | '&' | '|'))
             .unwrap_or(rest.len());
         let value = &rest[..end];
-        (!value.is_empty()).then(|| value.to_string())
+        (!value.is_empty()).then(|| (op, value.to_string()))
     }
 }
 

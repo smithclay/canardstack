@@ -39,14 +39,24 @@ impl SortDirection {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MatchOp {
+    Eq,
+    NotEq,
+    Regex,
+    NotRegex,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FieldMatcher {
     pub field: String,
     pub value: String,
+    pub op: MatchOp,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TextFilter {
     BodyContains(String),
+    BodyRegex(String),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -169,21 +179,40 @@ pub fn parse_selector(
     raw: &str,
     reason: &'static str,
 ) -> ApiResult<(String, BTreeMap<String, String>)> {
+    let (resource, matchers) = parse_selector_matchers(raw, reason)?;
+    let mut labels = BTreeMap::new();
+    for matcher in matchers {
+        if matcher.op != MatchOp::Eq {
+            return Err(ApiError::new(
+                400,
+                reason,
+                "regex and negative label filters are not supported",
+            ));
+        }
+        labels.insert(matcher.field, matcher.value);
+    }
+    Ok((resource, labels))
+}
+
+pub fn parse_selector_matchers(
+    raw: &str,
+    reason: &'static str,
+) -> ApiResult<(String, Vec<FieldMatcher>)> {
     let raw = raw.trim();
     if let Some((name, rest)) = raw.split_once('{') {
         let label_part = rest
             .strip_suffix('}')
             .ok_or_else(|| ApiError::new(400, "invalid_selector", "selector must end with }"))?;
-        let labels = parse_labels(label_part, reason)?;
+        let labels = parse_label_matchers(label_part, reason)?;
         Ok((name.trim().to_string(), labels))
     } else if raw.starts_with('{') {
         let label_part = raw
             .strip_prefix('{')
             .and_then(|s| s.strip_suffix('}'))
             .ok_or_else(|| ApiError::new(400, "invalid_selector", "selector must be {...}"))?;
-        Ok(("".to_string(), parse_labels(label_part, reason)?))
+        Ok(("".to_string(), parse_label_matchers(label_part, reason)?))
     } else if !raw.is_empty() && raw.chars().all(is_ident_char) {
-        Ok((raw.to_string(), BTreeMap::new()))
+        Ok((raw.to_string(), Vec::new()))
     } else {
         Err(ApiError::new(
             400,
@@ -191,6 +220,42 @@ pub fn parse_selector(
             "supported selector subset is name, name{label=\"value\"}, or {label=\"value\"}",
         ))
     }
+}
+
+pub fn normalize_matchers(
+    matchers: Vec<FieldMatcher>,
+    supported: &[(&str, &str)],
+    reason: &'static str,
+) -> ApiResult<Vec<FieldMatcher>> {
+    let mut normalized = Vec::new();
+    for matcher in matchers {
+        let Some((_, canonical)) = supported.iter().find(|(raw, _)| *raw == matcher.field) else {
+            return Err(ApiError::new(
+                400,
+                reason,
+                format!("unsupported label {} in v0 selector", matcher.field),
+            ));
+        };
+        if matcher.op == MatchOp::Eq
+            && normalized.iter().any(|existing: &FieldMatcher| {
+                existing.field == *canonical
+                    && existing.op == MatchOp::Eq
+                    && existing.value != matcher.value
+            })
+        {
+            return Err(ApiError::new(
+                400,
+                reason,
+                format!("conflicting values for label {canonical}"),
+            ));
+        }
+        normalized.push(FieldMatcher {
+            field: (*canonical).to_string(),
+            value: matcher.value,
+            op: matcher.op,
+        });
+    }
+    Ok(normalized)
 }
 
 pub fn normalize_labels(
@@ -224,7 +289,11 @@ pub fn normalize_labels(
 pub fn matchers_from_labels(labels: BTreeMap<String, String>) -> Vec<FieldMatcher> {
     labels
         .into_iter()
-        .map(|(field, value)| FieldMatcher { field, value })
+        .map(|(field, value)| FieldMatcher {
+            field,
+            value,
+            op: MatchOp::Eq,
+        })
         .collect()
 }
 
@@ -236,20 +305,64 @@ pub fn is_ident_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '_' | ':' | '.')
 }
 
-fn parse_labels(raw: &str, reason: &'static str) -> ApiResult<BTreeMap<String, String>> {
-    let mut labels = BTreeMap::new();
-    for part in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-        let (key, value) = part.split_once('=').ok_or_else(|| {
-            ApiError::new(400, reason, "only equality label filters are supported")
-        })?;
-        if key.ends_with('!') || key.ends_with('~') || part.contains("=~") || part.contains("!=") {
+fn parse_label_matchers(raw: &str, reason: &'static str) -> ApiResult<Vec<FieldMatcher>> {
+    let mut labels = Vec::new();
+    for part in split_label_matchers(raw, reason)? {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let (op, key, value) = if let Some((key, value)) = part.split_once("!~") {
+            (MatchOp::NotRegex, key, value)
+        } else if let Some((key, value)) = part.split_once("=~") {
+            (MatchOp::Regex, key, value)
+        } else if let Some((key, value)) = part.split_once("!=") {
+            (MatchOp::NotEq, key, value)
+        } else if let Some((key, value)) = part.split_once('=') {
+            (MatchOp::Eq, key, value)
+        } else {
             return Err(ApiError::new(
                 400,
                 reason,
-                "regex and negative label filters are not supported",
+                "label filters must use =, !=, =~, or !~",
             ));
-        }
-        labels.insert(key.trim().to_string(), unquote(value.trim()).to_string());
+        };
+        labels.push(FieldMatcher {
+            field: key.trim().to_string(),
+            value: unquote(value.trim()).to_string(),
+            op,
+        });
     }
     Ok(labels)
+}
+
+fn split_label_matchers<'a>(raw: &'a str, reason: &'static str) -> ApiResult<Vec<&'a str>> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut in_quote = false;
+    let mut escaped = false;
+    for (idx, ch) in raw.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' if in_quote => escaped = true,
+            '"' => in_quote = !in_quote,
+            ',' if !in_quote => {
+                parts.push(&raw[start..idx]);
+                start = idx + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    if in_quote {
+        return Err(ApiError::new(
+            400,
+            reason,
+            "unterminated quoted label value",
+        ));
+    }
+    parts.push(&raw[start..]);
+    Ok(parts)
 }

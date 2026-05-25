@@ -4,11 +4,12 @@ use super::params::{
 };
 use crate::query::log::parse_loki_query;
 use crate::query::plan::{LogPlan, TimeBounds};
+use crate::semantic_labels;
 use crate::validation::ApiResult;
 use crate::AppState;
 use chrono::Utc;
 use serde_json::{json, Map, Value};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 
 const INTERACTIVE_RANGE_SECS: i64 = 24 * 60 * 60;
 
@@ -22,16 +23,7 @@ pub fn loki_query_range(state: &AppState, params: &HashMap<String, String>) -> A
 
 pub fn loki_labels(_state: &AppState, params: &HashMap<String, String>) -> ApiResult<Value> {
     let _ = optional_range(params, INTERACTIVE_RANGE_SECS)?;
-    let labels = BTreeSet::from([
-        "service_name".to_string(),
-        "deployment_environment".to_string(),
-        "severity_text".to_string(),
-        "trace_id".to_string(),
-        "span_id".to_string(),
-        "http_route".to_string(),
-        "http_method".to_string(),
-    ]);
-    Ok(loki_success(json!(labels.into_iter().collect::<Vec<_>>())))
+    Ok(loki_success(json!(semantic_labels::loki_label_names())))
 }
 
 pub fn loki_label_values(

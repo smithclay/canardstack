@@ -14,6 +14,7 @@ pub mod otlp;
 pub mod query;
 mod runtime;
 pub mod seal;
+pub(crate) mod semantic_labels;
 pub mod signal;
 pub mod storage;
 pub mod validation;

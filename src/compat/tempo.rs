@@ -5,6 +5,7 @@ use crate::db::sql::{
 };
 use crate::query::plan::TimeBounds;
 use crate::query::trace::plan_tempo_search;
+use crate::semantic_labels;
 use crate::validation::{ApiError, ApiResult};
 use crate::AppState;
 use chrono::Utc;
@@ -176,7 +177,7 @@ pub fn tempo_search(state: &AppState, params: &HashMap<String, String>) -> ApiRe
 }
 
 pub fn tempo_tags() -> Value {
-    json!({"tagNames": ["service.name", "span.name", "name", "http.route", "status", "status.code", "traceID"]})
+    json!({"tagNames": semantic_labels::tempo_tag_names()})
 }
 
 pub fn tempo_tag_values(

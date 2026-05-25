@@ -24,10 +24,8 @@
 //! buckets it failed to refresh. `crate::metadata` is the read side of this same
 //! stage.
 
-use crate::db::sql::{
-    logs_deployment_environment_expr, logs_http_method_expr, logs_http_route_expr,
-    metrics_deployment_environment_expr, quote as sql_quote, spans_http_route_expr,
-};
+use crate::db::sql::{metrics_deployment_environment_expr, quote as sql_quote};
+use crate::semantic_labels::{self, LabelScope};
 use crate::signal::StorageSignal;
 use anyhow::{Context, Result};
 use chrono::NaiveDate;
@@ -142,15 +140,7 @@ impl<'a> MetadataRefreshDay<'a> {
 
 pub(super) fn logs_metadata_sql(prefix: &str, day: &MetadataRefreshDay<'_>) -> Vec<String> {
     let mut sql = Vec::new();
-    for (name, value_expr) in [
-        ("service_name", "service_name".to_string()),
-        ("deployment_environment", logs_deployment_environment_expr()),
-        ("severity_text", "severity_text".to_string()),
-        ("trace_id", "trace_id".to_string()),
-        ("span_id", "span_id".to_string()),
-        ("http_route", logs_http_route_expr()),
-        ("http_method", logs_http_method_expr()),
-    ] {
+    for (name, value_expr) in semantic_labels::metadata_labels(LabelScope::Logs) {
         sql.push(label_value_insert_sql(
             prefix,
             "logs",
@@ -161,7 +151,9 @@ pub(super) fn logs_metadata_sql(prefix: &str, day: &MetadataRefreshDay<'_>) -> V
             &value_expr,
         ));
     }
-    let deployment_environment = logs_deployment_environment_expr();
+    let deployment_environment =
+        semantic_labels::label_expr(LabelScope::Logs, "deployment_environment")
+            .expect("deployment_environment is registered for logs");
     sql.push(format!(
         "\
         SELECT 'logs', DATE {}, 'series', 'stream', NULL, NULL, NULL, NULL, \
@@ -178,14 +170,7 @@ pub(super) fn logs_metadata_sql(prefix: &str, day: &MetadataRefreshDay<'_>) -> V
 
 pub(super) fn spans_metadata_sql(prefix: &str, day: &MetadataRefreshDay<'_>) -> Vec<String> {
     let mut sql = Vec::new();
-    for (name, value_expr) in [
-        ("service.name", "service_name".to_string()),
-        ("span.name", "span_name".to_string()),
-        ("http.route", spans_http_route_expr()),
-        ("status", "status_code".to_string()),
-        ("status.code", "status_code".to_string()),
-        ("traceID", "trace_id".to_string()),
-    ] {
+    for (name, value_expr) in semantic_labels::metadata_labels(LabelScope::Spans) {
         sql.push(label_value_insert_sql(
             prefix,
             "spans",
@@ -208,14 +193,9 @@ pub(super) fn metric_metadata_sql(
     let table = signal.as_str();
     let signal = signal.as_str();
     let mut sql = Vec::new();
-    for (name, value_expr) in [
-        ("__name__", "metric_name".to_string()),
-        ("service_name", "service_name".to_string()),
-        (
-            "deployment_environment",
-            metrics_deployment_environment_expr(),
-        ),
-    ] {
+    let mut label_values = vec![("__name__", "metric_name".to_string())];
+    label_values.extend(semantic_labels::metadata_labels(LabelScope::Metrics));
+    for (name, value_expr) in label_values {
         sql.push(label_value_insert_sql(
             prefix,
             signal,

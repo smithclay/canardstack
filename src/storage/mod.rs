@@ -461,8 +461,8 @@ mod tests {
     #[test]
     fn metadata_refresh_uses_one_insert_per_signal_bucket() {
         for (signal, select_count) in [
-            (StorageSignal::Logs, 8),
-            (StorageSignal::Spans, 6),
+            (StorageSignal::Logs, 12),
+            (StorageSignal::Spans, 19),
             (StorageSignal::MetricGauge, 5),
             (StorageSignal::MetricSum, 5),
         ] {
