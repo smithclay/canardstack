@@ -4,10 +4,7 @@ pub mod prometheus;
 pub mod trace;
 
 use crate::config::Config;
-use crate::db::sql::{
-    json_attr, logs_deployment_environment_expr, logs_http_method_expr, logs_http_route_expr,
-    logs_http_status_code_expr, quote as sql_quote, time_predicate,
-};
+use crate::db::sql::{quote as sql_quote, time_predicate};
 use crate::metrics::Timer;
 use crate::query::plan::{
     FieldMatcher, LogPlan, MatchOp, MetricAggregation, MetricPlan, MetricSignal, TextFilter,
@@ -55,8 +52,10 @@ impl QueryEngine {
     pub fn execute_logs(&self, storage: &Storage, plan: &LogPlan) -> ApiResult<Value> {
         let timer = Timer::start();
         let where_sql = log_where_sql(plan)?;
+        let projected = semantic_labels::projected_labels(LabelScope::Logs);
         let sql = log_select_sql(
             "{prefix}logs",
+            &projected,
             &where_sql,
             plan.direction.sql(),
             plan.limit + 1,
@@ -67,7 +66,7 @@ impl QueryEngine {
                 self.interactive_timeout,
                 |conn, prefix| {
                     let mut stmt = conn.prepare(&sql.replace("{prefix}", prefix))?;
-                    let mapped = stmt.query_map([], log_row)?;
+                    let mapped = stmt.query_map([], |row| log_row(row, &projected))?;
                     Ok(collect_rows(mapped)?)
                 },
             )
@@ -221,24 +220,27 @@ impl QueryEngine {
     }
 }
 
-fn log_row(row: &Row<'_>) -> duckdb::Result<Value> {
-    Ok(json!({
-        "timestamp": row.get::<_, String>(0)?,
-        "ingested_at": row.get::<_, String>(1)?,
-        "trace_id": row.get::<_, Option<String>>(2)?,
-        "span_id": row.get::<_, Option<String>>(3)?,
-        "service_name": row.get::<_, Option<String>>(4)?,
-        "severity_text": row.get::<_, Option<String>>(5)?,
-        "body": row.get::<_, Option<String>>(6)?,
-        "deployment_environment": row.get::<_, Option<String>>(7)?,
-        "http_method": row.get::<_, Option<String>>(8)?,
-        "http_status_code": row.get::<_, Option<i32>>(9)?,
-        "http_route": row.get::<_, Option<String>>(10)?,
-        "service_namespace": row.get::<_, Option<String>>(11)?,
-        "service_instance_id": row.get::<_, Option<String>>(12)?,
-        "host_name": row.get::<_, Option<String>>(13)?,
-        "scope_name": row.get::<_, Option<String>>(14)?,
-    }))
+fn log_row(row: &Row<'_>, projected: &[(&str, String)]) -> duckdb::Result<Value> {
+    let mut obj = serde_json::Map::new();
+    obj.insert(
+        "timestamp".to_string(),
+        json!(row.get::<_, String>("timestamp")?),
+    );
+    obj.insert(
+        "ingested_at".to_string(),
+        json!(row.get::<_, String>("ingested_at")?),
+    );
+    obj.insert(
+        "body".to_string(),
+        json!(row.get::<_, Option<String>>("body")?),
+    );
+    for (name, _) in projected {
+        obj.insert(
+            (*name).to_string(),
+            json!(row.get::<_, Option<String>>(*name)?),
+        );
+    }
+    Ok(Value::Object(obj))
 }
 
 fn log_where_sql(plan: &LogPlan) -> ApiResult<Vec<String>> {
@@ -263,14 +265,26 @@ fn log_where_sql(plan: &LogPlan) -> ApiResult<Vec<String>> {
     Ok(where_sql)
 }
 
-fn log_select_sql(source: &str, where_sql: &[String], direction: &str, limit: usize) -> String {
+fn log_select_sql(
+    source: &str,
+    projected: &[(&str, String)],
+    where_sql: &[String],
+    direction: &str,
+    limit: usize,
+) -> String {
+    let mut columns = vec![
+        "timestamp::VARCHAR AS timestamp".to_string(),
+        "ingested_at::VARCHAR AS ingested_at".to_string(),
+        "body".to_string(),
+    ];
+    // Project every registry label as VARCHAR so the row reader can pull each
+    // column back by name with one uniform type; NULLs are preserved.
+    for (name, expr) in projected {
+        columns.push(format!("cast({expr} AS VARCHAR) AS {name}"));
+    }
     format!(
-        "SELECT timestamp::VARCHAR, ingested_at::VARCHAR, trace_id, span_id, service_name, severity_text, body, {} AS deployment_environment, {} AS http_method, {} AS http_status_code, {} AS http_route, service_namespace, service_instance_id, {} AS host_name, scope_name FROM {source} WHERE {} ORDER BY timestamp {direction} LIMIT {limit}",
-        logs_deployment_environment_expr(),
-        logs_http_method_expr(),
-        logs_http_status_code_expr(),
-        logs_http_route_expr(),
-        json_attr("resource_attributes", "host.name"),
+        "SELECT {} FROM {source} WHERE {} ORDER BY timestamp {direction} LIMIT {limit}",
+        columns.join(", "),
         where_sql.join(" AND ")
     )
 }

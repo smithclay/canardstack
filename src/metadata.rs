@@ -263,7 +263,7 @@ impl Metadata {
         from: DateTime<Utc>,
         to: DateTime<Utc>,
     ) -> ApiResult<Vec<String>> {
-        let Some(name) = tempo_tag_name(tag) else {
+        let Some(name) = semantic_labels::tempo_tag_name(tag) else {
             return Ok(Vec::new());
         };
         let key = CacheKey::window(Api::Tempo, Discovery::TagValue, name, from, to);
@@ -492,8 +492,4 @@ fn insert_opt(labels: &mut Map<String, Value>, name: &str, value: Option<String>
     if let Some(value) = value.filter(|v| !v.is_empty()) {
         labels.insert(name.to_string(), json!(value));
     }
-}
-
-fn tempo_tag_name(tag: &str) -> Option<&'static str> {
-    semantic_labels::tempo_tag_name(tag)
 }

@@ -1,7 +1,6 @@
 use crate::signal::StorageSignal;
 use crate::validation::{ApiError, ApiResult};
 use chrono::{DateTime, Utc};
-use std::collections::BTreeMap;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SortDirection {
@@ -175,25 +174,6 @@ pub enum TraceSort {
     DurationDesc,
 }
 
-pub fn parse_selector(
-    raw: &str,
-    reason: &'static str,
-) -> ApiResult<(String, BTreeMap<String, String>)> {
-    let (resource, matchers) = parse_selector_matchers(raw, reason)?;
-    let mut labels = BTreeMap::new();
-    for matcher in matchers {
-        if matcher.op != MatchOp::Eq {
-            return Err(ApiError::new(
-                400,
-                reason,
-                "regex and negative label filters are not supported",
-            ));
-        }
-        labels.insert(matcher.field, matcher.value);
-    }
-    Ok((resource, labels))
-}
-
 pub fn parse_selector_matchers(
     raw: &str,
     reason: &'static str,
@@ -256,45 +236,6 @@ pub fn normalize_matchers(
         });
     }
     Ok(normalized)
-}
-
-pub fn normalize_labels(
-    labels: BTreeMap<String, String>,
-    supported: &[(&str, &str)],
-    reason: &'static str,
-) -> ApiResult<BTreeMap<String, String>> {
-    let mut normalized = BTreeMap::new();
-    for (key, value) in labels {
-        let Some((_, canonical)) = supported.iter().find(|(raw, _)| *raw == key) else {
-            return Err(ApiError::new(
-                400,
-                reason,
-                format!("unsupported label {key} in v0 selector"),
-            ));
-        };
-        if let Some(existing) = normalized.get(*canonical) {
-            if existing != &value {
-                return Err(ApiError::new(
-                    400,
-                    reason,
-                    format!("conflicting values for label {canonical}"),
-                ));
-            }
-        }
-        normalized.insert((*canonical).to_string(), value);
-    }
-    Ok(normalized)
-}
-
-pub fn matchers_from_labels(labels: BTreeMap<String, String>) -> Vec<FieldMatcher> {
-    labels
-        .into_iter()
-        .map(|(field, value)| FieldMatcher {
-            field,
-            value,
-            op: MatchOp::Eq,
-        })
-        .collect()
 }
 
 pub fn unquote(value: &str) -> &str {
