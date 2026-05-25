@@ -48,12 +48,10 @@ canardstack
 In another terminal, send one OTLP/HTTP JSON log:
 
 ```bash
-NOW_NANOS="$(date +%s)000000000"
-
 curl -sS -X POST http://127.0.0.1:4318/v1/logs \
   -H 'Authorization: Bearer dev-canardstack-key' \
   -H 'Content-Type: application/json' \
-  --data "{\"resourceLogs\":[{\"scopeLogs\":[{\"logRecords\":[{\"timeUnixNano\":\"$NOW_NANOS\",\"body\":{\"stringValue\":\"hello world\"}}]}]}]}"
+  --data '{"resourceLogs":[{"scopeLogs":[{"logRecords":[{"timeUnixNano":"1779667200000000000","body":{"stringValue":"hello world"}}]}]}]}'
 ```
 
 Give the scheduler a moment to seal the row into DuckLake, then query it
@@ -132,6 +130,17 @@ canardstack accepts the standard OTLP/HTTP paths:
 - `POST /v1/logs`
 - `POST /v1/traces`
 - `POST /v1/metrics`
+
+## Deploy
+
+Use the [deployment docs](/deployment/) for MotherDuck, GCP Cloud Run, and AWS
+ECS/Fargate options.
+
+## Query Data
+
+Use the [Grafana datasource guide](/query-data/grafana/) to connect metrics,
+logs, and traces. Use the [DuckDB SQL guide](/query-data/duckdb/) to query the
+DuckLake tables directly.
 
 ## Build From Source
 

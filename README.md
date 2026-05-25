@@ -24,7 +24,7 @@ Builds on prior work from [otlp2parquet](https://github.com/smithclay/otlp2parqu
 - [What You Can Do](#what-you-can-do)
 - [Send Telemetry](#send-telemetry)
 - [Query Data](#query-data)
-- [Use MotherDuck](#use-motherduck)
+- [Deployment](#deployment)
 - [Architecture](#architecture)
 - [Operator Notes](#operator-notes)
 - [Limits](#limits)
@@ -46,12 +46,10 @@ canardstack
 In another terminal, send one OTLP/HTTP JSON log:
 
 ```bash
-NOW_NANOS="$(date +%s)000000000"
-
 curl -sS -X POST http://127.0.0.1:4318/v1/logs \
   -H 'Authorization: Bearer dev-canardstack-key' \
   -H 'Content-Type: application/json' \
-  --data "{\"resourceLogs\":[{\"scopeLogs\":[{\"logRecords\":[{\"timeUnixNano\":\"$NOW_NANOS\",\"body\":{\"stringValue\":\"hello world\"}}]}]}]}"
+  --data '{"resourceLogs":[{"scopeLogs":[{"logRecords":[{"timeUnixNano":"1779667200000000000","body":{"stringValue":"hello world"}}]}]}]}'
 ```
 
 canardstack acknowledges ingest after the raw request is fsynced locally. Give
@@ -261,38 +259,18 @@ Direct SQL is intentionally outside canardstack's HTTP product surface. Use the
 DuckDB CLI, MotherDuck, or another SQL client when you want to work with the
 underlying DuckLake tables.
 
-## Use MotherDuck
+## Deployment
 
-[MotherDuck](https://motherduck.com) has a hosted DuckLake path that is useful
-for remote-storage experiments. You can also host DuckLake yourself on a cloud
-platform such as
-[AWS](https://github.com/danielbeach/DuckLakeonS3andPostgres) or
-[Cloudflare](https://github.com/tobilg/cloudflare-ducklake).
+Deployment docs are published on GitHub Pages. The site is the canonical
+operator guide:
 
-After signing up for MotherDuck:
+- [Deployment overview](https://smithclay.github.io/canardstack/deployment/)
+- [MotherDuck](https://smithclay.github.io/canardstack/deployment/motherduck/)
+- [GCP Cloud Run](https://smithclay.github.io/canardstack/deployment/gcp-cloud-run/)
+- [AWS ECS/Fargate](https://smithclay.github.io/canardstack/deployment/aws-ecs-fargate/)
 
-1. Log in to `https://app.motherduck.com/`.
-2. Create a new database and choose `DuckLake` under `Advanced`.
-3. Copy the connection string for your DuckLake database, usually
-   `md:your-database-name`.
-4. Create a Read/Write token under MotherDuck Account Settings > Access Tokens.
-
-Set your MotherDuck token and DuckLake attach URI:
-
-```bash
-export MOTHERDUCK_TOKEN='<your-motherduck-token>'
-export CANARDSTACK_DUCKLAKE_ATTACH_URI='md:test-ducklake'
-```
-
-Then start canardstack and Grafana:
-
-```bash
-docker compose up
-```
-
-The canardstack container uses your `CANARDSTACK_DUCKLAKE_ATTACH_URI` and
-`MOTHERDUCK_TOKEN` for storage. Grafana stays local and queries canardstack
-through the provisioned Prometheus, Loki, and Tempo-compatible datasources.
+The deploy artifacts remain under [deploy/](deploy/). Keep walkthrough changes
+in the site docs and keep the deploy READMEs as pointers.
 
 ## Architecture
 
@@ -461,6 +439,7 @@ add or update tests for behavior changes when practical.
 ## Documentation
 
 - [Developer guide](docs/developer.md)
+- [Deployment overview](https://smithclay.github.io/canardstack/deployment/)
 - [V0 architecture](docs/architecture/v0-architecture.md)
 - [Storage schema](docs/architecture/storage-schema.md)
 - [Query API](docs/architecture/query-api.md)

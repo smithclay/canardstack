@@ -31,6 +31,22 @@ export default defineConfig({
           ],
         },
         {
+          label: 'Deployment',
+          items: [
+            { label: 'Overview', link: '/deployment/' },
+            { label: 'MotherDuck', link: '/deployment/motherduck/' },
+            { label: 'GCP Cloud Run', link: '/deployment/gcp-cloud-run/' },
+            { label: 'AWS ECS/Fargate', link: '/deployment/aws-ecs-fargate/' },
+          ],
+        },
+        {
+          label: 'Query Data',
+          items: [
+            { label: 'Grafana Datasources', link: '/query-data/grafana/' },
+            { label: 'DuckDB SQL', link: '/query-data/duckdb/' },
+          ],
+        },
+        {
           label: 'Project Docs',
           items: [
             {
