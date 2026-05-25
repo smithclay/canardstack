@@ -33,7 +33,7 @@ COPY --from=planner /app/recipe.json recipe.json
 # Actions, which is why dependencies were recompiled cold on every release build.
 RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry \
     --mount=type=cache,id=cargo-git,target=/usr/local/cargo/git \
-    cargo chef cook --release --locked --recipe-path recipe.json
+    cargo chef cook --release --locked --features catalog-tls --recipe-path recipe.json
 
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
@@ -41,7 +41,7 @@ COPY benches ./benches
 
 RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry \
     --mount=type=cache,id=cargo-git,target=/usr/local/cargo/git \
-    cargo build --release --locked \
+    cargo build --release --locked --features catalog-tls \
     && cp /app/target/release/canardstack /app/canardstack
 
 RUN mkdir -p /opt/duckdb/extensions \

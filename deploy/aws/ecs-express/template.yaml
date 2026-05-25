@@ -95,6 +95,13 @@ Parameters:
   ProcessMemoryLimitBytes:
     Type: Number
     Default: 3221225472
+  CpuArchitecture:
+    Type: String
+    Default: ARM64
+    AllowedValues:
+      - ARM64
+      - X86_64
+    Description: Fargate CPU architecture for both tasks. ARM64 (Graviton) is ~20% cheaper; the canardstack image is multi-arch so it runs on either.
 
 Conditions:
   HasS3BucketName:
@@ -325,6 +332,40 @@ Resources:
                   - s3:PutObject
                   - s3:DeleteObject
                 Resource: !Sub ${DuckLakeBucket.Arn}/${S3DataPrefix}/*
+        - PolicyName: ecs-exec
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssmmessages:CreateControlChannel
+                  - ssmmessages:CreateDataChannel
+                  - ssmmessages:OpenControlChannel
+                  - ssmmessages:OpenDataChannel
+                Resource: "*"
+
+  CatalogTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ecs-exec
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssmmessages:CreateControlChannel
+                  - ssmmessages:CreateDataChannel
+                  - ssmmessages:OpenControlChannel
+                  - ssmmessages:OpenDataChannel
+                Resource: "*"
 
   EcsInfrastructureRole:
     Type: AWS::IAM::Role
@@ -441,6 +482,9 @@ Resources:
       NetworkMode: awsvpc
       RequiresCompatibilities:
         - FARGATE
+      RuntimePlatform:
+        CpuArchitecture: !Ref CpuArchitecture
+        OperatingSystemFamily: LINUX
       Cpu: !Ref Cpu
       Memory: !Ref Memory
       ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
@@ -469,7 +513,10 @@ Resources:
               Value: /usr/local/lib/duckdb/extensions
             - Name: CANARDSTACK_DUCKLAKE_ATTACH_URI
               Value: !Sub ducklake:quack:${CatalogServiceDiscoveryName}.${ServiceDiscoveryNamespaceName}:${CatalogPort}
-            - Name: CANARDSTACK_DUCKLAKE_QUACK_DISABLE_SSL
+            # The catalog terminates TLS with a self-signed cert (no managed TLS
+            # on ECS), so skip cert verification for the catalog URL only; the
+            # Quack token authenticates and TLS encrypts in transit.
+            - Name: CANARDSTACK_DUCKLAKE_QUACK_INSECURE_TLS
               Value: "true"
             - Name: CANARDSTACK_DUCKLAKE_DATA_PATH
               Value: !Sub s3://${DuckLakeBucket}/${S3DataPrefix}/
@@ -513,9 +560,13 @@ Resources:
       NetworkMode: awsvpc
       RequiresCompatibilities:
         - FARGATE
+      RuntimePlatform:
+        CpuArchitecture: !Ref CpuArchitecture
+        OperatingSystemFamily: LINUX
       Cpu: !Ref CatalogCpu
       Memory: !Ref CatalogMemory
       ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt CatalogTaskRole.Arn
       Volumes:
         - Name: duckdb-catalog
           ConfiguredAtLaunch: true
@@ -537,8 +588,14 @@ Resources:
               Value: /var/lib/canardstack/canardstack.ducklake
             - Name: CANARDSTACK_DUCKDB_EXTENSION_DIR
               Value: /usr/local/lib/duckdb/extensions
+            # Terminate TLS in-binary (ECS has no managed TLS for Cloud Map names):
+            # serve TLS on CatalogPort and forward to a loopback plaintext Quack.
+            - Name: CANARDSTACK_CATALOG_TLS
+              Value: "true"
             - Name: CANARDSTACK_CATALOG_LISTEN
               Value: !Sub 0.0.0.0:${CatalogPort}
+            - Name: CANARDSTACK_CATALOG_QUACK_BACKEND
+              Value: 127.0.0.1:9495
             - Name: CANARDSTACK_CATALOG_HEALTH_BIND
               Value: 0.0.0.0:8080
           Secrets:

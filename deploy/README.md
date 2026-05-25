@@ -22,9 +22,10 @@ writes DuckLake data files to object storage.
   `gcs://bucket/prefix/` or `s3://bucket/prefix/`.
 - `CANARDSTACK_DUCKLAKE_CATALOG_PATH` is not set on the app in these examples;
   it is set on the `serve-catalog` container, which owns the catalog file.
-- `CANARDSTACK_DUCKLAKE_QUACK_DISABLE_SSL` is set on the app only where the Quack
-  link is plaintext (AWS intra-VPC). On Cloud Run the catalog is fronted by
-  managed TLS, so it stays unset.
+- `CANARDSTACK_DUCKLAKE_QUACK_INSECURE_TLS` is set on the app only where the
+  catalog terminates TLS with a self-signed cert (AWS, via the `serve-catalog`
+  `catalog-tls` shim). On Cloud Run the catalog is fronted by managed TLS with a
+  real cert, so it stays unset and verification is on.
 - `CANARDSTACK_POSTGRES_DSN` stays unset.
 
 ## Service Topology

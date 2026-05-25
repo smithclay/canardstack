@@ -15,11 +15,12 @@ use std::thread;
 use std::time::Duration;
 
 const DEFAULT_LISTEN: &str = "0.0.0.0:9494";
+const DEFAULT_QUACK_BACKEND: &str = "127.0.0.1:9495";
 const DEFAULT_HEALTH_BIND: &str = "0.0.0.0:8080";
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const HEALTH_SOCKET_TIMEOUT: Duration = Duration::from_secs(2);
 
-pub fn run(mut args: impl Iterator<Item = String>, shutdown: &AtomicBool) -> Result<()> {
+pub fn run(mut args: impl Iterator<Item = String>, shutdown: &'static AtomicBool) -> Result<()> {
     if let Some(arg) = args.next() {
         match arg.as_str() {
             "--help" | "-h" => {
@@ -27,7 +28,9 @@ pub fn run(mut args: impl Iterator<Item = String>, shutdown: &AtomicBool) -> Res
                 println!(
                     "serve the local DuckLake catalog DuckDB file over the Quack protocol.\n\
                      env: CANARDSTACK_DUCKLAKE_QUACK_TOKEN (required), CANARDSTACK_DUCKLAKE_CATALOG_PATH,\n\
-                     CANARDSTACK_CATALOG_LISTEN (default {DEFAULT_LISTEN}), CANARDSTACK_CATALOG_HEALTH_BIND (default {DEFAULT_HEALTH_BIND})"
+                     CANARDSTACK_CATALOG_LISTEN (default {DEFAULT_LISTEN}), CANARDSTACK_CATALOG_HEALTH_BIND (default {DEFAULT_HEALTH_BIND}).\n\
+                     TLS (requires --features catalog-tls): CANARDSTACK_CATALOG_TLS=true terminates TLS on\n\
+                     CANARDSTACK_CATALOG_LISTEN and forwards to CANARDSTACK_CATALOG_QUACK_BACKEND (default {DEFAULT_QUACK_BACKEND})"
                 );
                 return Ok(());
             }
@@ -51,33 +54,81 @@ pub fn run(mut args: impl Iterator<Item = String>, shutdown: &AtomicBool) -> Res
             )
         })?
         .to_string();
-    let listen = env_or("CANARDSTACK_CATALOG_LISTEN", DEFAULT_LISTEN);
+    let public_listen = env_or("CANARDSTACK_CATALOG_LISTEN", DEFAULT_LISTEN);
     let health_bind = env_or("CANARDSTACK_CATALOG_HEALTH_BIND", DEFAULT_HEALTH_BIND);
+    let tls_enabled = env_bool("CANARDSTACK_CATALOG_TLS");
+
+    // In TLS mode Quack binds a loopback backend and an in-binary TLS terminator
+    // fronts it on the public address; requests then arrive with a non-local Host,
+    // so allow_other_hostname must be on. In plaintext mode Quack binds the public
+    // address directly and only opts in when that address is non-loopback.
+    let (quack_listen, allow_other_hostname) = if tls_enabled {
+        (
+            env_or("CANARDSTACK_CATALOG_QUACK_BACKEND", DEFAULT_QUACK_BACKEND),
+            true,
+        )
+    } else {
+        (public_listen.clone(), !listens_on_loopback(&public_listen))
+    };
 
     let conn = storage::open_quack_catalog_connection(
         &catalog_path,
         config.operator.duckdb_extension_dir.as_deref(),
     )?;
-    conn.execute_batch(&quack_serve_sql(&listen, &token))
-        .context("start the Quack catalog server")?;
+    conn.execute_batch(&quack_serve_sql(
+        &quack_listen,
+        &token,
+        allow_other_hostname,
+    ))
+    .context("start the Quack catalog server")?;
     tracing::info!(
         event = "catalog_listening",
-        listen = %listen,
+        listen = %quack_listen,
+        tls = tls_enabled,
         catalog = %catalog_path.display(),
         "serving the DuckLake catalog over Quack"
     );
 
-    // Block on the health endpoint until shutdown; the Quack server runs on its
-    // own DuckDB-managed threads while `conn` stays alive.
+    if tls_enabled {
+        #[cfg(feature = "catalog-tls")]
+        {
+            let public = public_listen.clone();
+            let backend = quack_listen.clone();
+            thread::spawn(move || {
+                if let Err(err) =
+                    crate::cli::catalog_tls::run_tls_terminator(&public, backend, shutdown)
+                {
+                    tracing::error!(event = "catalog_tls_terminator_failed", error = %err);
+                }
+            });
+            tracing::info!(event = "catalog_tls_enabled", public = %public_listen);
+        }
+        #[cfg(not(feature = "catalog-tls"))]
+        {
+            anyhow::bail!(
+                "CANARDSTACK_CATALOG_TLS=true requires a build with --features catalog-tls"
+            );
+        }
+    }
+
+    // Block on the health endpoint until shutdown; the Quack server (and the TLS
+    // terminator, if any) run on their own threads while `conn` stays alive.
     let result = serve_health_until(&health_bind, shutdown);
 
     // Best-effort graceful stop so the listen socket and catalog file are
     // released before the process exits.
-    if let Err(err) = conn.execute_batch(&quack_stop_sql(&listen)) {
+    if let Err(err) = conn.execute_batch(&quack_stop_sql(&quack_listen)) {
         tracing::info!(event = "quack_stop_skipped", error = %err);
     }
     tracing::info!(event = "catalog_shutdown_complete");
     result
+}
+
+fn env_bool(name: &str) -> bool {
+    matches!(
+        std::env::var(name).ok().as_deref().map(str::trim),
+        Some("1") | Some("true") | Some("yes")
+    )
 }
 
 /// The catalog DuckDB file to serve: the explicit catalog path when set,
@@ -104,15 +155,15 @@ fn env_or(name: &str, default: &str) -> String {
     }
 }
 
-fn quack_serve_sql(listen: &str, token: &str) -> String {
+fn quack_serve_sql(listen: &str, token: &str, allow_other_hostname: bool) -> String {
     format!(
         "CALL quack_serve('quack:{}', token => '{}', allow_other_hostname => {});",
         sql_escape(listen),
         sql_escape(token),
-        if listens_on_loopback(listen) {
-            "false"
-        } else {
+        if allow_other_hostname {
             "true"
+        } else {
+            "false"
         },
     )
 }
@@ -183,21 +234,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn quack_serve_sql_binds_all_interfaces_with_remote_access() {
+    fn quack_serve_sql_renders_allow_other_hostname() {
         assert_eq!(
-            quack_serve_sql("0.0.0.0:9494", "tok"),
+            quack_serve_sql("0.0.0.0:9494", "tok", true),
             "CALL quack_serve('quack:0.0.0.0:9494', token => 'tok', allow_other_hostname => true);"
         );
-    }
-
-    #[test]
-    fn quack_serve_sql_loopback_disallows_other_hostname() {
-        assert!(quack_serve_sql("127.0.0.1:9494", "tok").contains("allow_other_hostname => false"));
+        assert!(quack_serve_sql("127.0.0.1:9494", "tok", false)
+            .contains("allow_other_hostname => false"));
     }
 
     #[test]
     fn quack_serve_sql_escapes_token_quotes() {
-        assert!(quack_serve_sql("0.0.0.0:9494", "a'b").contains("token => 'a''b'"));
+        assert!(quack_serve_sql("0.0.0.0:9494", "a'b", true).contains("token => 'a''b'"));
     }
 
     #[test]
