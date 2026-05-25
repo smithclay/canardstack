@@ -44,7 +44,6 @@ aws cloudformation deploy \
   --template-file deploy/aws/ecs-express/template.yaml \
   --capabilities CAPABILITY_IAM \
   --parameter-overrides \
-    Image=ghcr.io/<owner>/canardstack:<version> \
     CatalogImage=ghcr.io/<owner>/duckdb-quack:<version> \
     ApiKey=replace-with-a-long-random-value \
     AdminApiKey=replace-with-a-different-long-random-value \

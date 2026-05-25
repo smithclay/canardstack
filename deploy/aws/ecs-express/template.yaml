@@ -22,7 +22,8 @@ Parameters:
     Default: catalog
   Image:
     Type: String
-    Description: Public GHCR canardstack image, for example ghcr.io/<owner>/canardstack:<version>.
+    Default: ghcr.io/smithclay/canardstack:latest
+    Description: Public GHCR canardstack image.
   CatalogImage:
     Type: String
     Description: Public GHCR DuckDB/Quack catalog image. The image must serve Quack and persist its DuckDB catalog at DUCKDB_DATABASE.

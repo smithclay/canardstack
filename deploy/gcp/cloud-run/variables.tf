@@ -22,8 +22,9 @@ variable "catalog_service_name" {
 }
 
 variable "image" {
-  description = "Public GHCR canardstack image, for example ghcr.io/<owner>/canardstack:<version>."
+  description = "Public GHCR canardstack image."
   type        = string
+  default     = "ghcr.io/smithclay/canardstack:latest"
 }
 
 variable "catalog_image" {

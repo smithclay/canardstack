@@ -6,7 +6,7 @@ GitHub Container Registry images.
 Set images to release tags:
 
 ```bash
-export CANARDSTACK_IMAGE=ghcr.io/<owner>/canardstack:<version>
+export CANARDSTACK_IMAGE=ghcr.io/smithclay/canardstack:latest
 export DUCKDB_QUACK_IMAGE=ghcr.io/<owner>/duckdb-quack:<version>
 ```
 

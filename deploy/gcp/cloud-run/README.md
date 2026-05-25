@@ -38,7 +38,7 @@ gcloud infra-manager deployments apply projects/PROJECT_ID/locations/us-central1
   --git-source-repo=https://github.com/<owner>/<repo>.git \
   --git-source-directory=deploy/gcp/cloud-run \
   --git-source-ref=main \
-  --input-values=project_id=PROJECT_ID,region=us-central1,image=ghcr.io/<owner>/canardstack:<version>,catalog_image=ghcr.io/<owner>/duckdb-quack:<version>,api_key=REPLACE_ME,admin_api_key=REPLACE_ME_TOO,quack_token=REPLACE_ME_THREE
+  --input-values=project_id=PROJECT_ID,region=us-central1,catalog_image=ghcr.io/<owner>/duckdb-quack:<version>,api_key=REPLACE_ME,admin_api_key=REPLACE_ME_TOO,quack_token=REPLACE_ME_THREE
 ```
 
 By default, the canardstack service has no public invoker binding. Set
