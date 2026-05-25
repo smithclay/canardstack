@@ -90,6 +90,9 @@ pub struct OperatorConfig {
     pub duckdb_extension_dir: Option<PathBuf>,
     pub postgres_dsn: Option<String>,
     pub ducklake_attach_uri: Option<String>,
+    pub ducklake_catalog_path: Option<PathBuf>,
+    pub ducklake_data_path: Option<String>,
+    pub ducklake_quack_token: Option<String>,
     pub ducklake_maintenance: DuckLakeMaintenanceConfig,
     pub max_body_bytes: usize,
     pub runtime_memory_limit_bytes: Option<usize>,
@@ -303,6 +306,18 @@ impl OperatorConfig {
                 Some(value) => value,
                 None => file.optional_string(&["ducklake", "attach_uri"])?,
             },
+            ducklake_catalog_path: match env_optional_path("CANARDSTACK_DUCKLAKE_CATALOG_PATH")? {
+                Some(value) => value,
+                None => file.optional_path(&["ducklake", "catalog_path"])?,
+            },
+            ducklake_data_path: match env_optional_string("CANARDSTACK_DUCKLAKE_DATA_PATH")? {
+                Some(value) => value,
+                None => file.optional_string(&["ducklake", "data_path"])?,
+            },
+            ducklake_quack_token: match env_optional_string("CANARDSTACK_DUCKLAKE_QUACK_TOKEN")? {
+                Some(value) => value,
+                None => file.optional_string(&["ducklake", "quack_token"])?,
+            },
             ducklake_maintenance: DuckLakeMaintenanceConfig {
                 enabled: ducklake_maintenance_enabled,
                 data_inlining_row_limit: env_usize("CANARDSTACK_DUCKLAKE_DATA_INLINING_ROW_LIMIT")?
@@ -388,6 +403,9 @@ impl OperatorConfig {
             duckdb_extension_dir: None,
             postgres_dsn: None,
             ducklake_attach_uri: None,
+            ducklake_catalog_path: None,
+            ducklake_data_path: None,
+            ducklake_quack_token: None,
             ducklake_maintenance: DuckLakeMaintenanceConfig {
                 enabled: true,
                 data_inlining_row_limit: 10,
@@ -439,6 +457,19 @@ impl OperatorConfig {
         }
         if self.duckdb_write_memory_limit.trim().is_empty() {
             anyhow::bail!("CANARDSTACK_DUCKDB_MEMORY_LIMIT must not be empty");
+        }
+        if self
+            .ducklake_attach_uri
+            .as_deref()
+            .is_some_and(|uri| uri.trim().starts_with("ducklake:quack:"))
+            && self
+                .ducklake_quack_token
+                .as_deref()
+                .is_none_or(|token| token.trim().is_empty())
+        {
+            anyhow::bail!(
+                "CANARDSTACK_DUCKLAKE_QUACK_TOKEN must be set when CANARDSTACK_DUCKLAKE_ATTACH_URI uses ducklake:quack:"
+            );
         }
         if self.ducklake_maintenance.expire_older_than_days <= 0 {
             anyhow::bail!("CANARDSTACK_DUCKLAKE_EXPIRE_OLDER_THAN_DAYS must be > 0");
@@ -823,6 +854,9 @@ mod tests {
         "CANARDSTACK_DUCKDB_EXTENSION_DIR",
         "CANARDSTACK_POSTGRES_DSN",
         "CANARDSTACK_DUCKLAKE_ATTACH_URI",
+        "CANARDSTACK_DUCKLAKE_CATALOG_PATH",
+        "CANARDSTACK_DUCKLAKE_DATA_PATH",
+        "CANARDSTACK_DUCKLAKE_QUACK_TOKEN",
         "CANARDSTACK_DUCKLAKE_MAINTENANCE_ENABLED",
         "CANARDSTACK_DUCKLAKE_DATA_INLINING_ROW_LIMIT",
         "CANARDSTACK_DUCKLAKE_EXPIRE_OLDER_THAN_DAYS",
@@ -919,6 +953,9 @@ memory_limit = "2GiB"
 
 [ducklake]
 attach_uri = "md:file"
+catalog_path = "/catalog/canardstack.ducklake"
+data_path = "s3://file-bucket/canardstack/"
+quack_token = "file-quack-token"
 maintenance_enabled = false
 data_inlining_row_limit = 0
 expire_older_than_days = 7
@@ -967,6 +1004,12 @@ group_commit_ms = 3
             env::set_var(CONFIG_PATH_ENV, &config_path);
             env::set_var("CANARDSTACK_BIND", "127.0.0.1:4319");
             env::set_var("CANARDSTACK_DUCKLAKE_ATTACH_URI", "");
+            env::set_var("CANARDSTACK_DUCKLAKE_CATALOG_PATH", "/env/catalog.ducklake");
+            env::set_var(
+                "CANARDSTACK_DUCKLAKE_DATA_PATH",
+                "gcs://env-bucket/canardstack/",
+            );
+            env::set_var("CANARDSTACK_DUCKLAKE_QUACK_TOKEN", "env-quack-token");
         }
 
         let config = Config::from_env().unwrap();
@@ -986,6 +1029,18 @@ group_commit_ms = 3
             Some(PathBuf::from("/opt/duckdb/extensions"))
         );
         assert_eq!(config.operator.ducklake_attach_uri, None);
+        assert_eq!(
+            config.operator.ducklake_catalog_path,
+            Some(PathBuf::from("/env/catalog.ducklake"))
+        );
+        assert_eq!(
+            config.operator.ducklake_data_path,
+            Some("gcs://env-bucket/canardstack/".to_string())
+        );
+        assert_eq!(
+            config.operator.ducklake_quack_token,
+            Some("env-quack-token".to_string())
+        );
         assert!(!config.operator.ducklake_maintenance.enabled);
         assert_eq!(
             config.operator.ducklake_maintenance.data_inlining_row_limit,

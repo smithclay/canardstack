@@ -257,15 +257,7 @@ impl Storage {
         configure_base_connection(&writer)?;
         configure_write_connection(&writer, &config.operator.duckdb_write_memory_limit)?;
 
-        attach_ducklake_connection(
-            &writer,
-            config.operator.postgres_dsn.as_deref(),
-            config.operator.ducklake_attach_uri.as_deref(),
-            &config.operator.duckdb_path,
-            &config.operator.local_storage_dir,
-            config.operator.duckdb_extension_dir.as_deref(),
-        )
-        .context(
+        attach_ducklake_connection(&writer, config).context(
             "DuckLake attach failed. Fix the catalog config (URI, token, network, or extension path) and restart.",
         )?;
         let target_prefix = DUCKLAKE_TARGET_PREFIX.to_string();
@@ -335,6 +327,9 @@ mod tests {
         let plan = build_ducklake_attach_plan(
             None,
             Some("ducklake:md:test-ducklake"),
+            None,
+            None,
+            None,
             &dir.path().join("canardstack.duckdb"),
             &dir.path().join("storage"),
         )
@@ -355,6 +350,9 @@ mod tests {
         let plan = build_ducklake_attach_plan(
             None,
             Some("md:test-ducklake"),
+            None,
+            None,
+            None,
             &dir.path().join("canardstack.duckdb"),
             &dir.path().join("storage"),
         )
@@ -367,7 +365,49 @@ mod tests {
         assert_eq!(plan.mode, "ducklake_motherduck_remote");
         assert!(!plan.needs_ducklake);
         assert!(plan.needs_motherduck);
+        assert!(!plan.needs_quack);
         assert!(!plan.needs_postgres);
+    }
+
+    #[test]
+    fn quack_attach_uri_loads_quack_and_creates_secret() {
+        let dir = tempdir().unwrap();
+        let plan = build_ducklake_attach_plan(
+            None,
+            Some("ducklake:quack:catalog.internal:443"),
+            None,
+            Some("s3://canardstack-data/prod/"),
+            Some("catalog'token"),
+            &dir.path().join("canardstack.duckdb"),
+            &dir.path().join("storage"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            plan.sql,
+            "CREATE OR REPLACE SECRET canardstack_ducklake_quack (TYPE quack, SCOPE 'quack:catalog.internal:443', TOKEN 'catalog''token'); ATTACH 'ducklake:quack:catalog.internal:443' AS canardlake (DATA_PATH 's3://canardstack-data/prod/'); USE canardlake;"
+        );
+        assert!(plan.needs_ducklake);
+        assert!(plan.needs_quack);
+    }
+
+    #[test]
+    fn quack_attach_uri_requires_token() {
+        let dir = tempdir().unwrap();
+        let err = build_ducklake_attach_plan(
+            None,
+            Some("ducklake:quack:catalog.internal:443"),
+            None,
+            Some("s3://canardstack-data/prod/"),
+            None,
+            &dir.path().join("canardstack.duckdb"),
+            &dir.path().join("storage"),
+        )
+        .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("CANARDSTACK_DUCKLAKE_QUACK_TOKEN must be set"));
     }
 
     #[test]
@@ -376,6 +416,9 @@ mod tests {
         let err = build_ducklake_attach_plan(
             Some("dbname=ducklake_catalog host=localhost"),
             Some("ducklake:md:test-ducklake"),
+            None,
+            None,
+            None,
             &dir.path().join("canardstack.duckdb"),
             &dir.path().join("storage"),
         )
@@ -387,9 +430,31 @@ mod tests {
     }
 
     #[test]
+    fn catalog_path_requires_local_duckdb_catalog() {
+        let dir = tempdir().unwrap();
+        let err = build_ducklake_attach_plan(
+            None,
+            Some("ducklake:/catalog/canardstack.ducklake"),
+            Some(&dir.path().join("catalog.ducklake")),
+            None,
+            None,
+            &dir.path().join("canardstack.duckdb"),
+            &dir.path().join("storage"),
+        )
+        .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("CANARDSTACK_DUCKLAKE_CATALOG_PATH can only be set"));
+    }
+
+    #[test]
     fn local_ducklake_attach_uses_data_path() {
         let dir = tempdir().unwrap();
         let plan = build_ducklake_attach_plan(
+            None,
+            None,
+            None,
             None,
             None,
             &dir.path().join("canardstack.duckdb"),
@@ -398,6 +463,69 @@ mod tests {
         .unwrap();
 
         assert!(plan.sql.contains("DATA_PATH"));
+    }
+
+    #[test]
+    fn local_ducklake_attach_accepts_object_store_data_path() {
+        let dir = tempdir().unwrap();
+        let plan = build_ducklake_attach_plan(
+            None,
+            None,
+            None,
+            Some("s3://canardstack-data/prod/"),
+            None,
+            &dir.path().join("canardstack.duckdb"),
+            &dir.path().join("storage"),
+        )
+        .unwrap();
+
+        assert!(plan
+            .sql
+            .contains("(DATA_PATH 's3://canardstack-data/prod/')"));
+    }
+
+    #[test]
+    fn local_ducklake_attach_accepts_catalog_path_override() {
+        let dir = tempdir().unwrap();
+        let catalog_path = dir.path().join("catalog/canardstack.ducklake");
+        let plan = build_ducklake_attach_plan(
+            None,
+            None,
+            Some(&catalog_path),
+            Some("s3://canardstack-data/prod/"),
+            None,
+            &dir.path().join("canardstack.duckdb"),
+            &dir.path().join("storage"),
+        )
+        .unwrap();
+
+        assert!(plan.sql.contains(&format!(
+            "ATTACH 'ducklake:{}' AS canardlake",
+            catalog_path.to_string_lossy()
+        )));
+        assert!(plan
+            .sql
+            .contains("(DATA_PATH 's3://canardstack-data/prod/')"));
+    }
+
+    #[test]
+    fn custom_duckdb_ducklake_attach_accepts_object_store_data_path() {
+        let dir = tempdir().unwrap();
+        let plan = build_ducklake_attach_plan(
+            None,
+            Some("ducklake:/catalog/canardstack.ducklake"),
+            None,
+            Some("gcs://canardstack-data/prod/"),
+            None,
+            &dir.path().join("canardstack.duckdb"),
+            &dir.path().join("storage"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            plan.sql,
+            "ATTACH 'ducklake:/catalog/canardstack.ducklake' AS canardlake (DATA_PATH 'gcs://canardstack-data/prod/'); USE canardlake;"
+        );
     }
 
     #[test]
@@ -434,6 +562,9 @@ mod tests {
         let err = build_ducklake_attach_plan(
             None,
             Some("ATTACH 'md:test-ducklake';"),
+            None,
+            None,
+            None,
             &dir.path().join("canardstack.duckdb"),
             &dir.path().join("storage"),
         )
@@ -450,12 +581,34 @@ mod tests {
         let err = build_ducklake_attach_plan(
             None,
             Some("sqlite:/tmp/not-ducklake.db"),
+            None,
+            None,
+            None,
             &dir.path().join("canardstack.duckdb"),
             &dir.path().join("storage"),
         )
         .unwrap_err();
 
         assert!(err.to_string().contains("must be an md: or ducklake: URI"));
+    }
+
+    #[test]
+    fn motherduck_attach_uri_rejects_custom_data_path() {
+        let dir = tempdir().unwrap();
+        let err = build_ducklake_attach_plan(
+            None,
+            Some("md:test-ducklake"),
+            None,
+            Some("s3://canardstack-data/prod/"),
+            None,
+            &dir.path().join("canardstack.duckdb"),
+            &dir.path().join("storage"),
+        )
+        .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("CANARDSTACK_DUCKLAKE_DATA_PATH cannot be set"));
     }
 
     #[test]

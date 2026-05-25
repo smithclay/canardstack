@@ -19,23 +19,18 @@ pub(super) fn sql_path(path: &Path) -> String {
     path.to_string_lossy().replace('\'', "''")
 }
 
-pub(super) fn attach_ducklake_connection(
-    conn: &Connection,
-    postgres_dsn: Option<&str>,
-    attach_uri: Option<&str>,
-    duckdb_path: &Path,
-    local_storage_dir: &Path,
-    extension_dir: Option<&Path>,
-) -> Result<()> {
-    configure_extension_directory(conn, extension_dir)?;
-    let plan =
-        build_ducklake_attach_plan(postgres_dsn, attach_uri, duckdb_path, local_storage_dir)?;
+pub(super) fn attach_ducklake_connection(conn: &Connection, config: &Config) -> Result<()> {
+    configure_extension_directory(conn, config.operator.duckdb_extension_dir.as_deref())?;
+    let plan = ducklake_attach_plan(config)?;
 
     if plan.needs_motherduck && conn.execute_batch("LOAD md;").is_err() {
         conn.execute_batch("INSTALL md; LOAD md;")?;
     }
     if plan.needs_ducklake && conn.execute_batch("LOAD ducklake;").is_err() {
         conn.execute_batch("INSTALL ducklake; LOAD ducklake;")?;
+    }
+    if plan.needs_quack && conn.execute_batch("LOAD quack;").is_err() {
+        conn.execute_batch("INSTALL quack; LOAD quack;")?;
     }
     if plan.needs_postgres {
         conn.execute_batch("INSTALL postgres; LOAD postgres;")?;
@@ -50,6 +45,7 @@ pub(super) struct DuckLakeAttachPlan {
     pub(super) mode: &'static str,
     pub(super) needs_ducklake: bool,
     pub(super) needs_motherduck: bool,
+    pub(super) needs_quack: bool,
     pub(super) needs_postgres: bool,
 }
 
@@ -64,6 +60,9 @@ pub(super) fn ducklake_attach_plan(config: &Config) -> Result<DuckLakeAttachPlan
     build_ducklake_attach_plan(
         config.operator.postgres_dsn.as_deref(),
         config.operator.ducklake_attach_uri.as_deref(),
+        config.operator.ducklake_catalog_path.as_deref(),
+        config.operator.ducklake_data_path.as_deref(),
+        config.operator.ducklake_quack_token.as_deref(),
         &config.operator.duckdb_path,
         &config.operator.local_storage_dir,
     )
@@ -72,6 +71,9 @@ pub(super) fn ducklake_attach_plan(config: &Config) -> Result<DuckLakeAttachPlan
 pub(super) fn build_ducklake_attach_plan(
     postgres_dsn: Option<&str>,
     attach_uri: Option<&str>,
+    catalog_path: Option<&Path>,
+    data_path: Option<&str>,
+    quack_token: Option<&str>,
     duckdb_path: &Path,
     local_storage_dir: &Path,
 ) -> Result<DuckLakeAttachPlan> {
@@ -80,6 +82,16 @@ pub(super) fn build_ducklake_attach_plan(
             "set only one of CANARDSTACK_POSTGRES_DSN or CANARDSTACK_DUCKLAKE_ATTACH_URI"
         );
     }
+    if catalog_path.is_some() && (postgres_dsn.is_some() || attach_uri.is_some()) {
+        anyhow::bail!(
+            "CANARDSTACK_DUCKLAKE_CATALOG_PATH can only be set with the local DuckDB-backed DuckLake catalog"
+        );
+    }
+
+    let data_path = data_path
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
 
     if let Some(uri) = attach_uri {
         let uri = uri.trim();
@@ -93,14 +105,42 @@ pub(super) fn build_ducklake_attach_plan(
         }
         let is_motherduck = uri.starts_with("md:");
         let is_ducklake = uri.starts_with("ducklake:");
+        let is_quack = uri.starts_with("ducklake:quack:");
         if !is_motherduck && !is_ducklake {
             anyhow::bail!(
                 "CANARDSTACK_DUCKLAKE_ATTACH_URI must be an md: or ducklake: URI because Arrow appends write through DuckLake"
             );
         }
+        let quack_secret_sql = if is_quack {
+            let token = quack_token
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "CANARDSTACK_DUCKLAKE_QUACK_TOKEN must be set when CANARDSTACK_DUCKLAKE_ATTACH_URI uses ducklake:quack:"
+                    )
+                })?;
+            let scope = uri.strip_prefix("ducklake:").unwrap_or(uri);
+            format!(
+                "CREATE OR REPLACE SECRET canardstack_ducklake_quack (TYPE quack, SCOPE '{}', TOKEN '{}'); ",
+                sql_string(scope),
+                sql_string(token),
+            )
+        } else {
+            String::new()
+        };
+        if is_motherduck && data_path.is_some() {
+            anyhow::bail!(
+                "CANARDSTACK_DUCKLAKE_DATA_PATH cannot be set with a MotherDuck md: attach URI"
+            );
+        }
+        let attach_options = data_path
+            .as_ref()
+            .map(|path| format!(" (DATA_PATH '{}')", sql_string(path)))
+            .unwrap_or_default();
         return Ok(DuckLakeAttachPlan {
             sql: format!(
-                "ATTACH '{}' AS {DUCKLAKE_CATALOG_NAME}; USE {DUCKLAKE_CATALOG_NAME};",
+                "{quack_secret_sql}ATTACH '{}' AS {DUCKLAKE_CATALOG_NAME}{attach_options}; USE {DUCKLAKE_CATALOG_NAME};",
                 uri.replace('\'', "''"),
             ),
             mode: if is_motherduck {
@@ -110,11 +150,13 @@ pub(super) fn build_ducklake_attach_plan(
             },
             needs_ducklake: is_ducklake,
             needs_motherduck: is_motherduck,
+            needs_quack: is_quack,
             needs_postgres: false,
         });
     }
 
-    let data_path = sql_path(local_storage_dir);
+    let data_path = data_path.unwrap_or_else(|| local_storage_dir.to_string_lossy().to_string());
+    let data_path = sql_string(&data_path);
     if let Some(dsn) = postgres_dsn {
         return Ok(DuckLakeAttachPlan {
             sql: format!(
@@ -125,14 +167,17 @@ pub(super) fn build_ducklake_attach_plan(
             mode: "ducklake_postgres_catalog",
             needs_ducklake: true,
             needs_motherduck: false,
+            needs_quack: false,
             needs_postgres: true,
         });
     }
 
-    let metadata = duckdb_path
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new("."))
-        .join("canardstack.ducklake");
+    let metadata = catalog_path.map(Path::to_path_buf).unwrap_or_else(|| {
+        duckdb_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("canardstack.ducklake")
+    });
     Ok(DuckLakeAttachPlan {
         sql: format!(
             "ATTACH 'ducklake:{}' AS {DUCKLAKE_CATALOG_NAME} (DATA_PATH '{}'); USE {DUCKLAKE_CATALOG_NAME};",
@@ -142,8 +187,13 @@ pub(super) fn build_ducklake_attach_plan(
         mode: "ducklake_duckdb_catalog",
         needs_ducklake: true,
         needs_motherduck: false,
+        needs_quack: false,
         needs_postgres: false,
     })
+}
+
+fn sql_string(value: &str) -> String {
+    value.replace('\'', "''")
 }
 
 pub(super) fn configure_ducklake_maintenance_options(

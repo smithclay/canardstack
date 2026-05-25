@@ -7,6 +7,7 @@
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![DuckLake](https://img.shields.io/badge/storage-DuckLake-fff000.svg?logo=duckdb&logoColor=black)](https://ducklake.select/)
 [![OpenTelemetry](https://img.shields.io/badge/OTLP-HTTP-425cc7.svg?logo=opentelemetry&logoColor=white)](https://opentelemetry.io/)
+[![Deploy to AWS](https://img.shields.io/badge/deploy-AWS%20CloudFormation-ff9900.svg?logo=amazonwebservices&logoColor=white)](https://console.aws.amazon.com/cloudformation/home#/stacks/create/review?stackName=canardstack&templateURL=https%3A%2F%2Fraw.githubusercontent.com%2Fsmithclay%2Fcanardstack%2Fmain%2Fdeploy%2Faws%2Fecs-express%2Ftemplate.yaml)
 
 > OpenTelemetry logs, traces, and metrics stored in DuckLake, visualized in Grafana.
 

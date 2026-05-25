@@ -1,0 +1,494 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  canardstack on ECS/Fargate with a public GHCR canardstack image, an internal
+  DuckDB/Quack catalog service, S3 DuckLake data files, and a service-managed
+  EBS volume for the DuckDB-backed DuckLake catalog metadata file.
+
+Parameters:
+  ClusterName:
+    Type: String
+    Default: canardstack
+  ServiceName:
+    Type: String
+    Default: canardstack
+  CatalogServiceName:
+    Type: String
+    Default: canardstack-catalog
+  ServiceDiscoveryNamespaceName:
+    Type: String
+    Default: canardstack.local
+  CatalogServiceDiscoveryName:
+    Type: String
+    Default: catalog
+  Image:
+    Type: String
+    Description: Public GHCR canardstack image, for example ghcr.io/<owner>/canardstack:<version>.
+  CatalogImage:
+    Type: String
+    Description: Public GHCR DuckDB/Quack catalog image. The image must serve Quack and persist its DuckDB catalog at DUCKDB_DATABASE.
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+  AllowedIngressCidr:
+    Type: String
+    Default: 0.0.0.0/0
+  S3BucketName:
+    Type: String
+  S3DataPrefix:
+    Type: String
+    Default: ducklake-data
+  ApiKey:
+    Type: String
+    NoEcho: true
+    MinLength: 16
+  AdminApiKey:
+    Type: String
+    NoEcho: true
+    MinLength: 16
+  QuackToken:
+    Type: String
+    NoEcho: true
+    MinLength: 16
+  Cpu:
+    Type: String
+    Default: "2048"
+  Memory:
+    Type: String
+    Default: "4096"
+  CatalogCpu:
+    Type: String
+    Default: "1024"
+  CatalogMemory:
+    Type: String
+    Default: "2048"
+  CatalogPort:
+    Type: Number
+    Default: 8080
+  AppContainerUser:
+    Type: String
+    Default: "0"
+    Description: Container user override for canardstack. The default can write the root-owned EBS mount.
+  CatalogContainerUser:
+    Type: String
+    Default: "0"
+    Description: Container user override for the catalog image. The default can write the root-owned EBS mount.
+  EbsSizeGiB:
+    Type: Number
+    Default: 20
+  AppEbsSizeGiB:
+    Type: Number
+    Default: 20
+  ProcessMemoryLimitBytes:
+    Type: Number
+    Default: 3221225472
+
+Resources:
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Ref ClusterName
+
+  AppLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ecs/${ServiceName}
+      RetentionInDays: 14
+
+  CatalogLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ecs/${CatalogServiceName}
+      RetentionInDays: 14
+
+  DuckLakeBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref S3BucketName
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+
+  ApiKeySecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub ${ServiceName}/api-key
+      SecretString: !Ref ApiKey
+
+  AdminApiKeySecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub ${ServiceName}/admin-api-key
+      SecretString: !Ref AdminApiKey
+
+  QuackTokenSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub ${CatalogServiceName}/quack-token
+      SecretString: !Ref QuackToken
+
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: read-canardstack-secrets
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref ApiKeySecret
+                  - !Ref AdminApiKeySecret
+                  - !Ref QuackTokenSecret
+
+  AppTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ducklake-s3-data
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !GetAtt DuckLakeBucket.Arn
+                Condition:
+                  StringLike:
+                    s3:prefix:
+                      - !Sub ${S3DataPrefix}/*
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource: !Sub ${DuckLakeBucket.Arn}/${S3DataPrefix}/*
+
+  EcsInfrastructureRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSInfrastructureRolePolicyForVolumes
+
+  LoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: canardstack load balancer
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: !Ref AllowedIngressCidr
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: canardstack app
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 4318
+          ToPort: 4318
+          SourceSecurityGroupId: !Ref LoadBalancerSecurityGroup
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+
+  CatalogSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: canardstack DuckDB Quack catalog
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref CatalogPort
+          ToPort: !Ref CatalogPort
+          SourceSecurityGroupId: !Ref AppSecurityGroup
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Type: application
+      Scheme: internet-facing
+      SecurityGroups:
+        - !Ref LoadBalancerSecurityGroup
+      Subnets: !Ref SubnetIds
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref VpcId
+      Protocol: HTTP
+      Port: 4318
+      TargetType: ip
+      HealthCheckEnabled: true
+      HealthCheckPath: /healthz
+      HealthCheckProtocol: HTTP
+      Matcher:
+        HttpCode: "200"
+
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Protocol: HTTP
+      Port: 80
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  PrivateDnsNamespace:
+    Type: AWS::ServiceDiscovery::PrivateDnsNamespace
+    Properties:
+      Name: !Ref ServiceDiscoveryNamespaceName
+      Vpc: !Ref VpcId
+
+  CatalogDiscoveryService:
+    Type: AWS::ServiceDiscovery::Service
+    Properties:
+      Name: !Ref CatalogServiceDiscoveryName
+      NamespaceId: !Ref PrivateDnsNamespace
+      DnsConfig:
+        RoutingPolicy: MULTIVALUE
+        DnsRecords:
+          - Type: A
+            TTL: 10
+      HealthCheckCustomConfig:
+        FailureThreshold: 1
+
+  AppTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Ref ServiceName
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: !Ref Cpu
+      Memory: !Ref Memory
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt AppTaskRole.Arn
+      Volumes:
+        - Name: canardstack-data
+          ConfiguredAtLaunch: true
+      ContainerDefinitions:
+        - Name: canardstack
+          Image: !Ref Image
+          Essential: true
+          User: !Ref AppContainerUser
+          Command:
+            - canardstack
+            - serve
+          PortMappings:
+            - ContainerPort: 4318
+              Protocol: tcp
+              AppProtocol: http
+          Environment:
+            - Name: CANARDSTACK_BIND
+              Value: 0.0.0.0:4318
+            - Name: CANARDSTACK_DATA_DIR
+              Value: /var/lib/canardstack
+            - Name: CANARDSTACK_DUCKDB_EXTENSION_DIR
+              Value: /usr/local/lib/duckdb/extensions
+            - Name: CANARDSTACK_DUCKLAKE_ATTACH_URI
+              Value: !Sub ducklake:quack:${CatalogServiceDiscoveryName}.${ServiceDiscoveryNamespaceName}:${CatalogPort}
+            - Name: CANARDSTACK_DUCKLAKE_DATA_PATH
+              Value: !Sub s3://${S3BucketName}/${S3DataPrefix}/
+            - Name: CANARDSTACK_DUCKLAKE_MAINTENANCE_ENABLED
+              Value: "true"
+            - Name: CANARDSTACK_PROCESS_MEMORY_LIMIT_BYTES
+              Value: !Sub ${ProcessMemoryLimitBytes}
+          Secrets:
+            - Name: CANARDSTACK_API_KEY
+              ValueFrom: !Ref ApiKeySecret
+            - Name: CANARDSTACK_ADMIN_API_KEY
+              ValueFrom: !Ref AdminApiKeySecret
+            - Name: CANARDSTACK_DUCKLAKE_QUACK_TOKEN
+              ValueFrom: !Ref QuackTokenSecret
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref AppLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: canardstack
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - canardstack healthcheck http://127.0.0.1:4318/healthz
+            Interval: 10
+            Timeout: 5
+            Retries: 6
+            StartPeriod: 30
+          MountPoints:
+            - SourceVolume: canardstack-data
+              ContainerPath: /var/lib/canardstack
+
+  CatalogTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Ref CatalogServiceName
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: !Ref CatalogCpu
+      Memory: !Ref CatalogMemory
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      Volumes:
+        - Name: duckdb-catalog
+          ConfiguredAtLaunch: true
+      ContainerDefinitions:
+        - Name: duckdb-quack
+          Image: !Ref CatalogImage
+          Essential: true
+          User: !Ref CatalogContainerUser
+          PortMappings:
+            - ContainerPort: !Ref CatalogPort
+              Protocol: tcp
+          Environment:
+            - Name: DUCKDB_DATABASE
+              Value: /var/lib/duckdb/catalog/canardstack.ducklake
+            - Name: QUACK_HOST
+              Value: 0.0.0.0
+            - Name: QUACK_PORT
+              Value: !Sub ${CatalogPort}
+          Secrets:
+            - Name: QUACK_TOKEN
+              ValueFrom: !Ref QuackTokenSecret
+          MountPoints:
+            - SourceVolume: duckdb-catalog
+              ContainerPath: /var/lib/duckdb/catalog
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref CatalogLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: duckdb-quack
+
+  CatalogService:
+    Type: AWS::ECS::Service
+    Properties:
+      Cluster: !Ref Cluster
+      ServiceName: !Ref CatalogServiceName
+      TaskDefinition: !Ref CatalogTaskDefinition
+      DesiredCount: 1
+      LaunchType: FARGATE
+      PlatformVersion: LATEST
+      EnableECSManagedTags: true
+      EnableExecuteCommand: true
+      DeploymentConfiguration:
+        MaximumPercent: 100
+        MinimumHealthyPercent: 0
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      ServiceRegistries:
+        - RegistryArn: !GetAtt CatalogDiscoveryService.Arn
+          ContainerName: duckdb-quack
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          SecurityGroups:
+            - !Ref CatalogSecurityGroup
+          Subnets: !Ref SubnetIds
+      VolumeConfigurations:
+        - Name: duckdb-catalog
+          ManagedEBSVolume:
+            RoleArn: !GetAtt EcsInfrastructureRole.Arn
+            SizeInGiB: !Ref EbsSizeGiB
+            VolumeType: gp3
+            Encrypted: true
+            FilesystemType: ext4
+
+  AppService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - Listener
+      - CatalogService
+    Properties:
+      Cluster: !Ref Cluster
+      ServiceName: !Ref ServiceName
+      TaskDefinition: !Ref AppTaskDefinition
+      DesiredCount: 1
+      LaunchType: FARGATE
+      PlatformVersion: LATEST
+      EnableECSManagedTags: true
+      EnableExecuteCommand: true
+      DeploymentConfiguration:
+        MaximumPercent: 100
+        MinimumHealthyPercent: 0
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      LoadBalancers:
+        - ContainerName: canardstack
+          ContainerPort: 4318
+          TargetGroupArn: !Ref TargetGroup
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          SecurityGroups:
+            - !Ref AppSecurityGroup
+          Subnets: !Ref SubnetIds
+      VolumeConfigurations:
+        - Name: canardstack-data
+          ManagedEBSVolume:
+            RoleArn: !GetAtt EcsInfrastructureRole.Arn
+            SizeInGiB: !Ref AppEbsSizeGiB
+            VolumeType: gp3
+            Encrypted: true
+            FilesystemType: ext4
+
+Outputs:
+  ClusterArn:
+    Value: !GetAtt Cluster.Arn
+  ServiceArn:
+    Value: !Ref AppService
+  CatalogServiceArn:
+    Value: !Ref CatalogService
+  ServiceUrl:
+    Value: !Sub http://${LoadBalancer.DNSName}
+  DuckLakeAttachUri:
+    Value: !Sub ducklake:quack:${CatalogServiceDiscoveryName}.${ServiceDiscoveryNamespaceName}:${CatalogPort}
+  DuckLakeDataPath:
+    Value: !Sub s3://${S3BucketName}/${S3DataPrefix}/
+  ApiKeySecretArn:
+    Value: !Ref ApiKeySecret
+  AdminApiKeySecretArn:
+    Value: !Ref AdminApiKeySecret
+  QuackTokenSecretArn:
+    Value: !Ref QuackTokenSecret
