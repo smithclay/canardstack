@@ -37,11 +37,12 @@ Tempo compatibility APIs for Grafana-style clients.
 
 ## Start Locally
 
-Start canardstack from source. With no options, it uses local DuckLake storage
+Install and start canardstack. With no options, it uses local DuckLake storage
 under `.canardstack` and listens on `127.0.0.1:4318`.
 
 ```bash
-git clone https://github.com/smithclay/canardstack.git && cd canardstack && cargo run
+cargo install --locked canardstack
+canardstack
 ```
 
 In another terminal, send one OTLP/HTTP JSON log:

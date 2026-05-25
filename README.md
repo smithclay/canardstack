@@ -32,14 +32,14 @@ Builds on prior work from [otlp2parquet](https://github.com/smithclay/otlp2parqu
 
 ## Quick Start
 
-Start canardstack from source. With no options, it uses local DuckLake storage
+Install and start canardstack. With no options, it uses local DuckLake storage
 under `.canardstack` and listens for OTLP data on `127.0.0.1:4318`.
 
 ```bash
 # requires rust toolchain: `curl https://sh.rustup.rs -sSf | sh`
 # also assumes you have duckdb installed (`brew install duckdb`)
-git clone https://github.com/smithclay/canardstack.git && cd canardstack
-cargo run
+cargo install --locked canardstack
+canardstack
 ```
 
 In another terminal, send one OTLP/HTTP JSON log:
