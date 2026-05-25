@@ -48,6 +48,7 @@ jobs:
   docker-build:
     name: Build image (${{ matrix.platform }})
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
