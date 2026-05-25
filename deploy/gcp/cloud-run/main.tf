@@ -123,6 +123,40 @@ resource "google_storage_bucket_iam_member" "catalog_object_user" {
   member = "serviceAccount:${google_service_account.catalog.email}"
 }
 
+# DuckDB reaches GCS through the S3-compatible interop API, which authenticates
+# with HMAC keys; a bare GCP service-account identity does not work with core
+# DuckDB. The app's DuckLake DATA_PATH is gcs://, so mint an HMAC key for the app
+# service account and feed it to DuckDB's credential_chain through the standard
+# AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY variables (see the app service). The
+# key acts as the app service account, which already holds objectUser on the
+# bucket.
+resource "google_storage_hmac_key" "app" {
+  service_account_email = google_service_account.app.email
+
+  depends_on = [google_project_service.required]
+}
+
+resource "google_secret_manager_secret" "gcs_hmac_secret" {
+  secret_id = "${var.service_name}-gcs-hmac-secret"
+
+  replication {
+    auto {}
+  }
+
+  depends_on = [google_project_service.required]
+}
+
+resource "google_secret_manager_secret_version" "gcs_hmac_secret" {
+  secret      = google_secret_manager_secret.gcs_hmac_secret.id
+  secret_data = google_storage_hmac_key.app.secret
+}
+
+resource "google_secret_manager_secret_iam_member" "app_gcs_hmac_secret_accessor" {
+  secret_id = google_secret_manager_secret.gcs_hmac_secret.id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.app.email}"
+}
+
 resource "google_secret_manager_secret" "api_key" {
   secret_id = "${var.service_name}-api-key"
 
@@ -353,6 +387,31 @@ resource "google_cloud_run_v2_service" "app" {
         value = "gcs://${google_storage_bucket.ducklake.name}/${trimsuffix(var.data_prefix, "/")}/"
       }
 
+      # GCS credentials for the DuckLake DATA_PATH. DuckDB's credential_chain
+      # resolves these standard AWS variables; for gcs:// the HMAC key pair is
+      # used against the S3-compatible endpoint. access_id is the public half of
+      # the key; the secret half is pulled from Secret Manager. AWS_REGION only
+      # satisfies the AWS SDK's signer (GCS ignores the region for interop auth).
+      env {
+        name  = "AWS_ACCESS_KEY_ID"
+        value = google_storage_hmac_key.app.access_id
+      }
+
+      env {
+        name = "AWS_SECRET_ACCESS_KEY"
+        value_source {
+          secret_key_ref {
+            secret  = google_secret_manager_secret.gcs_hmac_secret.secret_id
+            version = "latest"
+          }
+        }
+      }
+
+      env {
+        name  = "AWS_REGION"
+        value = var.region
+      }
+
       env {
         name  = "CANARDSTACK_DUCKLAKE_MAINTENANCE_ENABLED"
         value = "true"
@@ -415,6 +474,8 @@ resource "google_cloud_run_v2_service" "app" {
     google_secret_manager_secret_iam_member.api_key_accessor,
     google_secret_manager_secret_iam_member.admin_api_key_accessor,
     google_secret_manager_secret_iam_member.app_quack_token_accessor,
+    google_secret_manager_secret_iam_member.app_gcs_hmac_secret_accessor,
+    google_secret_manager_secret_version.gcs_hmac_secret,
     google_storage_bucket_iam_member.app_object_user,
     google_storage_bucket_object.app_data_prefix,
     google_storage_bucket_object.data_prefix,

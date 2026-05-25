@@ -32,3 +32,13 @@ output "ducklake_data_path" {
   description = "DuckLake DATA_PATH configured for canardstack."
   value       = "gcs://${google_storage_bucket.ducklake.name}/${trimsuffix(var.data_prefix, "/")}/"
 }
+
+output "gcs_hmac_access_id" {
+  description = "Access ID of the GCS HMAC key the app uses to authenticate to the gcs:// DuckLake data store."
+  value       = google_storage_hmac_key.app.access_id
+}
+
+output "gcs_hmac_secret_name" {
+  description = "Secret Manager secret holding the GCS HMAC secret (value is sensitive and not exposed as an output)."
+  value       = google_secret_manager_secret.gcs_hmac_secret.secret_id
+}
