@@ -1,4 +1,8 @@
+# syntax=docker/dockerfile:1.7
+
 FROM rust:1.92-slim-bookworm AS builder
+
+ARG TARGETPLATFORM
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -14,11 +18,15 @@ COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY benches ./benches
 
-RUN cargo build --release --locked
+RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=cargo-git,target=/usr/local/cargo/git \
+    --mount=type=cache,id=cargo-target-${TARGETPLATFORM},target=/app/target \
+    cargo build --release --locked \
+    && cp /app/target/release/canardstack /app/canardstack
 
 RUN mkdir -p /opt/duckdb/extensions \
     && CANARDSTACK_DUCKDB_EXTENSION_DIR=/opt/duckdb/extensions \
-       ./target/release/canardstack install-ducklake-extension
+       /app/canardstack install-ducklake-extension
 
 FROM debian:bookworm-slim AS runtime
 
@@ -39,7 +47,7 @@ RUN apt-get update \
     && mkdir -p /usr/local/lib/duckdb/extensions /var/lib/canardstack/storage \
     && chown -R canardstack:canardstack /var/lib/canardstack /usr/local/lib/duckdb
 
-COPY --from=builder /app/target/release/canardstack /usr/local/bin/canardstack
+COPY --from=builder /app/canardstack /usr/local/bin/canardstack
 COPY --from=builder --chown=canardstack:canardstack /opt/duckdb/extensions /usr/local/lib/duckdb/extensions
 
 ENV HOME=/var/lib/canardstack \
