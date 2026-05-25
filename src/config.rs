@@ -235,6 +235,26 @@ impl Config {
                 "CANARDSTACK_MAX_BODY_BYTES must be <= CANARDSTACK_RAW_SPOOL_CAPACITY_BYTES"
             );
         }
+        // Cross-field check spanning both sub-structs: the seal pipeline must be
+        // able to hold projected query-visibility under the freshness budget. The
+        // seal cadence and the Arrow write-buffer max age each bound how old
+        // buffered rows get before a seal commits them; if either reaches the
+        // freshness SLA, buffer age alone can drive ingest into chronic
+        // freshness-budget 429s. The runtime seal-priority logic already consumes
+        // this relationship (`maintenance.rs`); validate it at boot so the
+        // misconfiguration fails loudly instead of degrading invisibly. The
+        // documented intent is "well under" the SLA; we hard-fail only the
+        // unambiguous `>=` case rather than encode a margin.
+        if self.mechanics.scheduler_seal_interval >= self.operator.freshness_budget_sla {
+            anyhow::bail!(
+                "CANARDSTACK_SEAL_INTERVAL_MS/SECS must be < CANARDSTACK_FRESHNESS_BUDGET_SLA_MS/SECS so the seal cadence can hold visibility under the freshness budget"
+            );
+        }
+        if self.mechanics.arrow_write_buffer_max_age >= self.operator.freshness_budget_sla {
+            anyhow::bail!(
+                "CANARDSTACK_ARROW_WRITE_BUFFER_MAX_AGE_MS/SECS must be < CANARDSTACK_FRESHNESS_BUDGET_SLA_MS/SECS so buffered rows seal before they breach the freshness budget"
+            );
+        }
         Ok(())
     }
 }
@@ -1122,6 +1142,35 @@ max_body_bytes = "large"
         }
 
         Config::from_env().unwrap().validate().unwrap();
+    }
+
+    #[test]
+    fn validate_rejects_seal_cadence_at_or_above_freshness_sla() {
+        // Baseline test config keeps the seal cadence well under the SLA.
+        let mut config = Config::test(PathBuf::from("canardstack.duckdb"));
+        config.validate().unwrap();
+
+        // A seal cadence at/above the freshness SLA cannot hold visibility under
+        // the budget, so boot must fail rather than degrade into chronic 429s.
+        config.mechanics.scheduler_seal_interval = config.operator.freshness_budget_sla;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("CANARDSTACK_SEAL_INTERVAL_MS/SECS must be <"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_buffer_max_age_at_or_above_freshness_sla() {
+        let mut config = Config::test(PathBuf::from("canardstack.duckdb"));
+        config.validate().unwrap();
+
+        config.mechanics.arrow_write_buffer_max_age = config.operator.freshness_budget_sla;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("CANARDSTACK_ARROW_WRITE_BUFFER_MAX_AGE_MS/SECS must be <"),
+            "{err}"
+        );
     }
 
     #[test]
