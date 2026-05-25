@@ -1,17 +1,18 @@
-//! Optional in-binary TLS termination for the `serve-catalog` role
-//! (`catalog-tls` feature). Quack's server never speaks TLS itself and a
-//! non-local client assumes HTTPS, so on platforms without managed TLS (e.g. ECS
-//! behind Cloud Map) the catalog needs a TLS front. This terminates TLS with an
-//! ephemeral self-signed cert and forwards the plaintext to the local Quack
-//! server. Clients reach it over HTTPS and skip cert verification with a scoped
-//! `(TYPE HTTP, VERIFY_SSL 0)` secret (see `CANARDSTACK_DUCKLAKE_QUACK_INSECURE_TLS`);
-//! the Quack token does authentication and TLS provides encryption in transit.
+//! Optional in-binary TLS termination for public HTTP listeners. The main
+//! `serve` endpoint and the `serve-catalog` Quack endpoint both keep their
+//! plaintext HTTP backends; this module terminates TLS on a public address and
+//! forwards decrypted HTTP/1.1 bytes to the configured loopback backend.
 
 use anyhow::{Context, Result};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use base64::Engine;
+use rustls::pki_types::{
+    CertificateDer, PrivateKeyDer, PrivatePkcs1KeyDer, PrivatePkcs8KeyDer, PrivateSec1KeyDer,
+};
 use rustls::{ServerConfig, ServerConnection, StreamOwned};
+use std::fs;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -21,43 +22,147 @@ const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const PUMP_IDLE_SLEEP: Duration = Duration::from_millis(1);
 const BUF_BYTES: usize = 32 * 1024;
 
-/// rustls config with a freshly generated self-signed cert. The cert identity is
-/// not verified by clients (they use `VERIFY_SSL 0`), so it exists only to
-/// establish the encrypted channel; nothing sensitive is baked into the image.
-fn self_signed_config() -> Result<Arc<ServerConfig>> {
-    let cert = rcgen::generate_simple_self_signed(vec!["canardstack-catalog".to_string()])
-        .context("generate self-signed catalog certificate")?;
+#[derive(Clone, Debug)]
+pub enum TlsIdentity {
+    File {
+        cert_file: PathBuf,
+        key_file: PathBuf,
+    },
+    EphemeralSelfSigned {
+        subject_alt_names: Vec<String>,
+    },
+}
+
+impl TlsIdentity {
+    fn server_config(&self) -> Result<Arc<ServerConfig>> {
+        match self {
+            Self::File {
+                cert_file,
+                key_file,
+            } => file_config(cert_file, key_file),
+            Self::EphemeralSelfSigned { subject_alt_names } => {
+                self_signed_config(subject_alt_names)
+            }
+        }
+    }
+}
+
+fn file_config(cert_file: &PathBuf, key_file: &PathBuf) -> Result<Arc<ServerConfig>> {
+    let cert_bytes =
+        fs::read(cert_file).with_context(|| format!("read TLS cert {}", cert_file.display()))?;
+    let key_bytes =
+        fs::read(key_file).with_context(|| format!("read TLS key {}", key_file.display()))?;
+    let certs = pem_blocks(&cert_bytes, &["CERTIFICATE"])
+        .with_context(|| format!("parse TLS cert {}", cert_file.display()))?
+        .into_iter()
+        .map(CertificateDer::from)
+        .collect::<Vec<_>>();
+    if certs.is_empty() {
+        anyhow::bail!(
+            "{} must contain at least one PEM CERTIFICATE block",
+            cert_file.display()
+        );
+    }
+
+    let key = first_private_key(&key_bytes)
+        .with_context(|| format!("parse TLS key {}", key_file.display()))?;
+    build_server_config(certs, key)
+}
+
+fn first_private_key(key_bytes: &[u8]) -> Result<PrivateKeyDer<'static>> {
+    if let Some(bytes) = pem_blocks(key_bytes, &["PRIVATE KEY"])?.into_iter().next() {
+        return Ok(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(bytes)));
+    }
+    if let Some(bytes) = pem_blocks(key_bytes, &["RSA PRIVATE KEY"])?
+        .into_iter()
+        .next()
+    {
+        return Ok(PrivateKeyDer::Pkcs1(PrivatePkcs1KeyDer::from(bytes)));
+    }
+    if let Some(bytes) = pem_blocks(key_bytes, &["EC PRIVATE KEY"])?
+        .into_iter()
+        .next()
+    {
+        return Ok(PrivateKeyDer::Sec1(PrivateSec1KeyDer::from(bytes)));
+    }
+    anyhow::bail!(
+        "TLS key must contain a PEM PRIVATE KEY, RSA PRIVATE KEY, or EC PRIVATE KEY block"
+    );
+}
+
+fn pem_blocks(input: &[u8], labels: &[&str]) -> Result<Vec<Vec<u8>>> {
+    let text = std::str::from_utf8(input).context("PEM file must be UTF-8 text")?;
+    let mut blocks = Vec::new();
+    for label in labels {
+        let begin = format!("-----BEGIN {label}-----");
+        let end = format!("-----END {label}-----");
+        let mut rest = text;
+        while let Some(begin_idx) = rest.find(&begin) {
+            let after_begin = &rest[begin_idx + begin.len()..];
+            let Some(end_idx) = after_begin.find(&end) else {
+                anyhow::bail!("PEM block {label} is missing its END marker");
+            };
+            let body = after_begin[..end_idx]
+                .chars()
+                .filter(|ch| !ch.is_whitespace())
+                .collect::<String>();
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(body.as_bytes())
+                .with_context(|| format!("decode PEM block {label}"))?;
+            blocks.push(decoded);
+            rest = &after_begin[end_idx + end.len()..];
+        }
+    }
+    Ok(blocks)
+}
+
+fn self_signed_config(subject_alt_names: &[String]) -> Result<Arc<ServerConfig>> {
+    let names = if subject_alt_names.is_empty() {
+        vec!["localhost".to_string()]
+    } else {
+        subject_alt_names.to_vec()
+    };
+    let cert = rcgen::generate_simple_self_signed(names)
+        .context("generate ephemeral self-signed TLS certificate")?;
     let cert_der = CertificateDer::from(cert.cert.der().to_vec());
     let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()));
+    build_server_config(vec![cert_der], key_der)
+}
+
+fn build_server_config(
+    certs: Vec<CertificateDer<'static>>,
+    key: PrivateKeyDer<'static>,
+) -> Result<Arc<ServerConfig>> {
     let mut config =
         ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
             .with_safe_default_protocol_versions()
-            .context("configure catalog TLS protocol versions")?
+            .context("configure TLS protocol versions")?
             .with_no_client_auth()
-            .with_single_cert(vec![cert_der], key_der)
-            .context("build catalog TLS server config")?;
-    // The plaintext Quack backend speaks HTTP/1.1, so advertise only http/1.1 to
-    // the client and forward the decrypted HTTP/1.1 bytes through unchanged.
+            .with_single_cert(certs, key)
+            .context("build TLS server config")?;
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
     Ok(Arc::new(config))
 }
 
-/// Terminate TLS on `public_addr` and forward decrypted bytes to the local
-/// plaintext Quack server at `backend_addr`. Blocks until `shutdown`.
+/// Terminate TLS on `public_addr` and forward decrypted bytes to the plaintext
+/// HTTP backend at `backend_addr`. Blocks until `shutdown`.
 pub fn run_tls_terminator(
     public_addr: &str,
     backend_addr: String,
+    identity: TlsIdentity,
+    endpoint: &'static str,
     shutdown: &'static AtomicBool,
 ) -> Result<()> {
-    let config = self_signed_config()?;
+    let config = identity.server_config()?;
     let listener = TcpListener::bind(public_addr)
-        .with_context(|| format!("bind catalog TLS listener {public_addr}"))?;
+        .with_context(|| format!("bind TLS listener {public_addr}"))?;
     listener.set_nonblocking(true)?;
     tracing::info!(
-        event = "catalog_tls_listening",
+        event = "tls_listening",
+        endpoint,
         addr = %public_addr,
         backend = %backend_addr,
-        "terminating TLS in front of the Quack catalog"
+        "terminating TLS in front of plaintext HTTP backend"
     );
     while !shutdown.load(Ordering::SeqCst) {
         match listener.accept() {
@@ -66,7 +171,7 @@ pub fn run_tls_terminator(
                 let backend = backend_addr.clone();
                 thread::spawn(move || {
                     if let Err(err) = proxy_connection(stream, config, &backend) {
-                        tracing::debug!(event = "catalog_tls_conn_failed", error = %err);
+                        tracing::debug!(event = "tls_conn_failed", endpoint, error = %err);
                     }
                 });
             }
@@ -78,17 +183,13 @@ pub fn run_tls_terminator(
     Ok(())
 }
 
-/// Single-threaded non-blocking bidirectional pump for one connection: decrypt
-/// client->backend and encrypt backend->client. Quack is request/response over
-/// HTTP/1.1, so one pump thread per connection is sufficient.
 fn proxy_connection(client: TcpStream, config: Arc<ServerConfig>, backend: &str) -> Result<()> {
     client.set_nonblocking(true)?;
     let conn = ServerConnection::new(config)?;
     let mut tls = StreamOwned::new(conn, client);
 
-    let backend = TcpStream::connect(backend).context("connect to local Quack backend")?;
+    let mut backend = TcpStream::connect(backend).context("connect to plaintext TLS backend")?;
     backend.set_nonblocking(true)?;
-    let mut backend = backend;
 
     let mut c2b = Pending::default();
     let mut b2c = Pending::default();
@@ -101,7 +202,6 @@ fn proxy_connection(client: TcpStream, config: Arc<ServerConfig>, backend: &str)
     loop {
         let mut progress = false;
 
-        // client (TLS) -> backend
         if c2b.is_empty() && !client_eof {
             match read_into(&mut tls, &mut scratch) {
                 ReadState::Data(n) => {
@@ -125,15 +225,11 @@ fn proxy_connection(client: TcpStream, config: Arc<ServerConfig>, backend: &str)
                 WriteState::Err(e) => return Err(e.into()),
             }
         }
-        // Propagate the client's half-close: once the full request is forwarded,
-        // half-close the backend write side so Quack stops waiting for more input
-        // and produces its response (the request/response is request-then-FIN).
         if client_eof && c2b.is_empty() && !backend_wr_closed {
             let _ = backend.shutdown(Shutdown::Write);
             backend_wr_closed = true;
         }
 
-        // backend -> client (TLS)
         if b2c.is_empty() && !backend_eof {
             match read_into(&mut backend, &mut scratch) {
                 ReadState::Data(n) => {
@@ -147,9 +243,6 @@ fn proxy_connection(client: TcpStream, config: Arc<ServerConfig>, backend: &str)
             }
         }
         if b2c.has_data() {
-            // rustls buffers the plaintext and only best-effort-writes to the
-            // socket, so the response must be flushed to completion or the client
-            // sees a truncated read.
             match write_some(&mut tls, b2c.unwritten()) {
                 WriteState::Wrote(n) => {
                     b2c.advance(n);
@@ -161,16 +254,12 @@ fn proxy_connection(client: TcpStream, config: Arc<ServerConfig>, backend: &str)
                 WriteState::Err(e) => return Err(e.into()),
             }
         }
-        // Propagate the backend's half-close: once the full response is delivered,
-        // send the TLS close_notify so the client sees a clean end of response.
         if backend_eof && b2c.is_empty() && !client_wr_closed {
             tls.conn.send_close_notify();
             let _ = flush_spin(&mut tls);
             client_wr_closed = true;
         }
 
-        // Exit only once BOTH directions have closed and drained, so a client that
-        // half-closes after its request still receives the full response.
         if client_eof && backend_eof && c2b.is_empty() && b2c.is_empty() {
             break;
         }
@@ -191,8 +280,6 @@ fn peer_closed(e: &std::io::Error) -> bool {
     )
 }
 
-/// Flush rustls's buffered output to the non-blocking socket, retrying on
-/// WouldBlock so the client receives the complete response before close.
 fn flush_spin<S: Write>(tls: &mut S) -> std::io::Result<()> {
     loop {
         match tls.flush() {
@@ -272,8 +359,29 @@ mod tests {
     use super::*;
     use std::process::Command;
 
-    // Large POST: the backend reads the full request body, verifies every byte,
-    // and echoes the count. Catches request-direction truncation/corruption.
+    #[test]
+    fn parses_pem_cert_and_pkcs8_key() {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert_pem = pem_text("CERTIFICATE", cert.cert.der());
+        let key_der = cert.key_pair.serialize_der();
+        let key_pem = pem_text("PRIVATE KEY", &key_der);
+        assert_eq!(
+            pem_blocks(cert_pem.as_bytes(), &["CERTIFICATE"])
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(matches!(
+            first_private_key(key_pem.as_bytes()).unwrap(),
+            PrivateKeyDer::Pkcs8(_)
+        ));
+    }
+
+    fn pem_text(label: &str, der: &[u8]) -> String {
+        let body = base64::engine::general_purpose::STANDARD.encode(der);
+        format!("-----BEGIN {label}-----\n{body}\n-----END {label}-----\n")
+    }
+
     #[test]
     #[ignore = "needs curl; exercises the live TLS terminator"]
     fn tls_terminator_forwards_large_request() {
@@ -285,7 +393,6 @@ mod tests {
                 let mut s = stream.unwrap();
                 let mut data = Vec::new();
                 let mut tmp = [0u8; 8192];
-                // Read headers + body until we have the full Content-Length body.
                 let mut content_len: Option<usize> = None;
                 let mut header_end: Option<usize> = None;
                 loop {
@@ -336,7 +443,15 @@ mod tests {
         let shutdown: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
         let pa = public_addr.clone();
         thread::spawn(move || {
-            let _ = run_tls_terminator(&pa, backend_addr, shutdown);
+            let _ = run_tls_terminator(
+                &pa,
+                backend_addr,
+                TlsIdentity::EphemeralSelfSigned {
+                    subject_alt_names: vec!["localhost".to_string()],
+                },
+                "test",
+                shutdown,
+            );
         });
         thread::sleep(Duration::from_millis(400));
         let out = Command::new("curl")
@@ -363,12 +478,10 @@ mod tests {
         );
     }
 
-    // Isolates the TLS terminator from Quack: a trivial HTTP/1.1 backend behind
-    // the shim, hit with curl -k. Needs curl; run with --ignored.
     #[test]
     #[ignore = "needs curl; exercises the live TLS terminator"]
     fn tls_terminator_forwards_http_roundtrip() {
-        const BODY_LEN: usize = 250_000; // larger than the 32k pump buffer
+        const BODY_LEN: usize = 250_000;
         let backend = TcpListener::bind("127.0.0.1:0").unwrap();
         let backend_addr = backend.local_addr().unwrap().to_string();
         thread::spawn(move || {
@@ -390,7 +503,15 @@ mod tests {
         let shutdown: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
         let pa = public_addr.clone();
         thread::spawn(move || {
-            let _ = run_tls_terminator(&pa, backend_addr, shutdown);
+            let _ = run_tls_terminator(
+                &pa,
+                backend_addr,
+                TlsIdentity::EphemeralSelfSigned {
+                    subject_alt_names: vec!["localhost".to_string()],
+                },
+                "test",
+                shutdown,
+            );
         });
         thread::sleep(Duration::from_millis(400));
         let out = Command::new("curl")

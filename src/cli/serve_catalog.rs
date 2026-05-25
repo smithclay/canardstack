@@ -4,9 +4,11 @@
 //! it. This is plain DuckDB plus Quack: it does not run the ingest/query
 //! pipeline and performs no DuckLake `ATTACH` of its own.
 
+use crate::config::TlsMode;
 use crate::storage;
 use crate::Config;
 use anyhow::{Context, Result};
+use std::env;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -29,8 +31,10 @@ pub fn run(mut args: impl Iterator<Item = String>, shutdown: &'static AtomicBool
                     "serve the local DuckLake catalog DuckDB file over the Quack protocol.\n\
                      env: CANARDSTACK_DUCKLAKE_QUACK_TOKEN (required), CANARDSTACK_DUCKLAKE_CATALOG_PATH,\n\
                      CANARDSTACK_CATALOG_LISTEN (default {DEFAULT_LISTEN}), CANARDSTACK_CATALOG_HEALTH_BIND (default {DEFAULT_HEALTH_BIND}).\n\
-                     TLS (requires --features catalog-tls): CANARDSTACK_CATALOG_TLS=true terminates TLS on\n\
-                     CANARDSTACK_CATALOG_LISTEN and forwards to CANARDSTACK_CATALOG_QUACK_BACKEND (default {DEFAULT_QUACK_BACKEND})"
+                     TLS (requires --features tls): CANARDSTACK_CATALOG_TLS=true terminates TLS on\n\
+                     CANARDSTACK_CATALOG_LISTEN and forwards to CANARDSTACK_CATALOG_QUACK_BACKEND (default {DEFAULT_QUACK_BACKEND});\n\
+                     set CANARDSTACK_CATALOG_TLS_MODE=file with CANARDSTACK_CATALOG_TLS_CERT_FILE and\n\
+                     CANARDSTACK_CATALOG_TLS_KEY_FILE to use a persistent certificate"
                 );
                 return Ok(());
             }
@@ -56,13 +60,13 @@ pub fn run(mut args: impl Iterator<Item = String>, shutdown: &'static AtomicBool
         .to_string();
     let public_listen = env_or("CANARDSTACK_CATALOG_LISTEN", DEFAULT_LISTEN);
     let health_bind = env_or("CANARDSTACK_CATALOG_HEALTH_BIND", DEFAULT_HEALTH_BIND);
-    let tls_enabled = env_bool("CANARDSTACK_CATALOG_TLS");
+    let tls = CatalogTlsConfig::from_env()?;
 
     // In TLS mode Quack binds a loopback backend and an in-binary TLS terminator
     // fronts it on the public address; requests then arrive with a non-local Host,
     // so allow_other_hostname must be on. In plaintext mode Quack binds the public
     // address directly and only opts in when that address is non-loopback.
-    let (quack_listen, allow_other_hostname) = if tls_enabled {
+    let (quack_listen, allow_other_hostname) = if tls.enabled {
         (
             env_or("CANARDSTACK_CATALOG_QUACK_BACKEND", DEFAULT_QUACK_BACKEND),
             true,
@@ -84,30 +88,37 @@ pub fn run(mut args: impl Iterator<Item = String>, shutdown: &'static AtomicBool
     tracing::info!(
         event = "catalog_listening",
         listen = %quack_listen,
-        tls = tls_enabled,
+        tls = tls.enabled,
         catalog = %catalog_path.display(),
         "serving the DuckLake catalog over Quack"
     );
 
-    if tls_enabled {
-        #[cfg(feature = "catalog-tls")]
+    if tls.enabled {
+        #[cfg(feature = "tls")]
         {
             let public = public_listen.clone();
             let backend = quack_listen.clone();
+            let identity = tls.identity()?;
             thread::spawn(move || {
-                if let Err(err) =
-                    crate::cli::catalog_tls::run_tls_terminator(&public, backend, shutdown)
-                {
+                if let Err(err) = crate::tls::run_tls_terminator(
+                    &public,
+                    backend,
+                    identity,
+                    "serve-catalog",
+                    shutdown,
+                ) {
                     tracing::error!(event = "catalog_tls_terminator_failed", error = %err);
                 }
             });
-            tracing::info!(event = "catalog_tls_enabled", public = %public_listen);
-        }
-        #[cfg(not(feature = "catalog-tls"))]
-        {
-            anyhow::bail!(
-                "CANARDSTACK_CATALOG_TLS=true requires a build with --features catalog-tls"
+            tracing::info!(
+                event = "catalog_tls_enabled",
+                public = %public_listen,
+                mode = tls.mode.as_str()
             );
+        }
+        #[cfg(not(feature = "tls"))]
+        {
+            anyhow::bail!("CANARDSTACK_CATALOG_TLS=true requires a build with --features tls");
         }
     }
 
@@ -129,6 +140,87 @@ fn env_bool(name: &str) -> bool {
         std::env::var(name).ok().as_deref().map(str::trim),
         Some("1") | Some("true") | Some("yes")
     )
+}
+
+#[derive(Clone, Debug)]
+struct CatalogTlsConfig {
+    enabled: bool,
+    mode: TlsMode,
+    cert_file: Option<PathBuf>,
+    key_file: Option<PathBuf>,
+}
+
+impl CatalogTlsConfig {
+    fn from_env() -> Result<Self> {
+        let enabled =
+            env_bool("CANARDSTACK_CATALOG_TLS") || env_bool("CANARDSTACK_CATALOG_TLS_ENABLED");
+        let cert_file = env_optional_path("CANARDSTACK_CATALOG_TLS_CERT_FILE");
+        let key_file = env_optional_path("CANARDSTACK_CATALOG_TLS_KEY_FILE");
+        let mode = env_optional_string("CANARDSTACK_CATALOG_TLS_MODE")
+            .map(|value| TlsMode::parse(&value))
+            .transpose()?
+            .unwrap_or_else(|| {
+                if cert_file.is_some() || key_file.is_some() {
+                    TlsMode::File
+                } else {
+                    TlsMode::EphemeralSelfSigned
+                }
+            });
+        let config = Self {
+            enabled,
+            mode,
+            cert_file,
+            key_file,
+        };
+        config.validate()?;
+        Ok(config)
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.enabled && self.mode == TlsMode::File {
+            if self.cert_file.is_none() {
+                anyhow::bail!(
+                    "CANARDSTACK_CATALOG_TLS_CERT_FILE must be set when CANARDSTACK_CATALOG_TLS_MODE=file"
+                );
+            }
+            if self.key_file.is_none() {
+                anyhow::bail!(
+                    "CANARDSTACK_CATALOG_TLS_KEY_FILE must be set when CANARDSTACK_CATALOG_TLS_MODE=file"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "tls")]
+    fn identity(&self) -> Result<crate::tls::TlsIdentity> {
+        match self.mode {
+            TlsMode::File => Ok(crate::tls::TlsIdentity::File {
+                cert_file: self
+                    .cert_file
+                    .clone()
+                    .expect("validated catalog TLS cert_file"),
+                key_file: self
+                    .key_file
+                    .clone()
+                    .expect("validated catalog TLS key_file"),
+            }),
+            TlsMode::EphemeralSelfSigned => Ok(crate::tls::TlsIdentity::EphemeralSelfSigned {
+                subject_alt_names: vec!["canardstack-catalog".to_string()],
+            }),
+        }
+    }
+}
+
+fn env_optional_string(name: &str) -> Option<String> {
+    env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn env_optional_path(name: &str) -> Option<PathBuf> {
+    env_optional_string(name).map(PathBuf::from)
 }
 
 /// The catalog DuckDB file to serve: the explicit catalog path when set,

@@ -396,6 +396,7 @@ version = "0.0.5"
 dependencies = [
  "anyhow",
  "arrow",
+ "base64",
  "chrono",
  "duckdb",
  "flate2",
