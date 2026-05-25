@@ -325,13 +325,22 @@ Resources:
                 Condition:
                   StringLike:
                     s3:prefix:
+                      # DuckLake CHECKPOINT scans the data-path root (no trailing
+                      # slash) for files scheduled for deletion, so the bare prefix
+                      # must be listable in addition to everything beneath it.
+                      - !Ref S3DataPrefix
                       - !Sub ${S3DataPrefix}/*
               - Effect: Allow
                 Action:
                   - s3:GetObject
                   - s3:PutObject
                   - s3:DeleteObject
-                Resource: !Sub ${DuckLakeBucket.Arn}/${S3DataPrefix}/*
+                # The bare-key resource (no trailing slash) covers the data-path
+                # root that CHECKPOINT reads via read_blob; without it the GET is
+                # denied (403) and CHECKPOINT aborts before any compaction runs.
+                Resource:
+                  - !Sub ${DuckLakeBucket.Arn}/${S3DataPrefix}
+                  - !Sub ${DuckLakeBucket.Arn}/${S3DataPrefix}/*
         - PolicyName: ecs-exec
           PolicyDocument:
             Version: "2012-10-17"
@@ -355,6 +364,31 @@ Resources:
               Service: ecs-tasks.amazonaws.com
             Action: sts:AssumeRole
       Policies:
+        # DuckLake CHECKPOINT over a Quack catalog runs its file-deletion scan as
+        # catalog-side SQL (read_blob over the data path) on this node, so the
+        # catalog -- not just the app -- needs object-store access. Mirrors the
+        # AppTaskRole data policy, including the bare-root coverage.
+        - PolicyName: ducklake-s3-data
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !GetAtt DuckLakeBucket.Arn
+                Condition:
+                  StringLike:
+                    s3:prefix:
+                      - !Ref S3DataPrefix
+                      - !Sub ${S3DataPrefix}/*
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource:
+                  - !Sub ${DuckLakeBucket.Arn}/${S3DataPrefix}
+                  - !Sub ${DuckLakeBucket.Arn}/${S3DataPrefix}/*
         - PolicyName: ecs-exec
           PolicyDocument:
             Version: "2012-10-17"
@@ -598,6 +632,12 @@ Resources:
               Value: 127.0.0.1:9495
             - Name: CANARDSTACK_CATALOG_HEALTH_BIND
               Value: 0.0.0.0:8080
+            # serve-catalog configures object-store credentials from the data path
+            # so DuckLake's catalog-side CHECKPOINT file-deletion scan can read S3.
+            - Name: CANARDSTACK_DUCKLAKE_DATA_PATH
+              Value: !Sub s3://${DuckLakeBucket}/${S3DataPrefix}/
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
           Secrets:
             - Name: CANARDSTACK_DUCKLAKE_QUACK_TOKEN
               ValueFrom: !Ref QuackTokenSecret

@@ -91,7 +91,7 @@ for non-local hosts. The app therefore sets
 for the catalog URL only. The Quack token authenticates the catalog request, and
 TLS still encrypts traffic in transit.
 
-The published canardstack image is built with the `catalog-tls` cargo feature.
+The published canardstack image is built with the `tls` cargo feature.
 Override `CatalogImage` only if your image includes that feature or provides the
 same TLS behavior another way.
 

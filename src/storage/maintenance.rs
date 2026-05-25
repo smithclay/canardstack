@@ -65,7 +65,13 @@ impl Storage {
                 }))
             }
             Err(err) => {
-                Err(anyhow::Error::from(err).context("run DuckLake CHECKPOINT maintenance"))
+                let err = anyhow::Error::from(err).context("run DuckLake CHECKPOINT maintenance");
+                // Log the full cause chain: the HTTP error envelope and the
+                // scheduler job log both render only the top context, so without
+                // this the underlying DuckDB/object-store error (e.g. an S3 403 on
+                // the catalog-side deletion scan) is invisible to operators.
+                tracing::error!(event = "ducklake_checkpoint_failed", error = ?err);
+                Err(err)
             }
         }
     }
