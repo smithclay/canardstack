@@ -628,7 +628,6 @@ impl IngestPipeline {
             &headers,
             request_bytes,
             decoded_body_len,
-            decoded_body_materialized_bytes,
             metrics,
         );
         metrics.inc(
@@ -1097,7 +1096,6 @@ impl IngestPipeline {
         headers: &HashMap<String, String>,
         request_bytes: usize,
         decoded_bytes: usize,
-        _decoded_body_materialized_bytes: usize,
         metrics: &Metrics,
     ) {
         let encoding = headers
