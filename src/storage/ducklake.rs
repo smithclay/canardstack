@@ -12,24 +12,42 @@ pub(super) const DUCKLAKE_TARGET_PREFIX: &str = "canardlake.";
 pub fn install_ducklake_extension(extension_dir: Option<&Path>) -> Result<()> {
     let conn = Connection::open_in_memory()?;
     configure_extension_directory(&conn, extension_dir)?;
-    conn.execute_batch("INSTALL ducklake; LOAD ducklake; INSTALL json; LOAD json;")?;
+    conn.execute_batch(
+        "INSTALL ducklake; LOAD ducklake; INSTALL json; LOAD json; INSTALL quack; LOAD quack; \
+         INSTALL httpfs; LOAD httpfs; INSTALL aws; LOAD aws;",
+    )?;
     Ok(())
+}
+
+/// Open a DuckDB connection that serves a local catalog file over the Quack
+/// protocol for the `serve-catalog` role. Unlike [`attach_ducklake_connection`],
+/// this performs no DuckLake `ATTACH`: the catalog process is plain DuckDB plus
+/// Quack, and remote clients attach DuckLake over Quack against the served file.
+pub fn open_quack_catalog_connection(
+    db_path: &Path,
+    extension_dir: Option<&Path>,
+) -> Result<Connection> {
+    if let Some(parent) = db_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)?;
+    }
+    let conn = Connection::open(db_path)?;
+    configure_extension_directory(&conn, extension_dir)?;
+    configure_base_connection(&conn)?;
+    if conn.execute_batch("LOAD quack;").is_err() {
+        conn.execute_batch("INSTALL quack; LOAD quack;")?;
+    }
+    Ok(conn)
 }
 pub(super) fn sql_path(path: &Path) -> String {
     path.to_string_lossy().replace('\'', "''")
 }
 
-pub(super) fn attach_ducklake_connection(
-    conn: &Connection,
-    postgres_dsn: Option<&str>,
-    attach_uri: Option<&str>,
-    duckdb_path: &Path,
-    local_storage_dir: &Path,
-    extension_dir: Option<&Path>,
-) -> Result<()> {
-    configure_extension_directory(conn, extension_dir)?;
-    let plan =
-        build_ducklake_attach_plan(postgres_dsn, attach_uri, duckdb_path, local_storage_dir)?;
+pub(super) fn attach_ducklake_connection(conn: &Connection, config: &Config) -> Result<()> {
+    configure_extension_directory(conn, config.operator.duckdb_extension_dir.as_deref())?;
+    let plan = ducklake_attach_plan(config)?;
 
     if plan.needs_motherduck && conn.execute_batch("LOAD md;").is_err() {
         conn.execute_batch("INSTALL md; LOAD md;")?;
@@ -37,11 +55,85 @@ pub(super) fn attach_ducklake_connection(
     if plan.needs_ducklake && conn.execute_batch("LOAD ducklake;").is_err() {
         conn.execute_batch("INSTALL ducklake; LOAD ducklake;")?;
     }
+    if plan.needs_quack && conn.execute_batch("LOAD quack;").is_err() {
+        conn.execute_batch("INSTALL quack; LOAD quack;")?;
+    }
     if plan.needs_postgres {
         conn.execute_batch("INSTALL postgres; LOAD postgres;")?;
     }
+    if let Some(kind) = plan.object_store {
+        configure_object_store_credentials(conn, kind)?;
+    }
     conn.execute_batch(&plan.sql)?;
     Ok(())
+}
+
+/// Object store backing the DuckLake `DATA_PATH`. A cloud path needs `httpfs`
+/// plus a credential secret before any read/write; a local path needs neither.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ObjectStore {
+    S3,
+    Gcs,
+}
+
+pub(super) fn object_store_kind(data_path: &str) -> Option<ObjectStore> {
+    let lower = data_path.trim_start().to_ascii_lowercase();
+    if lower.starts_with("s3://") || lower.starts_with("s3a://") {
+        Some(ObjectStore::S3)
+    } else if lower.starts_with("gcs://") || lower.starts_with("gs://") {
+        Some(ObjectStore::Gcs)
+    } else {
+        None
+    }
+}
+
+/// DuckDB secret that lets the writer/reader authenticate to the DuckLake data
+/// store. `credential_chain` resolves ambient credentials (ECS task role, GCE/
+/// Cloud Run service account, env, or shared config), so no static keys are
+/// baked into the deployment.
+pub(super) fn object_store_secret_sql(kind: ObjectStore, region: Option<&str>) -> String {
+    match kind {
+        ObjectStore::S3 => {
+            let region_clause = region
+                .map(str::trim)
+                .filter(|region| !region.is_empty())
+                .map(|region| format!(", REGION '{}'", sql_string(region)))
+                .unwrap_or_default();
+            format!(
+                "CREATE OR REPLACE SECRET canardstack_object_store (TYPE s3, PROVIDER credential_chain{region_clause});"
+            )
+        }
+        ObjectStore::Gcs => "CREATE OR REPLACE SECRET canardstack_object_store (TYPE gcs, PROVIDER credential_chain);".to_string(),
+    }
+}
+
+fn configure_object_store_credentials(conn: &Connection, kind: ObjectStore) -> Result<()> {
+    // httpfs provides the s3:// / gcs:// filesystems; the aws extension provides
+    // the S3 credential_chain provider. Both are baked into the runtime image by
+    // install_ducklake_extension, so LOAD succeeds offline; INSTALL is a fallback.
+    if conn.execute_batch("LOAD httpfs;").is_err() {
+        conn.execute_batch("INSTALL httpfs; LOAD httpfs;")?;
+    }
+    if matches!(kind, ObjectStore::S3) && conn.execute_batch("LOAD aws;").is_err() {
+        conn.execute_batch("INSTALL aws; LOAD aws;")?;
+    }
+    let region = object_store_region();
+    conn.execute_batch(&object_store_secret_sql(kind, region.as_deref()))?;
+    Ok(())
+}
+
+/// Region for the S3 credential secret, resolved from the canardstack override or
+/// the standard AWS environment the task/instance already carries.
+fn object_store_region() -> Option<String> {
+    [
+        "CANARDSTACK_OBJECT_STORE_REGION",
+        "AWS_REGION",
+        "AWS_DEFAULT_REGION",
+    ]
+    .into_iter()
+    .find_map(|name| std::env::var(name).ok())
+    .map(|value| value.trim().to_string())
+    .filter(|value| !value.is_empty())
 }
 
 #[derive(Clone, Debug)]
@@ -50,7 +142,9 @@ pub(super) struct DuckLakeAttachPlan {
     pub(super) mode: &'static str,
     pub(super) needs_ducklake: bool,
     pub(super) needs_motherduck: bool,
+    pub(super) needs_quack: bool,
     pub(super) needs_postgres: bool,
+    pub(super) object_store: Option<ObjectStore>,
 }
 
 #[derive(Clone, Debug)]
@@ -64,14 +158,23 @@ pub(super) fn ducklake_attach_plan(config: &Config) -> Result<DuckLakeAttachPlan
     build_ducklake_attach_plan(
         config.operator.postgres_dsn.as_deref(),
         config.operator.ducklake_attach_uri.as_deref(),
+        config.operator.ducklake_catalog_path.as_deref(),
+        config.operator.ducklake_data_path.as_deref(),
+        config.operator.ducklake_quack_token.as_deref(),
+        config.operator.ducklake_quack_disable_ssl,
         &config.operator.duckdb_path,
         &config.operator.local_storage_dir,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn build_ducklake_attach_plan(
     postgres_dsn: Option<&str>,
     attach_uri: Option<&str>,
+    catalog_path: Option<&Path>,
+    data_path: Option<&str>,
+    quack_token: Option<&str>,
+    quack_disable_ssl: bool,
     duckdb_path: &Path,
     local_storage_dir: &Path,
 ) -> Result<DuckLakeAttachPlan> {
@@ -80,6 +183,16 @@ pub(super) fn build_ducklake_attach_plan(
             "set only one of CANARDSTACK_POSTGRES_DSN or CANARDSTACK_DUCKLAKE_ATTACH_URI"
         );
     }
+    if catalog_path.is_some() && (postgres_dsn.is_some() || attach_uri.is_some()) {
+        anyhow::bail!(
+            "CANARDSTACK_DUCKLAKE_CATALOG_PATH can only be set with the local DuckDB-backed DuckLake catalog"
+        );
+    }
+
+    let data_path = data_path
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
 
     if let Some(uri) = attach_uri {
         let uri = uri.trim();
@@ -93,14 +206,52 @@ pub(super) fn build_ducklake_attach_plan(
         }
         let is_motherduck = uri.starts_with("md:");
         let is_ducklake = uri.starts_with("ducklake:");
+        let is_quack = uri.starts_with("ducklake:quack:");
         if !is_motherduck && !is_ducklake {
             anyhow::bail!(
                 "CANARDSTACK_DUCKLAKE_ATTACH_URI must be an md: or ducklake: URI because Arrow appends write through DuckLake"
             );
         }
+        let quack_secret_sql = if is_quack {
+            let token = quack_token
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "CANARDSTACK_DUCKLAKE_QUACK_TOKEN must be set when CANARDSTACK_DUCKLAKE_ATTACH_URI uses ducklake:quack:"
+                    )
+                })?;
+            let scope = uri.strip_prefix("ducklake:").unwrap_or(uri);
+            // The Quack server never terminates TLS itself; a non-local client
+            // assumes HTTPS by default, so plaintext intra-VPC links (no TLS
+            // proxy) must opt in to DISABLE_SSL. Off by default to keep
+            // TLS-fronted deployments unchanged.
+            let disable_ssl = if quack_disable_ssl {
+                ", DISABLE_SSL true"
+            } else {
+                ""
+            };
+            format!(
+                "CREATE OR REPLACE SECRET canardstack_ducklake_quack (TYPE quack, SCOPE '{}', TOKEN '{}'{}); ",
+                sql_string(scope),
+                sql_string(token),
+                disable_ssl,
+            )
+        } else {
+            String::new()
+        };
+        if is_motherduck && data_path.is_some() {
+            anyhow::bail!(
+                "CANARDSTACK_DUCKLAKE_DATA_PATH cannot be set with a MotherDuck md: attach URI"
+            );
+        }
+        let attach_options = data_path
+            .as_ref()
+            .map(|path| format!(" (DATA_PATH '{}')", sql_string(path)))
+            .unwrap_or_default();
         return Ok(DuckLakeAttachPlan {
             sql: format!(
-                "ATTACH '{}' AS {DUCKLAKE_CATALOG_NAME}; USE {DUCKLAKE_CATALOG_NAME};",
+                "{quack_secret_sql}ATTACH '{}' AS {DUCKLAKE_CATALOG_NAME}{attach_options}; USE {DUCKLAKE_CATALOG_NAME};",
                 uri.replace('\'', "''"),
             ),
             mode: if is_motherduck {
@@ -110,11 +261,16 @@ pub(super) fn build_ducklake_attach_plan(
             },
             needs_ducklake: is_ducklake,
             needs_motherduck: is_motherduck,
+            needs_quack: is_quack,
             needs_postgres: false,
+            object_store: data_path.as_deref().and_then(object_store_kind),
         });
     }
 
-    let data_path = sql_path(local_storage_dir);
+    let resolved_data_path =
+        data_path.unwrap_or_else(|| local_storage_dir.to_string_lossy().to_string());
+    let object_store = object_store_kind(&resolved_data_path);
+    let data_path = sql_string(&resolved_data_path);
     if let Some(dsn) = postgres_dsn {
         return Ok(DuckLakeAttachPlan {
             sql: format!(
@@ -125,14 +281,18 @@ pub(super) fn build_ducklake_attach_plan(
             mode: "ducklake_postgres_catalog",
             needs_ducklake: true,
             needs_motherduck: false,
+            needs_quack: false,
             needs_postgres: true,
+            object_store,
         });
     }
 
-    let metadata = duckdb_path
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new("."))
-        .join("canardstack.ducklake");
+    let metadata = catalog_path.map(Path::to_path_buf).unwrap_or_else(|| {
+        duckdb_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("canardstack.ducklake")
+    });
     Ok(DuckLakeAttachPlan {
         sql: format!(
             "ATTACH 'ducklake:{}' AS {DUCKLAKE_CATALOG_NAME} (DATA_PATH '{}'); USE {DUCKLAKE_CATALOG_NAME};",
@@ -142,8 +302,14 @@ pub(super) fn build_ducklake_attach_plan(
         mode: "ducklake_duckdb_catalog",
         needs_ducklake: true,
         needs_motherduck: false,
+        needs_quack: false,
         needs_postgres: false,
+        object_store,
     })
+}
+
+fn sql_string(value: &str) -> String {
+    value.replace('\'', "''")
 }
 
 pub(super) fn configure_ducklake_maintenance_options(

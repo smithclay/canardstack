@@ -1,8 +1,6 @@
 services:
   canardstack:
-    build:
-      context: .
-    image: canardstack:local
+    image: ${CANARDSTACK_IMAGE:-ghcr.io/smithclay/canardstack:latest}
     ports:
       - "4318:4318"
     environment:
@@ -43,9 +41,7 @@ services:
 
   smoke:
     profiles: ["smoke"]
-    build:
-      context: .
-    image: canardstack:local
+    image: ${CANARDSTACK_IMAGE:-ghcr.io/smithclay/canardstack:latest}
     depends_on:
       canardstack:
         condition: service_healthy
@@ -56,9 +52,7 @@ services:
 
   canardstack-bench:
     profiles: ["bench"]
-    build:
-      context: .
-    image: canardstack:local
+    image: ${CANARDSTACK_IMAGE:-ghcr.io/smithclay/canardstack:latest}
     ports:
       - "4319:4318"
     cpus: "${CANARDSTACK_BENCH_CPUS:-2.0}"

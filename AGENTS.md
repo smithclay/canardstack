@@ -6,7 +6,7 @@ This file is durable guidance for coding agents working in this repository. Keep
 
 canardstack is a single-binary, experimental observability backend written in Rust. It accepts OpenTelemetry logs, traces, gauge metrics, and sum metrics over OTLP/HTTP, normalizes them through `otlp2records` into Arrow `RecordBatch`es, stores them in DuckLake-managed DuckDB tables, and exposes bounded Prometheus/Loki/Tempo compatibility APIs for Grafana-style clients.
 
-There is exactly one binary (`canardstack`), one synchronous std-library HTTP server, and one DuckDB process. There is no async runtime, no OTLP/gRPC endpoint, no Kafka, and no separate hot store.
+There is exactly one binary (`canardstack`), one synchronous std-library HTTP server, and one DuckDB process per role. There is no async runtime, no OTLP/gRPC endpoint, no Kafka, and no separate hot store. The same binary also has a `serve-catalog` role (`src/cli/serve_catalog.rs`) that runs plain DuckDB + the Quack extension to serve a DuckLake catalog DuckDB file over the network; the cloud deploy examples use it so the app and the remote catalog share one image. It runs no ingest/query pipeline.
 
 ## Commands
 
@@ -35,6 +35,7 @@ cp config/example.env .env && set -a && . ./.env && set +a
 cargo run -- serve              # serves on CANARDSTACK_BIND, default 127.0.0.1:4318
 cargo run -- serve --role ingest # ingest routes plus operator endpoints; no query routes
 cargo run -- serve --role query  # query routes plus operator endpoints; no ingest routes
+cargo run -- serve-catalog      # catalog role: serve the DuckLake catalog DuckDB file over Quack (no pipeline)
 cargo run -- smoke              # in-process smoke: starts app, ingests fixtures, queries, prints health
 cargo run -- smoke-http <url>   # smoke against an already-running server
 cargo run -- healthcheck <url>  # used as the Docker healthcheck
@@ -74,7 +75,7 @@ Storage signals are `Logs`, `Spans`, `MetricGauge`, and `MetricSum`. Histograms 
 
 Top-level modules map to pipeline stages or boundaries. Subdirectories group helper code by ownership while preserving the public root module shims where they already exist.
 
-- `src/main.rs` - argv dispatch for `serve`, `smoke`, `smoke-http`, `healthcheck`, and `install-ducklake-extension`; installs SIGINT/SIGTERM handlers.
+- `src/main.rs` - argv dispatch for `serve`, `serve-catalog`, `smoke`, `smoke-http`, `healthcheck`, and `install-ducklake-extension`; installs SIGINT/SIGTERM handlers.
 - `src/lib.rs` - re-exports `AppState`, `Config`, and `Scheduler`; defines `log_event` and `LockExt::lock_or_poisoned`.
 - `src/app.rs` - wires long-lived components into shared `Arc<AppState>`.
 - `src/config.rs` - reads `CANARDSTACK_*` env vars into one `Config`; startup calls `Config::validate()`.

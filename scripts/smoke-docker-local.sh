@@ -4,7 +4,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 compose() {
-  docker compose "$@"
+  docker compose -f compose.yaml -f compose.build.yaml "$@"
 }
 
 echo "==> This smoke resets Docker Compose volumes: canardstack_canardstack-data, canardstack_grafana-data"

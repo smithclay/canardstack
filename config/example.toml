@@ -23,6 +23,12 @@ memory_limit = "1GiB"
 # catalog and local data files under data_dir.
 # postgres_dsn = "dbname=ducklake_catalog host=localhost user=postgres password=postgres"
 # attach_uri = "md:test-ducklake"
+# Optional local DuckDB-backed DuckLake metadata catalog file override.
+# catalog_path = "/var/lib/canardstack/catalog/canardstack.ducklake"
+# Optional DuckLake DATA_PATH override for object storage, e.g. s3:// or gcs://.
+# data_path = "s3://canardstack-data/prod/"
+# Required when attach_uri points at a ducklake:quack: catalog.
+# quack_token = "replace-with-catalog-token"
 # canardstack-owned DuckLake maintenance runs CHECKPOINT after logical retention
 # and can be triggered directly via /api/admin/maintenance/checkpoint/run.
 maintenance_enabled = true
