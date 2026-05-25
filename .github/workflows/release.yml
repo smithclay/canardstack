@@ -6,10 +6,45 @@ on:
       - 'v*'
 
 env:
+  CARGO_TERM_COLOR: always
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
+  RUSTFLAGS: -D warnings
 
 jobs:
+  crate:
+    name: Publish crate
+    runs-on: ubuntu-latest
+    environment: crates-io
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Check tag matches Cargo version
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          manifest_version="$(cargo metadata --locked --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "canardstack") | .version')"
+          if [ "$tag_version" != "$manifest_version" ]; then
+            echo "tag version $tag_version does not match Cargo.toml version $manifest_version" >&2
+            exit 1
+          fi
+
+      - name: Verify package
+        run: cargo publish --locked --dry-run
+
+      - name: Authenticate with crates.io
+        id: auth
+        uses: rust-lang/crates-io-auth-action@v1
+
+      - name: Publish to crates.io
+        run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+
   docker:
     name: Build and push image
     runs-on: ubuntu-latest

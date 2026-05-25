@@ -3,6 +3,22 @@ name = "canardstack"
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
+description = "Single-binary OpenTelemetry observability backend backed by DuckLake"
+repository = "https://github.com/smithclay/canardstack"
+homepage = "https://smithclay.github.io/canardstack/"
+readme = "README.md"
+keywords = ["observability", "opentelemetry", "otlp", "duckdb", "ducklake"]
+categories = ["command-line-utilities", "development-tools::debugging", "database"]
+include = [
+    "/benches",
+    "/canardstack.png",
+    "/Cargo.lock",
+    "/Cargo.toml",
+    "/LICENSE",
+    "/README.md",
+    "/src",
+    "/tests",
+]
 
 [dependencies]
 anyhow = "1.0.102"

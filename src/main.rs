@@ -10,6 +10,10 @@ fn main() -> anyhow::Result<()> {
     init_logging();
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
+        Some("--version") | Some("-V") => {
+            println!("canardstack {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
         Some("smoke") => smoke::run(),
         Some("smoke-http") => smoke_http::run(args),
         Some("healthcheck") => healthcheck::run(args.next()),
@@ -38,7 +42,7 @@ fn main() -> anyhow::Result<()> {
                 .map(|_| Scheduler::spawn(state.clone()));
             http::serve_until(state, &SHUTDOWN_REQUESTED)
         }
-        Some(other) => anyhow::bail!("unknown command {other}; use serve, smoke, smoke-http, healthcheck, or install-ducklake-extension"),
+        Some(other) => anyhow::bail!("unknown command {other}; use --version, serve, smoke, smoke-http, healthcheck, or install-ducklake-extension"),
     }
 }
 
