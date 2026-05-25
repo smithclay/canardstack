@@ -11,7 +11,8 @@ use canardstack::{AppState, Config, Scheduler};
 
 mod common;
 use arrow58::array::{
-    BooleanArray, Float64Array, Int32Array, Int64Array, StringArray, TimestampMicrosecondArray,
+    Array, BooleanArray, Float64Array, Int32Array, Int64Array, StringArray,
+    TimestampMicrosecondArray,
 };
 use arrow58::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow58::record_batch::RecordBatch;
@@ -294,76 +295,29 @@ fn assert_metric_inflight_bytes(state: &AppState, expected: usize) {
 }
 
 fn append_gauge_rows(state: &AppState, rows: &[(i64, &str, f64, &str)], source_format: &str) {
-    let len = rows.len();
-    let schema = Arc::new(Schema::new(vec![
-        Field::new(
-            "timestamp",
-            DataType::Timestamp(TimeUnit::Microsecond, None),
-            true,
-        ),
-        Field::new("start_timestamp", DataType::Int64, true),
-        Field::new("metric_name", DataType::Utf8, true),
-        Field::new("metric_description", DataType::Utf8, true),
-        Field::new("metric_unit", DataType::Utf8, true),
-        Field::new("value", DataType::Float64, true),
-        Field::new("service_name", DataType::Utf8, true),
-        Field::new("service_namespace", DataType::Utf8, true),
-        Field::new("service_instance_id", DataType::Utf8, true),
-        Field::new("resource_attributes", DataType::Utf8, true),
-        Field::new("scope_name", DataType::Utf8, true),
-        Field::new("scope_version", DataType::Utf8, true),
-        Field::new("scope_attributes", DataType::Utf8, true),
-        Field::new("metric_attributes", DataType::Utf8, true),
-        Field::new("flags", DataType::Int32, true),
-        Field::new("exemplars_json", DataType::Utf8, true),
-    ]));
-    let batch = RecordBatch::try_new(
-        schema,
-        vec![
-            Arc::new(TimestampMicrosecondArray::from(
-                rows.iter()
-                    .map(|(ms, _, _, _)| Some(ms.saturating_mul(1000)))
-                    .collect::<Vec<_>>(),
-            )),
-            Arc::new(Int64Array::from(vec![None; len])),
-            Arc::new(StringArray::from(
-                rows.iter()
-                    .map(|(_, name, _, _)| Some((*name).to_string()))
-                    .collect::<Vec<_>>(),
-            )),
-            Arc::new(StringArray::from(vec![None::<String>; len])),
-            Arc::new(StringArray::from(vec![None::<String>; len])),
-            Arc::new(Float64Array::from(
-                rows.iter()
-                    .map(|(_, _, value, _)| Some(*value))
-                    .collect::<Vec<_>>(),
-            )),
-            Arc::new(StringArray::from(
-                rows.iter()
-                    .map(|(_, _, _, service)| Some((*service).to_string()))
-                    .collect::<Vec<_>>(),
-            )),
-            Arc::new(StringArray::from(vec![None::<String>; len])),
-            Arc::new(StringArray::from(vec![None::<String>; len])),
-            Arc::new(StringArray::from(vec![Some("{}".to_string()); len])),
-            Arc::new(StringArray::from(vec![None::<String>; len])),
-            Arc::new(StringArray::from(vec![None::<String>; len])),
-            Arc::new(StringArray::from(vec![None::<String>; len])),
-            Arc::new(StringArray::from(vec![None::<String>; len])),
-            Arc::new(Int32Array::from(vec![None; len])),
-            Arc::new(StringArray::from(vec![None::<String>; len])),
-        ],
-    )
-    .unwrap();
-    state
-        .storage
-        .commit_internal_telemetry_batch(StorageSignal::MetricGauge, &batch, source_format)
-        .unwrap();
+    let rows = rows
+        .iter()
+        .map(|(ms, name, value, service)| (*ms, *name, *value, *service, "{}", "{}"))
+        .collect::<Vec<_>>();
+    append_metric_rows_with_attrs(state, StorageSignal::MetricGauge, &rows, source_format);
 }
 
 fn append_sum_rows(state: &AppState, rows: &[(i64, &str, f64, &str)], source_format: &str) {
+    let rows = rows
+        .iter()
+        .map(|(ms, name, value, service)| (*ms, *name, *value, *service, "{}", "{}"))
+        .collect::<Vec<_>>();
+    append_metric_rows_with_attrs(state, StorageSignal::MetricSum, &rows, source_format);
+}
+
+fn append_metric_rows_with_attrs(
+    state: &AppState,
+    signal: StorageSignal,
+    rows: &[(i64, &str, f64, &str, &str, &str)],
+    source_format: &str,
+) {
     let len = rows.len();
-    let schema = Arc::new(Schema::new(vec![
+    let mut fields = vec![
         Field::new(
             "timestamp",
             DataType::Timestamp(TimeUnit::Microsecond, None),
@@ -384,56 +338,91 @@ fn append_sum_rows(state: &AppState, rows: &[(i64, &str, f64, &str)], source_for
         Field::new("metric_attributes", DataType::Utf8, true),
         Field::new("flags", DataType::Int32, true),
         Field::new("exemplars_json", DataType::Utf8, true),
-        Field::new("aggregation_temporality", DataType::Int32, true),
-        Field::new("is_monotonic", DataType::Boolean, true),
-    ]));
-    let batch = RecordBatch::try_new(
-        schema,
-        vec![
-            Arc::new(TimestampMicrosecondArray::from(
-                rows.iter()
-                    .map(|(ms, _, _, _)| Some(ms.saturating_mul(1000)))
-                    .collect::<Vec<_>>(),
-            )),
-            Arc::new(Int64Array::from(vec![None; len])),
-            Arc::new(StringArray::from(
-                rows.iter()
-                    .map(|(_, name, _, _)| Some((*name).to_string()))
-                    .collect::<Vec<_>>(),
-            )),
-            Arc::new(StringArray::from(vec![None::<String>; len])),
-            Arc::new(StringArray::from(vec![None::<String>; len])),
-            Arc::new(Float64Array::from(
-                rows.iter()
-                    .map(|(_, _, value, _)| Some(*value))
-                    .collect::<Vec<_>>(),
-            )),
-            Arc::new(StringArray::from(
-                rows.iter()
-                    .map(|(_, _, _, service)| Some((*service).to_string()))
-                    .collect::<Vec<_>>(),
-            )),
-            Arc::new(StringArray::from(vec![None::<String>; len])),
-            Arc::new(StringArray::from(vec![None::<String>; len])),
-            Arc::new(StringArray::from(vec![Some("{}".to_string()); len])),
-            Arc::new(StringArray::from(vec![None::<String>; len])),
-            Arc::new(StringArray::from(vec![None::<String>; len])),
-            Arc::new(StringArray::from(vec![None::<String>; len])),
-            Arc::new(StringArray::from(vec![None::<String>; len])),
-            Arc::new(Int32Array::from(vec![None; len])),
-            Arc::new(StringArray::from(vec![None::<String>; len])),
-            Arc::new(Int32Array::from(vec![Some(2); len])),
-            Arc::new(BooleanArray::from(vec![Some(true); len])),
-        ],
-    )
-    .unwrap();
+    ];
+    if signal == StorageSignal::MetricSum {
+        fields.push(Field::new("aggregation_temporality", DataType::Int32, true));
+        fields.push(Field::new("is_monotonic", DataType::Boolean, true));
+    }
+    let schema = Arc::new(Schema::new(fields));
+    let mut arrays: Vec<Arc<dyn Array>> = vec![
+        Arc::new(TimestampMicrosecondArray::from(
+            rows.iter()
+                .map(|(ms, _, _, _, _, _)| Some(ms.saturating_mul(1000)))
+                .collect::<Vec<_>>(),
+        )),
+        Arc::new(Int64Array::from(vec![None; len])),
+        Arc::new(StringArray::from(
+            rows.iter()
+                .map(|(_, name, _, _, _, _)| Some((*name).to_string()))
+                .collect::<Vec<_>>(),
+        )),
+        Arc::new(StringArray::from(vec![None::<String>; len])),
+        Arc::new(StringArray::from(vec![None::<String>; len])),
+        Arc::new(Float64Array::from(
+            rows.iter()
+                .map(|(_, _, value, _, _, _)| Some(*value))
+                .collect::<Vec<_>>(),
+        )),
+        Arc::new(StringArray::from(
+            rows.iter()
+                .map(|(_, _, _, service, _, _)| Some((*service).to_string()))
+                .collect::<Vec<_>>(),
+        )),
+        Arc::new(StringArray::from(vec![None::<String>; len])),
+        Arc::new(StringArray::from(vec![None::<String>; len])),
+        Arc::new(StringArray::from(
+            rows.iter()
+                .map(|(_, _, _, _, resource_attrs, _)| Some((*resource_attrs).to_string()))
+                .collect::<Vec<_>>(),
+        )),
+        Arc::new(StringArray::from(vec![None::<String>; len])),
+        Arc::new(StringArray::from(vec![None::<String>; len])),
+        Arc::new(StringArray::from(vec![None::<String>; len])),
+        Arc::new(StringArray::from(
+            rows.iter()
+                .map(|(_, _, _, _, _, metric_attrs)| Some((*metric_attrs).to_string()))
+                .collect::<Vec<_>>(),
+        )),
+        Arc::new(Int32Array::from(vec![None; len])),
+        Arc::new(StringArray::from(vec![None::<String>; len])),
+    ];
+    if signal == StorageSignal::MetricSum {
+        arrays.push(Arc::new(Int32Array::from(vec![Some(2); len])));
+        arrays.push(Arc::new(BooleanArray::from(vec![Some(true); len])));
+    }
+    let batch = RecordBatch::try_new(schema, arrays).unwrap();
     state
         .storage
-        .commit_internal_telemetry_batch(StorageSignal::MetricSum, &batch, source_format)
+        .commit_internal_telemetry_batch(signal, &batch, source_format)
         .unwrap();
 }
 
 fn append_log_rows(state: &AppState, rows: &[(i64, &str, &str)], source_format: &str) {
+    let rows = rows
+        .iter()
+        .map(|(ms, body, service)| {
+            (
+                *ms, *body, *service, None, None, None, None, "{}", None, "{}",
+            )
+        })
+        .collect::<Vec<_>>();
+    append_log_rows_with_attrs(state, &rows, source_format);
+}
+
+type LogRowWithAttrs<'a> = (
+    i64,
+    &'a str,
+    &'a str,
+    Option<&'a str>,
+    Option<&'a str>,
+    Option<&'a str>,
+    Option<&'a str>,
+    &'a str,
+    Option<&'a str>,
+    &'a str,
+);
+
+fn append_log_rows_with_attrs(state: &AppState, rows: &[LogRowWithAttrs<'_>], source_format: &str) {
     let len = rows.len();
     let schema = Arc::new(Schema::new(vec![
         Field::new(
@@ -460,30 +449,64 @@ fn append_log_rows(state: &AppState, rows: &[(i64, &str, &str)], source_format: 
         vec![
             Arc::new(TimestampMicrosecondArray::from(
                 rows.iter()
-                    .map(|(ms, _, _)| Some(ms.saturating_mul(1000)))
+                    .map(|(ms, _, _, _, _, _, _, _, _, _)| Some(ms.saturating_mul(1000)))
                     .collect::<Vec<_>>(),
             )),
-            Arc::new(StringArray::from(vec![None::<String>; len])),
-            Arc::new(StringArray::from(vec![None::<String>; len])),
             Arc::new(StringArray::from(
                 rows.iter()
-                    .map(|(_, _, service)| Some((*service).to_string()))
+                    .map(|(_, _, _, _, _, trace_id, _, _, _, _)| trace_id.map(str::to_string))
                     .collect::<Vec<_>>(),
             )),
-            Arc::new(StringArray::from(vec![None::<String>; len])),
-            Arc::new(StringArray::from(vec![None::<String>; len])),
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|(_, _, _, _, _, _, span_id, _, _, _)| span_id.map(str::to_string))
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|(_, _, service, _, _, _, _, _, _, _)| Some((*service).to_string()))
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|(_, _, _, namespace, _, _, _, _, _, _)| namespace.map(str::to_string))
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|(_, _, _, _, instance, _, _, _, _, _)| instance.map(str::to_string))
+                    .collect::<Vec<_>>(),
+            )),
             Arc::new(Int32Array::from(vec![None; len])),
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|(_, _, _, _, _, _, _, _, severity, _)| severity.map(str::to_string))
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|(_, body, _, _, _, _, _, _, _, _)| Some((*body).to_string()))
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|(_, _, _, _, _, _, _, resource_attrs, _, _)| {
+                        Some((*resource_attrs).to_string())
+                    })
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|(_, _, _, _, _, _, _, _, _, _)| None::<String>)
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(vec![None::<String>; len])),
             Arc::new(StringArray::from(vec![None::<String>; len])),
             Arc::new(StringArray::from(
                 rows.iter()
-                    .map(|(_, body, _)| Some((*body).to_string()))
+                    .map(|(_, _, _, _, _, _, _, _, _, log_attrs)| Some((*log_attrs).to_string()))
                     .collect::<Vec<_>>(),
             )),
-            Arc::new(StringArray::from(vec![Some("{}".to_string()); len])),
-            Arc::new(StringArray::from(vec![None::<String>; len])),
-            Arc::new(StringArray::from(vec![None::<String>; len])),
-            Arc::new(StringArray::from(vec![None::<String>; len])),
-            Arc::new(StringArray::from(vec![Some("{}".to_string()); len])),
         ],
     )
     .unwrap();
@@ -2138,6 +2161,489 @@ fn prometheus_query_range_supports_explicit_grouping_over_promoted_labels() {
             .iter()
             .any(|sample| sample[1] == "10"),
         "ungrouped without sum missing: {body}"
+    );
+}
+
+#[test]
+fn prometheus_supports_common_otel_demo_metric_query_shapes() {
+    let (_dir, state) = app();
+    let t0 = Utc.with_ymd_and_hms(1970, 1, 1, 0, 10, 0).unwrap();
+    let t1 = t0 + Duration::minutes(1);
+    append_metric_rows_with_attrs(
+        &state,
+        StorageSignal::MetricSum,
+        &[
+            (
+                t0.timestamp_millis(),
+                "traces.span.metrics.calls",
+                10.0,
+                "frontend-proxy",
+                "{}",
+                r#"{"span.name":"ingress","status.code":"STATUS_CODE_ERROR"}"#,
+            ),
+            (
+                t1.timestamp_millis(),
+                "traces.span.metrics.calls",
+                40.0,
+                "frontend-proxy",
+                "{}",
+                r#"{"span.name":"ingress","status.code":"STATUS_CODE_ERROR"}"#,
+            ),
+            (
+                t0.timestamp_millis(),
+                "traces.span.metrics.calls",
+                5.0,
+                "checkout",
+                "{}",
+                r#"{"span.name":"checkout","status.code":"STATUS_CODE_OK"}"#,
+            ),
+            (
+                t1.timestamp_millis(),
+                "traces.span.metrics.calls",
+                8.0,
+                "checkout",
+                "{}",
+                r#"{"span.name":"checkout","status.code":"STATUS_CODE_OK"}"#,
+            ),
+            (
+                t0.timestamp_millis(),
+                "otelcol_exporter_sent_spans",
+                100.0,
+                "otel-collector",
+                r#"{"host.name":"collector-1"}"#,
+                r#"{"exporter":"otlphttp/canardstack"}"#,
+            ),
+            (
+                t1.timestamp_millis(),
+                "otelcol_exporter_sent_spans",
+                160.0,
+                "otel-collector",
+                r#"{"host.name":"collector-1"}"#,
+                r#"{"exporter":"otlphttp/canardstack"}"#,
+            ),
+        ],
+        "test",
+    );
+
+    append_metric_rows_with_attrs(
+        &state,
+        StorageSignal::MetricGauge,
+        &[
+            (
+                t1.timestamp_millis(),
+                "system.cpu.utilization",
+                0.9,
+                "checkout",
+                r#"{"host.name":"host-a"}"#,
+                r#"{"state":"idle"}"#,
+            ),
+            (
+                t1.timestamp_millis(),
+                "system.cpu.utilization",
+                0.4,
+                "checkout",
+                r#"{"host.name":"host-a"}"#,
+                r#"{"state":"user"}"#,
+            ),
+            (
+                t1.timestamp_millis(),
+                "process.runtime.cpython.memory",
+                42.0,
+                "recommendation",
+                "{}",
+                r#"{"type":"rss"}"#,
+            ),
+        ],
+        "test",
+    );
+
+    let params = |query: &str| {
+        HashMap::from([
+            ("query".to_string(), query.to_string()),
+            (
+                "start".to_string(),
+                (t0 - Duration::minutes(1)).timestamp().to_string(),
+            ),
+            (
+                "end".to_string(),
+                (t1 + Duration::minutes(1)).timestamp().to_string(),
+            ),
+            ("step".to_string(), "300".to_string()),
+        ])
+    };
+
+    // Based on odq.json Spanmetrics "Error Rate" panel.
+    let response = http::route(
+        "GET",
+        "/api/v1/query_range",
+        &params(
+            r#"sum by (span_name) (rate(traces_span_metrics_calls_total{status_code="STATUS_CODE_ERROR", service_name="frontend-proxy"}[$__rate_interval]))"#,
+        ),
+        &headers(&state),
+        &[],
+        &state,
+    );
+    assert_eq!(response.status(), 200, "{}", response.json_body());
+    assert!(
+        response.json_body()["data"]["result"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|series| series["metric"]["span_name"] == "ingress"),
+        "span_name grouping from metric attributes missing: {}",
+        response.json_body()
+    );
+
+    // Based on odq.json spanmetrics topk panels, without the outer topk wrapper.
+    let response = http::route(
+        "GET",
+        "/api/v1/query_range",
+        &params(
+            r#"sum by (service_name) (rate(traces_span_metrics_calls_total{service_name=~"frontend.*", span_name=~".*"}[$__range]))"#,
+        ),
+        &headers(&state),
+        &[],
+        &state,
+    );
+    assert_eq!(response.status(), 200, "{}", response.json_body());
+    assert_eq!(
+        response.json_body()["data"]["result"][0]["metric"]["service_name"],
+        "frontend-proxy"
+    );
+
+    // Based on odq.json Linux "CPU Utilization" panel, with the dashboard variables reduced.
+    let response = http::route(
+        "GET",
+        "/api/v1/query_range",
+        &params(r#"sum(system_cpu_utilization_ratio{job="", state!="idle"})"#),
+        &headers(&state),
+        &[],
+        &state,
+    );
+    assert_eq!(response.status(), 200, "{}", response.json_body());
+    assert!(
+        response.json_body()["data"]["result"][0]["values"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|sample| sample[1] == "0.4"),
+        "negative matcher did not exclude idle CPU: {}",
+        response.json_body()
+    );
+
+    // Based on odq.json Demo Dashboard "Recommendation Service Memory Usage".
+    let response = http::route(
+        "GET",
+        "/api/v1/query",
+        &HashMap::from([
+            (
+                "query".to_string(),
+                r#"process_runtime_cpython_memory_bytes{type="rss"}"#.to_string(),
+            ),
+            ("time".to_string(), t1.timestamp().to_string()),
+        ]),
+        &headers(&state),
+        &[],
+        &state,
+    );
+    assert_eq!(response.status(), 200, "{}", response.json_body());
+    assert_eq!(response.json_body()["data"]["result"][0]["value"][1], "42");
+
+    // Based on odq.json OpenTelemetry Collector "Spans Sent" panels.
+    let response = http::route(
+        "GET",
+        "/api/v1/query_range",
+        &params(
+            r#"sum by (exporter) (rate(otelcol_exporter_sent_spans_total{exporter=~".*"}[$__rate_interval]))"#,
+        ),
+        &headers(&state),
+        &[],
+        &state,
+    );
+    assert_eq!(response.status(), 200, "{}", response.json_body());
+    assert_eq!(
+        response.json_body()["data"]["result"][0]["metric"]["exporter"],
+        "otlphttp/canardstack"
+    );
+}
+
+#[test]
+fn prometheus_accepts_grafana_spaced_optional_dashboard_labels() {
+    let (_dir, state) = app();
+    let t0 = Utc.with_ymd_and_hms(1970, 1, 1, 0, 10, 0).unwrap();
+    let t1 = t0 + Duration::minutes(1);
+    append_metric_rows_with_attrs(
+        &state,
+        StorageSignal::MetricSum,
+        &[
+            (
+                t0.timestamp_millis(),
+                "otelcol_processor_incoming_items_total",
+                100.0,
+                "otel-collector",
+                r#"{"host.name":"collector-1"}"#,
+                r#"{"otel_signal":"logs","processor":"batch"}"#,
+            ),
+            (
+                t1.timestamp_millis(),
+                "otelcol_processor_incoming_items_total",
+                160.0,
+                "otel-collector",
+                r#"{"host.name":"collector-1"}"#,
+                r#"{"otel_signal":"logs","processor":"batch"}"#,
+            ),
+        ],
+        "test",
+    );
+    append_metric_rows_with_attrs(
+        &state,
+        StorageSignal::MetricGauge,
+        &[(
+            t1.timestamp_millis(),
+            "postgresql_backends",
+            7.0,
+            "postgres",
+            "{}",
+            r#"{"postgresql.database.name":"shop"}"#,
+        )],
+        "test",
+    );
+
+    let response = http::route(
+        "GET",
+        "/api/v1/query_range",
+        &HashMap::from([
+            (
+                "query".to_string(),
+                r#"sum by (otel_signal) (
+                  rate(
+                    otelcol_processor_incoming_items_total{
+                      deployment_environment_name =~ ".*",
+                      k8s_cluster_name           =~ ".*",
+                      k8s_node_name              =~ ".*",
+                      host_name                  =~ ".*",
+                      service_instance_id        =~ ".*",
+                      service_name               =~ "otel-collector",
+                      otel_signal                =  "logs",
+                      processor                  =~ "batch.*"
+                    }[$__rate_interval]
+                  )
+                )"#
+                .to_string(),
+            ),
+            (
+                "start".to_string(),
+                (t0 - Duration::minutes(1)).timestamp().to_string(),
+            ),
+            (
+                "end".to_string(),
+                (t1 + Duration::minutes(1)).timestamp().to_string(),
+            ),
+            ("step".to_string(), "300".to_string()),
+        ]),
+        &headers(&state),
+        &[],
+        &state,
+    );
+    assert_eq!(response.status(), 200, "{}", response.json_body());
+    assert_eq!(
+        response.json_body()["data"]["result"][0]["metric"]["otel_signal"],
+        "logs"
+    );
+
+    let response = http::route(
+        "GET",
+        "/api/v1/query",
+        &HashMap::from([
+            (
+                "query".to_string(),
+                r#"postgresql_backends{postgresql_database_name=~"shop", k8s_cluster_name=~".*"}"#
+                    .to_string(),
+            ),
+            ("time".to_string(), t1.timestamp().to_string()),
+        ]),
+        &headers(&state),
+        &[],
+        &state,
+    );
+    assert_eq!(response.status(), 200, "{}", response.json_body());
+    assert_eq!(response.json_body()["data"]["result"][0]["value"][1], "7");
+}
+
+#[test]
+fn loki_supports_otel_log_resource_labels_and_regex_filters() {
+    let (_dir, state) = app();
+    let at = Utc.with_ymd_and_hms(1970, 1, 1, 0, 10, 0).unwrap();
+    append_log_rows_with_attrs(
+        &state,
+        &[
+            (
+                at.timestamp_millis(),
+                "GET /api/products/L9ECAV7KIM HTTP/1.1 200",
+                "frontend-proxy",
+                Some("demo"),
+                Some("frontend-proxy-1"),
+                Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                Some("bbbbbbbbbbbbbbbb"),
+                r#"{"host.name":"frontend-host"}"#,
+                Some("INFO"),
+                r#"{"http.route":"/api/products/{id}","http.request.method":"GET","http.response.status_code":200}"#,
+            ),
+            (
+                at.timestamp_millis(),
+                "POST /api/checkout HTTP/1.1 500",
+                "checkout",
+                Some("demo"),
+                Some("checkout-1"),
+                Some("cccccccccccccccccccccccccccccccc"),
+                Some("dddddddddddddddd"),
+                r#"{"host.name":"checkout-host"}"#,
+                Some("ERROR"),
+                r#"{"http.route":"/api/checkout","http.request.method":"POST","http.response.status_code":500}"#,
+            ),
+        ],
+        "test",
+    );
+
+    let response = http::route(
+        "GET",
+        "/loki/api/v1/query_range",
+        &HashMap::from([
+            (
+                "query".to_string(),
+                r#"{resource.service.name=~"front.*",resource.service.namespace="demo",resource.host.name="frontend-host",severity.text!="DEBUG"} |~ "GET /api""#
+                    .to_string(),
+            ),
+            (
+                "start".to_string(),
+                (at - Duration::minutes(1)).timestamp().to_string(),
+            ),
+            (
+                "end".to_string(),
+                (at + Duration::minutes(1)).timestamp().to_string(),
+            ),
+            ("limit".to_string(), "10".to_string()),
+        ]),
+        &headers(&state),
+        &[],
+        &state,
+    );
+    assert_eq!(response.status(), 200, "{}", response.json_body());
+    let body = response.json_body();
+    let result = body["data"]["result"].as_array().unwrap();
+    assert_eq!(result.len(), 1, "{body}");
+    assert_eq!(result[0]["stream"]["service_name"], "frontend-proxy");
+    assert_eq!(result[0]["stream"]["service_namespace"], "demo");
+    assert_eq!(result[0]["stream"]["host_name"], "frontend-host");
+    assert!(result[0]["values"]
+        .to_string()
+        .contains("GET /api/products"));
+}
+
+#[test]
+fn tempo_search_supports_otel_resource_tags_and_traceql_matchers() {
+    let (_dir, state) = app();
+    let now = Utc::now();
+    let nanos = now.timestamp_nanos_opt().unwrap();
+    let body = json!({
+        "resourceSpans": [{
+            "resource": {"attributes": [
+                {"key": "service.name", "value": {"stringValue": "frontend"}},
+                {"key": "service.namespace", "value": {"stringValue": "demo"}},
+                {"key": "service.instance.id", "value": {"stringValue": "frontend-1"}},
+                {"key": "host.name", "value": {"stringValue": "frontend-host"}},
+                {"key": "deployment.environment", "value": {"stringValue": "dev"}}
+            ]},
+            "scopeSpans": [{
+                "scope": {"name": "otel-demo", "version": "1"},
+                "spans": [{
+                    "traceId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "spanId": "bbbbbbbbbbbbbbbb",
+                    "name": "GET /api/products",
+                    "kind": 2,
+                    "startTimeUnixNano": nanos.to_string(),
+                    "endTimeUnixNano": (nanos + 25_000_000).to_string(),
+                    "status": {"code": 1},
+                    "attributes": [
+                        {"key": "http.request.method", "value": {"stringValue": "GET"}},
+                        {"key": "http.response.status_code", "value": {"intValue": "200"}},
+                        {"key": "http.route", "value": {"stringValue": "/api/products/{id}"}}
+                    ]
+                }]
+            }]
+        }]
+    });
+    let ingest = http::route(
+        "POST",
+        "/v1/traces",
+        &HashMap::new(),
+        &headers(&state),
+        body.to_string().as_bytes(),
+        &state,
+    );
+    assert_eq!(ingest.status(), 202, "{}", ingest.json_body());
+    seal_all(&state);
+
+    let response = http::route(
+        "GET",
+        "/api/search",
+        &HashMap::from([
+            ("serviceName".to_string(), "frontend".to_string()),
+            (
+                "tags".to_string(),
+                r#"service.namespace="demo""#.to_string(),
+            ),
+            ("limit".to_string(), "10".to_string()),
+            (
+                "start".to_string(),
+                (now - Duration::minutes(1)).timestamp().to_string(),
+            ),
+            (
+                "end".to_string(),
+                (now + Duration::minutes(1)).timestamp().to_string(),
+            ),
+        ]),
+        &headers(&state),
+        &[],
+        &state,
+    );
+    assert_eq!(response.status(), 200, "{}", response.json_body());
+    assert_eq!(
+        response.json_body()["traces"][0]["traceID"],
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    );
+
+    let response = http::route(
+        "GET",
+        "/api/search",
+        &HashMap::from([
+            (
+                "q".to_string(),
+                r#"{ resource.service.namespace = "demo" && span.name =~ "GET .*" && http.response.status_code != "500" }"#.to_string(),
+            ),
+            ("limit".to_string(), "10".to_string()),
+            (
+                "start".to_string(),
+                (now - Duration::minutes(1)).timestamp().to_string(),
+            ),
+            (
+                "end".to_string(),
+                (now + Duration::minutes(1)).timestamp().to_string(),
+            ),
+        ]),
+        &headers(&state),
+        &[],
+        &state,
+    );
+    assert_eq!(response.status(), 200, "{}", response.json_body());
+    assert!(
+        response.json_body()["traces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|trace| trace["traceID"] == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        "TraceQL-like resource/span matcher did not find trace: {}",
+        response.json_body()
     );
 }
 

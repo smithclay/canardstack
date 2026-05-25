@@ -1,10 +1,8 @@
 use super::params::{optional_range, parse_any_time_to_utc, parse_usize, result_rows};
-use crate::db::sql::{
-    quote as sql_quote, span_row, spans_deployment_environment_expr, spans_exception_type_expr,
-    spans_http_method_expr, spans_http_route_expr, spans_http_status_code_expr, time_predicate,
-};
+use crate::db::sql::{quote as sql_quote, span_row, time_predicate};
 use crate::query::plan::TimeBounds;
 use crate::query::trace::plan_tempo_search;
+use crate::semantic_labels::{self, LabelScope};
 use crate::validation::{ApiError, ApiResult};
 use crate::AppState;
 use chrono::Utc;
@@ -17,6 +15,13 @@ use std::collections::HashMap;
 
 const INTERACTIVE_RANGE_SECS: i64 = 24 * 60 * 60;
 
+/// SQL expression for a span label, sourced from the semantic-label registry so
+/// the Tempo projection and the registry's tag discovery cannot drift apart.
+fn span_label(canonical: &str) -> String {
+    semantic_labels::label_expr(LabelScope::Spans, canonical)
+        .unwrap_or_else(|| panic!("span label {canonical} is registered for spans"))
+}
+
 pub fn tempo_trace(state: &AppState, trace_id: &str) -> ApiResult<Value> {
     validate_trace_id(trace_id)?;
     let to = Utc::now() + chrono::Duration::minutes(10);
@@ -25,8 +30,8 @@ pub fn tempo_trace(state: &AppState, trace_id: &str) -> ApiResult<Value> {
     state.queries.run_interactive(&state.storage, |conn, prefix| {
         let sql = format!(
             "SELECT timestamp::VARCHAR, trace_id, span_id, parent_span_id, service_name, span_name, duration, status_code, {} AS http_method, {} AS http_status_code FROM {prefix}spans WHERE trace_id = {} AND {} ORDER BY timestamp ASC LIMIT 20000",
-            spans_http_method_expr(),
-            spans_http_status_code_expr(),
+            span_label("http_method"),
+            span_label("http_status_code"),
             sql_quote(trace_id),
             time_predicate(from, to)
         );
@@ -55,11 +60,11 @@ pub fn tempo_trace_proto(state: &AppState, trace_id: &str) -> ApiResult<Vec<u8>>
     state.queries.run_interactive(&state.storage, |conn, prefix| {
         let sql = format!(
             "SELECT timestamp::VARCHAR, trace_id, span_id, parent_span_id, service_name, span_name, duration, status_code, {} AS http_method, {} AS http_status_code, trace_state, span_kind, status_message, scope_name, scope_version, {} AS deployment_environment, {} AS http_route, {} AS exception_type FROM {prefix}spans WHERE trace_id = {} AND {} ORDER BY timestamp ASC LIMIT 20000",
-            spans_http_method_expr(),
-            spans_http_status_code_expr(),
-            spans_deployment_environment_expr(),
-            spans_http_route_expr(),
-            spans_exception_type_expr(),
+            span_label("http_method"),
+            span_label("http_status_code"),
+            span_label("deployment_environment"),
+            span_label("http_route"),
+            span_label("exception_type"),
             sql_quote(trace_id),
             time_predicate(from, to)
         );
@@ -176,7 +181,7 @@ pub fn tempo_search(state: &AppState, params: &HashMap<String, String>) -> ApiRe
 }
 
 pub fn tempo_tags() -> Value {
-    json!({"tagNames": ["service.name", "span.name", "name", "http.route", "status", "status.code", "traceID"]})
+    json!({"tagNames": semantic_labels::tempo_tag_names()})
 }
 
 pub fn tempo_tag_values(

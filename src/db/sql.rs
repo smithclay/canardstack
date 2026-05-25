@@ -74,10 +74,6 @@ pub fn spans_http_route_expr() -> String {
     json_attr("span_attributes", "http.route")
 }
 
-pub fn spans_exception_type_expr() -> String {
-    json_attr("span_attributes", "exception.type")
-}
-
 pub fn metrics_deployment_environment_expr() -> String {
     json_attr("resource_attributes", "deployment.environment")
 }

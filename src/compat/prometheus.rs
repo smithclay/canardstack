@@ -7,11 +7,12 @@ use crate::query::plan::{
     TimeBounds,
 };
 use crate::query::prometheus::parse_prom_query;
+use crate::semantic_labels;
 use crate::validation::ApiResult;
 use crate::AppState;
 use chrono::Utc;
 use serde_json::{json, Map, Value};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 
 const METRIC_RANGE_SECS: i64 = 30 * 24 * 60 * 60;
 
@@ -134,12 +135,9 @@ pub fn prometheus_query_range(
 
 pub fn prometheus_labels(_state: &AppState, params: &HashMap<String, String>) -> ApiResult<Value> {
     let _ = optional_range(params, METRIC_RANGE_SECS)?;
-    let labels = BTreeSet::from([
-        "__name__".to_string(),
-        "service_name".to_string(),
-        "deployment_environment".to_string(),
-    ]);
-    Ok(prom_success(json!(labels.into_iter().collect::<Vec<_>>())))
+    Ok(prom_success(json!(
+        semantic_labels::prometheus_label_names()
+    )))
 }
 
 pub fn prometheus_label_values(
@@ -173,12 +171,15 @@ pub fn prometheus_metadata(state: &AppState) -> ApiResult<Value> {
 fn prom_metric_labels(metric_name: &str, row: Option<&Value>) -> Value {
     let mut labels = Map::new();
     labels.insert("__name__".to_string(), json!(metric_name));
-    if let Some(service) = row
-        .and_then(|r| r.get("service_name"))
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-    {
-        labels.insert("service_name".to_string(), json!(service));
+    if let Some(Value::Object(row)) = row {
+        for (key, value) in row {
+            if key == "timestamp" || key == "value" {
+                continue;
+            }
+            if let Some(label_value) = value.as_str().filter(|s| !s.is_empty()) {
+                labels.insert(key.clone(), json!(label_value));
+            }
+        }
     }
     Value::Object(labels)
 }
@@ -188,7 +189,7 @@ struct MetricPlanInput<'a> {
     metric_name: &'a str,
     signal: &'a str,
     aggregation: &'a str,
-    filters: BTreeMap<String, String>,
+    filters: Vec<FieldMatcher>,
     group_by: Vec<String>,
     time_bounds: TimeBounds,
     step_seconds: i64,
@@ -229,11 +230,7 @@ fn metric_plan(input: MetricPlanInput<'_>) -> ApiResult<MetricPlan> {
     Ok(MetricPlan {
         selector: SelectorPlan {
             resource: Some(input.metric_name.to_string()),
-            matchers: input
-                .filters
-                .into_iter()
-                .map(|(field, value)| FieldMatcher { field, value })
-                .collect(),
+            matchers: input.filters,
             text_filters: Vec::new(),
         },
         time_bounds: input.time_bounds,

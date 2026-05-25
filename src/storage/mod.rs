@@ -460,9 +460,11 @@ mod tests {
 
     #[test]
     fn metadata_refresh_uses_one_insert_per_signal_bucket() {
+        // Counts exclude high-cardinality id labels (trace_id, span_id,
+        // service_instance_id), which stay filterable but are not materialized.
         for (signal, select_count) in [
-            (StorageSignal::Logs, 8),
-            (StorageSignal::Spans, 6),
+            (StorageSignal::Logs, 9),
+            (StorageSignal::Spans, 16),
             (StorageSignal::MetricGauge, 5),
             (StorageSignal::MetricSum, 5),
         ] {

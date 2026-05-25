@@ -1,31 +1,9 @@
 use crate::query::plan::{
-    matchers_from_labels, normalize_labels, parse_selector, unquote, LogPlan, SelectorPlan,
-    SortDirection, TextFilter, TimeBounds,
+    normalize_matchers, parse_selector_matchers, unquote, LogPlan, SelectorPlan, SortDirection,
+    TextFilter, TimeBounds,
 };
+use crate::semantic_labels::{self, LabelScope};
 use crate::validation::ApiResult;
-
-const LOG_LABEL_ALIASES: &[(&str, &str)] = &[
-    ("service_name", "service_name"),
-    ("service.name", "service_name"),
-    ("deployment_environment", "deployment_environment"),
-    ("deployment.environment", "deployment_environment"),
-    ("severity_text", "severity_text"),
-    ("trace_id", "trace_id"),
-    ("span_id", "span_id"),
-    ("http_route", "http_route"),
-    ("http.route", "http_route"),
-    ("http_method", "http_method"),
-    ("http.method", "http_method"),
-];
-
-const LOKI_STREAM_LABELS: &[&str] = &[
-    "service_name",
-    "deployment_environment",
-    "severity_text",
-    "trace_id",
-    "span_id",
-    "http_route",
-];
 
 pub fn parse_loki_query(
     raw: &str,
@@ -33,30 +11,42 @@ pub fn parse_loki_query(
     limit: usize,
     direction: &str,
 ) -> ApiResult<LogPlan> {
-    let (selector, contains) = raw
-        .split_once("|=")
-        .map(|(left, right)| (left.trim(), Some(unquote(right.trim()).to_string())))
-        .unwrap_or((raw.trim(), None));
-    let (_, labels) = parse_selector(selector, "unsupported_selector")?;
-    let labels = normalize_labels(labels, LOG_LABEL_ALIASES, "unsupported_selector")?;
-    let mut text_filters = Vec::new();
-    if let Some(contains) = contains {
-        text_filters.push(TextFilter::BodyContains(contains));
-    }
+    let (selector, text_filters) = parse_log_pipeline(raw);
+    let (_, matchers) = parse_selector_matchers(selector, "unsupported_selector")?;
+    let aliases = semantic_labels::alias_pairs(LabelScope::Logs);
+    let matchers = normalize_matchers(matchers, &aliases, "unsupported_selector")?;
     Ok(LogPlan {
         selector: SelectorPlan {
             resource: None,
-            matchers: matchers_from_labels(labels),
+            matchers,
             text_filters,
         },
         time_bounds,
         limit,
         direction: SortDirection::from_loki(direction),
-        stream_labels: LOKI_STREAM_LABELS
-            .iter()
-            .map(|label| (*label).to_string())
-            .collect(),
+        stream_labels: semantic_labels::loki_stream_labels(),
     })
+}
+
+fn parse_log_pipeline(raw: &str) -> (&str, Vec<TextFilter>) {
+    let contains = raw.find("|=");
+    let regex = raw.find("|~");
+    let Some((idx, regex_filter)) = (match (contains, regex) {
+        (Some(contains), Some(regex)) if regex < contains => Some((regex, true)),
+        (Some(contains), Some(_)) | (Some(contains), None) => Some((contains, false)),
+        (None, Some(regex)) => Some((regex, true)),
+        (None, None) => None,
+    }) else {
+        return (raw.trim(), Vec::new());
+    };
+    let selector = raw[..idx].trim();
+    let term = unquote(raw[idx + 2..].trim()).to_string();
+    let filter = if regex_filter {
+        TextFilter::BodyRegex(term)
+    } else {
+        TextFilter::BodyContains(term)
+    };
+    (selector, vec![filter])
 }
 
 #[cfg(test)]
@@ -104,5 +94,45 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(err.reason, "unsupported_selector");
+    }
+
+    #[test]
+    fn loki_selector_supports_regex_and_resource_aliases() {
+        let plan = parse_loki_query(
+            r#"{resource.service.name=~"front.*",resource.service.namespace="demo",severity.text!="DEBUG"} |~ "GET|POST""#,
+            bounds(),
+            100,
+            "backward",
+        )
+        .unwrap();
+
+        assert_eq!(
+            plan.selector.matcher_value("service_namespace"),
+            Some("demo")
+        );
+        assert!(matches!(
+            plan.selector.text_filters.as_slice(),
+            [TextFilter::BodyRegex(term)] if term == "GET|POST"
+        ));
+    }
+
+    #[test]
+    fn loki_selector_keeps_commas_inside_quoted_regex_matchers() {
+        let plan = parse_loki_query(
+            r#"{service.name=~"frontend,checkout",severity.text!="DEBUG"}"#,
+            bounds(),
+            100,
+            "backward",
+        )
+        .unwrap();
+
+        let matcher = plan
+            .selector
+            .matchers
+            .iter()
+            .find(|matcher| matcher.field == "service_name")
+            .unwrap();
+        assert_eq!(matcher.value, "frontend,checkout");
+        assert_eq!(matcher.op, crate::query::plan::MatchOp::Regex);
     }
 }
