@@ -3,6 +3,7 @@
   canardstack
 </h1>
 
+[![Crates.io](https://img.shields.io/crates/v/canardstack)](https://crates.io/crates/canardstack)
 [![CI](https://github.com/smithclay/canardstack/actions/workflows/ci.yml/badge.svg)](https://github.com/smithclay/canardstack/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![DuckLake](https://img.shields.io/badge/storage-DuckLake-fff000.svg?logo=duckdb&logoColor=black)](https://ducklake.select/)
@@ -10,7 +11,7 @@
 
 > OpenTelemetry logs, traces, and metrics stored in DuckLake, visualized in Grafana.
 
-canardstack is an experimental backend that stores OpenTelemetry data in [DuckLake](https://ducklake.select/), a lakehouse standard from the creators of duckdb. The project goal is to explore cheap and simple ways to query terabytes of observability data *from a single node* stored in open formats on object storage.
+canardstack is an experimental project that makes it possible to stream OpenTelemetry data to [DuckLake](https://ducklake.select/), a lakehouse standard from the creators of duckdb. The project goal is to explore cheap and simple ways to query terabytes of observability data *from a single node* stored in open formats on object storage.
 
 Builds on prior work from [otlp2parquet](https://github.com/smithclay/otlp2parquet), [otlp2pipeline](https://github.com/smithclay/otlp2pipeline), and [duckdb-otlp](https://github.com/smithclay/duckdb-otlp).
 
