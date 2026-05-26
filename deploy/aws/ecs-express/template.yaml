@@ -237,8 +237,12 @@ Resources:
         BlockPublicPolicy: true
         IgnorePublicAcls: true
         RestrictPublicBuckets: true
-      VersioningConfiguration:
-        Status: Enabled
+      # Versioning intentionally NOT enabled. DuckLake tracks file references in
+      # its catalog and protects against accidental orphan deletion via the
+      # `delete_older_than` retention grace (default 24h), so S3 versioning adds
+      # no data-protection value here -- only operational drag on teardown
+      # (versions + delete markers block bucket delete; rm --recursive only adds
+      # delete markers, requiring a version-aware empty before CFN can delete).
 
   ApiKeySecret:
     Type: AWS::SecretsManager::Secret
