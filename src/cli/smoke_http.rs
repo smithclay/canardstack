@@ -10,19 +10,15 @@ use std::time::{Duration, Instant};
 const TRACE_ID: &str = "11111111111111111111111111111111";
 
 pub fn run(args: impl Iterator<Item = String>) -> Result<()> {
-    let mut base_url = "http://127.0.0.1:4318".to_string();
-    let mut mode = Mode::IngestAndVerify;
-    for arg in args {
-        match arg.as_str() {
-            "--verify-only" => mode = Mode::VerifyOnly,
-            "--expect-empty" => mode = Mode::ExpectEmpty,
-            _ if arg.starts_with("http://") => base_url = arg,
-            _ => bail!(
-                "unknown smoke-http argument {arg}; use [http://host:port] [--verify-only|--expect-empty]"
-            ),
-        }
-    }
+    let Some(options) = parse_args(args)? else {
+        return Ok(());
+    };
+    let base_url = options.base_url;
+    let mode = options.mode;
+    run_with_options(base_url, mode)
+}
 
+fn run_with_options(base_url: String, mode: Mode) -> Result<()> {
     let config = Config::from_env()?;
     let api_key = config.operator.api_key;
     let admin_key = config.operator.admin_api_key;
@@ -59,7 +55,46 @@ pub fn run(args: impl Iterator<Item = String>) -> Result<()> {
     Ok(())
 }
 
-#[derive(Copy, Clone, Eq, PartialEq)]
+#[derive(Debug)]
+struct SmokeHttpOptions {
+    base_url: String,
+    mode: Mode,
+}
+
+fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<SmokeHttpOptions>> {
+    let mut base_url = "http://127.0.0.1:4318".to_string();
+    let mut mode = Mode::IngestAndVerify;
+    let mut args = args.peekable();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--verify-only" => mode = Mode::VerifyOnly,
+            "--expect-empty" => mode = Mode::ExpectEmpty,
+            "--endpoint" => {
+                base_url = args
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--endpoint requires a base URL"))?;
+            }
+            "--help" | "-h" => {
+                println!(
+                    "usage: canardstack smoke-http [--endpoint http://host:port] [--verify-only|--expect-empty]"
+                );
+                return Ok(None);
+            }
+            _ => {
+                if let Some(value) = arg.strip_prefix("--endpoint=") {
+                    base_url = value.to_string();
+                } else {
+                    bail!(
+                        "unknown smoke-http argument {arg}; use [--endpoint http://host:port] [--verify-only|--expect-empty]"
+                    );
+                }
+            }
+        }
+    }
+    Ok(Some(SmokeHttpOptions { base_url, mode }))
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum Mode {
     IngestAndVerify,
     VerifyOnly,
@@ -258,4 +293,39 @@ fn ensure_text(value: &Value, needle: &str, message: &str) -> Result<()> {
         bail!("{message}: {value}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_args_accepts_named_endpoint() {
+        let options = parse_args(
+            ["--endpoint", "http://127.0.0.1:4320", "--verify-only"]
+                .into_iter()
+                .map(str::to_string),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(options.base_url, "http://127.0.0.1:4320");
+        assert_eq!(options.mode, Mode::VerifyOnly);
+    }
+
+    #[test]
+    fn parse_args_rejects_positional_endpoint() {
+        let err = parse_args(["http://127.0.0.1:4321"].into_iter().map(str::to_string))
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("unknown smoke-http argument"), "{err}");
+    }
+
+    #[test]
+    fn parse_args_help_is_ok_none() {
+        assert!(parse_args(["--help"].into_iter().map(str::to_string))
+            .unwrap()
+            .is_none());
+    }
 }

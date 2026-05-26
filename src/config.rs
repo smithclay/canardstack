@@ -136,6 +136,8 @@ pub struct OperatorConfig {
     pub ducklake_data_path: Option<String>,
     pub ducklake_quack_token: Option<String>,
     pub ducklake_quack_insecure_tls: bool,
+    pub local_catalog_enabled: bool,
+    pub local_catalog_listen: String,
     pub ducklake_maintenance: DuckLakeMaintenanceConfig,
     pub max_body_bytes: usize,
     pub runtime_memory_limit_bytes: Option<usize>,
@@ -402,6 +404,12 @@ impl OperatorConfig {
             ducklake_quack_insecure_tls: env_bool("CANARDSTACK_DUCKLAKE_QUACK_INSECURE_TLS")?
                 .or(file.bool(&["ducklake", "quack_insecure_tls"])?)
                 .unwrap_or(false),
+            local_catalog_enabled: env_bool("CANARDSTACK_LOCAL_CATALOG_ENABLED")?
+                .or(file.bool(&["ducklake", "local_catalog_enabled"])?)
+                .unwrap_or(false),
+            local_catalog_listen: env_string("CANARDSTACK_LOCAL_CATALOG_LISTEN")?
+                .or(file.string(&["ducklake", "local_catalog_listen"])?)
+                .unwrap_or_else(|| "127.0.0.1:9494".to_string()),
             ducklake_maintenance: DuckLakeMaintenanceConfig {
                 enabled: ducklake_maintenance_enabled,
                 data_inlining_row_limit: env_usize("CANARDSTACK_DUCKLAKE_DATA_INLINING_ROW_LIMIT")?
@@ -512,6 +520,8 @@ impl OperatorConfig {
             ducklake_data_path: None,
             ducklake_quack_token: None,
             ducklake_quack_insecure_tls: false,
+            local_catalog_enabled: false,
+            local_catalog_listen: "127.0.0.1:9494".to_string(),
             ducklake_maintenance: DuckLakeMaintenanceConfig {
                 enabled: true,
                 data_inlining_row_limit: 10,
@@ -625,6 +635,44 @@ impl OperatorConfig {
             anyhow::bail!(
                 "CANARDSTACK_DUCKLAKE_QUACK_TOKEN must be set when CANARDSTACK_DUCKLAKE_ATTACH_URI uses ducklake:quack:"
             );
+        }
+        if self.local_catalog_enabled {
+            if self.postgres_dsn.is_some() {
+                anyhow::bail!(
+                    "CANARDSTACK_LOCAL_CATALOG_ENABLED=true requires the local DuckDB-backed DuckLake catalog; unset CANARDSTACK_POSTGRES_DSN"
+                );
+            }
+            if self.ducklake_attach_uri.is_some() {
+                anyhow::bail!(
+                    "CANARDSTACK_LOCAL_CATALOG_ENABLED=true requires the local DuckDB-backed DuckLake catalog; unset CANARDSTACK_DUCKLAKE_ATTACH_URI"
+                );
+            }
+            if self
+                .ducklake_quack_token
+                .as_deref()
+                .is_none_or(|token| token.trim().is_empty())
+            {
+                anyhow::bail!(
+                    "CANARDSTACK_DUCKLAKE_QUACK_TOKEN must be set when CANARDSTACK_LOCAL_CATALOG_ENABLED=true"
+                );
+            }
+            if self.local_catalog_listen.trim().is_empty() {
+                anyhow::bail!(
+                    "CANARDSTACK_LOCAL_CATALOG_LISTEN must not be empty when CANARDSTACK_LOCAL_CATALOG_ENABLED=true"
+                );
+            }
+            if !listen_addr_is_loopback(&self.local_catalog_listen) {
+                anyhow::bail!(
+                    "CANARDSTACK_LOCAL_CATALOG_LISTEN must be a loopback address for local catalog endpoint mode"
+                );
+            }
+            if self.local_catalog_listen == self.bind
+                || (self.tls.enabled && self.local_catalog_listen == self.tls.backend_bind)
+            {
+                anyhow::bail!(
+                    "CANARDSTACK_LOCAL_CATALOG_LISTEN must differ from CANARDSTACK_BIND and CANARDSTACK_TLS_BACKEND_BIND"
+                );
+            }
         }
         if self.ducklake_maintenance.expire_older_than_days <= 0 {
             anyhow::bail!("CANARDSTACK_DUCKLAKE_EXPIRE_OLDER_THAN_DAYS must be > 0");
@@ -994,6 +1042,12 @@ fn trimmed_non_empty(value: String) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
+fn listen_addr_is_loopback(listen: &str) -> bool {
+    let host = listen.rsplit_once(':').map_or(listen, |(host, _)| host);
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    matches!(host, "127.0.0.1" | "localhost" | "::1")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1022,6 +1076,8 @@ mod tests {
         "CANARDSTACK_DUCKLAKE_DATA_PATH",
         "CANARDSTACK_DUCKLAKE_QUACK_TOKEN",
         "CANARDSTACK_DUCKLAKE_QUACK_INSECURE_TLS",
+        "CANARDSTACK_LOCAL_CATALOG_ENABLED",
+        "CANARDSTACK_LOCAL_CATALOG_LISTEN",
         "CANARDSTACK_DUCKLAKE_MAINTENANCE_ENABLED",
         "CANARDSTACK_DUCKLAKE_DATA_INLINING_ROW_LIMIT",
         "CANARDSTACK_DUCKLAKE_EXPIRE_OLDER_THAN_DAYS",
@@ -1451,6 +1507,49 @@ max_body_bytes = "large"
         let err = config.validate().unwrap_err().to_string();
         assert!(
             err.contains("CANARDSTACK_GRPC_MAX_BODY_BYTES must be <= CANARDSTACK_MAX_BODY_BYTES"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn local_catalog_enabled_requires_quack_token() {
+        let mut config = Config::test(PathBuf::from("canardstack.duckdb"));
+        config.operator.local_catalog_enabled = true;
+
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains(
+                "CANARDSTACK_DUCKLAKE_QUACK_TOKEN must be set when CANARDSTACK_LOCAL_CATALOG_ENABLED=true"
+            ),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn local_catalog_enabled_rejects_remote_catalog_config() {
+        let mut config = Config::test(PathBuf::from("canardstack.duckdb"));
+        config.operator.local_catalog_enabled = true;
+        config.operator.ducklake_quack_token = Some("token".to_string());
+        config.operator.ducklake_attach_uri =
+            Some("ducklake:quack:catalog.internal:9494".to_string());
+
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("unset CANARDSTACK_DUCKLAKE_ATTACH_URI"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn local_catalog_enabled_rejects_non_loopback_listen() {
+        let mut config = Config::test(PathBuf::from("canardstack.duckdb"));
+        config.operator.local_catalog_enabled = true;
+        config.operator.ducklake_quack_token = Some("token".to_string());
+        config.operator.local_catalog_listen = "0.0.0.0:9494".to_string();
+
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("CANARDSTACK_LOCAL_CATALOG_LISTEN must be a loopback address"),
             "{err}"
         );
     }

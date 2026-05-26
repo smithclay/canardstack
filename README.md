@@ -65,8 +65,18 @@ curl -sS -H 'Authorization: Bearer dev-canardstack-key' \
 <details>
 <summary>Query the local DuckLake directly with DuckDB 1.5.3+</summary>
 
-Shut down canardstack first so no second DuckDB process has the local DuckLake
-catalog open, then attach the catalog from the repository root:
+To inspect the local DuckLake while canardstack is still running, start the
+server with the in-process loopback Quack catalog endpoint. It is loopback-only
+and always plaintext — the app and any local DuckDB client attach through it
+over TCP loopback, so TLS is neither needed nor available here.
+`CANARDSTACK_CATALOG_TLS*` applies only to the separate `serve-catalog` role.
+
+```bash
+CANARDSTACK_DUCKLAKE_QUACK_TOKEN=dev-quack-token \
+  cargo run -- serve --local-catalog
+```
+
+Then attach through the in-process catalog endpoint from another terminal:
 
 ```bash
 duckdb --version
@@ -76,8 +86,13 @@ duckdb
 ```sql
 INSTALL ducklake;
 LOAD ducklake;
+INSTALL quack;
+LOAD quack;
 
-ATTACH 'ducklake:.canardstack/canardstack.ducklake' AS canardlake
+CREATE OR REPLACE SECRET canardstack_ducklake_quack
+  (TYPE quack, SCOPE 'quack:127.0.0.1:9494', TOKEN 'dev-quack-token');
+
+ATTACH 'ducklake:quack:127.0.0.1:9494' AS canardlake
   (DATA_PATH '.canardstack/storage');
 USE canardlake;
 

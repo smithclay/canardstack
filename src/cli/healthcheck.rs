@@ -4,8 +4,10 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
-pub fn run(url: Option<String>) -> Result<()> {
-    let url = url.unwrap_or_else(|| "http://127.0.0.1:4318/healthz".to_string());
+pub fn run(args: impl Iterator<Item = String>) -> Result<()> {
+    let Some(url) = parse_endpoint(args)? else {
+        return Ok(());
+    };
     let response = get(&url)?;
     if response.status != 200 {
         bail!(
@@ -20,6 +22,36 @@ pub fn run(url: Option<String>) -> Result<()> {
         bail!("healthcheck status was not ok: {body}");
     }
     Ok(())
+}
+
+fn parse_endpoint(mut args: impl Iterator<Item = String>) -> Result<Option<String>> {
+    let mut endpoint = None;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--endpoint" => {
+                endpoint = Some(
+                    args.next()
+                        .ok_or_else(|| anyhow::anyhow!("--endpoint requires a URL"))?,
+                );
+            }
+            "--help" | "-h" => {
+                println!("usage: canardstack healthcheck [--endpoint http://host:port/healthz]");
+                return Ok(None);
+            }
+            other => {
+                if let Some(value) = other.strip_prefix("--endpoint=") {
+                    endpoint = Some(value.to_string());
+                } else {
+                    bail!(
+                        "unknown healthcheck argument {other}; use [--endpoint http://host:port/healthz]"
+                    );
+                }
+            }
+        }
+    }
+    Ok(Some(endpoint.unwrap_or_else(|| {
+        "http://127.0.0.1:4318/healthz".to_string()
+    })))
 }
 
 struct Response {
@@ -78,5 +110,41 @@ impl HttpTarget {
             port: port.parse().context("parse URL port")?,
             path: format!("/{path}"),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_endpoint_accepts_named_endpoint() {
+        let url = parse_endpoint(
+            ["--endpoint", "http://127.0.0.1:4319/healthz"]
+                .into_iter()
+                .map(str::to_string),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(url, "http://127.0.0.1:4319/healthz");
+    }
+
+    #[test]
+    fn parse_endpoint_rejects_positional_url() {
+        let err = parse_endpoint(
+            ["http://127.0.0.1:8080/healthz"]
+                .into_iter()
+                .map(str::to_string),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("unknown healthcheck argument"), "{err}");
+    }
+
+    #[test]
+    fn parse_endpoint_help_is_ok_none() {
+        assert!(parse_endpoint(["--help"].into_iter().map(str::to_string))
+            .unwrap()
+            .is_none());
     }
 }

@@ -33,12 +33,14 @@ prek run --all-files
 # Local server workflow
 cp config/example.env .env && set -a && . ./.env && set +a
 cargo run -- serve              # serves on CANARDSTACK_BIND, default 127.0.0.1:4318
+cargo run -- serve --listen 127.0.0.1:4320
 cargo run -- serve --role ingest # ingest routes plus operator endpoints; no query routes
 cargo run -- serve --role query  # query routes plus operator endpoints; no ingest routes
+cargo run -- serve --local-catalog --catalog-listen 127.0.0.1:9494  # live local DuckLake inspection over Quack
 cargo run -- serve-catalog      # catalog role: serve the DuckLake catalog DuckDB file over Quack (no pipeline)
 cargo run -- smoke              # in-process smoke: starts app, ingests fixtures, queries, prints health
-cargo run -- smoke-http <url>   # smoke against an already-running server
-cargo run -- healthcheck <url>  # used as the Docker healthcheck
+cargo run -- smoke-http --endpoint <url>   # smoke against an already-running server
+cargo run -- healthcheck --endpoint <url>  # used as the Docker healthcheck
 
 # Docker quickstart
 docker compose up --build
