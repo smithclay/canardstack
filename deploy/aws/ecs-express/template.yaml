@@ -85,10 +85,7 @@ Parameters:
   CatalogContainerUser:
     Type: String
     Default: "0"
-    Description: Container user override for the catalog image. The default can write the root-owned EBS mount.
-  EbsSizeGiB:
-    Type: Number
-    Default: 20
+    Description: Container user override for the catalog image. The default can write the root-owned catalog mount.
   AppEbsSizeGiB:
     Type: Number
     Default: 20
@@ -456,6 +453,66 @@ Resources:
         - IpProtocol: -1
           CidrIp: 0.0.0.0/0
 
+  # Durable catalog storage. canardstack.ducklake is the index over the immutable
+  # S3 Parquet data; on a service-managed EBS volume it is per-task and destroyed
+  # on every catalog task replacement (services force deleteOnTermination=true),
+  # which orphans the S3 data. EFS persists it across deploys/restarts.
+  # NOTE: DuckDB advises against read-write database files on NFS; this is
+  # acceptable here only because serve-catalog is the single writer. For a
+  # stronger durability guarantee use a Postgres catalog instead.
+  CatalogEfsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: canardstack catalog EFS mount targets
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          SourceSecurityGroupId: !Ref CatalogSecurityGroup
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+
+  CatalogFileSystem:
+    Type: AWS::EFS::FileSystem
+    Properties:
+      Encrypted: true
+      PerformanceMode: generalPurpose
+      ThroughputMode: bursting
+      BackupPolicy:
+        Status: ENABLED
+      FileSystemTags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-catalog
+
+  CatalogAccessPoint:
+    Type: AWS::EFS::AccessPoint
+    Properties:
+      FileSystemId: !Ref CatalogFileSystem
+      RootDirectory:
+        Path: /catalog
+        CreationInfo:
+          OwnerUid: "0"
+          OwnerGid: "0"
+          Permissions: "0755"
+
+  CatalogMountTargetOne:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref CatalogFileSystem
+      SubnetId: !Ref PublicSubnetOne
+      SecurityGroups:
+        - !Ref CatalogEfsSecurityGroup
+
+  CatalogMountTargetTwo:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref CatalogFileSystem
+      SubnetId: !Ref PublicSubnetTwo
+      SecurityGroups:
+        - !Ref CatalogEfsSecurityGroup
+
   LoadBalancer:
     Type: AWS::ElasticLoadBalancingV2::LoadBalancer
     Properties:
@@ -603,7 +660,11 @@ Resources:
       TaskRoleArn: !GetAtt CatalogTaskRole.Arn
       Volumes:
         - Name: duckdb-catalog
-          ConfiguredAtLaunch: true
+          EFSVolumeConfiguration:
+            FilesystemId: !Ref CatalogFileSystem
+            TransitEncryption: ENABLED
+            AuthorizationConfig:
+              AccessPointId: !Ref CatalogAccessPoint
       ContainerDefinitions:
         - Name: canardstack-catalog
           Image: !Ref CatalogImage
@@ -661,6 +722,9 @@ Resources:
 
   CatalogService:
     Type: AWS::ECS::Service
+    DependsOn:
+      - CatalogMountTargetOne
+      - CatalogMountTargetTwo
     Properties:
       Cluster: !Ref Cluster
       ServiceName: !Ref CatalogServiceName
@@ -687,14 +751,6 @@ Resources:
           Subnets:
             - !Ref PublicSubnetOne
             - !Ref PublicSubnetTwo
-      VolumeConfigurations:
-        - Name: duckdb-catalog
-          ManagedEBSVolume:
-            RoleArn: !GetAtt EcsInfrastructureRole.Arn
-            SizeInGiB: !Ref EbsSizeGiB
-            VolumeType: gp3
-            Encrypted: true
-            FilesystemType: ext4
 
   AppService:
     Type: AWS::ECS::Service
