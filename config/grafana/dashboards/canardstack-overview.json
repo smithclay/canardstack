@@ -23,7 +23,7 @@
             "showPoints": "auto",
             "spanNulls": false
           },
-          "unit": "ms"
+          "unit": "short"
         },
         "overrides": []
       },
@@ -56,13 +56,13 @@
             "uid": "canardstack-prometheus"
           },
           "editorMode": "code",
-          "expr": "avg by (service_name) (smoke.gauge)",
+          "expr": "sum by (service_name) ({__name__=\"traces.span.metrics.calls\"})",
           "legendFormat": "{{service_name}}",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "Demo Latency by Service",
+      "title": "Span Calls by Service",
       "type": "timeseries"
     },
     {
@@ -113,13 +113,13 @@
             "uid": "canardstack-prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by (service_name) (smoke.sum)",
+          "expr": "sum by (service_name) ({__name__=\"demo.recommendation.requests\"})",
           "legendFormat": "{{service_name}}",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "Demo Requests by Service",
+      "title": "Recommendation Requests",
       "type": "timeseries"
     },
     {
@@ -152,7 +152,7 @@
           },
           "direction": "backward",
           "editorMode": "code",
-          "expr": "{deployment_environment=\"dev\"} |= \"smoke\"",
+          "expr": "{service_namespace=\"opentelemetry-demo\"}",
           "queryType": "range",
           "refId": "A"
         }
@@ -208,13 +208,46 @@
             "uid": "canardstack-prometheus"
           },
           "editorMode": "code",
-          "expr": "max({__name__=\"canardstack_storage_logical_rows\",service_name=\"canardstack\"})",
-          "legendFormat": "rows",
+          "expr": "sum({__name__=\"demo.ad.requests\"})",
+          "legendFormat": "ad requests",
           "range": true,
           "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "canardstack-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum({__name__=\"demo.product.review.requests\"})",
+          "legendFormat": "product reviews",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "canardstack-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum({__name__=\"demo.shipping.items_count\"})",
+          "legendFormat": "items shipped",
+          "range": true,
+          "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "canardstack-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum({__name__=\"demo.payment.transactions\"})",
+          "legendFormat": "payments",
+          "range": true,
+          "refId": "D"
         }
       ],
-      "title": "Stored Rows",
+      "title": "Business Events",
       "type": "timeseries"
     },
     {
@@ -269,13 +302,13 @@
             "uid": "canardstack-prometheus"
           },
           "editorMode": "code",
-          "expr": "sum({__name__=\"canardstack_ingest_requests_total\",service_name=\"canardstack\"})",
-          "legendFormat": "accepted",
+          "expr": "sum({__name__=\"demo.payment.transactions\"})",
+          "legendFormat": "payments",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "Ingest Requests",
+      "title": "Payments",
       "type": "stat"
     },
     {
@@ -330,13 +363,13 @@
             "uid": "canardstack-prometheus"
           },
           "editorMode": "code",
-          "expr": "sum({__name__=\"canardstack_query_requests_total\",service_name=\"canardstack\"})",
-          "legendFormat": "queries",
+          "expr": "sum({__name__=\"demo.product.review.requests\"})",
+          "legendFormat": "reviews",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "Query Requests",
+      "title": "Product Reviews",
       "type": "stat"
     },
     {
@@ -391,13 +424,13 @@
             "uid": "canardstack-prometheus"
           },
           "editorMode": "code",
-          "expr": "sum({__name__=\"canardstack_raw_spool_pending_records\",service_name=\"canardstack\"})",
-          "legendFormat": "pending records",
+          "expr": "sum({__name__=\"demo.shipping.items_count\"})",
+          "legendFormat": "items",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "Raw Spool Pending Records",
+      "title": "Items Shipped",
       "type": "stat"
     }
   ],
@@ -417,6 +450,6 @@
   "timezone": "browser",
   "title": "Canardstack",
   "uid": "canardstack-overview",
-  "version": 2,
+  "version": 3,
   "weekStart": ""
 }

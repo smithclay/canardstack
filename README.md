@@ -35,7 +35,6 @@ under `.canardstack` and listens for OTLP data on `127.0.0.1:4318`.
 
 ```bash
 # requires rust toolchain: `curl https://sh.rustup.rs -sSf | sh`
-# also assumes you have duckdb installed (`brew install duckdb`)
 cargo install --locked canardstack
 
 # starts server on :4318
@@ -45,27 +44,20 @@ canardstack
 In another terminal, send one OTLP/HTTP JSON log:
 
 ```bash
+OTLP_TIME_UNIX_NANO="$(date +%s)000000000"
 curl -sS -X POST http://127.0.0.1:4318/v1/logs \
   -H 'Authorization: Bearer dev-canardstack-key' \
   -H 'Content-Type: application/json' \
-  --data '{"resourceLogs":[{"scopeLogs":[{"logRecords":[{"timeUnixNano":"1779667200000000000","body":{"stringValue":"hello world"}}]}]}]}'
+  --data "{\"resourceLogs\":[{\"resource\":{\"attributes\":[{\"key\":\"service.name\",\"value\":{\"stringValue\":\"quickstart\"}}]},\"scopeLogs\":[{\"logRecords\":[{\"timeUnixNano\":\"${OTLP_TIME_UNIX_NANO}\",\"body\":{\"stringValue\":\"hello world\"}}]}]}]}"
 ```
 
 canardstack acknowledges ingest after the raw request is fsynced locally. Give
-the scheduler a few seconds to register the log with the DuckLake catalog, then query it directly:
+the scheduler a few seconds to register the log with the DuckLake catalog, then
+query it through the Loki-compatible API:
 
 ```bash
-duckdb
-```
-
-```sql
-INSTALL ducklake;
-LOAD ducklake;
-ATTACH 'ducklake:.canardstack/canardstack.ducklake' AS canardlake
-  (DATA_PATH '.canardstack/storage');
-USE canardlake;
-
-SELECT * FROM logs;
+curl -sS -H 'Authorization: Bearer dev-canardstack-key' \
+  'http://127.0.0.1:4318/loki/api/v1/query?query=%7Bservice_name%3D%22quickstart%22%7D'
 ```
 
 ## Demo

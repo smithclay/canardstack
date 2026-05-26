@@ -10,7 +10,7 @@
 # this host name by default.
 
 exporters:
-  otlphttp/canardstack:
+  otlp_http/canardstack:
     endpoint: http://host.docker.internal:4318
     encoding: proto
     headers:
@@ -21,7 +21,7 @@ service:
     traces:
       receivers: [otlp]
       processors: [resourcedetection, memory_limiter, transform/sanitize_spans]
-      exporters: [debug, span_metrics, otlphttp/canardstack]
+      exporters: [debug, span_metrics, otlp_http/canardstack]
     metrics:
       # Keep the app/span metrics path small and portable. The upstream demo's
       # default metrics receivers also scrape Docker, host, Postgres, Redis, and
@@ -29,8 +29,8 @@ service:
       # across local Docker runtimes.
       receivers: [otlp, span_metrics]
       processors: [resourcedetection, memory_limiter]
-      exporters: [debug, otlphttp/canardstack]
+      exporters: [debug, otlp_http/canardstack]
     logs:
       receivers: [otlp]
       processors: [resourcedetection, memory_limiter, transform/sanitize_logs]
-      exporters: [debug, otlphttp/canardstack]
+      exporters: [debug, otlp_http/canardstack]

@@ -4,8 +4,9 @@ description: Run canardstack against the OpenTelemetry demo.
 ---
 
 Run canardstack against the full
-[OpenTelemetry demo](https://github.com/open-telemetry/opentelemetry-demo).
-Keep the demo in a separate checkout; this repo only supplies the collector
+[OpenTelemetry demo](https://github.com/open-telemetry/opentelemetry-demo) with pre-built Grafana dashboards and data sources.
+
+Keep the otel demo repository in a separate checkout; this repo only supplies the collector
 extras file that points the demo collector at canardstack.
 
 ## Start canardstack
@@ -38,18 +39,14 @@ git clone https://github.com/open-telemetry/opentelemetry-demo.git ../openteleme
 cd ../opentelemetry-demo
 
 CANARDSTACK_DIR="$(cd ../canardstack && pwd)"
-DEMO_VERSION="$(sed -n 's/^IMAGE_VERSION=//p' .env)"
 
 OTEL_COLLECTOR_CONFIG_EXTRAS="$CANARDSTACK_DIR/config/otel-demo-collector-extras.yml" \
-DEMO_VERSION="$DEMO_VERSION" \
 make start-no-o11y
 ```
 
-`DEMO_VERSION="$DEMO_VERSION"` keeps the demo images aligned with the checked-out
-demo config. Without that, some demo checkouts may combine older config files
-with newer `latest-*` images. `start-no-o11y` skips the demo's Jaeger,
-Prometheus, OpenSearch, and Grafana services; use `make start-minimal-no-o11y`
-for the smaller core-only service set.
+`start-no-o11y` skips the demo's Jaeger, Prometheus, OpenSearch, and Grafana
+services; use `make start-minimal-no-o11y` for the smaller core-only service
+set.
 
 Open the demo storefront:
 
@@ -59,7 +56,7 @@ http://localhost:8080/
 
 The demo load generator starts with the stack and sends logs, traces, and
 metrics through the demo collector. The checked-in extras file adds an
-`otlphttp/canardstack` exporter to the demo's logs, traces, and metrics
+`otlp_http/canardstack` exporter to the demo's logs, traces, and metrics
 pipelines, using OTLP/HTTP protobuf to `http://host.docker.internal:4318`.
 
 ## Open Grafana
@@ -72,11 +69,12 @@ http://localhost:3000/d/canardstack-overview/canardstack-overview
 
 Use `admin/admin` if you log in to the bundled Grafana directly.
 
+![OpenTelemetry demo telemetry in the bundled canardstack Grafana dashboard](../../assets/grafana-dash-demo.png)
+
 ## Notes
 
 - `host.docker.internal` works out of the box on Docker Desktop and OrbStack. On
   plain Linux Docker Engine, use an equivalent host-gateway address or add a
   host alias for the demo collector.
-- The extras file keeps the demo's Jaeger, Prometheus, and OpenSearch exporters
-  enabled, but narrows the metrics receivers to OTLP and spanmetrics for local
-  portability.
+- The extras file sends logs, traces, and metrics to canardstack, and keeps the
+  metrics receivers to OTLP and spanmetrics for local portability.
