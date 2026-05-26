@@ -10,7 +10,7 @@
 
 > OpenTelemetry logs, traces, and metrics stored in DuckLake, visualized in Grafana.
 
-canardstack is an experimental backend that stores OpenTelemetry data in [DuckLake](https://ducklake.select/), an open lakehouse format from the creators of duckdb. Inspired by [ClickStack](https://clickhouse.com/docs/use-cases/observability/clickstack), the project goal is to explore cheap and simple ways to store and query terabytes of observability data *from a single node*.
+canardstack is an experimental backend that stores OpenTelemetry data in [DuckLake](https://ducklake.select/), a lakehouse standard from the creators of duckdb. The project goal is to explore cheap and simple ways to query terabytes of observability data *from a single node* stored in open formats on object storage.
 
 Builds on prior work from [otlp2parquet](https://github.com/smithclay/otlp2parquet), [otlp2pipeline](https://github.com/smithclay/otlp2pipeline), and [duckdb-otlp](https://github.com/smithclay/duckdb-otlp).
 
@@ -19,6 +19,7 @@ Builds on prior work from [otlp2parquet](https://github.com/smithclay/otlp2parqu
 - [Quickstart](#quickstart)
 - [Demo](#demo)
 - [What You Can Do](#what-you-can-do)
+- [Differences From ClickStack](#differences-from-clickstack)
 - [Send Telemetry](#send-telemetry)
 - [Query Data](#query-data)
 - [Deployment](#deployment)
@@ -80,6 +81,31 @@ Use canardstack to:
 canardstack is best suited for local, single-tenant, or experimental deployments
 where the operator wants direct access to lakehouse telemetry data and can
 accept the current v0 durability and compatibility limits.
+
+## Differences from ClickStack
+
+ClickStack is the production-grade observability stack built around
+ClickHouse, HyperDX, and an OpenTelemetry Collector.
+
+canardstack is a narrower experiment with different tradeoffs:
+
+- Storage is DuckLake over DuckDB, not ClickHouse. Telemetry lands in open
+  DuckLake tables backed by Parquet data files, so DuckDB-native clients can
+  inspect the same data directly.
+- The Grafana-facing APIs are compatibility adapters, not the primary query
+  path. canardstack implements bounded Prometheus, Loki, and Tempo subsets;
+  it does not try to match ClickStack's HyperDX UI or query experience.
+- Deployment is intentionally small: one Rust binary, one synchronous HTTP
+  server, one DuckDB process per role, and no async runtime, Kafka, or separate
+  hot store.
+- Ingest durability is local-spool-first and at-least-once. A `2xx` means the
+  raw request was fsynced and accepted for bounded processing, not that rows are
+  already query-visible.
+- Direct SQL access. Local clients can attach the
+  DuckLake catalog directly, and cloud deployments can expose the catalog over
+  Quack for DuckDB-native clients when the operator chooses to manage that
+  access boundary.
+- The scope is intentionally single-tenant and experimental.
 
 ## Send Telemetry
 
