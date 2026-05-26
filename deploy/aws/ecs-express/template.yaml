@@ -41,6 +41,11 @@ Parameters:
   AllowedIngressCidr:
     Type: String
     Default: 0.0.0.0/0
+  UseLoadBalancer:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "false"
+    Description: Front the app with an internet-facing ALB (stable HTTP endpoint). Default false exposes the app task directly with in-binary TLS (ephemeral self-signed cert; clients must skip verification) on port 4318 and drops the ALB cost. The container port stays 4318 in both modes so the transition is atomic on the ECS service.
   S3BucketName:
     Type: String
     Default: ""
@@ -65,16 +70,16 @@ Parameters:
     Description: Shared token between canardstack and the Quack catalog. Leave empty to auto-generate a random 40-char token in Secrets Manager; fetch it via the stack outputs after deploy.
   Cpu:
     Type: String
-    Default: "2048"
+    Default: "512"
   Memory:
     Type: String
-    Default: "4096"
+    Default: "1024"
   CatalogCpu:
     Type: String
-    Default: "1024"
+    Default: "256"
   CatalogMemory:
     Type: String
-    Default: "2048"
+    Default: "1024"
   CatalogPort:
     Type: Number
     Default: 9494
@@ -91,7 +96,7 @@ Parameters:
     Default: 20
   ProcessMemoryLimitBytes:
     Type: Number
-    Default: 3221225472
+    Default: 536870912
   CpuArchitecture:
     Type: String
     Default: ARM64
@@ -118,6 +123,14 @@ Conditions:
     Fn::Equals:
       - !Ref QuackToken
       - ""
+  WithAlb:
+    Fn::Equals:
+      - !Ref UseLoadBalancer
+      - "true"
+  DirectTls:
+    Fn::Equals:
+      - !Ref UseLoadBalancer
+      - "false"
 
 Resources:
   Vpc:
@@ -413,6 +426,7 @@ Resources:
 
   LoadBalancerSecurityGroup:
     Type: AWS::EC2::SecurityGroup
+    Condition: WithAlb
     Properties:
       GroupDescription: canardstack load balancer
       VpcId: !Ref Vpc
@@ -431,10 +445,19 @@ Resources:
       GroupDescription: canardstack app
       VpcId: !Ref Vpc
       SecurityGroupIngress:
-        - IpProtocol: tcp
-          FromPort: 4318
-          ToPort: 4318
-          SourceSecurityGroupId: !Ref LoadBalancerSecurityGroup
+        # ALB mode: only the load balancer reaches the plaintext app on 4318.
+        # Direct mode: the in-binary TLS terminator is exposed to AllowedIngressCidr
+        # on 4318 (clients use HTTPS with insecure/skip-verify).
+        - !If
+          - WithAlb
+          - IpProtocol: tcp
+            FromPort: 4318
+            ToPort: 4318
+            SourceSecurityGroupId: !Ref LoadBalancerSecurityGroup
+          - IpProtocol: tcp
+            FromPort: 4318
+            ToPort: 4318
+            CidrIp: !Ref AllowedIngressCidr
       SecurityGroupEgress:
         - IpProtocol: -1
           CidrIp: 0.0.0.0/0
@@ -515,6 +538,7 @@ Resources:
 
   LoadBalancer:
     Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Condition: WithAlb
     Properties:
       Type: application
       Scheme: internet-facing
@@ -526,6 +550,7 @@ Resources:
 
   TargetGroup:
     Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Condition: WithAlb
     Properties:
       VpcId: !Ref Vpc
       Protocol: HTTP
@@ -539,6 +564,7 @@ Resources:
 
   Listener:
     Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: WithAlb
     Properties:
       LoadBalancerArn: !Ref LoadBalancer
       Protocol: HTTP
@@ -594,10 +620,21 @@ Resources:
           PortMappings:
             - ContainerPort: 4318
               Protocol: tcp
-              AppProtocol: http
           Environment:
+            # Container port is 4318 in both modes (so the ECS service can switch
+            # between ALB and direct without the LoadBalancers/task-def port
+            # mismatch that blocks an atomic update). ALB mode: plaintext on 4318.
+            # Direct mode: in-binary TLS terminator on 4318 (ephemeral self-signed
+            # cert; clients skip-verify) forwarding to a plaintext backend on
+            # 127.0.0.1:4319; the health check probes 4319 in direct mode.
             - Name: CANARDSTACK_BIND
               Value: 0.0.0.0:4318
+            - Name: CANARDSTACK_TLS_ENABLED
+              Value: !If [WithAlb, "false", "true"]
+            - Name: CANARDSTACK_TLS_MODE
+              Value: ephemeral_self_signed
+            - Name: CANARDSTACK_TLS_BACKEND_BIND
+              Value: 127.0.0.1:4319
             - Name: CANARDSTACK_DATA_DIR
               Value: /var/lib/canardstack
             - Name: CANARDSTACK_DUCKDB_EXTENSION_DIR
@@ -635,7 +672,10 @@ Resources:
           HealthCheck:
             Command:
               - CMD-SHELL
-              - canardstack healthcheck http://127.0.0.1:4318/healthz
+              - !If
+                - WithAlb
+                - canardstack healthcheck http://127.0.0.1:4318/healthz
+                - canardstack healthcheck http://127.0.0.1:4319/healthz
             Interval: 10
             Timeout: 5
             Retries: 6
@@ -755,8 +795,13 @@ Resources:
   AppService:
     Type: AWS::ECS::Service
     DependsOn:
-      - Listener
       - CatalogService
+    Metadata:
+      # ALB mode requires the listener (which attaches the target group to the
+      # load balancer) to exist before the service registers targets. DependsOn
+      # can't be conditional, so this conditional Ref creates that implicit
+      # dependency only when the ALB is enabled; in direct mode it is NoValue.
+      AlbListenerDependency: !If [WithAlb, !Ref Listener, !Ref "AWS::NoValue"]
     Properties:
       Cluster: !Ref Cluster
       ServiceName: !Ref ServiceName
@@ -772,10 +817,12 @@ Resources:
         DeploymentCircuitBreaker:
           Enable: true
           Rollback: true
-      LoadBalancers:
-        - ContainerName: canardstack
-          ContainerPort: 4318
-          TargetGroupArn: !Ref TargetGroup
+      LoadBalancers: !If
+        - WithAlb
+        - - ContainerName: canardstack
+            ContainerPort: 4318
+            TargetGroupArn: !Ref TargetGroup
+        - !Ref "AWS::NoValue"
       NetworkConfiguration:
         AwsvpcConfiguration:
           AssignPublicIp: ENABLED
@@ -801,7 +848,22 @@ Outputs:
   CatalogServiceArn:
     Value: !Ref CatalogService
   ServiceUrl:
+    Condition: WithAlb
     Value: !Sub http://${LoadBalancer.DNSName}
+  DirectTlsEndpoint:
+    Condition: DirectTls
+    Description: >-
+      No ALB: the app task is exposed directly with in-binary TLS (ephemeral
+      self-signed cert) on port 4318. The task public IP is ephemeral and
+      changes on every deploy/restart; look it up, then use
+      https://<public-ip>:4318 with insecure/skip-verify.
+    Value: !Sub >-
+      aws ecs describe-tasks --cluster ${ClusterName} --region ${AWS::Region}
+      --tasks $(aws ecs list-tasks --cluster ${ClusterName} --service-name ${ServiceName}
+      --query 'taskArns[0]' --output text) --query
+      "tasks[0].attachments[0].details[?name=='networkInterfaceId'].value" --output text
+      | xargs -I{} aws ec2 describe-network-interfaces --network-interface-ids {}
+      --query 'NetworkInterfaces[0].Association.PublicIp' --output text  # then https://<ip>:4318
   DuckLakeAttachUri:
     Value: !Sub ducklake:quack:${CatalogServiceDiscoveryName}.${ServiceDiscoveryNamespaceName}:${CatalogPort}
   DuckLakeDataPath:
