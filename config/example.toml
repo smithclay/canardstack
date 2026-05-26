@@ -76,6 +76,7 @@ group_commit_ms = 1
 concurrency = 4
 timeout_secs = 15
 memory_limit = "1GiB"
+admission_wait_ms = 1000
 
 [admission]
 seal_capacity = 1

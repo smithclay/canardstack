@@ -421,18 +421,22 @@ fn with_query_admission<T>(
         QueryAdmission::None => run(),
         QueryAdmission::Cheap => {
             let inputs = state.ingestor.freshness_budget_inputs(&state.storage);
-            let _guard =
-                state
-                    .admission
-                    .reserve_query(QueryClass::Cheap, inputs, &state.metrics)?;
+            let _guard = state.admission.reserve_query_with_wait(
+                QueryClass::Cheap,
+                inputs,
+                state.config.operator.query_admission_wait,
+                &state.metrics,
+            )?;
             run()
         }
         QueryAdmission::Heavy => {
             let inputs = state.ingestor.freshness_budget_inputs(&state.storage);
-            let _guard =
-                state
-                    .admission
-                    .reserve_query(QueryClass::Heavy, inputs, &state.metrics)?;
+            let _guard = state.admission.reserve_query_with_wait(
+                QueryClass::Heavy,
+                inputs,
+                state.config.operator.query_admission_wait,
+                &state.metrics,
+            )?;
             run()
         }
     }

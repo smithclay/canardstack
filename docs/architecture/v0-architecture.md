@@ -318,13 +318,16 @@ the freshness-budget SLA, heavy query capacity degrades to
 `CANARDSTACK_HEAVY_QUERY_DEGRADED_CAPACITY`. If debt keeps rising, heavy queries
 return a protocol-compatible `429 freshness_debt` envelope. Cheap metadata,
 label, probe, and instant-ish routes retain
-`CANARDSTACK_CHEAP_QUERY_ADMISSION_CAPACITY`.
+`CANARDSTACK_CHEAP_QUERY_ADMISSION_CAPACITY`. Compatibility query routes wait
+briefly for saturated query admission before returning `429`, so normal
+dashboard fanout can drain through short-lived query slots.
 
 Admission knobs:
 
 - `CANARDSTACK_SEAL_ADMISSION_CAPACITY`, default `1`.
 - `CANARDSTACK_CHEAP_QUERY_ADMISSION_CAPACITY`, default `1`.
 - `CANARDSTACK_HEAVY_QUERY_DEGRADED_CAPACITY`, default `1`.
+- `CANARDSTACK_QUERY_ADMISSION_WAIT_SECS` or `_MS`, default `1s`.
 - `CANARDSTACK_FRESHNESS_BUDGET_SLA_SECS` or `_MS`, default `15s`.
 
 ## Storage
