@@ -4,9 +4,9 @@ description: High-level canardstack data flow.
 ---
 
 canardstack is one synchronous Rust process backed by one DuckDB process. It
-accepts OTLP over HTTP, normalizes telemetry into Arrow record batches, commits
-immutable Parquet segments through DuckLake, and serves bounded compatibility
-query APIs over the same tables.
+accepts OTLP over HTTP, normalizes telemetry into Arrow record batches, flushes
+the Arrow write buffer through DuckDB's Arrow appender into DuckLake tables, and
+serves bounded compatibility query APIs over the same tables.
 
 ```mermaid
 flowchart LR
@@ -32,7 +32,7 @@ flowchart LR
 
     Apps -->|logs / traces / metrics| Ingest
     Admission -.->|429 under pressure| Apps
-    Seal -->|commit Parquet| Lake[("DuckLake catalog + Parquet files")]
+    Seal -->|DuckDB Arrow append| Lake[("DuckLake tables")]
     Adapters --> Lake
     Clients -->|queries| Adapters
 ```
