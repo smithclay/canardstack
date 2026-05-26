@@ -385,7 +385,7 @@ impl IngestPipeline {
         let request_kind = pending.request_kind;
         validation::validate_body_size(pending.compressed_body.len(), &self.config)
             .map_err(|err| ReplayError::new(&pending, err.message.clone()))?;
-        validation::validate_content_type(&pending.headers)
+        validation::validate_otlp_http_content_type(&pending.headers)
             .map_err(|err| ReplayError::new(&pending, err.message.clone()))?;
         if !storage.accepts_memory_ingest() {
             return Err(ReplayError::new(
@@ -451,7 +451,7 @@ impl IngestPipeline {
             metrics.ingest_request(route.as_str(), err.status, err.reason);
             return Err(err);
         }
-        if let Err(err) = validation::validate_content_type(headers) {
+        if let Err(err) = validation::validate_otlp_http_content_type(headers) {
             metrics.ingest_request(route.as_str(), err.status, err.reason);
             return Err(err);
         }

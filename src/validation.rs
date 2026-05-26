@@ -92,7 +92,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-pub fn validate_content_type(headers: &HashMap<String, String>) -> ApiResult<()> {
+pub fn validate_otlp_http_content_type(headers: &HashMap<String, String>) -> ApiResult<()> {
     let Some(value) = headers.get("content-type") else {
         return Err(ApiError::new(
             400,
