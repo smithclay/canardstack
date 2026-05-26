@@ -76,6 +76,26 @@ ORDER BY ingested_at DESC
 LIMIT 1;
 ```
 
+## Schema
+
+canardstack stores four DuckLake telemetry tables: `logs`, `spans`,
+`metric_gauge`, and `metric_sum`. The physical columns come from
+[`otlp2records`](https://crates.io/crates/otlp2records), with two local storage
+columns added by canardstack: `ingested_at` and `source_format`.
+
+Arbitrary OpenTelemetry resource, scope, log, span, and metric attributes are
+stored as JSON strings in attribute columns. Grafana-facing labels such as
+`deployment_environment`, `http_method`, and `http_route` are derived from those
+canonical columns in bounded query and metadata paths instead of being stored as
+separate raw-table columns.
+
+:::caution[Schema stability]
+The current DuckLake schema is experimental and will evolve with breaking
+changes before canardstack is ready for stable production use. Medium-term
+schema work is expected to align more closely with the OpenTelemetry Arrow
+[`data_model.md`](https://github.com/open-telemetry/otel-arrow/blob/main/docs/data_model.md).
+:::
+
 ## Demo
 
 For the full OpenTelemetry demo workflow, use the [Demo guide](/demo/).

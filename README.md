@@ -62,11 +62,41 @@ curl -sS -H 'Authorization: Bearer dev-canardstack-key' \
   'http://127.0.0.1:4318/loki/api/v1/query?query=%7Bservice_name%3D%22quickstart%22%7D'
 ```
 
+<details>
+<summary>Query the local DuckLake directly with DuckDB 1.5.3+</summary>
+
+Shut down canardstack first so no second DuckDB process has the local DuckLake
+catalog open, then attach the catalog from the repository root:
+
+```bash
+duckdb --version
+duckdb
+```
+
+```sql
+INSTALL ducklake;
+LOAD ducklake;
+
+ATTACH 'ducklake:.canardstack/canardstack.ducklake' AS canardlake
+  (DATA_PATH '.canardstack/storage');
+USE canardlake;
+
+SELECT timestamp, service_name, severity_text, body
+FROM logs
+WHERE service_name = 'quickstart'
+ORDER BY timestamp DESC
+LIMIT 20;
+```
+
+</details>
+
 ## Demo
 
 Run canardstack with the full
 [OpenTelemetry demo](https://github.com/open-telemetry/opentelemetry-demo) using
 the [demo guide](https://smithclay.github.io/canardstack/demo/).
+
+![Grafana dashboard showing canardstack OpenTelemetry demo data](site/src/assets/grafana-dash-demo.png)
 
 ## What You Can Do
 

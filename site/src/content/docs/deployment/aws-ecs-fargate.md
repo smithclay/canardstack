@@ -22,6 +22,50 @@ S3 Files is intentionally not used for the DuckDB catalog file. The catalog
 service uses EBS. The app reaches that catalog over Quack and writes DuckLake
 data files to S3.
 
+## Architecture
+
+```mermaid
+flowchart TB
+  Producers["OTel producers"]
+  Grafana["Grafana / API clients"]
+  Alb["Application Load Balancer\npublic HTTP endpoint"]
+
+  subgraph ECS["ECS/Fargate cluster"]
+    AppTask["ECS service: canardstack\ncanardstack serve\ndesired count 1"]
+    CatalogTask["ECS service: catalog\ncanardstack serve-catalog\ndesired count 1"]
+  end
+
+  subgraph Network["VPC"]
+    CloudMap["AWS Cloud Map\nprivate catalog name"]
+    AppSg["security groups\nALB -> app, app -> catalog"]
+  end
+
+  AppEbs["service-managed EBS\nraw spool + app DuckDB state"]
+  CatalogEbs["service-managed EBS\ncanardstack.ducklake catalog file"]
+  S3["S3 bucket or prefix\nDuckLake Parquet data files"]
+  Secrets["Secrets Manager\nAPI keys + Quack token"]
+  Logs["CloudWatch Logs\ncontainer logs"]
+  Iam["IAM task roles\nS3 + Secrets access"]
+
+  Producers -->|"OTLP/HTTP"| Alb
+  Grafana -->|"Prometheus / Loki / Tempo HTTP"| Alb
+  Alb --> AppTask
+  AppTask -->|"fsync raw spool"| AppEbs
+  AppTask -->|"ducklake:quack over HTTPS"| CloudMap
+  CloudMap --> CatalogTask
+  CatalogTask -->|"DuckDB metadata catalog"| CatalogEbs
+  AppTask -->|"DuckLake DATA_PATH"| S3
+  CatalogTask -->|"DuckLake checkpoint scans"| S3
+  AppTask -.-> Secrets
+  CatalogTask -.-> Secrets
+  AppTask -.-> Logs
+  CatalogTask -.-> Logs
+  AppTask -.-> Iam
+  CatalogTask -.-> Iam
+  AppSg -.-> AppTask
+  AppSg -.-> CatalogTask
+```
+
 ## Durability notes
 
 ECS service-managed EBS volumes keep this example simple. Validate their

@@ -16,6 +16,45 @@ prefix at `/var/lib/canardstack` for `CANARDSTACK_DATA_DIR`, including the raw
 spool. The catalog service mounts a separate GCS prefix at `/catalog` for
 `canardstack.ducklake`.
 
+## Architecture
+
+```mermaid
+flowchart TB
+  Producers["OTel producers"]
+  Grafana["Grafana / API clients"]
+
+  subgraph Run["Cloud Run"]
+    AppSvc["service: canardstack\ncanardstack serve\nsingle writer"]
+    CatalogSvc["service: canardstack-catalog\ncanardstack serve-catalog\nmax instances 1"]
+  end
+
+  AppMount["Cloud Storage FUSE mount\nCANARDSTACK_DATA_DIR\nraw spool + app DuckDB state"]
+  CatalogMount["Cloud Storage FUSE mount\n/catalog/canardstack.ducklake"]
+  DataPrefix["GCS prefix\nDuckLake Parquet data files"]
+  Secrets["Secret Manager\nAPI keys + Quack token\nGCS HMAC secret"]
+  Hmac["Cloud Storage HMAC key\nS3-compatible DuckDB access"]
+  Iam["IAM bindings\nCloud Run invoker, Storage, Secret access"]
+  Logs["Cloud Logging\ncontainer logs"]
+  Vpc["optional VPC egress\nfor private catalog / NFS"]
+
+  Producers -->|"OTLP/HTTP"| AppSvc
+  Grafana -->|"Prometheus / Loki / Tempo HTTP"| AppSvc
+  AppSvc -->|"fsync raw spool"| AppMount
+  AppSvc -->|"ducklake:quack over Cloud Run TLS"| CatalogSvc
+  CatalogSvc -->|"DuckDB metadata catalog"| CatalogMount
+  AppSvc -->|"DuckLake DATA_PATH"| DataPrefix
+  CatalogSvc -->|"DuckLake checkpoint scans"| DataPrefix
+  AppSvc -.-> Secrets
+  CatalogSvc -.-> Secrets
+  AppSvc -.-> Hmac
+  AppSvc -.-> Iam
+  CatalogSvc -.-> Iam
+  AppSvc -.-> Logs
+  CatalogSvc -.-> Logs
+  Vpc -.-> AppSvc
+  Vpc -.-> CatalogSvc
+```
+
 ## Storage caveat
 
 The default Cloud Run layout is demo-grade.
