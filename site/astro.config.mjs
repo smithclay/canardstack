@@ -1,5 +1,6 @@
 import { defineConfig } from 'astro/config';
 import starlight from '@astrojs/starlight';
+import starlightClientMermaid from '@pasqal-io/starlight-client-mermaid';
 
 export default defineConfig({
   site: 'https://smithclay.github.io',
@@ -23,20 +24,31 @@ export default defineConfig({
       editLink: {
         baseUrl: 'https://github.com/smithclay/canardstack/edit/main/site/',
       },
+      plugins: [starlightClientMermaid()],
       sidebar: [
         {
           label: 'Start Here',
           items: [
             { label: 'Overview', link: '/' },
+            { label: 'Demo', link: '/demo/' },
+            { label: 'Architecture', link: '/architecture/' },
           ],
         },
         {
           label: 'Deployment',
           items: [
             { label: 'Overview', link: '/deployment/' },
+            { label: 'Send Telemetry', link: '/deployment/send-telemetry/' },
             { label: 'MotherDuck', link: '/deployment/motherduck/' },
             { label: 'GCP Cloud Run', link: '/deployment/gcp-cloud-run/' },
             { label: 'AWS ECS/Fargate', link: '/deployment/aws-ecs-fargate/' },
+          ],
+        },
+        {
+          label: 'Operations',
+          items: [
+            { label: 'Overview', link: '/operations/' },
+            { label: 'Failure Runbooks', link: '/operations/failure-runbooks/' },
           ],
         },
         {

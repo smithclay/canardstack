@@ -1,4 +1,7 @@
-# Failure Runbooks
+---
+title: Failure Runbooks
+description: Runbooks for canardstack v0 operator failure modes.
+---
 
 These runbooks describe the implemented v0 operator surface. Metrics listed in
 `operator-metrics.md` as "not currently emitted" are intentionally not used

@@ -395,4 +395,4 @@ never query DuckDB for admission.
 - [Query API](architecture/query-api.md)
 - [Operator metrics](architecture/operator-metrics.md)
 - [Benchmark gates](planning/benchmark.md)
-- [Failure runbooks](runbooks/failure-runbooks.md)
+- [Failure runbooks](https://smithclay.github.io/canardstack/operations/failure-runbooks/)

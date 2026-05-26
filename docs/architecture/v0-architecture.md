@@ -403,7 +403,7 @@ The operator surface distinguishes:
 - storage unavailable
 
 See [operator metrics](operator-metrics.md) and
-[failure runbooks](../runbooks/failure-runbooks.md) for the concrete metric and
+[failure runbooks](https://smithclay.github.io/canardstack/operations/failure-runbooks/) for the concrete metric and
 endpoint names.
 
 ## Maintenance

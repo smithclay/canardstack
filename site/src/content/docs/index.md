@@ -78,6 +78,8 @@ LIMIT 1;
 
 ## Demo
 
+For the full OpenTelemetry demo workflow, use the [Demo guide](/demo/).
+
 ### Start The Stack
 
 Start canardstack and Grafana with local DuckLake storage:
@@ -113,28 +115,11 @@ http://localhost:3000/d/canardstack-overview/canardstack-overview
 
 Use `admin/admin` if Grafana asks for credentials.
 
-## Send Your Own OTLP/HTTP Data
-
-Point an OpenTelemetry Collector `otlphttp` exporter at canardstack:
-
-```yaml
-exporters:
-  otlphttp/canardstack:
-    endpoint: http://localhost:4318
-    headers:
-      Authorization: Bearer dev-canardstack-key
-```
-
-canardstack accepts the standard OTLP/HTTP paths:
-
-- `POST /v1/logs`
-- `POST /v1/traces`
-- `POST /v1/metrics`
-
 ## Deploy
 
-Use the [deployment docs](/deployment/) for MotherDuck, GCP Cloud Run, and AWS
-ECS/Fargate options.
+Use the [send telemetry guide](/deployment/send-telemetry/) to configure
+OTLP/HTTP producers. Use the [deployment docs](/deployment/) for MotherDuck, GCP
+Cloud Run, and AWS ECS/Fargate options.
 
 ## Query Data
 
