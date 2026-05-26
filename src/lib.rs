@@ -4,6 +4,8 @@ pub mod cli;
 pub mod compat;
 pub mod config;
 mod db;
+#[cfg(feature = "grpc")]
+pub mod grpc;
 pub mod http;
 pub mod ingest;
 pub mod logging;

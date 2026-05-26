@@ -87,6 +87,14 @@ pub struct TlsServerConfig {
     pub backend_bind: String,
 }
 
+#[derive(Clone, Debug)]
+pub struct GrpcConfig {
+    pub enabled: bool,
+    pub bind: String,
+    pub max_body_bytes: usize,
+    pub tls_enabled: bool,
+}
+
 /// Process configuration, split by responsibility:
 ///
 /// - [`OperatorConfig`] — the public, supported deployment surface operators
@@ -116,6 +124,7 @@ pub struct OperatorConfig {
     pub serve_role: ServeRole,
     pub bind: String,
     pub tls: TlsServerConfig,
+    pub grpc: GrpcConfig,
     pub api_key: String,
     pub admin_api_key: String,
     pub duckdb_path: PathBuf,
@@ -343,6 +352,20 @@ impl OperatorConfig {
                     .or(file.string(&["server", "tls", "backend_bind"])?)
                     .unwrap_or_else(|| "127.0.0.1:4319".to_string()),
             },
+            grpc: GrpcConfig {
+                enabled: env_bool("CANARDSTACK_GRPC_ENABLED")?
+                    .or(file.bool(&["grpc", "enabled"])?)
+                    .unwrap_or(false),
+                bind: env_string("CANARDSTACK_GRPC_BIND")?
+                    .or(file.string(&["grpc", "bind"])?)
+                    .unwrap_or_else(|| "127.0.0.1:4317".to_string()),
+                max_body_bytes: env_usize("CANARDSTACK_GRPC_MAX_BODY_BYTES")?
+                    .or(file.usize(&["grpc", "max_body_bytes"])?)
+                    .unwrap_or(max_body_bytes),
+                tls_enabled: env_bool("CANARDSTACK_GRPC_TLS_ENABLED")?
+                    .or(file.bool(&["grpc", "tls_enabled"])?)
+                    .unwrap_or(false),
+            },
             api_key: env_string("CANARDSTACK_API_KEY")?
                 .or(file.string(&["auth", "api_key"])?)
                 .unwrap_or_else(|| "dev-canardstack-key".to_string()),
@@ -463,6 +486,12 @@ impl OperatorConfig {
                 key_file: None,
                 backend_bind: "127.0.0.1:0".to_string(),
             },
+            grpc: GrpcConfig {
+                enabled: false,
+                bind: "127.0.0.1:0".to_string(),
+                max_body_bytes: 8 * 1024 * 1024,
+                tls_enabled: false,
+            },
             api_key: "test-key".to_string(),
             admin_api_key: "test-admin-key".to_string(),
             duckdb_path,
@@ -529,6 +558,32 @@ impl OperatorConfig {
                         "CANARDSTACK_TLS_KEY_FILE must be set when CANARDSTACK_TLS_ENABLED=true and CANARDSTACK_TLS_MODE=file"
                     );
                 }
+            }
+        }
+        if self.grpc.enabled {
+            if !self.serve_role.accepts_ingest() {
+                anyhow::bail!(
+                    "CANARDSTACK_GRPC_ENABLED=true requires a serve role that accepts ingest"
+                );
+            }
+            if self.grpc.bind.trim().is_empty() {
+                anyhow::bail!("CANARDSTACK_GRPC_BIND must not be empty when gRPC is enabled");
+            }
+            if self.grpc.bind == self.bind {
+                anyhow::bail!("CANARDSTACK_GRPC_BIND must differ from CANARDSTACK_BIND");
+            }
+            if self.grpc.max_body_bytes == 0 {
+                anyhow::bail!("CANARDSTACK_GRPC_MAX_BODY_BYTES must be > 0");
+            }
+            if self.grpc.max_body_bytes > self.max_body_bytes {
+                anyhow::bail!(
+                    "CANARDSTACK_GRPC_MAX_BODY_BYTES must be <= CANARDSTACK_MAX_BODY_BYTES because the shared raw spool capacity is derived from CANARDSTACK_MAX_BODY_BYTES"
+                );
+            }
+            if self.grpc.tls_enabled {
+                anyhow::bail!(
+                    "CANARDSTACK_GRPC_TLS_ENABLED is reserved for future in-process gRPC TLS support; terminate TLS before canardstack for now"
+                );
             }
         }
         if self.admin_api_key.trim().is_empty() {
@@ -943,6 +998,10 @@ mod tests {
         "CANARDSTACK_TLS_CERT_FILE",
         "CANARDSTACK_TLS_KEY_FILE",
         "CANARDSTACK_TLS_BACKEND_BIND",
+        "CANARDSTACK_GRPC_ENABLED",
+        "CANARDSTACK_GRPC_BIND",
+        "CANARDSTACK_GRPC_MAX_BODY_BYTES",
+        "CANARDSTACK_GRPC_TLS_ENABLED",
         "CANARDSTACK_API_KEY",
         "CANARDSTACK_ADMIN_API_KEY",
         "CANARDSTACK_DATA_DIR",
@@ -1348,6 +1407,33 @@ max_body_bytes = "large"
         let err = config.validate().unwrap_err().to_string();
         assert!(
             err.contains("CANARDSTACK_ARROW_WRITE_BUFFER_MAX_AGE_MS/SECS must be <"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_grpc_on_query_only_role() {
+        let mut config = Config::test(PathBuf::from("canardstack.duckdb"));
+        config.operator.serve_role = ServeRole::Query;
+        config.operator.grpc.enabled = true;
+
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("CANARDSTACK_GRPC_ENABLED=true requires a serve role that accepts ingest"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_grpc_body_limit_above_shared_ingest_limit() {
+        let mut config = Config::test(PathBuf::from("canardstack.duckdb"));
+        config.operator.grpc.enabled = true;
+        config.operator.grpc.bind = "127.0.0.1:1".to_string();
+        config.operator.grpc.max_body_bytes = config.operator.max_body_bytes + 1;
+
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("CANARDSTACK_GRPC_MAX_BODY_BYTES must be <= CANARDSTACK_MAX_BODY_BYTES"),
             "{err}"
         );
     }

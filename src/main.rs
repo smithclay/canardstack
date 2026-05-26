@@ -41,6 +41,12 @@ fn main() -> anyhow::Result<()> {
             if config.operator.tls.enabled {
                 anyhow::bail!("CANARDSTACK_TLS_ENABLED=true requires a build with --features tls");
             }
+            #[cfg(not(feature = "grpc"))]
+            if config.operator.grpc.enabled {
+                anyhow::bail!(
+                    "CANARDSTACK_GRPC_ENABLED=true requires a build with --features grpc"
+                );
+            }
             let state = Arc::new(AppState::new(config)?);
             if !state.config.operator.scheduler_enabled {
                 tracing::warn!(
@@ -68,6 +74,12 @@ fn main() -> anyhow::Result<()> {
                     }
                 });
             }
+            #[cfg(feature = "grpc")]
+            let _grpc_server = if state.config.operator.grpc.enabled {
+                Some(canardstack::grpc::spawn(state.clone(), &SHUTDOWN_REQUESTED)?)
+            } else {
+                None
+            };
             http::serve_until(state, &SHUTDOWN_REQUESTED)
         }
         Some(other) => anyhow::bail!("unknown command {other}; use --version, serve, serve-catalog, smoke, smoke-http, healthcheck, or install-ducklake-extension"),
