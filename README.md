@@ -7,13 +7,10 @@
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![DuckLake](https://img.shields.io/badge/storage-DuckLake-fff000.svg?logo=duckdb&logoColor=black)](https://ducklake.select/)
 [![OpenTelemetry](https://img.shields.io/badge/OTLP-HTTP-425cc7.svg?logo=opentelemetry&logoColor=white)](https://opentelemetry.io/)
-[![Deploy to AWS](https://img.shields.io/badge/deploy-AWS%20CloudFormation-ff9900.svg?logo=amazonwebservices&logoColor=white)](https://console.aws.amazon.com/cloudformation/home#/stacks/create/review?stackName=canardstack&templateURL=https%3A%2F%2Fraw.githubusercontent.com%2Fsmithclay%2Fcanardstack%2Fmain%2Fdeploy%2Faws%2Fecs-express%2Ftemplate.yaml)
 
 > OpenTelemetry logs, traces, and metrics stored in DuckLake, visualized in Grafana.
 
-canardstack is an experimental observability backend that stores data in [DuckLake](https://ducklake.select/), an open-standard lakehouse format from the creators of duckdb. Inspired by [ClickStack](https://clickhouse.com/docs/use-cases/observability/clickstack), the project goal is to explore cheap and simple ways to store and query terabytes of observability data *from a single node*.
-
-It accepts OpenTelemetry logs, traces, gauge metrics, and sum metrics over OTLP/HTTP, stores normalized tables in [DuckLake](https://ducklake.select/), and exposes query APIs for Grafana to visualize the data.
+canardstack is an experimental backend that stores OpenTelemetry data in [DuckLake](https://ducklake.select/), an open lakehouse format from the creators of duckdb. Inspired by [ClickStack](https://clickhouse.com/docs/use-cases/observability/clickstack), the project goal is to explore cheap and simple ways to store and query terabytes of observability data *from a single node*.
 
 Builds on prior work from [otlp2parquet](https://github.com/smithclay/otlp2parquet), [otlp2pipeline](https://github.com/smithclay/otlp2pipeline), and [duckdb-otlp](https://github.com/smithclay/duckdb-otlp).
 
@@ -40,6 +37,8 @@ under `.canardstack` and listens for OTLP data on `127.0.0.1:4318`.
 # requires rust toolchain: `curl https://sh.rustup.rs -sSf | sh`
 # also assumes you have duckdb installed (`brew install duckdb`)
 cargo install --locked canardstack
+
+# starts server on :4318
 canardstack
 ```
 
@@ -53,7 +52,7 @@ curl -sS -X POST http://127.0.0.1:4318/v1/logs \
 ```
 
 canardstack acknowledges ingest after the raw request is fsynced locally. Give
-the scheduler a few seconds to sync the log into DuckLake, then query it directly:
+the scheduler a few seconds to register the log with the DuckLake catalog, then query it directly:
 
 ```bash
 duckdb

@@ -30,8 +30,8 @@ docker compose -f compose.yaml -f compose.build.yaml up --build canardstack graf
 
 ## Start The OpenTelemetry Demo
 
-In a separate checkout, start the full OpenTelemetry demo and mount the
-canardstack collector extras file:
+In a separate checkout, start the full OpenTelemetry demo without its bundled
+observability stack, and mount the canardstack collector extras file:
 
 ```bash
 git clone https://github.com/open-telemetry/opentelemetry-demo.git ../opentelemetry-demo
@@ -42,12 +42,14 @@ DEMO_VERSION="$(sed -n 's/^IMAGE_VERSION=//p' .env)"
 
 OTEL_COLLECTOR_CONFIG_EXTRAS="$CANARDSTACK_DIR/config/otel-demo-collector-extras.yml" \
 DEMO_VERSION="$DEMO_VERSION" \
-docker compose up -d
+make start-no-o11y
 ```
 
 `DEMO_VERSION="$DEMO_VERSION"` keeps the demo images aligned with the checked-out
 demo config. Without that, some demo checkouts may combine older config files
-with newer `latest-*` images.
+with newer `latest-*` images. `start-no-o11y` skips the demo's Jaeger,
+Prometheus, OpenSearch, and Grafana services; use `make start-minimal-no-o11y`
+for the smaller core-only service set.
 
 Open the demo storefront:
 
