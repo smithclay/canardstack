@@ -3264,36 +3264,32 @@ fn provisioned_grafana_dashboard_uses_supported_compat_queries() {
         }
     }
 
+    for expected in [
+        "traces.span.metrics.calls",
+        "demo.recommendation.requests",
+        "demo.ad.requests",
+        "demo.product.review.requests",
+        "demo.shipping.items_count",
+        "demo.payment.transactions",
+    ] {
+        assert!(
+            prom_exprs
+                .iter()
+                .any(|expr| expr.contains(&format!("__name__=\"{expected}\""))),
+            "dashboard should show OpenTelemetry demo metric {expected}: {prom_exprs:?}"
+        );
+    }
     assert!(
         prom_exprs
             .iter()
-            .any(|expr| expr.contains("__name__=\"canardstack_ingest_requests_total\"")),
-        "dashboard should show canardstack ingest metrics: {prom_exprs:?}"
-    );
-    assert!(
-        prom_exprs
-            .iter()
-            .filter(|expr| expr.contains("__name__=\"canardstack_"))
-            .all(|expr| expr.contains("service_name=\"canardstack\"")),
-        "dashboard should query stored self-metrics for the canardstack service: {prom_exprs:?}"
-    );
-    assert!(
-        prom_exprs
-            .iter()
-            .any(|expr| expr == "avg by (service_name) (smoke.gauge)"),
-        "dashboard should show grouped smoke latency demo metrics: {prom_exprs:?}"
-    );
-    assert!(
-        prom_exprs
-            .iter()
-            .any(|expr| expr == "sum by (service_name) (smoke.sum)"),
-        "dashboard should show grouped smoke request demo metrics: {prom_exprs:?}"
+            .any(|expr| expr == "sum by (service_name) ({__name__=\"traces.span.metrics.calls\"})"),
+        "dashboard should show grouped span calls by service: {prom_exprs:?}"
     );
     assert!(
         loki_exprs
             .iter()
-            .any(|expr| expr == "{deployment_environment=\"dev\"} |= \"smoke\""),
-        "dashboard should show smoke logs through Loki: {loki_exprs:?}"
+            .any(|expr| expr == "{service_namespace=\"opentelemetry-demo\"}"),
+        "dashboard should show OpenTelemetry demo logs through Loki: {loki_exprs:?}"
     );
     assert!(
         !prom_exprs

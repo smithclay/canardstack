@@ -143,6 +143,7 @@ pub struct OperatorConfig {
     pub late_accept_secs: i64,
     pub future_accept_secs: i64,
     pub query_interactive: QueryLimits,
+    pub query_admission_wait: Duration,
     pub seal_admission_capacity: usize,
     pub cheap_query_admission_capacity: usize,
     pub heavy_query_degraded_capacity: usize,
@@ -434,6 +435,14 @@ impl OperatorConfig {
                 timeout_secs: query_timeout_secs,
                 memory_limit: query_memory_limit,
             },
+            query_admission_wait: duration_ms_or_secs(
+                file,
+                &["query", "admission_wait_ms"],
+                &["query", "admission_wait_secs"],
+                "CANARDSTACK_QUERY_ADMISSION_WAIT_MS",
+                "CANARDSTACK_QUERY_ADMISSION_WAIT_SECS",
+                1,
+            )?,
             seal_admission_capacity: env_usize("CANARDSTACK_SEAL_ADMISSION_CAPACITY")?
                 .or(file.usize(&["admission", "seal_capacity"])?)
                 .unwrap_or(1),
@@ -519,6 +528,7 @@ impl OperatorConfig {
                 timeout_secs: 15,
                 memory_limit: "512MiB".to_string(),
             },
+            query_admission_wait: Duration::from_secs(1),
             seal_admission_capacity: 1,
             cheap_query_admission_capacity: 1,
             heavy_query_degraded_capacity: 1,
@@ -1027,6 +1037,8 @@ mod tests {
         "CANARDSTACK_QUERY_CONCURRENCY",
         "CANARDSTACK_QUERY_TIMEOUT_SECS",
         "CANARDSTACK_QUERY_MEMORY_LIMIT",
+        "CANARDSTACK_QUERY_ADMISSION_WAIT_MS",
+        "CANARDSTACK_QUERY_ADMISSION_WAIT_SECS",
         "CANARDSTACK_SEAL_ADMISSION_CAPACITY",
         "CANARDSTACK_CHEAP_QUERY_ADMISSION_CAPACITY",
         "CANARDSTACK_HEAVY_QUERY_DEGRADED_CAPACITY",
@@ -1138,6 +1150,7 @@ arrow_write_buffer_max_age_secs = 12
 concurrency = 6
 timeout_secs = 7
 memory_limit = "384MiB"
+admission_wait_ms = 250
 
 [admission]
 seal_capacity = 1
@@ -1229,6 +1242,10 @@ group_commit_ms = 3
         assert_eq!(config.operator.query_interactive.concurrency, 6);
         assert_eq!(config.operator.query_interactive.timeout_secs, 7);
         assert_eq!(config.operator.query_interactive.memory_limit, "384MiB");
+        assert_eq!(
+            config.operator.query_admission_wait,
+            Duration::from_millis(250)
+        );
         assert_eq!(config.operator.seal_admission_capacity, 1);
         assert_eq!(config.operator.cheap_query_admission_capacity, 2);
         assert_eq!(config.operator.heavy_query_degraded_capacity, 1);

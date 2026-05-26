@@ -60,8 +60,8 @@ use crate::metrics::{MetricName, Metrics};
 use crate::validation::{ApiError, ApiResult};
 use crate::LockExt;
 use serde::Serialize;
-use std::sync::Mutex;
-use std::time::Instant;
+use std::sync::{Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 /// Compile-time tuning of the freshness projection and admission band.
 ///
@@ -228,6 +228,7 @@ pub struct AdmissionSnapshot {
 
 pub struct AdmissionController {
     inner: Mutex<AdmissionState>,
+    query_available: Condvar,
     seal_capacity: usize,
     cheap_query_capacity: usize,
     heavy_query_capacity: usize,
@@ -305,6 +306,7 @@ impl AdmissionController {
                 query_rejections_total: 0,
                 ingest_freshness_rejections_total: 0,
             }),
+            query_available: Condvar::new(),
             seal_capacity,
             cheap_query_capacity,
             heavy_query_capacity,
@@ -353,11 +355,59 @@ impl AdmissionController {
         inputs: FreshnessBudgetInputs,
         metrics: &Metrics,
     ) -> ApiResult<QueryAdmissionGuard<'_>> {
+        self.reserve_query_with_wait(class, inputs, Duration::ZERO, metrics)
+    }
+
+    pub fn reserve_query_with_wait(
+        &self,
+        class: QueryClass,
+        inputs: FreshnessBudgetInputs,
+        max_wait: Duration,
+        metrics: &Metrics,
+    ) -> ApiResult<QueryAdmissionGuard<'_>> {
         let mut state = self.inner.lock_or_poisoned();
-        self.update_projection_locked(&mut state, inputs);
-        let effective_heavy = self.effective_heavy_capacity_locked(&state);
-        let rejection_reason = query_rejection_reason(class, &state, effective_heavy);
-        let accepted = match class {
+        let deadline = Instant::now() + max_wait;
+        let result = loop {
+            self.update_projection_locked(&mut state, inputs);
+            let effective_heavy = self.effective_heavy_capacity_locked(&state);
+            let rejection_reason = query_rejection_reason(class, &state, effective_heavy);
+            if self.try_reserve_query_locked(class, &mut state, effective_heavy) {
+                break Ok(QueryAdmissionGuard {
+                    admission: self,
+                    class,
+                });
+            }
+            if !self.query_rejection_can_wait_locked(class, &state, effective_heavy)
+                || max_wait.is_zero()
+            {
+                break self.reject_query_locked(class, rejection_reason, &mut state, metrics);
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                break self.reject_query_locked(class, rejection_reason, &mut state, metrics);
+            }
+            let remaining = deadline.saturating_duration_since(now);
+            let wait_result = self
+                .query_available
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state = wait_result.0;
+        };
+        // Query hot path: take the admission lock once, snapshot, release, then
+        // emit the (identical) gauges.
+        let snapshot = self.snapshot_from_state(&state);
+        drop(state);
+        self.emit_admission_gauges(metrics, &snapshot);
+        result
+    }
+
+    fn try_reserve_query_locked(
+        &self,
+        class: QueryClass,
+        state: &mut AdmissionState,
+        effective_heavy: usize,
+    ) -> bool {
+        match class {
             QueryClass::Cheap => {
                 if state.cheap_query_active < self.cheap_query_capacity {
                     state.cheap_query_active += 1;
@@ -367,7 +417,7 @@ impl AdmissionController {
                 }
             }
             QueryClass::Heavy => {
-                if self.freshness_at_risk_locked(&state) {
+                if self.freshness_at_risk_locked(state) {
                     false
                 } else if state.heavy_query_active < effective_heavy {
                     if effective_heavy < self.heavy_query_capacity {
@@ -379,30 +429,37 @@ impl AdmissionController {
                     false
                 }
             }
-        };
-        let result = if !accepted {
-            state.query_rejections_total += 1;
-            metrics.inc(
-                MetricName::AdmissionRejectionsTotal,
-                &[("admission", "query"), ("reason", rejection_reason)],
-                1,
-            );
-            Err(
-                ApiError::new(429, rejection_reason, query_rejection_message(class))
-                    .with_retry_after(1),
-            )
-        } else {
-            Ok(QueryAdmissionGuard {
-                admission: self,
-                class,
-            })
-        };
-        // Query hot path: take the admission lock once, snapshot, release, then
-        // emit the (identical) gauges.
-        let snapshot = self.snapshot_from_state(&state);
-        drop(state);
-        self.emit_admission_gauges(metrics, &snapshot);
-        result
+        }
+    }
+
+    fn reject_query_locked(
+        &self,
+        class: QueryClass,
+        reason: &'static str,
+        state: &mut AdmissionState,
+        metrics: &Metrics,
+    ) -> ApiResult<QueryAdmissionGuard<'_>> {
+        state.query_rejections_total += 1;
+        metrics.inc(
+            MetricName::AdmissionRejectionsTotal,
+            &[("admission", "query"), ("reason", reason)],
+            1,
+        );
+        Err(ApiError::new(429, reason, query_rejection_message(class)).with_retry_after(1))
+    }
+
+    fn query_rejection_can_wait_locked(
+        &self,
+        class: QueryClass,
+        state: &AdmissionState,
+        effective_heavy: usize,
+    ) -> bool {
+        match class {
+            QueryClass::Cheap => state.cheap_query_active >= self.cheap_query_capacity,
+            QueryClass::Heavy => {
+                !self.freshness_at_risk_locked(state) && state.heavy_query_active >= effective_heavy
+            }
+        }
     }
 
     pub fn admit_ingest(&self, inputs: FreshnessBudgetInputs, metrics: &Metrics) -> ApiResult<()> {
@@ -652,6 +709,8 @@ impl Drop for QueryAdmissionGuard<'_> {
                 state.heavy_query_active = state.heavy_query_active.saturating_sub(1);
             }
         }
+        drop(state);
+        self.admission.query_available.notify_one();
     }
 }
 
@@ -787,6 +846,36 @@ mod tests {
         assert!(admission
             .reserve_query(QueryClass::Heavy, inputs, &metrics)
             .is_ok());
+    }
+
+    #[test]
+    fn heavy_query_waits_for_capacity_before_rejecting() {
+        let admission = std::sync::Arc::new(controller());
+        let metrics = std::sync::Arc::new(Metrics::default());
+        let inputs = FreshnessBudgetInputs::default();
+        let first = admission
+            .reserve_query(QueryClass::Heavy, inputs, &metrics)
+            .unwrap();
+        let _second = admission
+            .reserve_query(QueryClass::Heavy, inputs, &metrics)
+            .unwrap();
+        let waiting_admission = admission.clone();
+        let waiting_metrics = metrics.clone();
+        let waiting = std::thread::spawn(move || {
+            waiting_admission
+                .reserve_query_with_wait(
+                    QueryClass::Heavy,
+                    inputs,
+                    std::time::Duration::from_millis(250),
+                    &waiting_metrics,
+                )
+                .map(|_guard| ())
+        });
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        drop(first);
+
+        assert!(waiting.join().unwrap().is_ok());
     }
 
     #[test]
