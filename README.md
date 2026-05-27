@@ -31,7 +31,8 @@ Builds on prior work from [otlp2parquet](https://github.com/smithclay/otlp2parqu
 
 ## Quick Start
 
-You can get started by installing canardstack with `cargo` and connecting to a local Ducklake catalog using the new Quack protocol.
+You can get started by installing canardstack with `cargo` and connecting to a local Ducklake catalog using the [new Quack protocol](https://duckdb.org/quack/).
+
 
 ```bash
 # requires rust toolchain: `curl https://sh.rustup.rs -sSf | sh`
@@ -124,26 +125,18 @@ runbooks live in the [operations docs](https://smithclay.github.io/canardstack/o
 
 ## Limits
 
-canardstack is experimental and not production-ready.
+canardstack is experimental and not production-ready. The schema may drift and query performance is uncertain.
 
-Known v0 limits:
+Other limits:
 
-- Current single-node throughput is bounded by raw-spool append and backlog
-  behavior. On May 20, 2026, the highest clean 10-minute mixed-signal run was
-  `2000 GB/day` with `--ingest-concurrency 64` (`23.1 MB/s` accepted decoded
-  throughput, no `429`/`503` or query failures). A `2500 GB/day` mixed run
-  reached Vector-like log event rates briefly, but failed the 10-minute
-  guardrail with `429` queue-pressure responses after roughly eight minutes.
-- No exactly-once ingest acknowledgement. A crash after `2xx` should replay a
+- Current single-node throughput is in the ballpark of `23.1 MB/s` accepted decoded
+  throughput without `429`/`503` or query failures.
+- Data weirdness possible: A crash after a `2xx` should replay a
   fsynced raw-spool record if it was not checkpointed, but duplicate replay can
   occur when storage commit succeeds before raw-spool checkpoint.
-- No OTLP/gRPC endpoint. Use an OpenTelemetry Collector if your clients need
-  gRPC.
-- No histograms or exponential histograms.
-- No multi-tenancy.
+- No histograms or exponential histograms metric support yet.
 - No full PromQL, LogQL, TraceQL, Prometheus, Loki, or Tempo implementation.
-- No arbitrary SQL through compatibility APIs.
-- No sub-second freshness target.
+- It takes time between data being accepted for it to appear in the DuckLake, this is configurable but at least several seconds.
 
 ## For Developers
 
@@ -153,16 +146,7 @@ itself.
 
 ## Documentation
 
-- [Developer guide](docs/developer.md)
-- [Deployment overview](https://smithclay.github.io/canardstack/deployment/)
-- [V0 architecture](docs/architecture/v0-architecture.md)
-- [Storage schema](docs/architecture/storage-schema.md)
-- [Query API](docs/architecture/query-api.md)
-- [Operator metrics](docs/architecture/operator-metrics.md)
-- [Operations](https://smithclay.github.io/canardstack/operations/)
-- [Benchmarking](docs/BENCHMARKING.md)
-- [Benchmark gates](docs/planning/benchmark.md)
-- [Failure runbooks](https://smithclay.github.io/canardstack/operations/failure-runbooks/)
+Docs are published at [https://smithclay.github.io/canardstack/](https://smithclay.github.io/canardstack/).
 
 ## Acknowledgements
 

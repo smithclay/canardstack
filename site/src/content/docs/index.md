@@ -39,17 +39,13 @@ production multi-tenant observability platform today.
 
 tl;dr - canardstack aspires to be a good fit if you know you want to put ~terabyes of data in an data lake with low operational overhead and decent query performance. Architectually, queries will never be as fast as ClickStack or a large APM vendor.
 
-| | canardstack | [OTel Parquet in object storage](https://github.com/smithclay/otlp2parquet) | OTel protobuf in object storage | ClickStack | Iceberg |
+| | canardstack | [OTel Parquet in S3](https://github.com/smithclay/otlp2parquet) | OTel protobuf in S3 | ClickStack | [Apache Iceberg](https://github.com/smithclay/otlp2pipeline) |
 | --- | --- | --- | --- | --- | --- |
-| Cost | low | low | low | medium-low | low |
+| Cost | low | low | low | medium-low | low-ish |
 | Operational complexity | low | medium | medium | medium | medium |
 | Storage efficiency | good | ok | not great | good | good |
 | Query speed | ok | slow | very slow | fast | ok |
 
-The table is intentionally coarse. canardstack sits between raw archive
-patterns and a full observability stack: it adds schema-managed DuckLake tables,
-local durable spooling, a seal scheduler, and bounded Grafana-facing query APIs
-without taking on the full ClickStack product surface.
 
 ## Start Locally
 
