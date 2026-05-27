@@ -1,6 +1,6 @@
 use crate::config::Config;
 use crate::signal::StorageSignal;
-use arrow58::array::{Array, TimestampMicrosecondArray};
+use arrow58::array::{Array, TimestampNanosecondArray};
 use arrow58::record_batch::RecordBatch;
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
@@ -198,7 +198,7 @@ pub fn validate_arrow_timestamp_skew(
     let now_ms = Utc::now().timestamp_millis();
     let min_ms = now_ms - config.operator.late_accept_secs * 1000;
     let max_ms = now_ms + config.operator.future_accept_secs * 1000;
-    let timestamp = arrow_timestamp_micros(batch, signal)?;
+    let timestamp = arrow_timestamp_nanos(batch, signal)?;
     for row in 0..timestamp.len() {
         if timestamp.is_null(row) {
             return Err(ApiError::new(
@@ -207,7 +207,10 @@ pub fn validate_arrow_timestamp_skew(
                 format!("{signal} timestamp is required and must be parseable"),
             ));
         }
-        let ts = timestamp.value(row) / 1000;
+        // Arrow timestamps land here as nanoseconds (otlp2records 0.8.0
+        // emits `Timestamp(Nanosecond)` for every record-time column);
+        // skew-window math is still milliseconds.
+        let ts = timestamp.value(row) / 1_000_000;
         if ts <= 0 {
             return Err(ApiError::new(
                 400,
@@ -233,11 +236,14 @@ pub fn validate_arrow_timestamp_skew(
     Ok(())
 }
 
-fn arrow_timestamp_micros(
+fn arrow_timestamp_nanos(
     batch: &RecordBatch,
     signal: StorageSignal,
-) -> ApiResult<&TimestampMicrosecondArray> {
-    let idx = batch.schema().index_of("timestamp").map_err(|_| {
+) -> ApiResult<&TimestampNanosecondArray> {
+    // Use the same per-signal record-time column as the storage layer
+    // (`time_unix_nano` for logs/metrics, `start_time_unix_nano` for spans).
+    let name = crate::storage::schema::table_timestamp_column(signal);
+    let idx = batch.schema().index_of(name).map_err(|_| {
         ApiError::new(
             400,
             "invalid_timestamp",
@@ -247,7 +253,7 @@ fn arrow_timestamp_micros(
     batch
         .column(idx)
         .as_any()
-        .downcast_ref::<TimestampMicrosecondArray>()
+        .downcast_ref::<TimestampNanosecondArray>()
         .ok_or_else(|| {
             ApiError::new(
                 400,

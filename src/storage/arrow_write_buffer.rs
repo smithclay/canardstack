@@ -160,7 +160,7 @@ impl Storage {
             });
             let prepare_started = Instant::now();
             let prepared_batch = storage_duckdb_batch(storage_signal, &batch, source_format)?;
-            let timestamp_days = batch_timestamp_days(&prepared_batch)?;
+            let timestamp_days = batch_timestamp_days(storage_signal, &prepared_batch)?;
             let prepare_seconds = prepare_started.elapsed().as_secs_f64();
             prepared.push(PreparedArrowBatch {
                 storage_signal,
@@ -203,7 +203,7 @@ impl Storage {
         let rows = batch.num_rows();
         let prepare_started = Instant::now();
         let prepared = storage_duckdb_batch(storage_signal, batch, source_format)?;
-        let timestamp_days = batch_timestamp_days(&prepared)?;
+        let timestamp_days = batch_timestamp_days(storage_signal, &prepared)?;
         let mut timings = vec![ArrowBatchBufferTiming {
             storage_signal,
             phase: TimingPhase::Prepare,

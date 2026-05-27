@@ -82,7 +82,11 @@ impl QueryEngine {
             sort,
         } = plan;
         let timer = Timer::start();
-        let mut where_sql = vec![time_predicate(time_bounds.from, time_bounds.to)];
+        let mut where_sql = vec![time_predicate(
+            "start_time_unix_nano",
+            time_bounds.from,
+            time_bounds.to,
+        )];
         for matcher in &selector.matchers {
             push_matcher(
                 &mut where_sql,
@@ -95,8 +99,12 @@ impl QueryEngine {
             TraceSort::DurationDesc => "7 DESC",
             TraceSort::TimestampDesc => "3 DESC",
         };
+        // v2 OTAP: `trace_id` is BLOB → hex VARCHAR for output; `timestamp` →
+        // `start_time_unix_nano`; `span_name` → `name`; `duration` →
+        // `duration_time_unix_nano` (BIGINT nanoseconds, downstream `tempo_*`
+        // converts to ms).
         let sql = format!(
-            "SELECT trace_id, min(timestamp)::VARCHAR, max(timestamp)::VARCHAR, max(service_name), max(span_name), count(*), max(duration) FROM {{prefix}}spans WHERE {} GROUP BY trace_id ORDER BY {order} LIMIT {}",
+            "SELECT lower(hex(trace_id)), min(start_time_unix_nano)::VARCHAR, max(start_time_unix_nano)::VARCHAR, max(service_name), max(name), count(*), max(duration_time_unix_nano) FROM {{prefix}}spans WHERE {} GROUP BY trace_id ORDER BY {order} LIMIT {}",
             where_sql.join(" AND "),
             limit + 1
         );
@@ -127,14 +135,19 @@ impl QueryEngine {
     pub fn execute_metric(&self, storage: &Storage, plan: &MetricPlan) -> ApiResult<Value> {
         let timer = Timer::start();
         let table = plan.signal.table();
-        let agg_sql = match plan.aggregation {
-            MetricAggregation::Avg => "avg(value)",
-            MetricAggregation::Min => "min(value)",
-            MetricAggregation::Max => "max(value)",
-            MetricAggregation::Sum => "sum(value)",
-            MetricAggregation::Count => "count(*)",
+        // v2 gauge/sum tables store both `int_value BIGINT` and
+        // `double_value DOUBLE`; coalesce to a single DOUBLE for aggregation
+        // so downstream value handling is uniform. The double channel wins
+        // when both are populated, matching OTLP semantics.
+        let value_expr = "coalesce(double_value, int_value::DOUBLE)";
+        let agg_sql: String = match plan.aggregation {
+            MetricAggregation::Avg => format!("avg({value_expr})"),
+            MetricAggregation::Min => format!("min({value_expr})"),
+            MetricAggregation::Max => format!("max({value_expr})"),
+            MetricAggregation::Sum => format!("sum({value_expr})"),
+            MetricAggregation::Count => "count(*)".to_string(),
             MetricAggregation::Rate if plan.signal == MetricSignal::Sum => {
-                "case when epoch(max(timestamp)-min(timestamp)) > 0 then (max(value)-min(value))/epoch(max(timestamp)-min(timestamp)) else null end"
+                format!("case when epoch(max(time_unix_nano)-min(time_unix_nano)) > 0 then (max({value_expr})-min({value_expr}))/epoch(max(time_unix_nano)-min(time_unix_nano)) else null end")
             }
             MetricAggregation::Rate => {
                 return Err(ApiError::new(
@@ -150,8 +163,8 @@ impl QueryEngine {
                 ApiError::new(400, "missing_metric_name", "metric_name is required")
             })?;
         let mut where_sql = vec![
-            time_predicate(plan.time_bounds.from, plan.time_bounds.to),
-            format!("metric_name = {}", sql_quote(metric_name)),
+            time_predicate("time_unix_nano", plan.time_bounds.from, plan.time_bounds.to),
+            format!("name = {}", sql_quote(metric_name)),
         ];
         for matcher in &plan.selector.matchers {
             push_matcher(
@@ -186,7 +199,7 @@ impl QueryEngine {
                 .collect::<String>()
         };
         let sql = format!(
-            "SELECT to_timestamp(floor(epoch(timestamp)/{step})*{step})::VARCHAR AS bucket{group_select_clause}, {agg_sql} AS value FROM {{prefix}}{table} WHERE {} GROUP BY bucket{group_clause} ORDER BY bucket {} LIMIT {}",
+            "SELECT to_timestamp(floor(epoch(time_unix_nano)/{step})*{step})::VARCHAR AS bucket{group_select_clause}, {agg_sql} AS value FROM {{prefix}}{table} WHERE {} GROUP BY bucket{group_clause} ORDER BY bucket {} LIMIT {}",
             where_sql.join(" AND "),
             plan.order.sql(),
             plan.limit + 1
@@ -244,7 +257,11 @@ fn log_row(row: &Row<'_>, projected: &[(&str, String)]) -> duckdb::Result<Value>
 }
 
 fn log_where_sql(plan: &LogPlan) -> ApiResult<Vec<String>> {
-    let mut where_sql = vec![time_predicate(plan.time_bounds.from, plan.time_bounds.to)];
+    let mut where_sql = vec![time_predicate(
+        "time_unix_nano",
+        plan.time_bounds.from,
+        plan.time_bounds.to,
+    )];
     for matcher in &plan.selector.matchers {
         push_matcher(
             &mut where_sql,
@@ -273,7 +290,9 @@ fn log_select_sql(
     limit: usize,
 ) -> String {
     let mut columns = vec![
-        "timestamp::VARCHAR AS timestamp".to_string(),
+        // Alias the v2 `time_unix_nano` storage column back to the stable
+        // `timestamp` output column the log row reader pulls by name.
+        "time_unix_nano::VARCHAR AS timestamp".to_string(),
         "ingested_at::VARCHAR AS ingested_at".to_string(),
         "body".to_string(),
     ];
@@ -283,7 +302,7 @@ fn log_select_sql(
         columns.push(format!("cast({expr} AS VARCHAR) AS {name}"));
     }
     format!(
-        "SELECT {} FROM {source} WHERE {} ORDER BY timestamp {direction} LIMIT {limit}",
+        "SELECT {} FROM {source} WHERE {} ORDER BY time_unix_nano {direction} LIMIT {limit}",
         columns.join(", "),
         where_sql.join(" AND ")
     )

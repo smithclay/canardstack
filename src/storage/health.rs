@@ -1,5 +1,6 @@
 use super::ducklake::ducklake_metadata_prefix;
 use super::{Storage, StorageCapabilities, StorageHealth, StorageProbe};
+use crate::signal::StorageSignal;
 use crate::LockExt;
 use anyhow::Result;
 use chrono::Utc;
@@ -120,9 +121,11 @@ impl Storage {
     pub fn freshness_watermarks(&self) -> Result<Value> {
         self.with_conn(|conn, prefix| {
             let mut map = serde_json::Map::new();
-            for table in ["logs", "spans", "metric_gauge", "metric_sum"] {
+            for signal in StorageSignal::ALL {
+                let table = signal.as_str();
+                let ts = crate::storage::schema::table_timestamp_column(signal);
                 let sql = format!(
-                    "SELECT max(timestamp)::VARCHAR, epoch(max(timestamp)), max(ingested_at)::VARCHAR, epoch(max(ingested_at)) FROM {prefix}{table}"
+                    "SELECT max({ts})::VARCHAR, epoch(max({ts})), max(ingested_at)::VARCHAR, epoch(max(ingested_at)) FROM {prefix}{table}"
                 );
                 let (
                     event_watermark,

@@ -1,8 +1,8 @@
 use crate::db::sql::{
     json_attr, logs_deployment_environment_expr, logs_http_method_expr, logs_http_route_expr,
-    logs_http_status_code_expr, metrics_deployment_environment_expr,
+    logs_http_status_code_expr, metrics_deployment_environment_expr, span_id_hex_expr,
     spans_deployment_environment_expr, spans_http_method_expr, spans_http_route_expr,
-    spans_http_status_code_expr,
+    spans_http_status_code_expr, trace_id_hex_expr,
 };
 use std::collections::BTreeSet;
 
@@ -358,25 +358,28 @@ const LOG_SEVERITY_SOURCES: &[ScopedLabelSource] = &[ScopedLabelSource {
     source: LabelSource::Column("severity_text"),
 }];
 
+// v2 stores trace/span IDs as BLOB; label matching and projection need them as
+// lowercase hex strings to stay round-trippable with client query input, so the
+// source is the `lower(hex(...))` SQL expression rather than the raw column.
 const TRACE_ID_SOURCES: &[ScopedLabelSource] = &[
     ScopedLabelSource {
         scope: LabelScope::Logs,
-        source: LabelSource::Column("trace_id"),
+        source: LabelSource::Sql(trace_id_hex_expr),
     },
     ScopedLabelSource {
         scope: LabelScope::Spans,
-        source: LabelSource::Column("trace_id"),
+        source: LabelSource::Sql(trace_id_hex_expr),
     },
 ];
 
 const SPAN_ID_SOURCES: &[ScopedLabelSource] = &[
     ScopedLabelSource {
         scope: LabelScope::Logs,
-        source: LabelSource::Column("span_id"),
+        source: LabelSource::Sql(span_id_hex_expr),
     },
     ScopedLabelSource {
         scope: LabelScope::Spans,
-        source: LabelSource::Column("span_id"),
+        source: LabelSource::Sql(span_id_hex_expr),
     },
 ];
 
@@ -427,9 +430,11 @@ const HTTP_RESPONSE_STATUS_METRIC_SOURCES: &[ScopedLabelSource] = &[ScopedLabelS
 }];
 
 const SPAN_NAME_SOURCES: &[ScopedLabelSource] = &[
+    // v2 renamed the span name column from `span_name` to `name`; the public
+    // canonical label vocabulary still calls it `span_name`.
     ScopedLabelSource {
         scope: LabelScope::Spans,
-        source: LabelSource::Column("span_name"),
+        source: LabelSource::Column("name"),
     },
     ScopedLabelSource {
         scope: LabelScope::Metrics,

@@ -22,7 +22,7 @@ mod maintenance;
 mod metadata;
 mod metadata_refresh;
 mod query_conn;
-mod schema;
+pub(crate) mod schema;
 
 pub use arrow_write::ArrowFlushOutcome;
 use arrow_write::ArrowWriteBuffer;
@@ -808,7 +808,7 @@ mod tests {
 
     #[test]
     fn arrow_write_buffer_tracks_distinct_timestamp_days() {
-        fn timestamp_micros(year: i32, month: u32, day: u32, hour: u32) -> i64 {
+        fn timestamp_nanos(year: i32, month: u32, day: u32, hour: u32) -> i64 {
             DateTime::<Utc>::from_naive_utc_and_offset(
                 NaiveDate::from_ymd_opt(year, month, day)
                     .unwrap()
@@ -816,31 +816,34 @@ mod tests {
                     .unwrap(),
                 Utc,
             )
-            .timestamp_micros()
+            .timestamp_nanos_opt()
+            .unwrap()
         }
 
+        // Logs use `time_unix_nano` as the storage timestamp column (see
+        // `table_timestamp_column`); v2 stores nanosecond precision directly.
         let schema = Arc::new(arrow58_types::Schema::new(vec![
             arrow58_types::Field::new(
-                "timestamp",
-                arrow58_types::DataType::Timestamp(arrow58_types::TimeUnit::Microsecond, None),
+                "time_unix_nano",
+                arrow58_types::DataType::Timestamp(arrow58_types::TimeUnit::Nanosecond, None),
                 true,
             ),
-            arrow58_types::Field::new("value", arrow58_types::DataType::Int64, true),
+            arrow58_types::Field::new("int_value", arrow58_types::DataType::Int64, true),
         ]));
         let batch = RecordBatch::try_new(
             schema,
             vec![
-                Arc::new(arrow58_array::TimestampMicrosecondArray::from(vec![
-                    Some(timestamp_micros(2026, 5, 16, 0)),
-                    Some(timestamp_micros(2026, 5, 16, 1)),
-                    Some(timestamp_micros(2026, 5, 17, 0)),
+                Arc::new(arrow58_array::TimestampNanosecondArray::from(vec![
+                    Some(timestamp_nanos(2026, 5, 16, 0)),
+                    Some(timestamp_nanos(2026, 5, 16, 1)),
+                    Some(timestamp_nanos(2026, 5, 17, 0)),
                 ])),
                 Arc::new(arrow58_array::Int64Array::from(vec![1, 2, 3])),
             ],
         )
         .unwrap();
 
-        let days = batch_timestamp_days(&batch).unwrap();
+        let days = batch_timestamp_days(StorageSignal::Logs, &batch).unwrap();
 
         assert_eq!(days, vec!["2026-05-16", "2026-05-17"]);
     }

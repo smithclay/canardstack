@@ -290,6 +290,15 @@ fn phase_name(phase: TransformPhase) -> &'static str {
         TransformPhase::MetricArrayJson => "otlp2records_metric_array_json",
         TransformPhase::MetricsCapacity => "otlp2records_metrics_capacity",
         TransformPhase::ArrowFinalize => "otlp2records_arrow_finalize",
+        // 0.8.0 OTAP cutover added broad per-resource/scope/metric phases that
+        // mirror the existing logs/spans broad timings.
+        TransformPhase::ResourceMetricsBuild => "otlp2records_resource_metrics_build",
+        TransformPhase::ScopeMetricsBuild => "otlp2records_scope_metrics_build",
+        TransformPhase::MetricBuild => "otlp2records_metric_build",
+        // `TransformPhase` is `#[non_exhaustive]` so future additions don't
+        // break the build; surface unknowns under a stable label so they show
+        // up in `/metrics` instead of being silently dropped.
+        _ => "otlp2records_unknown_phase",
     }
 }
 
@@ -305,6 +314,10 @@ fn counter_name(counter: TransformCounter) -> &'static str {
         TransformCounter::ResourceAttributesRowCopyBytes => "resource_attributes_row_copy_bytes",
         TransformCounter::ScopeAttributesRowCopies => "scope_attributes_row_copies",
         TransformCounter::ScopeAttributesRowCopyBytes => "scope_attributes_row_copy_bytes",
+        // `TransformCounter` is `#[non_exhaustive]`; keep new counters
+        // observable instead of dropping them, matching `phase_name`'s
+        // fallback policy.
+        _ => "unknown_counter",
     }
 }
 
