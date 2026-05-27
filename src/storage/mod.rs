@@ -427,7 +427,7 @@ mod tests {
     }
 
     #[test]
-    fn local_quack_tls_forces_https_for_loopback_uri() {
+    fn local_quack_insecure_tls_does_not_emit_ducklake_ssl_option() {
         let dir = tempdir().unwrap();
         let plan = build_ducklake_attach_plan(
             None,
@@ -442,8 +442,12 @@ mod tests {
         .unwrap();
 
         assert!(plan.sql.contains(
-            "ATTACH 'ducklake:quack:127.0.0.1:9494' AS canardlake (DATA_PATH '/data', DISABLE_SSL false);"
+            "CREATE OR REPLACE SECRET canardstack_quack_tls (TYPE HTTP, SCOPE 'https://127.0.0.1:9494', VERIFY_SSL 0);"
         ));
+        assert!(plan
+            .sql
+            .contains("ATTACH 'ducklake:quack:127.0.0.1:9494' AS canardlake (DATA_PATH '/data');"));
+        assert!(!plan.sql.contains("DISABLE_SSL"));
     }
 
     #[test]

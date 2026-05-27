@@ -139,9 +139,8 @@ fn serve_local_catalog_allows_live_quack_attach_and_cleans_up() {
     assert_port_closed(&catalog_listen);
 }
 
-#[cfg(feature = "tls")]
 #[test]
-fn serve_local_catalog_can_opt_into_tls() {
+fn serve_local_catalog_ignores_catalog_tls_env() {
     let dir = tempdir().unwrap();
     let app_listen = reserve_loopback_addr();
     let catalog_listen = reserve_loopback_addr();
@@ -159,12 +158,9 @@ fn serve_local_catalog_can_opt_into_tls() {
     conn.execute_batch("INSTALL ducklake; LOAD ducklake; INSTALL quack; LOAD quack;")
         .unwrap();
     conn.execute_batch(&format!(
-        "CREATE OR REPLACE SECRET canardstack_quack_tls \
-         (TYPE HTTP, SCOPE 'https://{}', VERIFY_SSL 0); \
-         CREATE OR REPLACE SECRET canardstack_ducklake_quack \
+        "CREATE OR REPLACE SECRET canardstack_ducklake_quack \
          (TYPE quack, SCOPE 'quack:{}', TOKEN 'test-local-catalog-token'); \
          ATTACH 'ducklake:quack:{}' AS canardlake (DATA_PATH '{}'); USE canardlake;",
-        catalog_listen,
         catalog_listen,
         catalog_listen,
         sql_string(&dir.path().join("storage").to_string_lossy()),

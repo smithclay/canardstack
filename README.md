@@ -39,7 +39,7 @@ under `.canardstack` and listens for OTLP data on `127.0.0.1:4318`.
 # requires rust toolchain: `curl https://sh.rustup.rs -sSf | sh`
 cargo install --locked canardstack
 
-# starts server on :4318
+# starts server on 127.0.0.1:4318
 canardstack
 ```
 
@@ -53,9 +53,9 @@ curl -sS -X POST http://127.0.0.1:4318/v1/logs \
   --data "{\"resourceLogs\":[{\"resource\":{\"attributes\":[{\"key\":\"service.name\",\"value\":{\"stringValue\":\"quickstart\"}}]},\"scopeLogs\":[{\"logRecords\":[{\"timeUnixNano\":\"${OTLP_TIME_UNIX_NANO}\",\"body\":{\"stringValue\":\"hello world\"}}]}]}]}"
 ```
 
-canardstack acknowledges ingest after the raw request is fsynced locally. Give
-the scheduler a few seconds to register the log with the DuckLake catalog, then
-query it through the Loki-compatible API:
+canardstack acknowledges ingest after the raw request is fsynced locally. By
+default, the scheduler seals buffered rows within about 10 seconds; wait a
+moment, then query the log through the Loki-compatible API:
 
 ```bash
 curl -sS -H 'Authorization: Bearer dev-canardstack-key' \
@@ -66,15 +66,20 @@ curl -sS -H 'Authorization: Bearer dev-canardstack-key' \
 <summary>Query the local DuckLake directly with DuckDB 1.5.3+</summary>
 
 To inspect the local DuckLake while canardstack is still running, start the
-server with the in-process loopback Quack catalog endpoint. It is loopback-only
-and always plaintext — the app and any local DuckDB client attach through it
-over TCP loopback, so TLS is neither needed nor available here.
+server with the in-process loopback Quack catalog endpoint instead of the plain
+`canardstack` command above. It uses `127.0.0.1:4318` for OTLP/HTTP and
+`127.0.0.1:9494` for the catalog. The catalog endpoint is loopback-only and
+always plaintext — the app and any local DuckDB client attach through it over
+TCP loopback, so TLS is neither needed nor available here.
 `CANARDSTACK_CATALOG_TLS*` applies only to the separate `serve-catalog` role.
 
 ```bash
 CANARDSTACK_DUCKLAKE_QUACK_TOKEN=dev-quack-token \
-  cargo run -- serve --local-catalog
+  canardstack serve --local-catalog
 ```
+
+When running from a source checkout, use
+`cargo run -- serve --local-catalog` instead.
 
 Then attach through the in-process catalog endpoint from another terminal:
 
