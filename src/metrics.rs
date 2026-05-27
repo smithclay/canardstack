@@ -3,8 +3,8 @@ use crate::storage::Storage;
 use crate::LockExt;
 use anyhow::{Context, Result};
 use arrow58::array::{
-    ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, StringArray,
-    TimestampMicrosecondArray,
+    ArrayRef, BooleanArray, Float64Array, Int32Array, StringArray, TimestampNanosecondArray,
+    UInt32Array,
 };
 use arrow58::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow58::record_batch::RecordBatch;
@@ -909,19 +909,30 @@ fn escape_label_value(value: &str) -> String {
 
 fn metric_samples_batch(samples: &[MetricSample], signal: StorageSignal) -> Result<RecordBatch> {
     let rows = samples.len();
-    let timestamp = Utc::now().timestamp_micros();
+    // v2 storage uses TIMESTAMP_NS for record-time columns and emits both
+    // `int_value`/`double_value`. Operator self-telemetry samples are all
+    // `f64`, so the int channel is left null and consumers reading the table
+    // coalesce to the double channel.
+    let timestamp_ns = Utc::now()
+        .timestamp_nanos_opt()
+        .unwrap_or_else(|| Utc::now().timestamp_micros() * 1_000);
     let resource_attributes = json!({"service.name": "canardstack"}).to_string();
     let mut fields = vec![
         Field::new(
-            "timestamp",
-            DataType::Timestamp(TimeUnit::Microsecond, None),
+            "time_unix_nano",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
             true,
         ),
-        Field::new("start_timestamp", DataType::Int64, true),
-        Field::new("metric_name", DataType::Utf8, true),
-        Field::new("metric_description", DataType::Utf8, true),
-        Field::new("metric_unit", DataType::Utf8, true),
-        Field::new("value", DataType::Float64, true),
+        Field::new(
+            "start_time_unix_nano",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            true,
+        ),
+        Field::new("name", DataType::Utf8, true),
+        Field::new("description", DataType::Utf8, true),
+        Field::new("unit", DataType::Utf8, true),
+        Field::new("int_value", DataType::Int64, true),
+        Field::new("double_value", DataType::Float64, true),
         Field::new("service_name", DataType::Utf8, true),
         Field::new("service_namespace", DataType::Utf8, true),
         Field::new("service_instance_id", DataType::Utf8, true),
@@ -930,12 +941,15 @@ fn metric_samples_batch(samples: &[MetricSample], signal: StorageSignal) -> Resu
         Field::new("scope_version", DataType::Utf8, true),
         Field::new("scope_attributes", DataType::Utf8, true),
         Field::new("metric_attributes", DataType::Utf8, true),
-        Field::new("flags", DataType::Int32, true),
+        Field::new("flags", DataType::UInt32, true),
         Field::new("exemplars_json", DataType::Utf8, true),
     ];
     let mut arrays: Vec<ArrayRef> = vec![
-        Arc::new(TimestampMicrosecondArray::from(vec![Some(timestamp); rows])),
-        Arc::new(Int64Array::from(vec![None; rows])),
+        Arc::new(TimestampNanosecondArray::from(vec![
+            Some(timestamp_ns);
+            rows
+        ])),
+        Arc::new(TimestampNanosecondArray::from(vec![None::<i64>; rows])),
         Arc::new(StringArray::from(
             samples
                 .iter()
@@ -944,6 +958,8 @@ fn metric_samples_batch(samples: &[MetricSample], signal: StorageSignal) -> Resu
         )),
         Arc::new(StringArray::from(vec![None::<String>; rows])),
         Arc::new(StringArray::from(vec![None::<String>; rows])),
+        // int_value channel: unused for operator telemetry.
+        Arc::new(arrow58::array::Int64Array::from(vec![None::<i64>; rows])),
         Arc::new(Float64Array::from(
             samples
                 .iter()
@@ -969,7 +985,7 @@ fn metric_samples_batch(samples: &[MetricSample], signal: StorageSignal) -> Resu
                 .map(|sample| Some(labels_json(&sample.labels).to_string()))
                 .collect::<Vec<_>>(),
         )),
-        Arc::new(Int32Array::from(vec![None; rows])),
+        Arc::new(UInt32Array::from(vec![None::<u32>; rows])),
         Arc::new(StringArray::from(vec![None::<String>; rows])),
     ];
     if signal == StorageSignal::MetricSum {

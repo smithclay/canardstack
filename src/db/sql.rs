@@ -10,9 +10,13 @@ pub fn quote(value: &str) -> String {
     format!("'{}'", escape_value(value))
 }
 
-pub fn time_predicate(from: DateTime<Utc>, to: DateTime<Utc>) -> String {
+/// Half-open record-time predicate `[from, to)` against the per-signal
+/// timestamp column (`time_unix_nano` for logs/metrics,
+/// `start_time_unix_nano` for spans). The literal stays `TIMESTAMP` —
+/// DuckDB implicitly widens it to the TIMESTAMP_NS column for the compare.
+pub fn time_predicate(time_col: &str, from: DateTime<Utc>, to: DateTime<Utc>) -> String {
     format!(
-        "timestamp >= TIMESTAMP {} AND timestamp < TIMESTAMP {}",
+        "{time_col} >= TIMESTAMP {} AND {time_col} < TIMESTAMP {}",
         quote(&from.format("%Y-%m-%d %H:%M:%S%.3f").to_string()),
         quote(&to.format("%Y-%m-%d %H:%M:%S%.3f").to_string())
     )
@@ -76,6 +80,18 @@ pub fn spans_http_route_expr() -> String {
 
 pub fn metrics_deployment_environment_expr() -> String {
     json_attr("resource_attributes", "deployment.environment")
+}
+
+/// Render the BLOB `trace_id` storage column as a lowercase hex string for
+/// label matching/projection. v2 ID columns are `FixedSizeBinary` (BLOB) but
+/// client query input is hex, so every label path that compares or projects
+/// `trace_id`/`span_id` goes through these helpers.
+pub fn trace_id_hex_expr() -> String {
+    "lower(hex(trace_id))".to_string()
+}
+
+pub fn span_id_hex_expr() -> String {
+    "lower(hex(span_id))".to_string()
 }
 
 pub fn span_row(row: &Row<'_>) -> duckdb::Result<Value> {

@@ -148,21 +148,21 @@ pub(super) fn arrow_write_timing_snapshot(timings: &[ArrowBatchBufferTiming]) ->
 }
 
 pub(super) fn timestamp_day(
-    timestamps: &arrow58_array::TimestampMicrosecondArray,
+    timestamps: &arrow58_array::TimestampNanosecondArray,
     row: usize,
 ) -> Option<String> {
     timestamp_utc(timestamps, row).map(|timestamp| timestamp.date_naive().to_string())
 }
 
 fn timestamp_utc(
-    timestamps: &arrow58_array::TimestampMicrosecondArray,
+    timestamps: &arrow58_array::TimestampNanosecondArray,
     row: usize,
 ) -> Option<DateTime<Utc>> {
     if timestamps.is_null(row) {
         return None;
     }
-    let micros = timestamps.value(row);
-    let secs = micros.div_euclid(1_000_000);
-    let nanos = micros.rem_euclid(1_000_000) as u32 * 1_000;
-    DateTime::<Utc>::from_timestamp(secs, nanos)
+    let nanos = timestamps.value(row);
+    let secs = nanos.div_euclid(1_000_000_000);
+    let subsec_nanos = nanos.rem_euclid(1_000_000_000) as u32;
+    DateTime::<Utc>::from_timestamp(secs, subsec_nanos)
 }

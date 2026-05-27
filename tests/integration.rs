@@ -11,8 +11,8 @@ use canardstack::{AppState, Config, Scheduler};
 
 mod common;
 use arrow58::array::{
-    Array, BooleanArray, Float64Array, Int32Array, Int64Array, StringArray,
-    TimestampMicrosecondArray,
+    Array, BinaryArray, BooleanArray, Float64Array, Int32Array, Int64Array, StringArray,
+    TimestampNanosecondArray, UInt32Array,
 };
 use arrow58::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow58::record_batch::RecordBatch;
@@ -518,17 +518,26 @@ fn append_metric_rows_with_attrs(
     source_format: &str,
 ) {
     let len = rows.len();
+    // v2 OTAP schema: gauge/sum tables use TIMESTAMP_NS record timestamps,
+    // OTAP names (`name`/`description`/`unit`), split `int_value`/`double_value`,
+    // and `UInt32` flags. The test rows ship millisecond timestamps and a
+    // single f64 value; the int channel is left null.
     let mut fields = vec![
         Field::new(
-            "timestamp",
-            DataType::Timestamp(TimeUnit::Microsecond, None),
+            "time_unix_nano",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
             true,
         ),
-        Field::new("start_timestamp", DataType::Int64, true),
-        Field::new("metric_name", DataType::Utf8, true),
-        Field::new("metric_description", DataType::Utf8, true),
-        Field::new("metric_unit", DataType::Utf8, true),
-        Field::new("value", DataType::Float64, true),
+        Field::new(
+            "start_time_unix_nano",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            true,
+        ),
+        Field::new("name", DataType::Utf8, true),
+        Field::new("description", DataType::Utf8, true),
+        Field::new("unit", DataType::Utf8, true),
+        Field::new("int_value", DataType::Int64, true),
+        Field::new("double_value", DataType::Float64, true),
         Field::new("service_name", DataType::Utf8, true),
         Field::new("service_namespace", DataType::Utf8, true),
         Field::new("service_instance_id", DataType::Utf8, true),
@@ -537,7 +546,7 @@ fn append_metric_rows_with_attrs(
         Field::new("scope_version", DataType::Utf8, true),
         Field::new("scope_attributes", DataType::Utf8, true),
         Field::new("metric_attributes", DataType::Utf8, true),
-        Field::new("flags", DataType::Int32, true),
+        Field::new("flags", DataType::UInt32, true),
         Field::new("exemplars_json", DataType::Utf8, true),
     ];
     if signal == StorageSignal::MetricSum {
@@ -546,12 +555,12 @@ fn append_metric_rows_with_attrs(
     }
     let schema = Arc::new(Schema::new(fields));
     let mut arrays: Vec<Arc<dyn Array>> = vec![
-        Arc::new(TimestampMicrosecondArray::from(
+        Arc::new(TimestampNanosecondArray::from(
             rows.iter()
-                .map(|(ms, _, _, _, _, _)| Some(ms.saturating_mul(1000)))
+                .map(|(ms, _, _, _, _, _)| Some(ms.saturating_mul(1_000_000)))
                 .collect::<Vec<_>>(),
         )),
-        Arc::new(Int64Array::from(vec![None; len])),
+        Arc::new(TimestampNanosecondArray::from(vec![None::<i64>; len])),
         Arc::new(StringArray::from(
             rows.iter()
                 .map(|(_, name, _, _, _, _)| Some((*name).to_string()))
@@ -559,6 +568,7 @@ fn append_metric_rows_with_attrs(
         )),
         Arc::new(StringArray::from(vec![None::<String>; len])),
         Arc::new(StringArray::from(vec![None::<String>; len])),
+        Arc::new(Int64Array::from(vec![None::<i64>; len])),
         Arc::new(Float64Array::from(
             rows.iter()
                 .map(|(_, _, value, _, _, _)| Some(*value))
@@ -584,7 +594,7 @@ fn append_metric_rows_with_attrs(
                 .map(|(_, _, _, _, _, metric_attrs)| Some((*metric_attrs).to_string()))
                 .collect::<Vec<_>>(),
         )),
-        Arc::new(Int32Array::from(vec![None; len])),
+        Arc::new(UInt32Array::from(vec![None::<u32>; len])),
         Arc::new(StringArray::from(vec![None::<String>; len])),
     ];
     if signal == StorageSignal::MetricSum {
@@ -625,42 +635,74 @@ type LogRowWithAttrs<'a> = (
 
 fn append_log_rows_with_attrs(state: &AppState, rows: &[LogRowWithAttrs<'_>], source_format: &str) {
     let len = rows.len();
+    // v2 OTAP schema: TIMESTAMP_NS record timestamps, BLOB trace/span IDs,
+    // UINTEGER counts. Test inputs ship hex strings for IDs; convert them to
+    // raw bytes here so the BinaryArray matches the BLOB column type.
+    fn hex_bytes(hex: &str) -> Vec<u8> {
+        let mut out = Vec::with_capacity(hex.len() / 2);
+        let mut chars = hex.chars();
+        while let (Some(a), Some(b)) = (chars.next(), chars.next()) {
+            let hi = a.to_digit(16).unwrap() as u8;
+            let lo = b.to_digit(16).unwrap() as u8;
+            out.push((hi << 4) | lo);
+        }
+        out
+    }
     let schema = Arc::new(Schema::new(vec![
         Field::new(
-            "timestamp",
-            DataType::Timestamp(TimeUnit::Microsecond, None),
+            "time_unix_nano",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
             true,
         ),
-        Field::new("trace_id", DataType::Utf8, true),
-        Field::new("span_id", DataType::Utf8, true),
+        Field::new(
+            "observed_time_unix_nano",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            true,
+        ),
+        Field::new("trace_id", DataType::Binary, true),
+        Field::new("span_id", DataType::Binary, true),
         Field::new("service_name", DataType::Utf8, true),
         Field::new("service_namespace", DataType::Utf8, true),
         Field::new("service_instance_id", DataType::Utf8, true),
         Field::new("severity_number", DataType::Int32, true),
         Field::new("severity_text", DataType::Utf8, true),
+        Field::new("event_name", DataType::Utf8, true),
         Field::new("body", DataType::Utf8, true),
         Field::new("resource_attributes", DataType::Utf8, true),
         Field::new("scope_name", DataType::Utf8, true),
         Field::new("scope_version", DataType::Utf8, true),
         Field::new("scope_attributes", DataType::Utf8, true),
         Field::new("log_attributes", DataType::Utf8, true),
+        Field::new("dropped_attributes_count", DataType::UInt32, true),
+        Field::new("flags", DataType::UInt32, true),
     ]));
+    let trace_ids: Vec<Option<Vec<u8>>> = rows
+        .iter()
+        .map(|(_, _, _, _, _, trace_id, _, _, _, _)| trace_id.map(hex_bytes))
+        .collect();
+    let span_ids: Vec<Option<Vec<u8>>> = rows
+        .iter()
+        .map(|(_, _, _, _, _, _, span_id, _, _, _)| span_id.map(hex_bytes))
+        .collect();
     let batch = RecordBatch::try_new(
         schema,
         vec![
-            Arc::new(TimestampMicrosecondArray::from(
+            Arc::new(TimestampNanosecondArray::from(
                 rows.iter()
-                    .map(|(ms, _, _, _, _, _, _, _, _, _)| Some(ms.saturating_mul(1000)))
+                    .map(|(ms, _, _, _, _, _, _, _, _, _)| Some(ms.saturating_mul(1_000_000)))
                     .collect::<Vec<_>>(),
             )),
-            Arc::new(StringArray::from(
-                rows.iter()
-                    .map(|(_, _, _, _, _, trace_id, _, _, _, _)| trace_id.map(str::to_string))
+            Arc::new(TimestampNanosecondArray::from(vec![None::<i64>; len])),
+            Arc::new(BinaryArray::from(
+                trace_ids
+                    .iter()
+                    .map(|opt| opt.as_deref())
                     .collect::<Vec<_>>(),
             )),
-            Arc::new(StringArray::from(
-                rows.iter()
-                    .map(|(_, _, _, _, _, _, span_id, _, _, _)| span_id.map(str::to_string))
+            Arc::new(BinaryArray::from(
+                span_ids
+                    .iter()
+                    .map(|opt| opt.as_deref())
                     .collect::<Vec<_>>(),
             )),
             Arc::new(StringArray::from(
@@ -684,6 +726,7 @@ fn append_log_rows_with_attrs(state: &AppState, rows: &[LogRowWithAttrs<'_>], so
                     .map(|(_, _, _, _, _, _, _, _, severity, _)| severity.map(str::to_string))
                     .collect::<Vec<_>>(),
             )),
+            Arc::new(StringArray::from(vec![None::<String>; len])),
             Arc::new(StringArray::from(
                 rows.iter()
                     .map(|(_, body, _, _, _, _, _, _, _, _)| Some((*body).to_string()))
@@ -708,6 +751,8 @@ fn append_log_rows_with_attrs(state: &AppState, rows: &[LogRowWithAttrs<'_>], so
                     .map(|(_, _, _, _, _, _, _, _, _, log_attrs)| Some((*log_attrs).to_string()))
                     .collect::<Vec<_>>(),
             )),
+            Arc::new(UInt32Array::from(vec![None::<u32>; len])),
+            Arc::new(UInt32Array::from(vec![None::<u32>; len])),
         ],
     )
     .unwrap();

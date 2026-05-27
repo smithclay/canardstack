@@ -24,6 +24,7 @@
 //! buckets it failed to refresh. `crate::metadata` is the read side of this same
 //! stage.
 
+use super::schema::table_timestamp_column;
 use crate::db::sql::{metrics_deployment_environment_expr, quote as sql_quote};
 use crate::semantic_labels::{self, LabelScope};
 use crate::signal::StorageSignal;
@@ -88,7 +89,7 @@ pub(super) fn metadata_refresh_sql(
     signal: StorageSignal,
     date: &str,
 ) -> Result<String> {
-    let day = MetadataRefreshDay::new(date)?;
+    let day = MetadataRefreshDay::new(date, signal)?;
     let selects = match signal {
         StorageSignal::Logs => logs_metadata_sql(prefix, &day),
         StorageSignal::Spans => spans_metadata_sql(prefix, &day),
@@ -113,10 +114,14 @@ pub(super) struct MetadataRefreshDay<'a> {
     date: &'a str,
     start: String,
     end: String,
+    /// The per-signal record-time column (`time_unix_nano` for logs/metrics,
+    /// `start_time_unix_nano` for spans). Threaded so the day predicate and the
+    /// `min`/`max` aggregations don't have to be per-call-site lookups.
+    time_col: &'static str,
 }
 
 impl<'a> MetadataRefreshDay<'a> {
-    fn new(date: &'a str) -> Result<Self> {
+    fn new(date: &'a str, signal: StorageSignal) -> Result<Self> {
         let start = NaiveDate::parse_from_str(date, "%Y-%m-%d")
             .with_context(|| format!("parse metadata refresh date {date}"))?;
         let end = start
@@ -126,15 +131,22 @@ impl<'a> MetadataRefreshDay<'a> {
             date,
             start: format!("{start} 00:00:00"),
             end: format!("{end} 00:00:00"),
+            time_col: table_timestamp_column(signal),
         })
     }
 
     fn predicate(&self) -> String {
         format!(
-            "timestamp >= TIMESTAMP {} AND timestamp < TIMESTAMP {}",
+            "{} >= TIMESTAMP {} AND {} < TIMESTAMP {}",
+            self.time_col,
             sql_quote(&self.start),
+            self.time_col,
             sql_quote(&self.end)
         )
+    }
+
+    fn time_col(&self) -> &'static str {
+        self.time_col
     }
 }
 
@@ -154,11 +166,12 @@ pub(super) fn logs_metadata_sql(prefix: &str, day: &MetadataRefreshDay<'_>) -> V
     let deployment_environment =
         semantic_labels::label_expr(LabelScope::Logs, "deployment_environment")
             .expect("deployment_environment is registered for logs");
+    let ts = day.time_col();
     sql.push(format!(
         "\
         SELECT 'logs', DATE {}, 'series', 'stream', NULL, NULL, NULL, NULL, \
                service_name, {deployment_environment}, severity_text, \
-               count(*), min(timestamp), max(timestamp) \
+               count(*), min({ts}), max({ts}) \
         FROM {prefix}logs \
         WHERE {} \
         GROUP BY service_name, {deployment_environment}, severity_text",
@@ -192,8 +205,11 @@ pub(super) fn metric_metadata_sql(
 ) -> Vec<String> {
     let table = signal.as_str();
     let signal = signal.as_str();
+    let ts = day.time_col();
     let mut sql = Vec::new();
-    let mut label_values = vec![("__name__", "metric_name".to_string())];
+    // The metric-name column on the v2 OTAP schema is just `name`; the
+    // discovery vocabulary still calls it `__name__` (Prometheus convention).
+    let mut label_values = vec![("__name__", "name".to_string())];
     label_values.extend(semantic_labels::metadata_labels(LabelScope::Metrics));
     for (name, value_expr) in label_values {
         sql.push(label_value_insert_sql(
@@ -209,12 +225,12 @@ pub(super) fn metric_metadata_sql(
     let deployment_environment = metrics_deployment_environment_expr();
     sql.push(format!(
         "\
-        SELECT {}, DATE {}, 'series', metric_name, NULL, {}, NULL, NULL, \
+        SELECT {}, DATE {}, 'series', name, NULL, {}, NULL, NULL, \
                service_name, {deployment_environment}, NULL, \
-               count(*), min(timestamp), max(timestamp) \
+               count(*), min({ts}), max({ts}) \
         FROM {prefix}{table} \
-        WHERE {} AND metric_name IS NOT NULL AND metric_name <> '' \
-        GROUP BY metric_name, service_name, {deployment_environment}",
+        WHERE {} AND name IS NOT NULL AND name <> '' \
+        GROUP BY name, service_name, {deployment_environment}",
         sql_quote(signal),
         sql_quote(day.date),
         sql_quote(metric_type),
@@ -222,12 +238,12 @@ pub(super) fn metric_metadata_sql(
     ));
     sql.push(format!(
         "\
-        SELECT {}, DATE {}, 'metric_metadata', metric_name, NULL, {}, \
-               max(coalesce(metric_unit, '')), max(coalesce(metric_description, '')), \
-               NULL, NULL, NULL, count(*), min(timestamp), max(timestamp) \
+        SELECT {}, DATE {}, 'metric_metadata', name, NULL, {}, \
+               max(coalesce(unit, '')), max(coalesce(description, '')), \
+               NULL, NULL, NULL, count(*), min({ts}), max({ts}) \
         FROM {prefix}{table} \
-        WHERE {} AND metric_name IS NOT NULL AND metric_name <> '' \
-        GROUP BY metric_name",
+        WHERE {} AND name IS NOT NULL AND name <> '' \
+        GROUP BY name",
         sql_quote(signal),
         sql_quote(day.date),
         sql_quote(metric_type),
@@ -245,10 +261,11 @@ pub(super) fn label_value_insert_sql(
     name: &str,
     value_expr: &str,
 ) -> String {
+    let ts = day.time_col();
     format!(
         "\
         SELECT {}, DATE {}, {}, {}, {value_expr}::VARCHAR, NULL, NULL, NULL, \
-               NULL, NULL, NULL, count(*), min(timestamp), max(timestamp) \
+               NULL, NULL, NULL, count(*), min({ts}), max({ts}) \
         FROM {prefix}{table} \
         WHERE {} AND {value_expr} IS NOT NULL AND {value_expr}::VARCHAR <> '' \
         GROUP BY {value_expr}",

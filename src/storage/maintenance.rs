@@ -1,5 +1,6 @@
 use super::{RetentionPolicy, Storage};
 use crate::db::sql::quote as sql_quote;
+use crate::signal::StorageSignal;
 use crate::LockExt;
 use anyhow::Result;
 use chrono::Utc;
@@ -81,18 +82,22 @@ impl Storage {
         let mut results = Vec::new();
         let mut metadata_deleted_total = 0_i64;
         for target in [
-            ("logs", policy.logs_days),
-            ("spans", policy.spans_days),
-            ("metric_gauge", policy.metrics_days),
-            ("metric_sum", policy.metrics_days),
+            (StorageSignal::Logs, policy.logs_days),
+            (StorageSignal::Spans, policy.spans_days),
+            (StorageSignal::MetricGauge, policy.metrics_days),
+            (StorageSignal::MetricSum, policy.metrics_days),
         ] {
-            let (table, retention_days) = target;
+            let (signal, retention_days) = target;
+            let table = signal.as_str();
+            let ts_col = super::schema::table_timestamp_column(signal);
             let cutoff = (Utc::now() - chrono::Duration::days(retention_days))
                 .format("%Y-%m-%d")
                 .to_string();
             let full_table = format!("{}{}", self.target_prefix, table);
+            // v2 uses the per-signal record-time column for retention cutoff,
+            // not the v1 `timestamp` column that no longer exists.
             let predicate = format!(
-                "timestamp < TIMESTAMP {}",
+                "{ts_col} < TIMESTAMP {}",
                 sql_quote(&format!("{cutoff} 00:00:00"))
             );
             let count_sql = format!("SELECT count(*) FROM {full_table} WHERE {predicate}");

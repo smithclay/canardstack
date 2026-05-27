@@ -28,12 +28,17 @@ pub fn tempo_trace(state: &AppState, trace_id: &str) -> ApiResult<Value> {
     let from = to - chrono::Duration::days(7);
     let mut spans = Vec::new();
     state.queries.run_interactive(&state.storage, |conn, prefix| {
+        // v2 storage holds IDs as BLOBs (otlp2records 0.8.0 `FixedSizeBinary`)
+        // and durations as BIGINT nanoseconds (`duration_time_unix_nano`). The
+        // public span JSON keys stay stable (`timestamp`, `trace_id`,
+        // `span_name`, `duration`) so the Tempo adapter and `span_row` keep
+        // their existing positional contract.
         let sql = format!(
-            "SELECT timestamp::VARCHAR, trace_id, span_id, parent_span_id, service_name, span_name, duration, status_code, {} AS http_method, {} AS http_status_code FROM {prefix}spans WHERE trace_id = {} AND {} ORDER BY timestamp ASC LIMIT 20000",
+            "SELECT start_time_unix_nano::VARCHAR, lower(hex(trace_id)), lower(hex(span_id)), lower(hex(parent_span_id)), service_name, name, duration_time_unix_nano, status_code, {} AS http_method, {} AS http_status_code FROM {prefix}spans WHERE trace_id = unhex({}) AND {} ORDER BY start_time_unix_nano ASC LIMIT 20000",
             span_label("http_method"),
             span_label("http_status_code"),
             sql_quote(trace_id),
-            time_predicate(from, to)
+            time_predicate("start_time_unix_nano", from, to)
         );
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map([], span_row)?;
@@ -58,15 +63,19 @@ pub fn tempo_trace_proto(state: &AppState, trace_id: &str) -> ApiResult<Vec<u8>>
     let from = to - chrono::Duration::days(7);
     let mut spans = Vec::new();
     state.queries.run_interactive(&state.storage, |conn, prefix| {
+        // Same v2 mapping as the JSON sibling above: IDs come out as hex
+        // VARCHAR via `lower(hex(...))`, durations are nanoseconds, and the
+        // span_name column was renamed `name` while status_message became
+        // `status_status_message` in the OTAP schema.
         let sql = format!(
-            "SELECT timestamp::VARCHAR, trace_id, span_id, parent_span_id, service_name, span_name, duration, status_code, {} AS http_method, {} AS http_status_code, trace_state, span_kind, status_message, scope_name, scope_version, {} AS deployment_environment, {} AS http_route, {} AS exception_type FROM {prefix}spans WHERE trace_id = {} AND {} ORDER BY timestamp ASC LIMIT 20000",
+            "SELECT start_time_unix_nano::VARCHAR, lower(hex(trace_id)), lower(hex(span_id)), lower(hex(parent_span_id)), service_name, name, duration_time_unix_nano, status_code, {} AS http_method, {} AS http_status_code, trace_state, kind, status_status_message, scope_name, scope_version, {} AS deployment_environment, {} AS http_route, {} AS exception_type FROM {prefix}spans WHERE trace_id = unhex({}) AND {} ORDER BY start_time_unix_nano ASC LIMIT 20000",
             span_label("http_method"),
             span_label("http_status_code"),
             span_label("deployment_environment"),
             span_label("http_route"),
             span_label("exception_type"),
             sql_quote(trace_id),
-            time_predicate(from, to)
+            time_predicate("start_time_unix_nano", from, to)
         );
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map([], |row| {
@@ -166,6 +175,9 @@ pub fn tempo_search(state: &AppState, params: &HashMap<String, String>) -> ApiRe
                 .get("matched_spans")
                 .and_then(Value::as_i64)
                 .unwrap_or_default();
+            // v2 stores `duration_time_unix_nano` in nanoseconds; Tempo
+            // wants milliseconds.
+            let duration_ns = row.get("duration").and_then(Value::as_i64).unwrap_or(0);
             json!({
                 "traceID": row.get("trace_id").and_then(Value::as_str).unwrap_or_default(),
                 "startTimeUnixNano": start_time_unix_nano,
@@ -173,7 +185,7 @@ pub fn tempo_search(state: &AppState, params: &HashMap<String, String>) -> ApiRe
                 "rootTraceName": row.get("span_name").and_then(Value::as_str),
                 "spanSet": {"spans": [], "matched": matched},
                 "spanSets": [{"spans": [], "matched": matched}],
-                "durationMs": row.get("duration").and_then(Value::as_i64).unwrap_or_default()
+                "durationMs": duration_ns / 1_000_000
             })
         })
         .collect::<Vec<_>>();
@@ -216,15 +228,20 @@ pub(super) fn tempo_span(row: Value) -> Value {
         .and_then(Value::as_str)
         .and_then(parse_any_time_to_utc)
         .unwrap_or_else(Utc::now);
-    let duration_ms = row.get("duration").and_then(Value::as_i64).unwrap_or(0);
+    // v2: `duration_time_unix_nano` lands in the span JSON as nanoseconds
+    // under the stable `duration` key; downstream just adds it to start_nanos.
+    let duration_ns = row.get("duration").and_then(Value::as_i64).unwrap_or(0);
+    let start_nanos = start
+        .timestamp_nanos_opt()
+        .unwrap_or_else(|| start.timestamp_micros() * 1000);
     json!({
         "traceId": trace_id,
         "spanId": span_id,
         "parentSpanId": row.get("parent_span_id").and_then(Value::as_str).unwrap_or_default(),
         "name": row.get("span_name").and_then(Value::as_str).unwrap_or_default(),
         "kind": "SPAN_KIND_UNSPECIFIED",
-        "startTimeUnixNano": start.timestamp_nanos_opt().unwrap_or_else(|| start.timestamp_micros() * 1000).to_string(),
-        "endTimeUnixNano": (start.timestamp_nanos_opt().unwrap_or_else(|| start.timestamp_micros() * 1000) + duration_ms * 1_000_000).to_string(),
+        "startTimeUnixNano": start_nanos.to_string(),
+        "endTimeUnixNano": (start_nanos + duration_ns).to_string(),
         "attributes": [
             {"key": "service.name", "value": {"stringValue": row.get("service_name").and_then(Value::as_str).unwrap_or_default()}},
             {"key": "http.request.method", "value": {"stringValue": row.get("http_method").and_then(Value::as_str).unwrap_or_default()}},
@@ -243,7 +260,9 @@ pub(super) fn tempo_proto_span(row: Value) -> Span {
     let start_nanos = start
         .timestamp_nanos_opt()
         .unwrap_or_else(|| start.timestamp_micros() * 1000) as u64;
-    let duration_ms = row
+    // v2: `duration_time_unix_nano` is BIGINT nanoseconds; clamp negatives
+    // before widening to u64 the same way the millisecond path used to.
+    let duration_ns = row
         .get("duration")
         .and_then(Value::as_i64)
         .unwrap_or(0)
@@ -295,7 +314,7 @@ pub(super) fn tempo_proto_span(row: Value) -> Span {
             .map(|kind| kind as i32)
             .unwrap_or(0),
         start_time_unix_nano: start_nanos,
-        end_time_unix_nano: start_nanos + duration_ms * 1_000_000,
+        end_time_unix_nano: start_nanos + duration_ns,
         attributes: compact_attrs([
             string_attr(
                 "service.name",

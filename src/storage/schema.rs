@@ -52,72 +52,99 @@ pub(super) fn configure_telemetry_partitioning_on(conn: &Connection, prefix: &st
         StorageSignal::MetricGauge,
         StorageSignal::MetricSum,
     ] {
+        let ts = table_timestamp_column(table);
         conn.execute_batch(&format!(
-            "ALTER TABLE {prefix}{} SET PARTITIONED BY (year(timestamp), month(timestamp), day(timestamp));",
+            "ALTER TABLE {prefix}{} SET PARTITIONED BY (year({ts}), month({ts}), day({ts}));",
             table.as_str()
         ))
         .with_context(|| format!("configure DuckLake timestamp partitioning for {table}"))?;
     }
     Ok(())
 }
+
+/// The TIMESTAMP_NS column each storage table partitions and orders on. Tracks
+/// the otlp2records 0.8.0 OTAP schema: logs and metrics use the record's
+/// `time_unix_nano`, spans use the start of the span (`start_time_unix_nano`).
+/// One source of truth that the storage shim, partition DDL, query plans,
+/// freshness probes, and metadata refresh all share.
+pub(crate) fn table_timestamp_column(signal: StorageSignal) -> &'static str {
+    match signal {
+        StorageSignal::Logs => "time_unix_nano",
+        StorageSignal::Spans => "start_time_unix_nano",
+        StorageSignal::MetricGauge | StorageSignal::MetricSum => "time_unix_nano",
+    }
+}
+// v0 storage uses the otlp2records 0.8.0 OTAP field names and types verbatim,
+// so the storage shim doesn't translate at all — it copies the otlp2records
+// output batch straight through and only synthesizes the two book-keeping
+// columns (`ingested_at`, `source_format`). The DuckDB types below are the
+// `expected_duckdb_type` mapping the alignment test pins. Integer ID columns
+// are BLOB (raw bytes from `FixedSizeBinary{8,16}`) and rendered as hex in
+// compatibility-layer SELECTs via `lower(hex(col))`; durations are BIGINT
+// nanoseconds (Arrow `Duration(Nanosecond)`); record timestamps are
+// `TIMESTAMP_NS` so partition expressions stay cheap.
 pub(super) const LOGS_COLUMNS: &[(&str, &str)] = &[
-    ("timestamp", "TIMESTAMP"),
+    ("time_unix_nano", "TIMESTAMP_NS"),
+    ("observed_time_unix_nano", "TIMESTAMP_NS"),
     ("ingested_at", "TIMESTAMP"),
     ("source_format", "VARCHAR"),
-    ("trace_id", "VARCHAR"),
-    ("span_id", "VARCHAR"),
+    ("trace_id", "BLOB"),
+    ("span_id", "BLOB"),
     ("service_name", "VARCHAR"),
     ("service_namespace", "VARCHAR"),
     ("service_instance_id", "VARCHAR"),
     ("severity_number", "INTEGER"),
     ("severity_text", "VARCHAR"),
+    ("event_name", "VARCHAR"),
     ("body", "VARCHAR"),
     ("resource_attributes", "VARCHAR"),
     ("scope_name", "VARCHAR"),
     ("scope_version", "VARCHAR"),
     ("scope_attributes", "VARCHAR"),
     ("log_attributes", "VARCHAR"),
+    ("dropped_attributes_count", "UINTEGER"),
+    ("flags", "UINTEGER"),
 ];
 
 pub(super) const SPANS_COLUMNS: &[(&str, &str)] = &[
-    ("timestamp", "TIMESTAMP"),
+    ("start_time_unix_nano", "TIMESTAMP_NS"),
+    ("duration_time_unix_nano", "BIGINT"),
     ("ingested_at", "TIMESTAMP"),
     ("source_format", "VARCHAR"),
-    ("end_timestamp", "BIGINT"),
-    ("duration", "BIGINT"),
-    ("trace_id", "VARCHAR"),
-    ("span_id", "VARCHAR"),
-    ("parent_span_id", "VARCHAR"),
+    ("trace_id", "BLOB"),
+    ("span_id", "BLOB"),
+    ("parent_span_id", "BLOB"),
     ("trace_state", "VARCHAR"),
-    ("span_name", "VARCHAR"),
-    ("span_kind", "INTEGER"),
-    ("status_code", "INTEGER"),
-    ("status_message", "VARCHAR"),
     ("service_name", "VARCHAR"),
     ("service_namespace", "VARCHAR"),
     ("service_instance_id", "VARCHAR"),
+    ("name", "VARCHAR"),
+    ("kind", "INTEGER"),
+    ("status_code", "INTEGER"),
+    ("status_status_message", "VARCHAR"),
+    ("resource_attributes", "VARCHAR"),
     ("scope_name", "VARCHAR"),
     ("scope_version", "VARCHAR"),
     ("scope_attributes", "VARCHAR"),
     ("span_attributes", "VARCHAR"),
-    ("resource_attributes", "VARCHAR"),
     ("events_json", "VARCHAR"),
     ("links_json", "VARCHAR"),
-    ("dropped_attributes_count", "INTEGER"),
-    ("dropped_events_count", "INTEGER"),
-    ("dropped_links_count", "INTEGER"),
-    ("flags", "INTEGER"),
+    ("dropped_attributes_count", "UINTEGER"),
+    ("dropped_events_count", "UINTEGER"),
+    ("dropped_links_count", "UINTEGER"),
+    ("flags", "UINTEGER"),
 ];
 
 pub(super) const METRIC_GAUGE_COLUMNS: &[(&str, &str)] = &[
-    ("timestamp", "TIMESTAMP"),
+    ("time_unix_nano", "TIMESTAMP_NS"),
+    ("start_time_unix_nano", "TIMESTAMP_NS"),
     ("ingested_at", "TIMESTAMP"),
     ("source_format", "VARCHAR"),
-    ("start_timestamp", "BIGINT"),
-    ("metric_name", "VARCHAR"),
-    ("metric_description", "VARCHAR"),
-    ("metric_unit", "VARCHAR"),
-    ("value", "DOUBLE"),
+    ("name", "VARCHAR"),
+    ("description", "VARCHAR"),
+    ("unit", "VARCHAR"),
+    ("int_value", "BIGINT"),
+    ("double_value", "DOUBLE"),
     ("service_name", "VARCHAR"),
     ("service_namespace", "VARCHAR"),
     ("service_instance_id", "VARCHAR"),
@@ -126,19 +153,20 @@ pub(super) const METRIC_GAUGE_COLUMNS: &[(&str, &str)] = &[
     ("scope_version", "VARCHAR"),
     ("scope_attributes", "VARCHAR"),
     ("metric_attributes", "VARCHAR"),
-    ("flags", "INTEGER"),
+    ("flags", "UINTEGER"),
     ("exemplars_json", "VARCHAR"),
 ];
 
 pub(super) const METRIC_SUM_COLUMNS: &[(&str, &str)] = &[
-    ("timestamp", "TIMESTAMP"),
+    ("time_unix_nano", "TIMESTAMP_NS"),
+    ("start_time_unix_nano", "TIMESTAMP_NS"),
     ("ingested_at", "TIMESTAMP"),
     ("source_format", "VARCHAR"),
-    ("start_timestamp", "BIGINT"),
-    ("metric_name", "VARCHAR"),
-    ("metric_description", "VARCHAR"),
-    ("metric_unit", "VARCHAR"),
-    ("value", "DOUBLE"),
+    ("name", "VARCHAR"),
+    ("description", "VARCHAR"),
+    ("unit", "VARCHAR"),
+    ("int_value", "BIGINT"),
+    ("double_value", "DOUBLE"),
     ("service_name", "VARCHAR"),
     ("service_namespace", "VARCHAR"),
     ("service_instance_id", "VARCHAR"),
@@ -147,7 +175,7 @@ pub(super) const METRIC_SUM_COLUMNS: &[(&str, &str)] = &[
     ("scope_version", "VARCHAR"),
     ("scope_attributes", "VARCHAR"),
     ("metric_attributes", "VARCHAR"),
-    ("flags", "INTEGER"),
+    ("flags", "UINTEGER"),
     ("exemplars_json", "VARCHAR"),
     ("aggregation_temporality", "INTEGER"),
     ("is_monotonic", "BOOLEAN"),
@@ -192,13 +220,20 @@ pub(super) fn create_table_sql(prefix: &str, name: &str, cols: &[(&str, &str)]) 
 
 /// The storage schema generation this binary WRITES. Bump when a `*_COLUMNS`
 /// set or the partitioning changes (see the module doc on schema evolution).
-pub(super) const SCHEMA_VERSION: u32 = 1;
+///
+/// v2 is the otlp2records 0.8.0 OTAP cutover: every typed column was renamed
+/// or retyped (`timestamp` → `time_unix_nano`/`start_time_unix_nano`,
+/// `metric_*` → `name`/`description`/`unit`, `value DOUBLE` split into
+/// `int_value BIGINT` + `double_value DOUBLE`, ID columns flipped from
+/// VARCHAR hex to BLOB raw bytes, counts to UINTEGER/UBIGINT). This is a
+/// hard, expand-only break — there is no in-place migration from v1.
+pub(super) const SCHEMA_VERSION: u32 = 2;
 /// The oldest catalog schema generation this binary can safely operate on. Keep
 /// it equal to [`SCHEMA_VERSION`] for a breaking change; an additive,
 /// schema-on-read-tolerant (expand/contract) change can leave this low so a
 /// newer binary still opens an older catalog. This is the min-reader/min-writer
 /// window the lakehouse formats (Delta/Iceberg) use, scaled to v0.
-pub(super) const MIN_COMPATIBLE_SCHEMA_VERSION: u32 = 1;
+pub(super) const MIN_COMPATIBLE_SCHEMA_VERSION: u32 = 2;
 
 const META_TABLE: &str = "canardstack_meta";
 const META_COLUMNS: &[(&str, &str)] = &[("key", "VARCHAR"), ("value", "VARCHAR")];
@@ -400,16 +435,29 @@ mod tests {
 
     /// The DuckDB column type canardstack declares to store an otlp2records field
     /// of the given type. JSON attribute fields are stored as VARCHAR (see the
-    /// `schema` module doc).
+    /// `schema` module doc). Duration columns are stored as BIGINT nanoseconds
+    /// because that's what `Arrow::Duration(Nanosecond)` represents at the wire
+    /// level. ID columns (`FixedSizeBinary{8,16}`) are stored as BLOB; the
+    /// compatibility layer renders them as hex with `lower(hex(col))` in
+    /// SELECTs. List columns are only present on the histogram tables, which
+    /// v0 does not store.
     fn expected_duckdb_type(field_type: FieldType) -> &'static str {
         match field_type {
-            FieldType::Timestamp => "TIMESTAMP",
+            FieldType::Timestamp => "TIMESTAMP_NS",
+            FieldType::Duration => "BIGINT",
             FieldType::Int64 => "BIGINT",
             FieldType::Int32 => "INTEGER",
+            FieldType::UInt64 => "UBIGINT",
+            FieldType::UInt32 => "UINTEGER",
             FieldType::Float64 => "DOUBLE",
             FieldType::Bool => "BOOLEAN",
             FieldType::String => "VARCHAR",
             FieldType::Json => "VARCHAR",
+            FieldType::FixedSizeBinary16 | FieldType::FixedSizeBinary8 => "BLOB",
+            // List columns only appear on histogram/exp_histogram schemas, which
+            // canardstack v0 rejects at ingest — keep the variants explicit so a
+            // future histogram column trips the alignment test.
+            FieldType::ListUInt64 | FieldType::ListFloat64 => "<list-unsupported>",
         }
     }
 

@@ -1,6 +1,7 @@
 use anyhow::{bail, Context, Result};
 use arrow58::array::{
-    BooleanArray, Float64Array, Int32Array, Int64Array, StringArray, TimestampMicrosecondArray,
+    BinaryArray, BooleanArray, Float64Array, Int32Array, Int64Array, StringArray,
+    TimestampNanosecondArray, UInt32Array,
 };
 use arrow58::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow58::record_batch::RecordBatch;
@@ -171,7 +172,10 @@ fn print_query_latencies(storage: &Storage) -> Result<()> {
         ),
         (
             "metric_gauge_avg",
-            "SELECT avg(value) FROM {prefix}metric_gauge WHERE metric_name = 'storage.pipeline.gauge'",
+            // v2: `metric_name` → `name`; coalesce the new split `int_value` /
+            // `double_value` channels so the bench's correctness probe doesn't
+            // depend on which channel a sample landed in.
+            "SELECT avg(coalesce(double_value, int_value::DOUBLE)) FROM {prefix}metric_gauge WHERE name = 'storage.pipeline.gauge'",
         ),
     ] {
         let started = Instant::now();
@@ -398,33 +402,56 @@ fn make_batch(
 }
 
 fn logs_batch(rows: usize, iteration: usize, body_bytes: usize) -> Result<RecordBatch> {
+    // v2 OTAP schema: timestamps are TIMESTAMP_NS, trace/span IDs are BLOBs,
+    // and the table grew `observed_time_unix_nano`, `event_name`,
+    // `dropped_attributes_count`, `flags`.
     let schema = Arc::new(Schema::new(vec![
-        ts_field("timestamp"),
-        str_field("trace_id"),
-        str_field("span_id"),
+        ts_field("time_unix_nano"),
+        ts_field("observed_time_unix_nano"),
+        bin_field("trace_id"),
+        bin_field("span_id"),
         str_field("service_name"),
         str_field("service_namespace"),
         str_field("service_instance_id"),
         int_field("severity_number"),
         str_field("severity_text"),
+        str_field("event_name"),
         str_field("body"),
         str_field("resource_attributes"),
         str_field("scope_name"),
         str_field("scope_version"),
         str_field("scope_attributes"),
         str_field("log_attributes"),
+        uint_field("dropped_attributes_count"),
+        uint_field("flags"),
     ]));
+    let trace_ids: Vec<Vec<u8>> = (0..rows)
+        .map(|idx| sixteen_byte_id(idx + iteration * rows))
+        .collect();
+    let span_ids: Vec<Vec<u8>> = (0..rows).map(eight_byte_id).collect();
     RecordBatch::try_new(
         schema,
         vec![
             Arc::new(timestamps(rows, iteration)),
-            Arc::new(strings(rows, |idx| format!("{:032x}", idx + iteration * rows))),
-            Arc::new(strings(rows, |idx| format!("{:016x}", idx))),
+            Arc::new(TimestampNanosecondArray::from(vec![None::<i64>; rows])),
+            Arc::new(BinaryArray::from(
+                trace_ids
+                    .iter()
+                    .map(|bytes| Some(bytes.as_slice()))
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(BinaryArray::from(
+                span_ids
+                    .iter()
+                    .map(|bytes| Some(bytes.as_slice()))
+                    .collect::<Vec<_>>(),
+            )),
             Arc::new(service_names(rows)),
             Arc::new(repeated(rows, "bench")),
             Arc::new(strings(rows, |idx| format!("instance-{}", idx % 32))),
             Arc::new(Int32Array::from(vec![9; rows])),
             Arc::new(repeated(rows, "INFO")),
+            Arc::new(StringArray::from(vec![None::<String>; rows])),
             Arc::new(repeated(rows, &payload("storage-pipeline-log", body_bytes))),
             Arc::new(repeated(rows, resource_attributes())),
             Arc::new(repeated(rows, "bench-scope")),
@@ -434,60 +461,86 @@ fn logs_batch(rows: usize, iteration: usize, body_bytes: usize) -> Result<Record
                 rows,
                 r#"{"http.request.method":"GET","http.response.status_code":200,"http.route":"/bench"}"#,
             )),
+            Arc::new(UInt32Array::from(vec![0u32; rows])),
+            Arc::new(UInt32Array::from(vec![0u32; rows])),
         ],
     )
     .context("build logs batch")
 }
 
 fn spans_batch(rows: usize, iteration: usize, attr_bytes: usize) -> Result<RecordBatch> {
+    // v2 OTAP schema: `timestamp` → `start_time_unix_nano` (TIMESTAMP_NS);
+    // `end_timestamp` dropped (recomputable from start + duration);
+    // `duration` → `duration_time_unix_nano` BIGINT NANOSECONDS;
+    // `span_name`/`span_kind`/`status_message` → `name`/`kind`/
+    // `status_status_message`; IDs are BLOBs; dropped_*_count/flags are
+    // UINTEGER.
     let schema = Arc::new(Schema::new(vec![
-        ts_field("timestamp"),
-        int64_field("end_timestamp"),
-        int64_field("duration"),
-        str_field("trace_id"),
-        str_field("span_id"),
-        str_field("parent_span_id"),
+        ts_field("start_time_unix_nano"),
+        int64_field("duration_time_unix_nano"),
+        bin_field("trace_id"),
+        bin_field("span_id"),
+        bin_field("parent_span_id"),
         str_field("trace_state"),
-        str_field("span_name"),
-        int_field("span_kind"),
-        int_field("status_code"),
-        str_field("status_message"),
         str_field("service_name"),
         str_field("service_namespace"),
         str_field("service_instance_id"),
+        str_field("name"),
+        int_field("kind"),
+        int_field("status_code"),
+        str_field("status_status_message"),
+        str_field("resource_attributes"),
         str_field("scope_name"),
         str_field("scope_version"),
         str_field("scope_attributes"),
         str_field("span_attributes"),
-        str_field("resource_attributes"),
         str_field("events_json"),
         str_field("links_json"),
-        int_field("dropped_attributes_count"),
-        int_field("dropped_events_count"),
-        int_field("dropped_links_count"),
-        int_field("flags"),
+        uint_field("dropped_attributes_count"),
+        uint_field("dropped_events_count"),
+        uint_field("dropped_links_count"),
+        uint_field("flags"),
     ]));
+    let trace_ids: Vec<Vec<u8>> = (0..rows)
+        .map(|idx| sixteen_byte_id(idx + iteration * rows))
+        .collect();
+    let span_ids: Vec<Vec<u8>> = (0..rows).map(eight_byte_id).collect();
+    let parent_span_ids: Vec<Vec<u8>> = (0..rows)
+        .map(|idx| eight_byte_id(idx.saturating_sub(1)))
+        .collect();
     RecordBatch::try_new(
         schema,
         vec![
             Arc::new(timestamps(rows, iteration)),
-            Arc::new(Int64Array::from(
-                (0..rows)
-                    .map(|idx| timestamp_micros(iteration, idx) + 25_000)
+            // 25 ms duration in nanoseconds.
+            Arc::new(Int64Array::from(vec![25_000_000; rows])),
+            Arc::new(BinaryArray::from(
+                trace_ids
+                    .iter()
+                    .map(|bytes| Some(bytes.as_slice()))
                     .collect::<Vec<_>>(),
             )),
-            Arc::new(Int64Array::from(vec![25_000; rows])),
-            Arc::new(strings(rows, |idx| format!("{:032x}", idx + iteration * rows))),
-            Arc::new(strings(rows, |idx| format!("{:016x}", idx))),
-            Arc::new(strings(rows, |idx| format!("{:016x}", idx.saturating_sub(1)))),
-            Arc::new(repeated(rows, "")),
-            Arc::new(repeated(rows, "GET /bench")),
-            Arc::new(Int32Array::from(vec![2; rows])),
-            Arc::new(Int32Array::from(vec![1; rows])),
+            Arc::new(BinaryArray::from(
+                span_ids
+                    .iter()
+                    .map(|bytes| Some(bytes.as_slice()))
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(BinaryArray::from(
+                parent_span_ids
+                    .iter()
+                    .map(|bytes| Some(bytes.as_slice()))
+                    .collect::<Vec<_>>(),
+            )),
             Arc::new(repeated(rows, "")),
             Arc::new(service_names(rows)),
             Arc::new(repeated(rows, "bench")),
             Arc::new(strings(rows, |idx| format!("instance-{}", idx % 32))),
+            Arc::new(repeated(rows, "GET /bench")),
+            Arc::new(Int32Array::from(vec![2; rows])),
+            Arc::new(Int32Array::from(vec![1; rows])),
+            Arc::new(repeated(rows, "")),
+            Arc::new(repeated(rows, resource_attributes())),
             Arc::new(repeated(rows, "bench-scope")),
             Arc::new(repeated(rows, "1.0.0")),
             Arc::new(repeated(rows, "{}")),
@@ -498,13 +551,12 @@ fn spans_batch(rows: usize, iteration: usize, attr_bytes: usize) -> Result<Recor
                     attr_bytes,
                 ),
             )),
-            Arc::new(repeated(rows, resource_attributes())),
             Arc::new(repeated(rows, "[]")),
             Arc::new(repeated(rows, "[]")),
-            Arc::new(Int32Array::from(vec![0; rows])),
-            Arc::new(Int32Array::from(vec![0; rows])),
-            Arc::new(Int32Array::from(vec![0; rows])),
-            Arc::new(Int32Array::from(vec![1; rows])),
+            Arc::new(UInt32Array::from(vec![0u32; rows])),
+            Arc::new(UInt32Array::from(vec![0u32; rows])),
+            Arc::new(UInt32Array::from(vec![0u32; rows])),
+            Arc::new(UInt32Array::from(vec![1u32; rows])),
         ],
     )
     .context("build spans batch")
@@ -516,13 +568,19 @@ fn metric_batch(
     iteration: usize,
     description_bytes: usize,
 ) -> Result<RecordBatch> {
+    // v2 OTAP schema: `timestamp`/`start_timestamp` → `time_unix_nano`/
+    // `start_time_unix_nano` (TIMESTAMP_NS); `metric_name`/`metric_description`/
+    // `metric_unit` → `name`/`description`/`unit`; the single `value` column is
+    // split into `int_value BIGINT` + `double_value DOUBLE` — bench rows only
+    // populate the double channel.
     let mut fields = vec![
-        ts_field("timestamp"),
-        int64_field("start_timestamp"),
-        str_field("metric_name"),
-        str_field("metric_description"),
-        str_field("metric_unit"),
-        Field::new("value", DataType::Float64, true),
+        ts_field("time_unix_nano"),
+        ts_field("start_time_unix_nano"),
+        str_field("name"),
+        str_field("description"),
+        str_field("unit"),
+        Field::new("int_value", DataType::Int64, true),
+        Field::new("double_value", DataType::Float64, true),
         str_field("service_name"),
         str_field("service_namespace"),
         str_field("service_instance_id"),
@@ -531,7 +589,7 @@ fn metric_batch(
         str_field("scope_version"),
         str_field("scope_attributes"),
         str_field("metric_attributes"),
-        int_field("flags"),
+        uint_field("flags"),
         str_field("exemplars_json"),
     ];
     if signal == StorageSignal::MetricSum {
@@ -547,9 +605,10 @@ fn metric_batch(
     };
     let mut arrays: Vec<Arc<dyn arrow58::array::Array>> = vec![
         Arc::new(timestamps(rows, iteration)),
-        Arc::new(Int64Array::from(
+        // start_time_unix_nano: one second before the record time, in nanos.
+        Arc::new(TimestampNanosecondArray::from(
             (0..rows)
-                .map(|idx| timestamp_micros(iteration, idx) - 1_000_000)
+                .map(|idx| Some(timestamp_nanos(iteration, idx) - 1_000_000_000))
                 .collect::<Vec<_>>(),
         )),
         Arc::new(repeated(rows, metric_name)),
@@ -558,6 +617,7 @@ fn metric_batch(
             &payload("storage pipeline metric description", description_bytes),
         )),
         Arc::new(repeated(rows, "1")),
+        Arc::new(Int64Array::from(vec![None::<i64>; rows])),
         Arc::new(Float64Array::from(
             (0..rows).map(|idx| idx as f64).collect::<Vec<_>>(),
         )),
@@ -571,7 +631,7 @@ fn metric_batch(
         Arc::new(strings(rows, |idx| {
             format!(r#"{{"series":"{}"}}"#, idx % 512)
         })),
-        Arc::new(Int32Array::from(vec![0; rows])),
+        Arc::new(UInt32Array::from(vec![0u32; rows])),
         Arc::new(repeated(rows, "[]")),
     ];
     if signal == StorageSignal::MetricSum {
@@ -582,7 +642,7 @@ fn metric_batch(
 }
 
 fn ts_field(name: &str) -> Field {
-    Field::new(name, DataType::Timestamp(TimeUnit::Microsecond, None), true)
+    Field::new(name, DataType::Timestamp(TimeUnit::Nanosecond, None), true)
 }
 
 fn str_field(name: &str) -> Field {
@@ -597,16 +657,41 @@ fn int64_field(name: &str) -> Field {
     Field::new(name, DataType::Int64, true)
 }
 
-fn timestamps(rows: usize, iteration: usize) -> TimestampMicrosecondArray {
-    TimestampMicrosecondArray::from(
+fn uint_field(name: &str) -> Field {
+    Field::new(name, DataType::UInt32, true)
+}
+
+fn bin_field(name: &str) -> Field {
+    Field::new(name, DataType::Binary, true)
+}
+
+fn timestamps(rows: usize, iteration: usize) -> TimestampNanosecondArray {
+    TimestampNanosecondArray::from(
         (0..rows)
-            .map(|idx| timestamp_micros(iteration, idx))
+            .map(|idx| timestamp_nanos(iteration, idx))
             .collect::<Vec<_>>(),
     )
 }
 
-fn timestamp_micros(iteration: usize, row: usize) -> i64 {
-    Utc::now().timestamp_micros() + (iteration as i64 * 1_000_000) + row as i64
+fn timestamp_nanos(iteration: usize, row: usize) -> i64 {
+    // Same monotonic-per-row pattern as the v1 helper, just at nanosecond
+    // resolution; the row offset is in nanoseconds so two adjacent rows are
+    // distinguishable under TIMESTAMP_NS.
+    Utc::now()
+        .timestamp_nanos_opt()
+        .unwrap_or_else(|| Utc::now().timestamp_micros() * 1_000)
+        + (iteration as i64 * 1_000_000_000)
+        + row as i64
+}
+
+fn sixteen_byte_id(idx: usize) -> Vec<u8> {
+    let mut out = vec![0u8; 16];
+    out[8..].copy_from_slice(&(idx as u64).to_be_bytes());
+    out
+}
+
+fn eight_byte_id(idx: usize) -> Vec<u8> {
+    (idx as u64).to_be_bytes().to_vec()
 }
 
 fn strings(rows: usize, f: impl Fn(usize) -> String) -> StringArray {
