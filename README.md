@@ -17,10 +17,9 @@ Builds on prior work from [otlp2parquet](https://github.com/smithclay/otlp2parqu
 
 ## Contents
 
-- [Quickstart](#quickstart)
+- [Quickstart](#quick-start)
 - [Demo](#demo)
-- [What You Can Do](#what-you-can-do)
-- [Differences From ClickStack](#differences-from-clickstack)
+- [Why canardstack?](#why-canardstack)
 - [Send Telemetry](#send-telemetry)
 - [Query Data](#query-data)
 - [Deployment](#deployment)
@@ -32,15 +31,14 @@ Builds on prior work from [otlp2parquet](https://github.com/smithclay/otlp2parqu
 
 ## Quick Start
 
-Install and start canardstack. With no options, it uses local DuckLake storage
-under `.canardstack` and listens for OTLP data on `127.0.0.1:4318`.
+You can get started by installing canardstack with `cargo` and connecting to a local Ducklake catalog using the new Quack protocol.
 
 ```bash
 # requires rust toolchain: `curl https://sh.rustup.rs -sSf | sh`
 cargo install --locked canardstack
 
-# starts server on :4318
-canardstack
+# starts server on 127.0.0.1:4318 with a Ducklake catalog accessible over Quack
+CANARDSTACK_DUCKLAKE_QUACK_TOKEN=dev-quack-token canardstack serve --local-catalog
 ```
 
 In another terminal, send one OTLP/HTTP JSON log:
@@ -53,20 +51,7 @@ curl -sS -X POST http://127.0.0.1:4318/v1/logs \
   --data "{\"resourceLogs\":[{\"resource\":{\"attributes\":[{\"key\":\"service.name\",\"value\":{\"stringValue\":\"quickstart\"}}]},\"scopeLogs\":[{\"logRecords\":[{\"timeUnixNano\":\"${OTLP_TIME_UNIX_NANO}\",\"body\":{\"stringValue\":\"hello world\"}}]}]}]}"
 ```
 
-canardstack acknowledges ingest after the raw request is fsynced locally. Give
-the scheduler a few seconds to register the log with the DuckLake catalog, then
-query it through the Loki-compatible API:
-
-```bash
-curl -sS -H 'Authorization: Bearer dev-canardstack-key' \
-  'http://127.0.0.1:4318/loki/api/v1/query?query=%7Bservice_name%3D%22quickstart%22%7D'
-```
-
-<details>
-<summary>Query the local DuckLake directly with DuckDB 1.5.3+</summary>
-
-Shut down canardstack first so no second DuckDB process has the local DuckLake
-catalog open, then attach the catalog from the repository root:
+canardstack acknowledges ingest after the raw request is fsynced locally. By default, the scheduler seals buffered rows within about 10 seconds; wait a moment, then attach to the Ducklake in duckdb 1.5.3+ or higher:
 
 ```bash
 duckdb --version
@@ -76,67 +61,38 @@ duckdb
 ```sql
 INSTALL ducklake;
 LOAD ducklake;
+INSTALL quack;
+LOAD quack;
 
-ATTACH 'ducklake:.canardstack/canardstack.ducklake' AS canardlake
-  (DATA_PATH '.canardstack/storage');
+CREATE OR REPLACE SECRET canardstack_ducklake_quack
+  (TYPE quack, SCOPE 'quack:127.0.0.1:9494', TOKEN 'dev-quack-token');
+
+ATTACH 'ducklake:quack:127.0.0.1:9494' AS canardlake;
 USE canardlake;
 
-SELECT timestamp, service_name, severity_text, body
-FROM logs
-WHERE service_name = 'quickstart'
-ORDER BY timestamp DESC
-LIMIT 20;
+SELECT * FROM logs;
+┌─────────────────────┬────────────────────────────┬───────────────┬───┬──────────────────┬────────────────┐
+│      timestamp      │        ingested_at         │ source_format │ … │ scope_attributes │ log_attributes │
+│      timestamp      │         timestamp          │    varchar    │ … │     varchar      │    varchar     │
+├─────────────────────┼────────────────────────────┼───────────────┼───┼──────────────────┼────────────────┤
+│ 2026-05-27 00:14:12 │ 2026-05-27 00:14:12.086916 │ otlp_json     │ … │ NULL             │ NULL           │
+└─────────────────────┴────────────────────────────┴───────────────┴───┴──────────────────┴────────────────┘
 ```
 
-</details>
+You just streamed an OTLP log to Ducklake! For a more comprehensive example, see the demo below or review cloud [deployment examples](https://smithclay.github.io/canardstack/deployment/).
 
 ## Demo
 
-Run canardstack with the full
-[OpenTelemetry demo](https://github.com/open-telemetry/opentelemetry-demo) using
+Run canardstack with the full [OpenTelemetry demo](https://github.com/open-telemetry/opentelemetry-demo) using
 the [demo guide](https://smithclay.github.io/canardstack/demo/).
 
 ![Grafana dashboard showing canardstack OpenTelemetry demo data](site/src/assets/grafana-dash-demo.png)
 
-## What You Can Do
+## Why canardstack?
 
-Use canardstack to:
+canardstack's goal is to make it easy and cheap for anyone to store and query terabytes of observability data on cheap hardware using vendor-neutral stanards with few moving pieces. There are many high-quality open-source observability solutions like [ClickStack](https://clickhouse.com/docs/use-cases/observability/clickstack) and [SigNoz](https://github.com/SigNoz/signoz), canardstack's primary difference is the deep integration with duckdb/DuckLake and (intentionally) simple single-node architecture.
 
-- Receive OTLP/HTTP logs, traces, gauge metrics, and sum metrics.
-- Store normalized telemetry in DuckLake-backed DuckDB tables.
-- Inspect data in Grafana through Prometheus, Loki, and Tempo-compatible APIs.
-- Query the same DuckLake data directly from DuckDB, MotherDuck, or another SQL
-  client.
-- Run local experiments with a single Rust binary and one DuckDB process.
-
-canardstack is best suited for local, single-tenant, or experimental deployments
-where the operator wants direct access to lakehouse telemetry data and can
-accept the current v0 durability and compatibility limits.
-
-## Differences from ClickStack
-
-ClickStack is the production-grade observability stack built around
-ClickHouse, HyperDX, and an OpenTelemetry Collector.
-
-canardstack is a narrower experiment with different tradeoffs:
-
-- Storage is DuckLake over DuckDB, not ClickHouse. Telemetry lands in open
-  DuckLake tables backed by Parquet data files, so DuckDB-native clients can
-  inspect the same data directly.
-- The Grafana-facing APIs are compatibility adapters, not the primary query
-  path. canardstack implements bounded Prometheus, Loki, and Tempo subsets;
-  it does not try to match ClickStack's HyperDX UI or query experience.
-- Deployment is intentionally small: one Rust binary, one synchronous HTTP
-  server, one DuckDB process per role, and no async runtime, Kafka, or separate
-  hot store.
-- Ingest durability is local-spool-first and at-least-once. A `2xx` means the
-  raw request was fsynced and accepted for bounded processing, not that rows are
-  already query-visible.
-- Direct SQL access. Local clients can attach the
-  DuckLake catalog directly, and cloud deployments can expose the catalog over
-  Quack for DuckDB-native clients when the operator chooses to manage that
-  access boundary.
-- The scope is intentionally single-tenant and experimental.
+See the [overview docs](https://smithclay.github.io/canardstack/) for more information.
 
 ## Send Telemetry
 
@@ -159,7 +115,7 @@ Configure OTLP/HTTP producers and OpenTelemetry Collectors with the
 ## Architecture
 
 The current high-level data-flow diagram lives in the
-[site architecture guide](https://smithclay.github.io/canardstack/architecture/).
+[architecture guide in docs](https://smithclay.github.io/canardstack/architecture/).
 
 ## Operations
 

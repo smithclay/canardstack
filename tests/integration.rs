@@ -24,7 +24,9 @@ use otlp2records::proto_output::inspect_tempo_trace_by_id_response;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::env;
-use std::io::Write;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration as StdDuration;
@@ -36,6 +38,205 @@ fn app() -> (tempfile::TempDir, AppState) {
     let mut config = Config::test(dir.path().join("canardstack.duckdb"));
     config.operator.local_storage_dir = dir.path().join("storage");
     (dir, AppState::new(config).unwrap())
+}
+
+struct LocalServerChild {
+    child: Child,
+}
+
+impl LocalServerChild {
+    fn spawn(
+        data_dir: &std::path::Path,
+        app_listen: &str,
+        catalog_listen: &str,
+        token: &str,
+    ) -> Self {
+        Self::spawn_with_env(data_dir, app_listen, catalog_listen, token, &[])
+    }
+
+    fn spawn_with_env(
+        data_dir: &std::path::Path,
+        app_listen: &str,
+        catalog_listen: &str,
+        token: &str,
+        envs: &[(&str, &str)],
+    ) -> Self {
+        let child = Command::new(env!("CARGO_BIN_EXE_canardstack"))
+            .arg("serve")
+            .arg("--listen")
+            .arg(app_listen)
+            .arg("--local-catalog")
+            .arg("--catalog-listen")
+            .arg(catalog_listen)
+            .env("CANARDSTACK_DATA_DIR", data_dir)
+            .env("CANARDSTACK_DUCKLAKE_QUACK_TOKEN", token)
+            .env("CANARDSTACK_SCHEDULER_ENABLED", "false")
+            .envs(envs.iter().copied())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap();
+        Self { child }
+    }
+
+    fn terminate(&mut self) {
+        request_child_shutdown(&mut self.child);
+        let deadline = Instant::now() + StdDuration::from_secs(10);
+        while Instant::now() < deadline {
+            if self.child.try_wait().unwrap().is_some() {
+                return;
+            }
+            thread::sleep(StdDuration::from_millis(100));
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        panic!("local canardstack subprocess did not exit after SIGTERM");
+    }
+}
+
+impl Drop for LocalServerChild {
+    fn drop(&mut self) {
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
+#[test]
+fn serve_local_catalog_allows_live_quack_attach_and_cleans_up() {
+    let dir = tempdir().unwrap();
+    let app_listen = reserve_loopback_addr();
+    let catalog_listen = reserve_loopback_addr();
+    let mut child = LocalServerChild::spawn(
+        dir.path(),
+        &app_listen,
+        &catalog_listen,
+        "test-local-catalog-token",
+    );
+
+    wait_for_http_ok(&app_listen, "/healthz");
+
+    let conn = duckdb::Connection::open_in_memory().unwrap();
+    conn.execute_batch("INSTALL ducklake; LOAD ducklake; INSTALL quack; LOAD quack;")
+        .unwrap();
+    conn.execute_batch(&format!(
+        "CREATE OR REPLACE SECRET canardstack_ducklake_quack \
+         (TYPE quack, SCOPE 'quack:{}', TOKEN 'test-local-catalog-token'); \
+         ATTACH 'ducklake:quack:{}' AS canardlake (DATA_PATH '{}'); USE canardlake;",
+        catalog_listen,
+        catalog_listen,
+        sql_string(&dir.path().join("storage").to_string_lossy()),
+    ))
+    .unwrap();
+    let row_count: i64 = conn
+        .query_row("SELECT count(*) FROM logs", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(row_count, 0);
+
+    child.terminate();
+    assert_port_closed(&app_listen);
+    assert_port_closed(&catalog_listen);
+}
+
+#[test]
+fn serve_local_catalog_ignores_catalog_tls_env() {
+    let dir = tempdir().unwrap();
+    let app_listen = reserve_loopback_addr();
+    let catalog_listen = reserve_loopback_addr();
+    let mut child = LocalServerChild::spawn_with_env(
+        dir.path(),
+        &app_listen,
+        &catalog_listen,
+        "test-local-catalog-token",
+        &[("CANARDSTACK_CATALOG_TLS_ENABLED", "true")],
+    );
+
+    wait_for_http_ok(&app_listen, "/healthz");
+
+    let conn = duckdb::Connection::open_in_memory().unwrap();
+    conn.execute_batch("INSTALL ducklake; LOAD ducklake; INSTALL quack; LOAD quack;")
+        .unwrap();
+    conn.execute_batch(&format!(
+        "CREATE OR REPLACE SECRET canardstack_ducklake_quack \
+         (TYPE quack, SCOPE 'quack:{}', TOKEN 'test-local-catalog-token'); \
+         ATTACH 'ducklake:quack:{}' AS canardlake (DATA_PATH '{}'); USE canardlake;",
+        catalog_listen,
+        catalog_listen,
+        sql_string(&dir.path().join("storage").to_string_lossy()),
+    ))
+    .unwrap();
+    let row_count: i64 = conn
+        .query_row("SELECT count(*) FROM logs", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(row_count, 0);
+
+    child.terminate();
+    assert_port_closed(&app_listen);
+    assert_port_closed(&catalog_listen);
+}
+
+fn reserve_loopback_addr() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.local_addr().unwrap().to_string()
+}
+
+fn wait_for_http_ok(addr: &str, path: &str) {
+    let deadline = Instant::now() + StdDuration::from_secs(30);
+    let mut last = String::new();
+    while Instant::now() < deadline {
+        match http_get(addr, path) {
+            Ok(response) if response.starts_with("HTTP/1.1 200") => return,
+            Ok(response) => last = response.lines().next().unwrap_or("").to_string(),
+            Err(err) => last = err.to_string(),
+        }
+        thread::sleep(StdDuration::from_millis(100));
+    }
+    panic!("timed out waiting for http://{addr}{path}: {last}");
+}
+
+fn assert_port_closed(addr: &str) {
+    let deadline = Instant::now() + StdDuration::from_secs(5);
+    while Instant::now() < deadline {
+        if TcpStream::connect(addr).is_err() {
+            return;
+        }
+        thread::sleep(StdDuration::from_millis(100));
+    }
+    panic!("{addr} was still accepting connections after shutdown");
+}
+
+fn http_get(addr: &str, path: &str) -> std::io::Result<String> {
+    let mut stream = TcpStream::connect(addr)?;
+    stream.set_read_timeout(Some(StdDuration::from_secs(2)))?;
+    stream.set_write_timeout(Some(StdDuration::from_secs(2)))?;
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nhost: {addr}\r\nconnection: close\r\n\r\n"
+    )?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response)?;
+    Ok(response)
+}
+
+fn sql_string(value: &str) -> String {
+    value.replace('\'', "''")
+}
+
+#[cfg(unix)]
+fn request_child_shutdown(child: &mut Child) {
+    unsafe extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+    const SIGTERM: i32 = 15;
+    unsafe {
+        let _ = kill(child.id() as i32, SIGTERM);
+    }
+}
+
+#[cfg(not(unix))]
+fn request_child_shutdown(child: &mut Child) {
+    let _ = child.kill();
 }
 
 fn headers(state: &AppState) -> HashMap<String, String> {
@@ -3827,6 +4028,80 @@ fn checkpoint_dry_run_reports_checkpoint_skipped() {
         json!(false)
     );
     assert!(response.json_body().get("retention").is_none());
+}
+
+/// Proof that a CHECKPOINT issued on the app's writer succeeds when the app
+/// attaches DuckLake via an in-process loopback Quack catalog endpoint, rather
+/// than opening the catalog file directly. This is the one-process variant of
+/// the production `serve-catalog` topology: same Quack-over-loopback path, same
+/// catalog-side `read_blob` for file deletion, just no subprocess between the
+/// two halves. If this passes, `serve --local-catalog` does not need to spawn a
+/// child `serve-catalog` to get CHECKPOINT working.
+#[test]
+fn checkpoint_succeeds_via_loopback_quack_catalog() {
+    let dir = tempdir().unwrap();
+    let token = "test-loopback-catalog-token";
+    let catalog_listen = {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().to_string()
+    };
+
+    // Build a config whose catalog file lives under the tempdir, then start
+    // the in-process Quack endpoint that owns that file. The app config below
+    // points at the loopback Quack URI so the writer never opens the file.
+    let mut endpoint_config = Config::test(dir.path().join("canardstack.duckdb"));
+    endpoint_config.operator.local_storage_dir = dir.path().join("storage");
+    endpoint_config.operator.ducklake_quack_token = Some(token.to_string());
+    let endpoint = canardstack::cli::serve_catalog::start_local_catalog_endpoint(
+        &endpoint_config,
+        &catalog_listen,
+    )
+    .expect("start in-process Quack catalog endpoint");
+
+    // App attaches DuckLake via Quack loopback. DATA_PATH is the same local
+    // storage dir the endpoint config used, so segments and catalog metadata
+    // refer to the same on-disk files.
+    let mut app_config = Config::test(dir.path().join("canardstack.duckdb"));
+    app_config.operator.local_storage_dir = dir.path().join("storage");
+    app_config.operator.ducklake_attach_uri = Some(format!("ducklake:quack:{}", endpoint.listen()));
+    app_config.operator.ducklake_quack_token = Some(token.to_string());
+    app_config.operator.ducklake_data_path =
+        Some(dir.path().join("storage").to_string_lossy().into_owned());
+    app_config.operator.ducklake_catalog_path = None;
+    let state = AppState::new(app_config).expect("AppState attaches via loopback Quack URI");
+
+    // Ingest one row, flush+seal so a parquet segment is registered, then run
+    // CHECKPOINT. The interesting assertion is `status == "ok"`: CHECKPOINT
+    // fans catalog-side SQL through the loopback Quack connection, and that
+    // connection has to stay alive across the call.
+    let now_ms = Utc::now().timestamp_millis();
+    append_log_rows(
+        &state,
+        &[(now_ms, "loopback checkpoint log", "legacy")],
+        "otlp_json",
+    );
+    seal_all(&state);
+
+    let response = http::route(
+        "POST",
+        "/api/admin/maintenance/checkpoint/run",
+        &HashMap::new(),
+        &admin_headers(&state),
+        &[],
+        &state,
+    );
+    assert_eq!(response.status(), 200, "{}", response.json_body());
+    assert_eq!(
+        response.json_body()["ducklake_checkpoint"]["status"],
+        json!("ok"),
+        "CHECKPOINT over loopback Quack must report ok; got {}",
+        response.json_body()
+    );
+
+    // Drop order matters: the app's writer holds a Quack client connection to
+    // the endpoint; tear the app down first so the endpoint stop is clean.
+    drop(state);
+    drop(endpoint);
 }
 
 #[test]

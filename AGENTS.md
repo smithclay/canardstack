@@ -6,7 +6,7 @@ This file is durable guidance for coding agents working in this repository. Keep
 
 canardstack is a single-binary, experimental observability backend written in Rust. It accepts OpenTelemetry logs, traces, gauge metrics, and sum metrics over OTLP/HTTP, normalizes them through `otlp2records` into Arrow `RecordBatch`es, stores them in DuckLake-managed DuckDB tables, and exposes bounded Prometheus/Loki/Tempo compatibility APIs for Grafana-style clients.
 
-There is exactly one binary (`canardstack`), one synchronous std-library HTTP server, and one DuckDB process per role. There is no async runtime, no OTLP/gRPC endpoint, no Kafka, and no separate hot store. The same binary also has a `serve-catalog` role (`src/cli/serve_catalog.rs`) that runs plain DuckDB + the Quack extension to serve a DuckLake catalog DuckDB file over the network; the cloud deploy examples use it so the app and the remote catalog share one image. It runs no ingest/query pipeline. The optional `tls` cargo feature (deps `rustls` + `rcgen`, off by default, enabled in the Docker image) adds a synchronous in-binary TLS terminator in front of Quack for platforms without managed TLS (e.g. ECS behind Cloud Map); clients reach it over HTTPS and skip self-signed cert verification via `CANARDSTACK_DUCKLAKE_QUACK_INSECURE_TLS` (a scoped `TYPE HTTP, VERIFY_SSL 0` secret — DuckLake/Quack reject `DISABLE_SSL`). On managed-TLS platforms (Cloud Run) the catalog stays plaintext and the platform provides the real cert. Because DuckLake CHECKPOINT over a Quack catalog runs its file-deletion scan as catalog-side SQL (`read_blob` over the data path), `serve-catalog` also configures object-store credentials from `CANARDSTACK_DUCKLAKE_DATA_PATH`, so the catalog node needs object-store IAM, not just the app.
+There is exactly one binary (`canardstack`), one synchronous std-library HTTP server, and one DuckDB process per role. There is no async runtime, no OTLP/gRPC endpoint, no Kafka, and no separate hot store. The same binary also has a `serve-catalog` role (`src/cli/serve_catalog.rs`) that runs plain DuckDB + the Quack extension to serve a DuckLake catalog DuckDB file over the network; the cloud deploy examples use it so the app and the remote catalog share one image. It runs no ingest/query pipeline. The optional `tls` cargo feature (deps `rustls` + `rcgen`, off by default, enabled in the Docker image) adds a synchronous in-binary TLS terminator in front of Quack for platforms without managed TLS (e.g. ECS behind Cloud Map) when `CANARDSTACK_CATALOG_TLS_ENABLED=true`; clients reach it over HTTPS and skip self-signed cert verification via `CANARDSTACK_DUCKLAKE_QUACK_INSECURE_TLS` (a scoped `TYPE HTTP, VERIFY_SSL 0` secret — DuckLake/Quack reject `DISABLE_SSL`). On managed-TLS platforms (Cloud Run) the catalog stays plaintext and the platform provides the real cert. Because DuckLake CHECKPOINT over a Quack catalog runs its file-deletion scan as catalog-side SQL (`read_blob` over the data path), `serve-catalog` also configures object-store credentials from `CANARDSTACK_DUCKLAKE_DATA_PATH`, so the catalog node needs object-store IAM, not just the app.
 
 ## Commands
 
@@ -33,12 +33,14 @@ prek run --all-files
 # Local server workflow
 cp config/example.env .env && set -a && . ./.env && set +a
 cargo run -- serve              # serves on CANARDSTACK_BIND, default 127.0.0.1:4318
+cargo run -- serve --listen 127.0.0.1:4320
 cargo run -- serve --role ingest # ingest routes plus operator endpoints; no query routes
 cargo run -- serve --role query  # query routes plus operator endpoints; no ingest routes
+cargo run -- serve --local-catalog --catalog-listen 127.0.0.1:9494  # live local DuckLake inspection over Quack
 cargo run -- serve-catalog      # catalog role: serve the DuckLake catalog DuckDB file over Quack (no pipeline)
 cargo run -- smoke              # in-process smoke: starts app, ingests fixtures, queries, prints health
-cargo run -- smoke-http <url>   # smoke against an already-running server
-cargo run -- healthcheck <url>  # used as the Docker healthcheck
+cargo run -- smoke-http --endpoint <url>   # smoke against an already-running server
+cargo run -- healthcheck --endpoint <url>  # used as the Docker healthcheck
 
 # Docker quickstart
 docker compose up --build

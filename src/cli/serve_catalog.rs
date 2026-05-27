@@ -22,27 +22,10 @@ const DEFAULT_HEALTH_BIND: &str = "0.0.0.0:8080";
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const HEALTH_SOCKET_TIMEOUT: Duration = Duration::from_secs(2);
 
-pub fn run(mut args: impl Iterator<Item = String>, shutdown: &'static AtomicBool) -> Result<()> {
-    if let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--help" | "-h" => {
-                println!("usage: canardstack serve-catalog");
-                println!(
-                    "serve the local DuckLake catalog DuckDB file over the Quack protocol.\n\
-                     env: CANARDSTACK_DUCKLAKE_QUACK_TOKEN (required), CANARDSTACK_DUCKLAKE_CATALOG_PATH,\n\
-                     CANARDSTACK_CATALOG_LISTEN (default {DEFAULT_LISTEN}), CANARDSTACK_CATALOG_HEALTH_BIND (default {DEFAULT_HEALTH_BIND}).\n\
-                     TLS (requires --features tls): CANARDSTACK_CATALOG_TLS=true terminates TLS on\n\
-                     CANARDSTACK_CATALOG_LISTEN and forwards to CANARDSTACK_CATALOG_QUACK_BACKEND (default {DEFAULT_QUACK_BACKEND});\n\
-                     set CANARDSTACK_CATALOG_TLS_MODE=file with CANARDSTACK_CATALOG_TLS_CERT_FILE and\n\
-                     CANARDSTACK_CATALOG_TLS_KEY_FILE to use a persistent certificate"
-                );
-                return Ok(());
-            }
-            other => anyhow::bail!(
-                "unknown serve-catalog option {other}; usage: canardstack serve-catalog"
-            ),
-        }
-    }
+pub fn run(args: impl Iterator<Item = String>, shutdown: &'static AtomicBool) -> Result<()> {
+    let Some(options) = parse_options(args)? else {
+        return Ok(());
+    };
 
     let config = Config::from_env()?;
     let catalog_path = catalog_db_path(&config);
@@ -58,8 +41,12 @@ pub fn run(mut args: impl Iterator<Item = String>, shutdown: &'static AtomicBool
             )
         })?
         .to_string();
-    let public_listen = env_or("CANARDSTACK_CATALOG_LISTEN", DEFAULT_LISTEN);
-    let health_bind = env_or("CANARDSTACK_CATALOG_HEALTH_BIND", DEFAULT_HEALTH_BIND);
+    let public_listen = options
+        .listen
+        .unwrap_or_else(|| env_or("CANARDSTACK_CATALOG_LISTEN", DEFAULT_LISTEN));
+    let health_bind = options
+        .health_listen
+        .unwrap_or_else(|| env_or("CANARDSTACK_CATALOG_HEALTH_BIND", DEFAULT_HEALTH_BIND));
     let tls = CatalogTlsConfig::from_env()?;
 
     // In TLS mode Quack binds a loopback backend and an in-binary TLS terminator
@@ -68,13 +55,42 @@ pub fn run(mut args: impl Iterator<Item = String>, shutdown: &'static AtomicBool
     // address directly and only opts in when that address is non-loopback.
     let (quack_listen, allow_other_hostname) = if tls.enabled {
         (
-            env_or("CANARDSTACK_CATALOG_QUACK_BACKEND", DEFAULT_QUACK_BACKEND),
+            options.backend_listen.unwrap_or_else(|| {
+                env_or("CANARDSTACK_CATALOG_QUACK_BACKEND", DEFAULT_QUACK_BACKEND)
+            }),
             true,
         )
     } else {
         (public_listen.clone(), !listens_on_loopback(&public_listen))
     };
 
+    validate_catalog_listens(&public_listen, &quack_listen, &health_bind, tls.enabled)?;
+
+    run_catalog_server(
+        config,
+        catalog_path,
+        token,
+        public_listen,
+        health_bind,
+        quack_listen,
+        allow_other_hostname,
+        tls,
+        shutdown,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_catalog_server(
+    config: Config,
+    catalog_path: PathBuf,
+    token: String,
+    public_listen: String,
+    health_bind: String,
+    quack_listen: String,
+    allow_other_hostname: bool,
+    tls: CatalogTlsConfig,
+    shutdown: &'static AtomicBool,
+) -> Result<()> {
     let conn = storage::open_quack_catalog_connection(
         &catalog_path,
         config.operator.duckdb_extension_dir.as_deref(),
@@ -116,6 +132,9 @@ pub fn run(mut args: impl Iterator<Item = String>, shutdown: &'static AtomicBool
         "serving the DuckLake catalog over Quack"
     );
 
+    // Silence the public listener when TLS code that uses it is not compiled in.
+    #[cfg(not(feature = "tls"))]
+    let _ = &public_listen;
     if tls.enabled {
         #[cfg(feature = "tls")]
         {
@@ -141,7 +160,9 @@ pub fn run(mut args: impl Iterator<Item = String>, shutdown: &'static AtomicBool
         }
         #[cfg(not(feature = "tls"))]
         {
-            anyhow::bail!("CANARDSTACK_CATALOG_TLS=true requires a build with --features tls");
+            anyhow::bail!(
+                "CANARDSTACK_CATALOG_TLS_ENABLED=true requires a build with --features tls"
+            );
         }
     }
 
@@ -156,6 +177,148 @@ pub fn run(mut args: impl Iterator<Item = String>, shutdown: &'static AtomicBool
     }
     tracing::info!(event = "catalog_shutdown_complete");
     result
+}
+
+/// RAII guard around an in-process Quack catalog endpoint. Dropping it stops
+/// the embedded Quack server and closes the catalog `Connection`, mirroring the
+/// shutdown path that `run_catalog_server` runs at the end of `serve-catalog`.
+pub struct QuackCatalogEndpoint {
+    conn: duckdb::Connection,
+    listen: String,
+}
+
+impl QuackCatalogEndpoint {
+    pub fn listen(&self) -> &str {
+        &self.listen
+    }
+}
+
+impl Drop for QuackCatalogEndpoint {
+    fn drop(&mut self) {
+        if let Err(err) = self.conn.execute_batch(&quack_stop_sql(&self.listen)) {
+            tracing::info!(event = "quack_stop_skipped", error = %err);
+        }
+    }
+}
+
+/// Start a loopback Quack catalog endpoint inside the current process.
+///
+/// The returned guard owns the catalog DuckDB `Connection`; keeping it alive
+/// keeps the Quack server bound to `listen`. The app's writer connection is
+/// expected to `ATTACH 'ducklake:quack:<listen>'` rather than opening the
+/// catalog file directly, so there is exactly one `Database` instance on the
+/// catalog file even though everything runs in one process.
+pub fn start_local_catalog_endpoint(config: &Config, listen: &str) -> Result<QuackCatalogEndpoint> {
+    let catalog_path = catalog_db_path(config);
+    let token = config
+        .operator
+        .ducklake_quack_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "CANARDSTACK_DUCKLAKE_QUACK_TOKEN must be set to serve the local Quack catalog endpoint"
+            )
+        })?;
+    let conn = storage::open_quack_catalog_connection(
+        &catalog_path,
+        config.operator.duckdb_extension_dir.as_deref(),
+    )?;
+    // CHECKPOINT on the app's writer fans out catalog-side `read_blob` calls
+    // through Quack to this connection. When DATA_PATH is in object storage,
+    // those reads need credentials installed on the catalog side too.
+    if let Some(data_path) = config
+        .operator
+        .ducklake_data_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+    {
+        match storage::configure_object_store_for_data_path(&conn, data_path)? {
+            Some(scheme) => tracing::info!(
+                event = "local_catalog_object_store_configured",
+                scheme,
+                "configured object-store credentials for local Quack catalog endpoint"
+            ),
+            None => tracing::debug!(
+                event = "local_catalog_object_store_skipped",
+                "DATA_PATH is local; no object-store credentials needed"
+            ),
+        }
+    }
+    conn.execute_batch(&quack_serve_sql(listen, token, false))
+        .with_context(|| format!("start local Quack catalog endpoint on {listen}"))?;
+    tracing::info!(
+        event = "local_catalog_listening",
+        listen,
+        catalog = %catalog_path.display(),
+        "serving the local DuckLake catalog over Quack"
+    );
+    Ok(QuackCatalogEndpoint {
+        conn,
+        listen: listen.to_string(),
+    })
+}
+
+#[derive(Default)]
+struct CatalogOptions {
+    listen: Option<String>,
+    health_listen: Option<String>,
+    backend_listen: Option<String>,
+}
+
+fn parse_options(mut args: impl Iterator<Item = String>) -> Result<Option<CatalogOptions>> {
+    let mut options = CatalogOptions::default();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--help" | "-h" => {
+                println!("usage: canardstack serve-catalog [--listen addr] [--health-listen addr] [--backend-listen addr]");
+                println!(
+                    "serve the local DuckLake catalog DuckDB file over the Quack protocol.\n\
+                     env: CANARDSTACK_DUCKLAKE_QUACK_TOKEN (required), CANARDSTACK_DUCKLAKE_CATALOG_PATH,\n\
+                     CANARDSTACK_CATALOG_LISTEN (default {DEFAULT_LISTEN}), CANARDSTACK_CATALOG_HEALTH_BIND (default {DEFAULT_HEALTH_BIND}).\n\
+                     TLS (requires --features tls): CANARDSTACK_CATALOG_TLS_ENABLED=true terminates TLS on\n\
+                     CANARDSTACK_CATALOG_LISTEN and forwards to CANARDSTACK_CATALOG_QUACK_BACKEND (default {DEFAULT_QUACK_BACKEND});\n\
+                     set CANARDSTACK_CATALOG_TLS_MODE=file with CANARDSTACK_CATALOG_TLS_CERT_FILE and\n\
+                     CANARDSTACK_CATALOG_TLS_KEY_FILE to use a persistent certificate"
+                );
+                return Ok(None);
+            }
+            "--listen" => {
+                options.listen = Some(
+                    args.next()
+                        .ok_or_else(|| anyhow::anyhow!("--listen requires an address"))?,
+                );
+            }
+            "--health-listen" => {
+                options.health_listen = Some(
+                    args.next()
+                        .ok_or_else(|| anyhow::anyhow!("--health-listen requires an address"))?,
+                );
+            }
+            "--backend-listen" => {
+                options.backend_listen = Some(
+                    args.next()
+                        .ok_or_else(|| anyhow::anyhow!("--backend-listen requires an address"))?,
+                );
+            }
+            other => {
+                if let Some(value) = other.strip_prefix("--listen=") {
+                    options.listen = Some(value.to_string());
+                } else if let Some(value) = other.strip_prefix("--health-listen=") {
+                    options.health_listen = Some(value.to_string());
+                } else if let Some(value) = other.strip_prefix("--backend-listen=") {
+                    options.backend_listen = Some(value.to_string());
+                } else {
+                    anyhow::bail!(
+                        "unknown serve-catalog option {other}; usage: canardstack serve-catalog [--listen addr] [--health-listen addr] [--backend-listen addr]"
+                    );
+                }
+            }
+        }
+    }
+    Ok(Some(options))
 }
 
 fn env_bool(name: &str) -> bool {
@@ -175,8 +338,8 @@ struct CatalogTlsConfig {
 
 impl CatalogTlsConfig {
     fn from_env() -> Result<Self> {
-        let enabled =
-            env_bool("CANARDSTACK_CATALOG_TLS") || env_bool("CANARDSTACK_CATALOG_TLS_ENABLED");
+        // Matches the main app's CANARDSTACK_TLS_ENABLED naming.
+        let enabled = env_bool("CANARDSTACK_CATALOG_TLS_ENABLED");
         let cert_file = env_optional_path("CANARDSTACK_CATALOG_TLS_CERT_FILE");
         let key_file = env_optional_path("CANARDSTACK_CATALOG_TLS_KEY_FILE");
         let mode = env_optional_string("CANARDSTACK_CATALOG_TLS_MODE")
@@ -203,12 +366,12 @@ impl CatalogTlsConfig {
         if self.enabled && self.mode == TlsMode::File {
             if self.cert_file.is_none() {
                 anyhow::bail!(
-                    "CANARDSTACK_CATALOG_TLS_CERT_FILE must be set when CANARDSTACK_CATALOG_TLS_MODE=file"
+                    "CANARDSTACK_CATALOG_TLS_CERT_FILE must be set when CANARDSTACK_CATALOG_TLS_ENABLED=true and CANARDSTACK_CATALOG_TLS_MODE=file"
                 );
             }
             if self.key_file.is_none() {
                 anyhow::bail!(
-                    "CANARDSTACK_CATALOG_TLS_KEY_FILE must be set when CANARDSTACK_CATALOG_TLS_MODE=file"
+                    "CANARDSTACK_CATALOG_TLS_KEY_FILE must be set when CANARDSTACK_CATALOG_TLS_ENABLED=true and CANARDSTACK_CATALOG_TLS_MODE=file"
                 );
             }
         }
@@ -248,7 +411,7 @@ fn env_optional_path(name: &str) -> Option<PathBuf> {
 
 /// The catalog DuckDB file to serve: the explicit catalog path when set,
 /// otherwise the same default location the local DuckLake catalog uses.
-fn catalog_db_path(config: &Config) -> PathBuf {
+pub fn catalog_db_path(config: &Config) -> PathBuf {
     config
         .operator
         .ducklake_catalog_path
@@ -297,6 +460,34 @@ fn listens_on_loopback(listen: &str) -> bool {
     let host = listen.rsplit_once(':').map_or(listen, |(host, _)| host);
     let host = host.trim_start_matches('[').trim_end_matches(']');
     matches!(host, "127.0.0.1" | "localhost" | "::1")
+}
+
+/// Refuse to start when two catalog listeners would collide at bind time.
+/// In TLS mode the public listener fronts a loopback Quack backend, so the
+/// three addresses must be distinct; in plaintext mode `public` and `quack`
+/// are the same socket by design, so only the health bind has to differ.
+fn validate_catalog_listens(
+    public: &str,
+    quack: &str,
+    health: &str,
+    tls_enabled: bool,
+) -> Result<()> {
+    if tls_enabled && public == quack {
+        anyhow::bail!(
+            "CANARDSTACK_CATALOG_QUACK_BACKEND must differ from CANARDSTACK_CATALOG_LISTEN when CANARDSTACK_CATALOG_TLS_ENABLED=true (the TLS terminator cannot forward to itself)"
+        );
+    }
+    if public == health {
+        anyhow::bail!(
+            "CANARDSTACK_CATALOG_HEALTH_BIND must differ from CANARDSTACK_CATALOG_LISTEN"
+        );
+    }
+    if tls_enabled && quack == health {
+        anyhow::bail!(
+            "CANARDSTACK_CATALOG_HEALTH_BIND must differ from CANARDSTACK_CATALOG_QUACK_BACKEND when CANARDSTACK_CATALOG_TLS_ENABLED=true"
+        );
+    }
+    Ok(())
 }
 
 /// Minimal single-threaded health endpoint: replies `{"status":"ok"}` to any
@@ -372,12 +563,83 @@ mod tests {
     }
 
     #[test]
+    fn validate_listens_catches_tls_terminator_loop() {
+        let err = validate_catalog_listens("0.0.0.0:9494", "0.0.0.0:9494", "0.0.0.0:8080", true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("CANARDSTACK_CATALOG_QUACK_BACKEND must differ"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn validate_listens_catches_public_health_collision() {
+        let err = validate_catalog_listens("0.0.0.0:8080", "0.0.0.0:8080", "0.0.0.0:8080", false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(
+                "CANARDSTACK_CATALOG_HEALTH_BIND must differ from CANARDSTACK_CATALOG_LISTEN"
+            ),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn validate_listens_catches_backend_health_collision() {
+        let err =
+            validate_catalog_listens("0.0.0.0:9494", "127.0.0.1:8080", "127.0.0.1:8080", true)
+                .unwrap_err()
+                .to_string();
+        assert!(
+            err.contains("CANARDSTACK_CATALOG_HEALTH_BIND must differ from CANARDSTACK_CATALOG_QUACK_BACKEND"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn validate_listens_accepts_distinct_addresses() {
+        // TLS mode: three distinct sockets.
+        assert!(
+            validate_catalog_listens("0.0.0.0:9494", "127.0.0.1:9495", "0.0.0.0:8080", true)
+                .is_ok()
+        );
+        // Plaintext mode: public and quack are the same socket by design, only
+        // health has to differ.
+        assert!(
+            validate_catalog_listens("0.0.0.0:9494", "0.0.0.0:9494", "0.0.0.0:8080", false).is_ok()
+        );
+    }
+
+    #[test]
     fn loopback_detection_covers_common_forms() {
         assert!(listens_on_loopback("127.0.0.1:9494"));
         assert!(listens_on_loopback("localhost:8080"));
         assert!(listens_on_loopback("[::1]:9494"));
         assert!(!listens_on_loopback("0.0.0.0:9494"));
         assert!(!listens_on_loopback("10.0.0.5:9494"));
+    }
+
+    #[test]
+    fn parse_options_accepts_listen_flags() {
+        let options = parse_options(
+            [
+                "--listen",
+                "0.0.0.0:9494",
+                "--health-listen=127.0.0.1:8080",
+                "--backend-listen",
+                "127.0.0.1:9495",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(options.listen.as_deref(), Some("0.0.0.0:9494"));
+        assert_eq!(options.health_listen.as_deref(), Some("127.0.0.1:8080"));
+        assert_eq!(options.backend_listen.as_deref(), Some("127.0.0.1:9495"));
     }
 
     #[test]

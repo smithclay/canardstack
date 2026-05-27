@@ -124,7 +124,7 @@ to switch.
 ## Catalog TLS
 
 The catalog container runs `canardstack serve-catalog` with
-`CANARDSTACK_CATALOG_TLS=true`. It opens the DuckLake catalog DuckDB file on the
+`CANARDSTACK_CATALOG_TLS_ENABLED=true`. It opens the DuckLake catalog DuckDB file on the
 EBS mount, serves it over Quack, and terminates TLS in-binary with a self-signed
 certificate on `CatalogPort`, default `9494`. `/healthz` listens on container
 port `8080` for the ECS health check.

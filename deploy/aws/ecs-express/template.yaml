@@ -678,8 +678,8 @@ Resources:
               - CMD-SHELL
               - !If
                 - WithAlb
-                - canardstack healthcheck http://127.0.0.1:4318/healthz
-                - canardstack healthcheck http://127.0.0.1:4319/healthz
+                - canardstack healthcheck --endpoint http://127.0.0.1:4318/healthz
+                - canardstack healthcheck --endpoint http://127.0.0.1:4319/healthz
             Interval: 10
             Timeout: 5
             Retries: 6
@@ -729,7 +729,7 @@ Resources:
               Value: /usr/local/lib/duckdb/extensions
             # Terminate TLS in-binary (ECS has no managed TLS for Cloud Map names):
             # serve TLS on CatalogPort and forward to a loopback plaintext Quack.
-            - Name: CANARDSTACK_CATALOG_TLS
+            - Name: CANARDSTACK_CATALOG_TLS_ENABLED
               Value: "true"
             - Name: CANARDSTACK_CATALOG_LISTEN
               Value: !Sub 0.0.0.0:${CatalogPort}
@@ -749,7 +749,7 @@ Resources:
           HealthCheck:
             Command:
               - CMD-SHELL
-              - canardstack healthcheck http://127.0.0.1:8080/healthz
+              - canardstack healthcheck --endpoint http://127.0.0.1:8080/healthz
             Interval: 10
             Timeout: 5
             Retries: 6

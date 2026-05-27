@@ -276,10 +276,15 @@ pub(super) fn build_ducklake_attach_plan(
                 "CANARDSTACK_DUCKLAKE_DATA_PATH cannot be set with a MotherDuck md: attach URI"
             );
         }
-        let attach_options = data_path
-            .as_ref()
-            .map(|path| format!(" (DATA_PATH '{}')", sql_string(path)))
-            .unwrap_or_default();
+        let mut attach_options = Vec::new();
+        if let Some(path) = data_path.as_ref() {
+            attach_options.push(format!("DATA_PATH '{}'", sql_string(path)));
+        }
+        let attach_options = if attach_options.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", attach_options.join(", "))
+        };
         return Ok(DuckLakeAttachPlan {
             sql: format!(
                 "{quack_secret_sql}ATTACH '{}' AS {DUCKLAKE_CATALOG_NAME}{attach_options}; USE {DUCKLAKE_CATALOG_NAME};",

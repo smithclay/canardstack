@@ -79,6 +79,6 @@ USER 10001:10001
 EXPOSE 4318
 
 HEALTHCHECK --interval=5s --timeout=5s --start-period=20s --retries=12 \
-    CMD ["canardstack", "healthcheck", "http://127.0.0.1:4318/healthz"]
+    CMD ["canardstack", "healthcheck", "--endpoint", "http://127.0.0.1:4318/healthz"]
 
 CMD ["canardstack", "serve"]

@@ -20,12 +20,12 @@ compose run --rm smoke
 
 echo "==> Restarting service and verifying named-volume persistence"
 compose restart canardstack
-compose run --rm smoke canardstack smoke-http http://canardstack:4318 --verify-only
+compose run --rm smoke canardstack smoke-http --endpoint http://canardstack:4318 --verify-only
 
 echo "==> Removing named volume and verifying fixture data disappears"
 compose down -v
 compose up -d canardstack
-compose run --rm smoke canardstack smoke-http http://canardstack:4318 --expect-empty
+compose run --rm smoke canardstack smoke-http --endpoint http://canardstack:4318 --expect-empty
 
 echo "==> Stopping clean empty stack"
 compose down -v

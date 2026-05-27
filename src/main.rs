@@ -20,7 +20,7 @@ fn main() -> anyhow::Result<()> {
         }
         Some("smoke") => smoke::run(),
         Some("smoke-http") => smoke_http::run(args),
-        Some("healthcheck") => healthcheck::run(args.next()),
+        Some("healthcheck") => healthcheck::run(args),
         Some("install-ducklake-extension") => {
             let config = Config::from_env()?;
             storage::install_ducklake_extension(config.operator.duckdb_extension_dir.as_deref())
@@ -31,10 +31,25 @@ fn main() -> anyhow::Result<()> {
         }
         Some("serve") | None => {
             install_shutdown_signal_handlers();
-            let role = parse_serve_role(args)?;
+            let Some(serve_options) = parse_serve_options(args)? else {
+                return Ok(());
+            };
             let mut config = Config::from_env()?;
-            config.operator.serve_role = role;
+            config.operator.serve_role = serve_options.role;
+            if serve_options.local_catalog_enabled {
+                config.operator.local_catalog_enabled = true;
+            }
+            if let Some(listen) = serve_options.listen {
+                config.operator.bind = listen;
+            }
+            if let Some(listen) = serve_options.local_catalog_listen {
+                // Supplying the catalog listener is shorthand for enabling the
+                // local catalog mode; otherwise the address would be ignored.
+                config.operator.local_catalog_enabled = true;
+                config.operator.local_catalog_listen = listen;
+            }
             config.validate()?;
+            let _local_catalog = prepare_local_catalog(&mut config)?;
             #[cfg(feature = "tls")]
             let tls_frontend = prepare_serve_tls(&mut config)?;
             #[cfg(not(feature = "tls"))]
@@ -86,8 +101,20 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
-fn parse_serve_role(mut args: impl Iterator<Item = String>) -> anyhow::Result<ServeRole> {
+struct ServeOptions {
+    role: ServeRole,
+    listen: Option<String>,
+    local_catalog_enabled: bool,
+    local_catalog_listen: Option<String>,
+}
+
+fn parse_serve_options(
+    mut args: impl Iterator<Item = String>,
+) -> anyhow::Result<Option<ServeOptions>> {
     let mut role = ServeRole::All;
+    let mut listen = None;
+    let mut local_catalog_enabled = false;
+    let mut local_catalog_listen = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--role" => {
@@ -96,20 +123,90 @@ fn parse_serve_role(mut args: impl Iterator<Item = String>) -> anyhow::Result<Se
                     .ok_or_else(|| anyhow::anyhow!("--role requires all, ingest, or query"))?;
                 role = ServeRole::parse(&value)?;
             }
-            "--role=all" => role = ServeRole::All,
-            "--role=ingest" => role = ServeRole::Ingest,
-            "--role=query" => role = ServeRole::Query,
+            "--listen" => {
+                listen = Some(
+                    args.next()
+                        .ok_or_else(|| anyhow::anyhow!("{arg} requires an address"))?,
+                );
+            }
+            "--local-catalog" => local_catalog_enabled = true,
+            "--catalog-listen" => {
+                let listen = args
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--catalog-listen requires an address"))?;
+                local_catalog_listen = Some(listen);
+            }
             "--help" | "-h" => {
-                anyhow::bail!("usage: canardstack serve [--role all|ingest|query]");
+                println!(
+                    "usage: canardstack serve [--role all|ingest|query] [--listen addr] [--local-catalog] [--catalog-listen addr]"
+                );
+                return Ok(None);
             }
             other => {
+                if let Some(value) = other.strip_prefix("--role=") {
+                    role = ServeRole::parse(value)?;
+                    continue;
+                }
+                if let Some(value) = other.strip_prefix("--listen=") {
+                    listen = Some(value.to_string());
+                    continue;
+                }
+                if let Some(value) = other.strip_prefix("--catalog-listen=") {
+                    local_catalog_listen = Some(value.to_string());
+                    continue;
+                }
                 anyhow::bail!(
-                    "unknown serve option {other}; usage: canardstack serve [--role all|ingest|query]"
+                    "unknown serve option {other}; usage: canardstack serve [--role all|ingest|query] [--listen addr] [--local-catalog] [--catalog-listen addr]"
                 );
             }
         }
     }
-    Ok(role)
+    Ok(Some(ServeOptions {
+        role,
+        listen,
+        local_catalog_enabled,
+        local_catalog_listen,
+    }))
+}
+
+fn prepare_local_catalog(
+    config: &mut Config,
+) -> anyhow::Result<Option<serve_catalog::QuackCatalogEndpoint>> {
+    if !config.operator.local_catalog_enabled {
+        return Ok(None);
+    }
+    let listen = config.operator.local_catalog_listen.clone();
+    let data_path = config
+        .operator
+        .ducklake_data_path
+        .clone()
+        .unwrap_or_else(|| {
+            config
+                .operator
+                .local_storage_dir
+                .to_string_lossy()
+                .into_owned()
+        });
+    // Start the loopback Quack catalog endpoint in this process; it owns the
+    // sole `Database` handle on the catalog file. Redirect the app's DuckLake
+    // ATTACH at that loopback URI so the writer talks Quack to it instead of
+    // opening the catalog file directly -- this is the same trick the
+    // production `serve-catalog` topology uses, just without a process boundary.
+    let endpoint = serve_catalog::start_local_catalog_endpoint(config, &listen)?;
+    config.operator.ducklake_attach_uri = Some(format!("ducklake:quack:{}", endpoint.listen()));
+    config.operator.ducklake_data_path = Some(data_path.clone());
+    config.operator.ducklake_catalog_path = None;
+    // Loopback never leaves the process, so the insecure-TLS escape hatch is
+    // irrelevant here; reset it so a stale env value can't enable verification
+    // bypass on the now-unused TLS path.
+    config.operator.ducklake_quack_insecure_tls = false;
+    tracing::info!(
+        event = "local_catalog_ready",
+        attach_uri = %config.operator.ducklake_attach_uri.as_deref().unwrap_or(""),
+        data_path = %data_path,
+        "local DuckLake catalog is available over Quack for DuckDB clients"
+    );
+    Ok(Some(endpoint))
 }
 
 #[cfg(feature = "tls")]
@@ -169,3 +266,66 @@ fn install_shutdown_signal_handlers() {
 
 #[cfg(not(unix))]
 fn install_shutdown_signal_handlers() {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_serve_options_enables_local_catalog_enabled_with_listen() {
+        let options = parse_serve_options(
+            [
+                "--role=query",
+                "--local-catalog",
+                "--catalog-listen=127.0.0.1:9495",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(options.role, ServeRole::Query);
+        assert!(options.listen.is_none());
+        assert!(options.local_catalog_enabled);
+        assert_eq!(
+            options.local_catalog_listen.as_deref(),
+            Some("127.0.0.1:9495")
+        );
+    }
+
+    #[test]
+    fn parse_serve_options_accepts_listen() {
+        let options = parse_serve_options(
+            ["--listen", "127.0.0.1:4320"]
+                .into_iter()
+                .map(str::to_string),
+        )
+        .unwrap();
+        let options = options.unwrap();
+        assert_eq!(options.listen.as_deref(), Some("127.0.0.1:4320"));
+
+        let options =
+            parse_serve_options(["--listen=127.0.0.1:4321"].into_iter().map(str::to_string))
+                .unwrap()
+                .unwrap();
+        assert_eq!(options.listen.as_deref(), Some("127.0.0.1:4321"));
+    }
+
+    #[test]
+    fn parse_serve_options_accepts_role_equals() {
+        let options = parse_serve_options(["--role=query"].into_iter().map(str::to_string))
+            .unwrap()
+            .unwrap();
+        assert_eq!(options.role, ServeRole::Query);
+    }
+
+    #[test]
+    fn parse_serve_options_help_is_ok_none() {
+        assert!(
+            parse_serve_options(["--help"].into_iter().map(str::to_string))
+                .unwrap()
+                .is_none()
+        );
+    }
+}

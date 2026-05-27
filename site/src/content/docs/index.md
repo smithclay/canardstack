@@ -22,59 +22,86 @@ It accepts OTLP/HTTP, normalizes telemetry into Arrow batches, stores immutable
 Parquet-backed DuckLake segments, and exposes bounded Prometheus, Loki, and
 Tempo compatibility APIs for Grafana-style clients.
 
-## What This Is
+## Why canardstack?
 
-- A single Rust process with synchronous std-library HTTP serving.
-- Local DuckLake storage by default, with remote DuckLake attach support.
-- A focused compatibility surface for inspecting telemetry through existing
-  Prometheus, Loki, Tempo, and DuckDB-compatible tools.
+canardstack is for exploring observability data as lakehouse data: OTLP in,
+DuckLake tables out, with the same files queryable through Grafana-compatible
+APIs and direct DuckDB SQL. The small single-binary shape keeps local
+experiments understandable, while the storage format stays open enough to
+inspect outside the service.
 
-## What This Is Not
+The project is intentionally narrow. It is useful when you want direct SQL
+access to telemetry, cheap object-storage-backed retention, or a compact place
+to test DuckDB and DuckLake observability ideas. It is not trying to replace a
+production multi-tenant observability platform today.
 
-- A full observability suite.
-- A multi-tenant production service.
-- A full Prometheus, Loki, Tempo, PromQL, LogQL, or TraceQL implementation.
+## Comparison with other backends
+
+tl;dr - canardstack aspires to be a good fit if you know you want to put ~terabyes of data in an data lake with low operational overhead and decent query performance. Architectually, queries will never be as fast as ClickStack or a large APM vendor.
+
+| | canardstack | [OTel Parquet in object storage](https://github.com/smithclay/otlp2parquet) | OTel protobuf in object storage | ClickStack | Iceberg |
+| --- | --- | --- | --- | --- | --- |
+| Cost | low | low | low | medium-low | low |
+| Operational complexity | low | medium | medium | medium | medium |
+| Storage efficiency | good | ok | not great | good | good |
+| Query speed | ok | slow | very slow | fast | ok |
+
+The table is intentionally coarse. canardstack sits between raw archive
+patterns and a full observability stack: it adds schema-managed DuckLake tables,
+local durable spooling, a seal scheduler, and bounded Grafana-facing query APIs
+without taking on the full ClickStack product surface.
 
 ## Start Locally
 
-Install and start canardstack. With no options, it uses local DuckLake storage
-under `.canardstack` and listens on `127.0.0.1:4318`.
+Install and start canardstack with its local DuckLake catalog exposed over
+Quack. The app listens on `127.0.0.1:4318`, and DuckDB clients can attach to
+the live local catalog on `127.0.0.1:9494` without stopping canardstack.
 
 ```bash
 cargo install --locked canardstack
-canardstack
+CANARDSTACK_DUCKLAKE_QUACK_TOKEN=dev-quack-token canardstack serve --local-catalog
 ```
 
 In another terminal, send one OTLP/HTTP JSON log:
 
 ```bash
+OTLP_TIME_UNIX_NANO="$(date +%s)000000000"
 curl -sS -X POST http://127.0.0.1:4318/v1/logs \
   -H 'Authorization: Bearer dev-canardstack-key' \
   -H 'Content-Type: application/json' \
-  --data '{"resourceLogs":[{"scopeLogs":[{"logRecords":[{"timeUnixNano":"1779667200000000000","body":{"stringValue":"hello world"}}]}]}]}'
+  --data "{\"resourceLogs\":[{\"resource\":{\"attributes\":[{\"key\":\"service.name\",\"value\":{\"stringValue\":\"quickstart\"}}]},\"scopeLogs\":[{\"logRecords\":[{\"timeUnixNano\":\"${OTLP_TIME_UNIX_NANO}\",\"body\":{\"stringValue\":\"hello world\"}}]}]}]}"
 ```
 
-Give the scheduler a moment to seal the row into DuckLake, then query it
-directly from the DuckDB CLI:
+canardstack acknowledges ingest after the raw request is fsynced locally. By
+default, the scheduler seals buffered rows within about 10 seconds; wait a
+moment, then attach to the live DuckLake catalog from DuckDB 1.5.3 or newer:
 
 ```bash
-sleep 2
 duckdb
 ```
 
 ```sql
 INSTALL ducklake;
 LOAD ducklake;
-ATTACH 'ducklake:.canardstack/canardstack.ducklake' AS canardlake
-  (DATA_PATH '.canardstack/storage');
+INSTALL quack;
+LOAD quack;
+
+CREATE OR REPLACE SECRET canardstack_ducklake_quack
+  (TYPE quack, SCOPE 'quack:127.0.0.1:9494', TOKEN 'dev-quack-token');
+
+ATTACH 'ducklake:quack:127.0.0.1:9494' AS canardlake;
 USE canardlake;
 
-SELECT timestamp, body
+SELECT timestamp, service_name, body
 FROM logs
 WHERE body = 'hello world'
 ORDER BY ingested_at DESC
 LIMIT 1;
 ```
+
+The catalog endpoint is for local, single-process development. Cloud
+deployments still recommend the separate `serve-catalog` role so the catalog
+can be isolated and scaled independently.
 
 ## Schema
 
@@ -95,45 +122,6 @@ changes before canardstack is ready for stable production use. Medium-term
 schema work is expected to align more closely with the OpenTelemetry Arrow
 [`data_model.md`](https://github.com/open-telemetry/otel-arrow/blob/main/docs/data_model.md).
 :::
-
-## Demo
-
-For the full OpenTelemetry demo workflow, use the [Demo guide](/demo/).
-
-### Start The Stack
-
-Start canardstack and Grafana with local DuckLake storage:
-
-```bash
-docker compose up --build
-```
-
-The default local stack exposes:
-
-- canardstack: `http://localhost:4318`
-- Grafana: `http://localhost:3000`
-
-### Send Sample Telemetry
-
-In another terminal, run the smoke client:
-
-```bash
-docker compose run --rm smoke
-```
-
-The smoke workload sends logs, a multi-span trace, gauge samples, and
-cumulative sum samples through OTLP/HTTP. It also checks storage health and the
-Prometheus, Loki, and Tempo-compatible query paths.
-
-### Open Grafana
-
-Open the provisioned dashboard:
-
-```text
-http://localhost:3000/d/canardstack-overview/canardstack-overview
-```
-
-Use `admin/admin` if Grafana asks for credentials.
 
 ## Deploy
 
