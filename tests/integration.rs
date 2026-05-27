@@ -150,7 +150,7 @@ fn serve_local_catalog_can_opt_into_tls() {
         &app_listen,
         &catalog_listen,
         "test-local-catalog-token",
-        &[("CANARDSTACK_CATALOG_TLS", "true")],
+        &[("CANARDSTACK_CATALOG_TLS_ENABLED", "true")],
     );
 
     wait_for_http_ok(&app_listen, "/healthz");

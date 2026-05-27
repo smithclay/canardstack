@@ -19,6 +19,7 @@ socket_write_timeout_secs = 30
 #
 # Explicit single-binary dev/service-to-service mode. This encrypts traffic but
 # clients must trust the generated cert or skip verification.
+# enabled = true
 # mode = "ephemeral_self_signed"
 
 [auth]
@@ -47,10 +48,15 @@ memory_limit = "1GiB"
 # loopback Quack catalog endpoint and makes canardstack attach through it via
 # ducklake:quack:<listen>, so DuckDB clients can inspect the local DuckLake
 # while canardstack keeps running. The endpoint is loopback-only and always
-# plaintext; CANARDSTACK_CATALOG_TLS* applies only to the separate
-# serve-catalog role and has no effect here.
+# plaintext; CANARDSTACK_CATALOG_TLS_* env vars apply only to the separate
+# serve-catalog role and have no effect here.
 # local_catalog_enabled = true
 # local_catalog_listen = "127.0.0.1:9494"
+#
+# TLS for the separate `serve-catalog` role is environment-only (no TOML
+# binding), since it is set on the catalog container/process, not on the
+# app config. Use CANARDSTACK_CATALOG_TLS_ENABLED / _MODE / _CERT_FILE /
+# _KEY_FILE on the serve-catalog process; see config/example.env.
 # canardstack-owned DuckLake maintenance runs CHECKPOINT after logical retention
 # and can be triggered directly via /api/admin/maintenance/checkpoint/run.
 maintenance_enabled = true

@@ -65,7 +65,7 @@ impl TlsMode {
     pub fn parse(value: &str) -> Result<Self> {
         match value.trim() {
             "file" => Ok(Self::File),
-            "ephemeral_self_signed" | "self_signed" => Ok(Self::EphemeralSelfSigned),
+            "ephemeral_self_signed" => Ok(Self::EphemeralSelfSigned),
             _ => anyhow::bail!("TLS mode must be file or ephemeral_self_signed"),
         }
     }
@@ -92,7 +92,6 @@ pub struct GrpcConfig {
     pub enabled: bool,
     pub bind: String,
     pub max_body_bytes: usize,
-    pub tls_enabled: bool,
 }
 
 /// Process configuration, split by responsibility:
@@ -365,9 +364,6 @@ impl OperatorConfig {
                 max_body_bytes: env_usize("CANARDSTACK_GRPC_MAX_BODY_BYTES")?
                     .or(file.usize(&["grpc", "max_body_bytes"])?)
                     .unwrap_or(max_body_bytes),
-                tls_enabled: env_bool("CANARDSTACK_GRPC_TLS_ENABLED")?
-                    .or(file.bool(&["grpc", "tls_enabled"])?)
-                    .unwrap_or(false),
             },
             api_key: env_string("CANARDSTACK_API_KEY")?
                 .or(file.string(&["auth", "api_key"])?)
@@ -507,7 +503,6 @@ impl OperatorConfig {
                 enabled: false,
                 bind: "127.0.0.1:0".to_string(),
                 max_body_bytes: 8 * 1024 * 1024,
-                tls_enabled: false,
             },
             api_key: "test-key".to_string(),
             admin_api_key: "test-admin-key".to_string(),
@@ -600,11 +595,6 @@ impl OperatorConfig {
                     "CANARDSTACK_GRPC_MAX_BODY_BYTES must be <= CANARDSTACK_MAX_BODY_BYTES because the shared raw spool capacity is derived from CANARDSTACK_MAX_BODY_BYTES"
                 );
             }
-            if self.grpc.tls_enabled {
-                anyhow::bail!(
-                    "CANARDSTACK_GRPC_TLS_ENABLED is reserved for future in-process gRPC TLS support; terminate TLS before canardstack for now"
-                );
-            }
         }
         if self.admin_api_key.trim().is_empty() {
             anyhow::bail!("CANARDSTACK_ADMIN_API_KEY must not be empty");
@@ -635,6 +625,22 @@ impl OperatorConfig {
             anyhow::bail!(
                 "CANARDSTACK_DUCKLAKE_QUACK_TOKEN must be set when CANARDSTACK_DUCKLAKE_ATTACH_URI uses ducklake:quack:"
             );
+        }
+        // CANARDSTACK_DUCKLAKE_QUACK_INSECURE_TLS only makes sense for an attach
+        // URI that actually speaks Quack over TLS. Catch the set-but-unused
+        // shapes (no URI, md:, postgres, ...) at boot rather than silently
+        // ignoring the operator's intent. local_catalog_enabled mode resets
+        // this flag after validate() runs, so skip the check there.
+        if self.ducklake_quack_insecure_tls && !self.local_catalog_enabled {
+            let uri_uses_quack = self
+                .ducklake_attach_uri
+                .as_deref()
+                .is_some_and(|uri| uri.trim().starts_with("ducklake:quack:"));
+            if !uri_uses_quack {
+                anyhow::bail!(
+                    "CANARDSTACK_DUCKLAKE_QUACK_INSECURE_TLS=true has no effect unless CANARDSTACK_DUCKLAKE_ATTACH_URI uses ducklake:quack:; unset one of them"
+                );
+            }
         }
         if self.local_catalog_enabled {
             if self.postgres_dsn.is_some() {
@@ -1065,7 +1071,6 @@ mod tests {
         "CANARDSTACK_GRPC_ENABLED",
         "CANARDSTACK_GRPC_BIND",
         "CANARDSTACK_GRPC_MAX_BODY_BYTES",
-        "CANARDSTACK_GRPC_TLS_ENABLED",
         "CANARDSTACK_API_KEY",
         "CANARDSTACK_ADMIN_API_KEY",
         "CANARDSTACK_DATA_DIR",
@@ -1552,6 +1557,58 @@ max_body_bytes = "large"
             err.contains("CANARDSTACK_LOCAL_CATALOG_LISTEN must be a loopback address"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn quack_insecure_tls_without_attach_uri_is_rejected() {
+        let mut config = Config::test(PathBuf::from("canardstack.duckdb"));
+        config.operator.ducklake_quack_insecure_tls = true;
+
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("CANARDSTACK_DUCKLAKE_QUACK_INSECURE_TLS=true has no effect"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn quack_insecure_tls_with_motherduck_uri_is_rejected() {
+        let mut config = Config::test(PathBuf::from("canardstack.duckdb"));
+        config.operator.ducklake_quack_insecure_tls = true;
+        config.operator.ducklake_attach_uri = Some("md:test-ducklake".to_string());
+
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("CANARDSTACK_DUCKLAKE_QUACK_INSECURE_TLS=true has no effect"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn quack_insecure_tls_with_quack_uri_is_accepted() {
+        let mut config = Config::test(PathBuf::from("canardstack.duckdb"));
+        config.operator.ducklake_quack_insecure_tls = true;
+        config.operator.ducklake_attach_uri =
+            Some("ducklake:quack:catalog.internal:9494".to_string());
+        config.operator.ducklake_quack_token = Some("token".to_string());
+
+        config
+            .validate()
+            .expect("insecure-tls is valid with a Quack URI");
+    }
+
+    #[test]
+    fn quack_insecure_tls_under_local_catalog_is_allowed() {
+        // local_catalog_enabled mode resets quack_insecure_tls after validate
+        // runs, so stale env shouldn't make boot fail.
+        let mut config = Config::test(PathBuf::from("canardstack.duckdb"));
+        config.operator.ducklake_quack_insecure_tls = true;
+        config.operator.local_catalog_enabled = true;
+        config.operator.ducklake_quack_token = Some("token".to_string());
+
+        config
+            .validate()
+            .expect("insecure-tls is reset by prepare_local_catalog after validate");
     }
 
     #[test]

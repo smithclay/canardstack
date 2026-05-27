@@ -729,7 +729,7 @@ Resources:
               Value: /usr/local/lib/duckdb/extensions
             # Terminate TLS in-binary (ECS has no managed TLS for Cloud Map names):
             # serve TLS on CatalogPort and forward to a loopback plaintext Quack.
-            - Name: CANARDSTACK_CATALOG_TLS
+            - Name: CANARDSTACK_CATALOG_TLS_ENABLED
               Value: "true"
             - Name: CANARDSTACK_CATALOG_LISTEN
               Value: !Sub 0.0.0.0:${CatalogPort}

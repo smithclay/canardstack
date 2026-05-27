@@ -64,6 +64,8 @@ pub fn run(args: impl Iterator<Item = String>, shutdown: &'static AtomicBool) ->
         (public_listen.clone(), !listens_on_loopback(&public_listen))
     };
 
+    validate_catalog_listens(&public_listen, &quack_listen, &health_bind, tls.enabled)?;
+
     run_catalog_server(
         config,
         catalog_path,
@@ -158,7 +160,9 @@ fn run_catalog_server(
         }
         #[cfg(not(feature = "tls"))]
         {
-            anyhow::bail!("CANARDSTACK_CATALOG_TLS=true requires a build with --features tls");
+            anyhow::bail!(
+                "CANARDSTACK_CATALOG_TLS_ENABLED=true requires a build with --features tls"
+            );
         }
     }
 
@@ -274,7 +278,7 @@ fn parse_options(mut args: impl Iterator<Item = String>) -> Result<Option<Catalo
                     "serve the local DuckLake catalog DuckDB file over the Quack protocol.\n\
                      env: CANARDSTACK_DUCKLAKE_QUACK_TOKEN (required), CANARDSTACK_DUCKLAKE_CATALOG_PATH,\n\
                      CANARDSTACK_CATALOG_LISTEN (default {DEFAULT_LISTEN}), CANARDSTACK_CATALOG_HEALTH_BIND (default {DEFAULT_HEALTH_BIND}).\n\
-                     TLS (requires --features tls): CANARDSTACK_CATALOG_TLS=true terminates TLS on\n\
+                     TLS (requires --features tls): CANARDSTACK_CATALOG_TLS_ENABLED=true terminates TLS on\n\
                      CANARDSTACK_CATALOG_LISTEN and forwards to CANARDSTACK_CATALOG_QUACK_BACKEND (default {DEFAULT_QUACK_BACKEND});\n\
                      set CANARDSTACK_CATALOG_TLS_MODE=file with CANARDSTACK_CATALOG_TLS_CERT_FILE and\n\
                      CANARDSTACK_CATALOG_TLS_KEY_FILE to use a persistent certificate"
@@ -334,8 +338,8 @@ struct CatalogTlsConfig {
 
 impl CatalogTlsConfig {
     fn from_env() -> Result<Self> {
-        let enabled =
-            env_bool("CANARDSTACK_CATALOG_TLS") || env_bool("CANARDSTACK_CATALOG_TLS_ENABLED");
+        // Matches the main app's CANARDSTACK_TLS_ENABLED naming.
+        let enabled = env_bool("CANARDSTACK_CATALOG_TLS_ENABLED");
         let cert_file = env_optional_path("CANARDSTACK_CATALOG_TLS_CERT_FILE");
         let key_file = env_optional_path("CANARDSTACK_CATALOG_TLS_KEY_FILE");
         let mode = env_optional_string("CANARDSTACK_CATALOG_TLS_MODE")
@@ -362,12 +366,12 @@ impl CatalogTlsConfig {
         if self.enabled && self.mode == TlsMode::File {
             if self.cert_file.is_none() {
                 anyhow::bail!(
-                    "CANARDSTACK_CATALOG_TLS_CERT_FILE must be set when CANARDSTACK_CATALOG_TLS_MODE=file"
+                    "CANARDSTACK_CATALOG_TLS_CERT_FILE must be set when CANARDSTACK_CATALOG_TLS_ENABLED=true and CANARDSTACK_CATALOG_TLS_MODE=file"
                 );
             }
             if self.key_file.is_none() {
                 anyhow::bail!(
-                    "CANARDSTACK_CATALOG_TLS_KEY_FILE must be set when CANARDSTACK_CATALOG_TLS_MODE=file"
+                    "CANARDSTACK_CATALOG_TLS_KEY_FILE must be set when CANARDSTACK_CATALOG_TLS_ENABLED=true and CANARDSTACK_CATALOG_TLS_MODE=file"
                 );
             }
         }
@@ -458,6 +462,34 @@ fn listens_on_loopback(listen: &str) -> bool {
     matches!(host, "127.0.0.1" | "localhost" | "::1")
 }
 
+/// Refuse to start when two catalog listeners would collide at bind time.
+/// In TLS mode the public listener fronts a loopback Quack backend, so the
+/// three addresses must be distinct; in plaintext mode `public` and `quack`
+/// are the same socket by design, so only the health bind has to differ.
+fn validate_catalog_listens(
+    public: &str,
+    quack: &str,
+    health: &str,
+    tls_enabled: bool,
+) -> Result<()> {
+    if tls_enabled && public == quack {
+        anyhow::bail!(
+            "CANARDSTACK_CATALOG_QUACK_BACKEND must differ from CANARDSTACK_CATALOG_LISTEN when CANARDSTACK_CATALOG_TLS_ENABLED=true (the TLS terminator cannot forward to itself)"
+        );
+    }
+    if public == health {
+        anyhow::bail!(
+            "CANARDSTACK_CATALOG_HEALTH_BIND must differ from CANARDSTACK_CATALOG_LISTEN"
+        );
+    }
+    if tls_enabled && quack == health {
+        anyhow::bail!(
+            "CANARDSTACK_CATALOG_HEALTH_BIND must differ from CANARDSTACK_CATALOG_QUACK_BACKEND when CANARDSTACK_CATALOG_TLS_ENABLED=true"
+        );
+    }
+    Ok(())
+}
+
 /// Minimal single-threaded health endpoint: replies `{"status":"ok"}` to any
 /// request so `canardstack healthcheck` and ECS/Cloud Map can probe liveness.
 /// Health checks are infrequent, so one-at-a-time accept is sufficient.
@@ -527,6 +559,56 @@ mod tests {
         assert_eq!(
             quack_stop_sql("0.0.0.0:9494"),
             "CALL quack_stop('quack:0.0.0.0:9494');"
+        );
+    }
+
+    #[test]
+    fn validate_listens_catches_tls_terminator_loop() {
+        let err = validate_catalog_listens("0.0.0.0:9494", "0.0.0.0:9494", "0.0.0.0:8080", true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("CANARDSTACK_CATALOG_QUACK_BACKEND must differ"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn validate_listens_catches_public_health_collision() {
+        let err = validate_catalog_listens("0.0.0.0:8080", "0.0.0.0:8080", "0.0.0.0:8080", false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(
+                "CANARDSTACK_CATALOG_HEALTH_BIND must differ from CANARDSTACK_CATALOG_LISTEN"
+            ),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn validate_listens_catches_backend_health_collision() {
+        let err =
+            validate_catalog_listens("0.0.0.0:9494", "127.0.0.1:8080", "127.0.0.1:8080", true)
+                .unwrap_err()
+                .to_string();
+        assert!(
+            err.contains("CANARDSTACK_CATALOG_HEALTH_BIND must differ from CANARDSTACK_CATALOG_QUACK_BACKEND"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn validate_listens_accepts_distinct_addresses() {
+        // TLS mode: three distinct sockets.
+        assert!(
+            validate_catalog_listens("0.0.0.0:9494", "127.0.0.1:9495", "0.0.0.0:8080", true)
+                .is_ok()
+        );
+        // Plaintext mode: public and quack are the same socket by design, only
+        // health has to differ.
+        assert!(
+            validate_catalog_listens("0.0.0.0:9494", "0.0.0.0:9494", "0.0.0.0:8080", false).is_ok()
         );
     }
 
