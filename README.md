@@ -32,15 +32,14 @@ Builds on prior work from [otlp2parquet](https://github.com/smithclay/otlp2parqu
 
 ## Quick Start
 
-Install and start canardstack. With no options, it uses local DuckLake storage
-under `.canardstack` and listens for OTLP data on `127.0.0.1:4318`.
+You can get started by installing canardstack with `cargo` and connecting to a local Ducklake catalog using the new Quack protocol.
 
 ```bash
 # requires rust toolchain: `curl https://sh.rustup.rs -sSf | sh`
 cargo install --locked canardstack
 
-# starts server on 127.0.0.1:4318
-canardstack
+# starts server on 127.0.0.1:4318 with a Ducklake catalog accessible over Quack
+CANARDSTACK_DUCKLAKE_QUACK_TOKEN=dev-quack-token canardstack serve --local-catalog
 ```
 
 In another terminal, send one OTLP/HTTP JSON log:
@@ -53,35 +52,7 @@ curl -sS -X POST http://127.0.0.1:4318/v1/logs \
   --data "{\"resourceLogs\":[{\"resource\":{\"attributes\":[{\"key\":\"service.name\",\"value\":{\"stringValue\":\"quickstart\"}}]},\"scopeLogs\":[{\"logRecords\":[{\"timeUnixNano\":\"${OTLP_TIME_UNIX_NANO}\",\"body\":{\"stringValue\":\"hello world\"}}]}]}]}"
 ```
 
-canardstack acknowledges ingest after the raw request is fsynced locally. By
-default, the scheduler seals buffered rows within about 10 seconds; wait a
-moment, then query the log through the Loki-compatible API:
-
-```bash
-curl -sS -H 'Authorization: Bearer dev-canardstack-key' \
-  'http://127.0.0.1:4318/loki/api/v1/query?query=%7Bservice_name%3D%22quickstart%22%7D'
-```
-
-<details>
-<summary>Query the local DuckLake directly with DuckDB 1.5.3+</summary>
-
-To inspect the local DuckLake while canardstack is still running, start the
-server with the in-process loopback Quack catalog endpoint instead of the plain
-`canardstack` command above. It uses `127.0.0.1:4318` for OTLP/HTTP and
-`127.0.0.1:9494` for the catalog. The catalog endpoint is loopback-only and
-always plaintext — the app and any local DuckDB client attach through it over
-TCP loopback, so TLS is neither needed nor available here.
-`CANARDSTACK_CATALOG_TLS*` applies only to the separate `serve-catalog` role.
-
-```bash
-CANARDSTACK_DUCKLAKE_QUACK_TOKEN=dev-quack-token \
-  canardstack serve --local-catalog
-```
-
-When running from a source checkout, use
-`cargo run -- serve --local-catalog` instead.
-
-Then attach through the in-process catalog endpoint from another terminal:
+canardstack acknowledges ingest after the raw request is fsynced locally. By default, the scheduler seals buffered rows within about 10 seconds; wait a moment, then attach to the Ducklake in duckdb 1.5.3+ or higher:
 
 ```bash
 duckdb --version
@@ -97,23 +68,23 @@ LOAD quack;
 CREATE OR REPLACE SECRET canardstack_ducklake_quack
   (TYPE quack, SCOPE 'quack:127.0.0.1:9494', TOKEN 'dev-quack-token');
 
-ATTACH 'ducklake:quack:127.0.0.1:9494' AS canardlake
-  (DATA_PATH '.canardstack/storage');
+ATTACH 'ducklake:quack:127.0.0.1:9494' AS canardlake;
 USE canardlake;
 
-SELECT timestamp, service_name, severity_text, body
-FROM logs
-WHERE service_name = 'quickstart'
-ORDER BY timestamp DESC
-LIMIT 20;
+SELECT * FROM logs;
+┌─────────────────────┬────────────────────────────┬───────────────┬───┬──────────────────┬────────────────┐
+│      timestamp      │        ingested_at         │ source_format │ … │ scope_attributes │ log_attributes │
+│      timestamp      │         timestamp          │    varchar    │ … │     varchar      │    varchar     │
+├─────────────────────┼────────────────────────────┼───────────────┼───┼──────────────────┼────────────────┤
+│ 2026-05-27 00:14:12 │ 2026-05-27 00:14:12.086916 │ otlp_json     │ … │ NULL             │ NULL           │
+└─────────────────────┴────────────────────────────┴───────────────┴───┴──────────────────┴────────────────┘
 ```
 
-</details>
+You just streamed an OTLP log to Ducklake! For a more comprehensive example, see the demo below or review cloud [deployment examples](https://smithclay.github.io/canardstack/deployment/).
 
 ## Demo
 
-Run canardstack with the full
-[OpenTelemetry demo](https://github.com/open-telemetry/opentelemetry-demo) using
+Run canardstack with the full [OpenTelemetry demo](https://github.com/open-telemetry/opentelemetry-demo) using
 the [demo guide](https://smithclay.github.io/canardstack/demo/).
 
 ![Grafana dashboard showing canardstack OpenTelemetry demo data](site/src/assets/grafana-dash-demo.png)
@@ -179,7 +150,7 @@ Configure OTLP/HTTP producers and OpenTelemetry Collectors with the
 ## Architecture
 
 The current high-level data-flow diagram lives in the
-[site architecture guide](https://smithclay.github.io/canardstack/architecture/).
+[architecture guide in docs](https://smithclay.github.io/canardstack/architecture/).
 
 ## Operations
 
