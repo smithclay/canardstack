@@ -18,7 +18,7 @@ model deliberately.
 
 | Path | Use it for | Storage shape |
 | --- | --- | --- |
-| [Local quickstart](/#start-locally) | First run, laptop checks, development | Local DuckLake catalog and data files under `.canardstack`. |
+| [Local quickstart](/#start-locally) | First run, laptop checks, development | Single process with local DuckLake storage and a loopback Quack catalog endpoint. |
 | [Send telemetry](/deployment/send-telemetry/) | Configure OTLP/HTTP producers | OpenTelemetry Collector `otlphttp` exporter to canardstack. |
 | [MotherDuck](/deployment/motherduck/) | Fast remote DuckLake experiments | Local app and Grafana, hosted DuckLake catalog through `md:`. |
 | [GCP Cloud Run](/deployment/gcp-cloud-run/) | Push-button GCP demo | Cloud Run app and catalog services, GCS DuckLake data files. |
