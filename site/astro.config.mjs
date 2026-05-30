@@ -27,25 +27,34 @@ export default defineConfig({
       plugins: [starlightClientMermaid()],
       sidebar: [
         {
-          label: 'Start Here',
+          label: 'Tutorials',
           items: [
             { label: 'Overview', link: '/' },
-            { label: 'Architecture', link: '/architecture/' },
-            {
-              label: 'Local E2E Smoke',
-              link: 'https://github.com/smithclay/canardstack/blob/main/docs/e2e-duckdb-otlp.md',
-            },
+            { label: 'Get Started', link: '/get-started/' },
+            { label: 'Serve DuckLake', link: '/quickstart/serve/' },
           ],
         },
         {
-          label: 'Operations',
-          items: [{ label: 'Overview', link: '/operations/' }],
+          label: 'How-to Guides',
+          items: [
+            { label: 'Write with duckdb-otlp', link: '/guides/lakehouse-ingest/' },
+            { label: 'Query with Grafana', link: '/guides/query-with-grafana/' },
+            { label: 'Query with DuckDB SQL', link: '/guides/query-with-duckdb/' },
+          ],
         },
         {
-          label: 'Query Data',
+          label: 'Reference',
           items: [
-            { label: 'Grafana Datasources', link: '/query-data/grafana/' },
-            { label: 'DuckDB SQL', link: '/query-data/duckdb/' },
+            { label: 'API', link: '/reference/api/' },
+            { label: 'Schema', link: '/reference/schema/' },
+            { label: 'Server Contract', link: '/reference/server/' },
+            { label: 'Operational Limits', link: '/reference/operational-limits/' },
+          ],
+        },
+        {
+          label: 'Explanation',
+          items: [
+            { label: 'Architecture', link: '/architecture/' },
           ],
         },
         {
