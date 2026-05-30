@@ -60,8 +60,6 @@ pub struct OperatorConfig {
     pub ducklake_quack_insecure_tls: bool,
     pub max_body_bytes: usize,
     pub duckdb_write_memory_limit: String,
-    pub late_accept_secs: i64,
-    pub future_accept_secs: i64,
     pub query_interactive: QueryLimits,
     pub query_admission_wait: Duration,
     pub cheap_query_admission_capacity: usize,
@@ -192,12 +190,6 @@ impl OperatorConfig {
             duckdb_write_memory_limit: env_string("CANARDSTACK_DUCKDB_MEMORY_LIMIT")?
                 .or(file.string(&["duckdb", "memory_limit"])?)
                 .unwrap_or_else(|| "1GiB".to_string()),
-            late_accept_secs: env_i64("CANARDSTACK_ACCEPT_LATE_SECS")?
-                .or(file.i64(&["validation", "accept_late_secs"])?)
-                .unwrap_or(24 * 60 * 60),
-            future_accept_secs: env_i64("CANARDSTACK_ACCEPT_FUTURE_SECS")?
-                .or(file.i64(&["validation", "accept_future_secs"])?)
-                .unwrap_or(10 * 60),
             query_interactive: QueryLimits {
                 concurrency: query_concurrency,
                 timeout_secs: query_timeout_secs,
@@ -255,8 +247,6 @@ impl OperatorConfig {
             ducklake_quack_insecure_tls: false,
             max_body_bytes: 8 * 1024 * 1024,
             duckdb_write_memory_limit: "512MiB".to_string(),
-            late_accept_secs: 24 * 60 * 60,
-            future_accept_secs: 10 * 60,
             query_interactive: QueryLimits {
                 concurrency: 4,
                 timeout_secs: 15,
@@ -427,15 +417,6 @@ impl FileConfig {
             .transpose()
     }
 
-    fn i64(&self, path: &[&str]) -> Result<Option<i64>> {
-        self.item(path)
-            .map(|item| {
-                item.as_integer()
-                    .with_context(|| format!("{} must be an integer", path.join(".")))
-            })
-            .transpose()
-    }
-
     fn bool(&self, path: &[&str]) -> Result<Option<bool>> {
         self.item(path)
             .map(|item| {
@@ -519,17 +500,6 @@ fn env_usize(name: &str) -> Result<Option<usize>> {
     }
 }
 
-fn env_i64(name: &str) -> Result<Option<i64>> {
-    match env::var(name) {
-        Ok(value) => value
-            .parse()
-            .with_context(|| format!("{name} must be an integer"))
-            .map(Some),
-        Err(env::VarError::NotPresent) => Ok(None),
-        Err(err) => Err(err).with_context(|| format!("read {name}")),
-    }
-}
-
 fn env_bool(name: &str) -> Result<Option<bool>> {
     match env::var(name) {
         Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
@@ -575,8 +545,6 @@ mod tests {
         "CANARDSTACK_LOCAL_CATALOG_ENABLED",
         "CANARDSTACK_MAX_BODY_BYTES",
         "CANARDSTACK_DUCKDB_MEMORY_LIMIT",
-        "CANARDSTACK_ACCEPT_LATE_SECS",
-        "CANARDSTACK_ACCEPT_FUTURE_SECS",
         "CANARDSTACK_QUERY_CONCURRENCY",
         "CANARDSTACK_QUERY_TIMEOUT_SECS",
         "CANARDSTACK_QUERY_MEMORY_LIMIT",
@@ -660,10 +628,6 @@ attach_uri = "md:file"
 catalog_path = "/catalog/canardstack.ducklake"
 data_path = "s3://file-bucket/canardstack/"
 quack_token = "file-quack-token"
-
-[validation]
-accept_late_secs = 100
-accept_future_secs = 20
 
 [query]
 concurrency = 6

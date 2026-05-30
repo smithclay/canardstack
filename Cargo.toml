@@ -22,9 +22,8 @@ include = [
 
 [dependencies]
 anyhow = "1.0.102"
-chrono = { version = "0.4.44", features = ["clock", "serde"] }
-arrow58 = { package = "arrow", version = "58", default-features = false, features = ["ffi", "ipc", "json"] }
-duckdb = { version = "1.10503.1", features = ["bundled", "appender-arrow"] }
+chrono = { version = "0.4.44", features = ["clock"] }
+duckdb = { version = "1.10503.1", features = ["bundled"] }
 otlp2records = "0.8.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
