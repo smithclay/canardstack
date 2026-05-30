@@ -576,25 +576,9 @@ impl OperatorConfig {
             }
         }
         if self.grpc.enabled {
-            if !self.serve_role.accepts_ingest() {
-                anyhow::bail!(
-                    "CANARDSTACK_GRPC_ENABLED=true requires a serve role that accepts ingest"
-                );
-            }
-            if self.grpc.bind.trim().is_empty() {
-                anyhow::bail!("CANARDSTACK_GRPC_BIND must not be empty when gRPC is enabled");
-            }
-            if self.grpc.bind == self.bind {
-                anyhow::bail!("CANARDSTACK_GRPC_BIND must differ from CANARDSTACK_BIND");
-            }
-            if self.grpc.max_body_bytes == 0 {
-                anyhow::bail!("CANARDSTACK_GRPC_MAX_BODY_BYTES must be > 0");
-            }
-            if self.grpc.max_body_bytes > self.max_body_bytes {
-                anyhow::bail!(
-                    "CANARDSTACK_GRPC_MAX_BODY_BYTES must be <= CANARDSTACK_MAX_BODY_BYTES because the shared raw spool capacity is derived from CANARDSTACK_MAX_BODY_BYTES"
-                );
-            }
+            anyhow::bail!(
+                "CANARDSTACK_GRPC_ENABLED is no longer supported; canardstack is query-only"
+            );
         }
         if self.admin_api_key.trim().is_empty() {
             anyhow::bail!("CANARDSTACK_ADMIN_API_KEY must not be empty");
@@ -643,42 +627,7 @@ impl OperatorConfig {
             }
         }
         if self.local_catalog_enabled {
-            if self.postgres_dsn.is_some() {
-                anyhow::bail!(
-                    "CANARDSTACK_LOCAL_CATALOG_ENABLED=true requires the local DuckDB-backed DuckLake catalog; unset CANARDSTACK_POSTGRES_DSN"
-                );
-            }
-            if self.ducklake_attach_uri.is_some() {
-                anyhow::bail!(
-                    "CANARDSTACK_LOCAL_CATALOG_ENABLED=true requires the local DuckDB-backed DuckLake catalog; unset CANARDSTACK_DUCKLAKE_ATTACH_URI"
-                );
-            }
-            if self
-                .ducklake_quack_token
-                .as_deref()
-                .is_none_or(|token| token.trim().is_empty())
-            {
-                anyhow::bail!(
-                    "CANARDSTACK_DUCKLAKE_QUACK_TOKEN must be set when CANARDSTACK_LOCAL_CATALOG_ENABLED=true"
-                );
-            }
-            if self.local_catalog_listen.trim().is_empty() {
-                anyhow::bail!(
-                    "CANARDSTACK_LOCAL_CATALOG_LISTEN must not be empty when CANARDSTACK_LOCAL_CATALOG_ENABLED=true"
-                );
-            }
-            if !listen_addr_is_loopback(&self.local_catalog_listen) {
-                anyhow::bail!(
-                    "CANARDSTACK_LOCAL_CATALOG_LISTEN must be a loopback address for local catalog endpoint mode"
-                );
-            }
-            if self.local_catalog_listen == self.bind
-                || (self.tls.enabled && self.local_catalog_listen == self.tls.backend_bind)
-            {
-                anyhow::bail!(
-                    "CANARDSTACK_LOCAL_CATALOG_LISTEN must differ from CANARDSTACK_BIND and CANARDSTACK_TLS_BACKEND_BIND"
-                );
-            }
+            anyhow::bail!("CANARDSTACK_LOCAL_CATALOG_ENABLED is no longer supported; run an external DuckDB catalog/writer");
         }
         if self.ducklake_maintenance.expire_older_than_days <= 0 {
             anyhow::bail!("CANARDSTACK_DUCKLAKE_EXPIRE_OLDER_THAN_DAYS must be > 0");
@@ -835,7 +784,7 @@ impl TestOverrides {
             seal_rate_seed_bytes: DEFAULT_SEAL_RATE_SEED_BYTES,
             seal_rate_seed_window: DEFAULT_SEAL_RATE_SEED_WINDOW,
             bench_http_keepalive: true,
-            ingest_worker_channel_capacity: crate::ingest::INGEST_WORKER_CHANNEL_CAPACITY,
+            ingest_worker_channel_capacity: 1024,
         }
     }
 
@@ -1046,12 +995,6 @@ fn env_optional_usize(name: &str) -> Result<Option<Option<usize>>> {
 fn trimmed_non_empty(value: String) -> Option<String> {
     let trimmed = value.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_string())
-}
-
-fn listen_addr_is_loopback(listen: &str) -> bool {
-    let host = listen.rsplit_once(':').map_or(listen, |(host, _)| host);
-    let host = host.trim_start_matches('[').trim_end_matches(']');
-    matches!(host, "127.0.0.1" | "localhost" | "::1")
 }
 
 #[cfg(test)]
@@ -1342,10 +1285,7 @@ group_commit_ms = 3
         );
         assert_eq!(config.mechanics.ingest_workers, 3);
         // Fixed test hooks stay out of the operator/file config surface.
-        assert_eq!(
-            config.test_overrides.ingest_worker_channel_capacity,
-            crate::ingest::INGEST_WORKER_CHANNEL_CAPACITY
-        );
+        assert_eq!(config.test_overrides.ingest_worker_channel_capacity, 1024);
         assert_eq!(
             config.test_overrides.seal_rate_seed_bytes,
             DEFAULT_SEAL_RATE_SEED_BYTES
@@ -1490,71 +1430,25 @@ max_body_bytes = "large"
     }
 
     #[test]
-    fn validate_rejects_grpc_on_query_only_role() {
-        let mut config = Config::test(PathBuf::from("canardstack.duckdb"));
-        config.operator.serve_role = ServeRole::Query;
-        config.operator.grpc.enabled = true;
-
-        let err = config.validate().unwrap_err().to_string();
-        assert!(
-            err.contains("CANARDSTACK_GRPC_ENABLED=true requires a serve role that accepts ingest"),
-            "{err}"
-        );
-    }
-
-    #[test]
-    fn validate_rejects_grpc_body_limit_above_shared_ingest_limit() {
+    fn validate_rejects_grpc() {
         let mut config = Config::test(PathBuf::from("canardstack.duckdb"));
         config.operator.grpc.enabled = true;
-        config.operator.grpc.bind = "127.0.0.1:1".to_string();
-        config.operator.grpc.max_body_bytes = config.operator.max_body_bytes + 1;
 
         let err = config.validate().unwrap_err().to_string();
         assert!(
-            err.contains("CANARDSTACK_GRPC_MAX_BODY_BYTES must be <= CANARDSTACK_MAX_BODY_BYTES"),
+            err.contains("CANARDSTACK_GRPC_ENABLED is no longer supported"),
             "{err}"
         );
     }
 
     #[test]
-    fn local_catalog_enabled_requires_quack_token() {
+    fn local_catalog_enabled_is_rejected() {
         let mut config = Config::test(PathBuf::from("canardstack.duckdb"));
         config.operator.local_catalog_enabled = true;
 
         let err = config.validate().unwrap_err().to_string();
         assert!(
-            err.contains(
-                "CANARDSTACK_DUCKLAKE_QUACK_TOKEN must be set when CANARDSTACK_LOCAL_CATALOG_ENABLED=true"
-            ),
-            "{err}"
-        );
-    }
-
-    #[test]
-    fn local_catalog_enabled_rejects_remote_catalog_config() {
-        let mut config = Config::test(PathBuf::from("canardstack.duckdb"));
-        config.operator.local_catalog_enabled = true;
-        config.operator.ducklake_quack_token = Some("token".to_string());
-        config.operator.ducklake_attach_uri =
-            Some("ducklake:quack:catalog.internal:9494".to_string());
-
-        let err = config.validate().unwrap_err().to_string();
-        assert!(
-            err.contains("unset CANARDSTACK_DUCKLAKE_ATTACH_URI"),
-            "{err}"
-        );
-    }
-
-    #[test]
-    fn local_catalog_enabled_rejects_non_loopback_listen() {
-        let mut config = Config::test(PathBuf::from("canardstack.duckdb"));
-        config.operator.local_catalog_enabled = true;
-        config.operator.ducklake_quack_token = Some("token".to_string());
-        config.operator.local_catalog_listen = "0.0.0.0:9494".to_string();
-
-        let err = config.validate().unwrap_err().to_string();
-        assert!(
-            err.contains("CANARDSTACK_LOCAL_CATALOG_LISTEN must be a loopback address"),
+            err.contains("CANARDSTACK_LOCAL_CATALOG_ENABLED is no longer supported"),
             "{err}"
         );
     }
@@ -1595,20 +1489,6 @@ max_body_bytes = "large"
         config
             .validate()
             .expect("insecure-tls is valid with a Quack URI");
-    }
-
-    #[test]
-    fn quack_insecure_tls_under_local_catalog_is_allowed() {
-        // local_catalog_enabled mode resets quack_insecure_tls after validate
-        // runs, so stale env shouldn't make boot fail.
-        let mut config = Config::test(PathBuf::from("canardstack.duckdb"));
-        config.operator.ducklake_quack_insecure_tls = true;
-        config.operator.local_catalog_enabled = true;
-        config.operator.ducklake_quack_token = Some("token".to_string());
-
-        config
-            .validate()
-            .expect("insecure-tls is reset by prepare_local_catalog after validate");
     }
 
     #[test]

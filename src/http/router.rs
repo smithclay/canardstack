@@ -1,13 +1,10 @@
-use crate::ingest::OtlpRequestKind;
 use crate::metrics::{MetricName, Metrics};
 use crate::signal::StorageSignal;
 use crate::validation::{self, ApiError};
 use crate::AppState;
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::time::Instant;
 
-use super::auth::admin;
 use super::compat_routes::{match_compat_route, route_compat};
 use super::response::HttpResponse;
 
@@ -59,13 +56,6 @@ impl RequestBody<'_> {
             Self::Owned(body) => body,
         }
     }
-
-    fn into_vec(self) -> Vec<u8> {
-        match self {
-            Self::Borrowed(body) => body.to_vec(),
-            Self::Owned(body) => body,
-        }
-    }
 }
 
 fn route_inner(
@@ -77,94 +67,27 @@ fn route_inner(
     state: &AppState,
 ) -> HttpResponse {
     if let Some(matched) = match_compat_route(method, path) {
-        if matched.role_category().serves_queries()
-            && !state.config.operator.serve_role.serves_queries()
-        {
-            return HttpResponse::from_api_error(&ApiError::new(
-                404,
-                "not_found",
-                "query routes are disabled for this serve role",
-            ));
-        }
         return route_compat(matched, query, headers, body.as_slice(), state);
     }
 
     let result = match (method, path) {
         ("GET", "/healthz") => {
             let probe = state.storage.probe();
-            // A wedged raw-spool writer 503s ingest for its signal forever, so
-            // the node must report NOT ready even when storage is fine.
-            let unhealthy_spools: Vec<Value> = state
-                .ingestor
-                .raw_spool_health_by_request_kind()
-                .into_iter()
-                .filter(|(_, (healthy, _))| !healthy)
-                .map(|(request_kind, (_, error))| json!({"request_kind": request_kind, "error": error}))
-                .collect();
-            let raw_spool_healthy = unhealthy_spools.is_empty();
-            let ok = probe.is_ready() && raw_spool_healthy;
-            let mut body = json!({
+            let ok = probe.is_ready();
+            let body = json!({
                 "status": if ok { "ok" } else { "error" },
-                "storage": probe,
-                "raw_spool_healthy": raw_spool_healthy,
+                "storage": probe
             });
-            if !raw_spool_healthy {
-                body["raw_spool_unhealthy"] = json!(unhealthy_spools);
-            }
             return HttpResponse::json(if ok { 200 } else { 503 }, body);
         }
         ("GET", "/metrics") => {
             record_operator_gauges(state);
+            record_storage_operator_gauges(state);
             return HttpResponse::text(
                 200,
                 "text/plain; charset=utf-8",
                 state.metrics.render_prometheus(),
             );
-        }
-        ("POST", "/v1/logs") => {
-            if !state.config.operator.serve_role.accepts_ingest() {
-                return HttpResponse::from_api_error(&ApiError::new(
-                    404,
-                    "not_found",
-                    "ingest routes are disabled for this serve role",
-                ));
-            }
-            return ingest_response(ingest(
-                OtlpRequestKind::Logs,
-                headers,
-                body.into_vec(),
-                state,
-            ));
-        }
-        ("POST", "/v1/traces") => {
-            if !state.config.operator.serve_role.accepts_ingest() {
-                return HttpResponse::from_api_error(&ApiError::new(
-                    404,
-                    "not_found",
-                    "ingest routes are disabled for this serve role",
-                ));
-            }
-            return ingest_response(ingest(
-                OtlpRequestKind::Traces,
-                headers,
-                body.into_vec(),
-                state,
-            ));
-        }
-        ("POST", "/v1/metrics") => {
-            if !state.config.operator.serve_role.accepts_ingest() {
-                return HttpResponse::from_api_error(&ApiError::new(
-                    404,
-                    "not_found",
-                    "ingest routes are disabled for this serve role",
-                ));
-            }
-            return ingest_response(ingest(
-                OtlpRequestKind::Metrics,
-                headers,
-                body.into_vec(),
-                state,
-            ));
         }
         ("GET", "/api/admin/health/storage") => {
             return admin_health_response(headers, state, || {
@@ -172,137 +95,20 @@ fn route_inner(
                 (health.is_ready(), json!(health))
             });
         }
-        ("GET", "/api/admin/health/ingest") => {
-            return admin_health_response(headers, state, || {
-                let raw_spool_healthy = state.ingestor.raw_spool_healthy();
-                let raw_spool = state
-                    .ingestor
-                    .raw_spool_stats()
-                    .map(|stats| json!(stats))
-                    .unwrap_or_else(|err| json!({"error": err.to_string()}));
-                let raw_spool_by_request_kind = state
-                    .ingestor
-                    .raw_spool_stats_by_request_kind()
-                    .map(|stats| json!(stats))
-                    .unwrap_or_else(|err| json!({"error": err.to_string()}));
-                let body = json!({
-                    "raw_spool_healthy": raw_spool_healthy,
-                    "inflight": state.ingestor.snapshots(),
-                    "admission": state.admission.snapshot_for(state.ingestor.freshness_budget_inputs(&state.storage)),
-                    "raw_spool": raw_spool,
-                    "raw_spool_by_request_kind": raw_spool_by_request_kind,
-                    "raw_spool_config": {
-                        // The raw spool is partitioned by request kind (one writer
-                        // per logs/traces/metrics); capacity is per-kind, so the
-                        // aggregate worst case is 3x the limit below. See `RawSpool`.
-                        "partition": "per_request_kind",
-                        "max_total_bytes_per_request_kind": state.config.mechanics.raw_spool_max_total_bytes_per_request_kind,
-                        "writer_queue_capacity": crate::ingest::spool::RAW_SPOOL_WRITER_QUEUE_CAPACITY,
-                        "group_commit_records": crate::ingest::spool::RAW_SPOOL_GROUP_COMMIT_RECORDS,
-                        "group_commit_ms": state.config.mechanics.raw_spool_group_commit_delay.as_millis(),
-                        "checkpoint_fsync_records": crate::ingest::spool::RAW_SPOOL_CHECKPOINT_FSYNC_RECORDS,
-                        "checkpoint_fsync_ms": crate::ingest::spool::RAW_SPOOL_CHECKPOINT_FSYNC_DELAY.as_millis()
-                    }
-                });
-                (raw_spool_healthy, body)
-            });
-        }
-        ("GET", "/api/admin/health/maintenance") => {
-            return admin_health_response(headers, state, || {
-                (state.maintenance.is_ready(), state.maintenance.health())
-            });
-        }
         ("GET", "/api/admin/health/queries") => {
             return admin_health_response(headers, state, || {
                 // Queries are only as healthy as DuckDB; 200 here while
                 // storage is wedged would mislead the runbook step.
                 let mut health = state.queries.health();
-                health["admission"] = json!(state
-                    .admission
-                    .snapshot_for(state.ingestor.freshness_budget_inputs(&state.storage)));
+                health["admission"] = json!(state.admission.snapshot_for(Default::default()));
                 (state.storage.probe().is_ready(), health)
             });
         }
-        ("POST", "/api/admin/maintenance/pause") => admin(headers, state, || {
-            ensure_maintenance_allowed(state)?;
-            state.maintenance.pause();
-            Ok(json!({"paused": true}))
-        }),
-        ("POST", "/api/admin/maintenance/resume") => admin(headers, state, || {
-            ensure_maintenance_allowed(state)?;
-            state.maintenance.resume();
-            Ok(json!({"paused": false}))
-        }),
-        ("POST", "/api/admin/maintenance/seal") => admin(headers, state, || {
-            ensure_maintenance_allowed(state)?;
-            let started = Instant::now();
-            let result = crate::seal::run(state);
-            record_maintenance_metrics(state, "seal", &result, started);
-            result
-        }),
-        ("POST", "/api/admin/maintenance/checkpoint/dry-run") => admin(headers, state, || {
-            ensure_maintenance_allowed(state)?;
-            run_maintenance_job(state, "checkpoint", || {
-                state
-                    .maintenance
-                    .checkpoint(&state.storage, true, &state.metrics)
-            })
-        }),
-        ("POST", "/api/admin/maintenance/checkpoint/run") => admin(headers, state, || {
-            ensure_maintenance_allowed(state)?;
-            run_maintenance_job(state, "checkpoint", || {
-                state
-                    .maintenance
-                    .checkpoint(&state.storage, false, &state.metrics)
-            })
-        }),
-        ("POST", "/api/admin/maintenance/retention/dry-run") => admin(headers, state, || {
-            ensure_maintenance_allowed(state)?;
-            run_maintenance_job(state, "retention", || {
-                state
-                    .maintenance
-                    .retention(&state.storage, true, &state.metrics)
-            })
-        }),
-        ("POST", "/api/admin/maintenance/retention/run") => admin(headers, state, || {
-            ensure_maintenance_allowed(state)?;
-            run_maintenance_job(state, "retention", || {
-                state
-                    .maintenance
-                    .retention(&state.storage, false, &state.metrics)
-            })
-        }),
         _ => Err(ApiError::new(404, "not_found", "route not found")),
     };
 
     match result {
         Ok(value) => HttpResponse::json(200, value),
-        Err(err) => HttpResponse::from_api_error(&err),
-    }
-}
-
-fn ingest(
-    route: OtlpRequestKind,
-    headers: &HashMap<String, String>,
-    body: Vec<u8>,
-    state: &AppState,
-) -> Result<Value, ApiError> {
-    validation::validate_api_key(headers, &state.config, false)?;
-    state.ingestor.ingest(
-        route,
-        headers,
-        body,
-        &state.storage,
-        &state.admission,
-        state.metrics.clone(),
-    )
-}
-
-fn ingest_response(result: Result<Value, ApiError>) -> HttpResponse {
-    // 202 matches the local-spool write acknowledgement the body advertises
-    // and the metric label canardstack_ingest_requests_total{status="202"}.
-    match result {
-        Ok(value) => HttpResponse::json(202, value),
         Err(err) => HttpResponse::from_api_error(&err),
     }
 }
@@ -320,122 +126,39 @@ fn admin_health_response(
     HttpResponse::json(if ready { 200 } else { 503 }, body)
 }
 
-fn storage_error(err: anyhow::Error) -> ApiError {
-    ApiError::new(503, "storage_operation_failed", err.to_string())
-}
-
-fn run_maintenance_job(
-    state: &AppState,
-    job: &str,
-    run: impl FnOnce() -> anyhow::Result<Value>,
-) -> Result<Value, ApiError> {
-    let started = Instant::now();
-    let result = run().map_err(storage_error);
-    record_maintenance_metrics(state, job, &result, started);
-    result
-}
-
-fn ensure_maintenance_allowed(state: &AppState) -> Result<(), ApiError> {
-    if state
-        .config
-        .operator
-        .serve_role
-        .allows_maintenance_mutation()
-    {
-        Ok(())
-    } else {
-        Err(ApiError::new(
-            404,
-            "not_found",
-            "maintenance mutations are disabled for this serve role",
-        ))
-    }
-}
-
-fn record_maintenance_metrics(
-    state: &AppState,
-    job: &str,
-    result: &Result<Value, ApiError>,
-    started: Instant,
-) {
-    let (status, reason) = match result {
-        Ok(_) => ("ok", "ok"),
-        Err(err) => ("error", err.reason),
-    };
-    state
-        .metrics
-        .maintenance_run(job, status, reason, started.elapsed().as_secs_f64());
-}
-
 fn storage_signal_gauge(metrics: &Metrics, name: MetricName, storage_signal: &str, value: f64) {
     metrics.gauge(name, &[("storage_signal", storage_signal)], value);
 }
 
 pub(crate) fn record_operator_gauges(state: &AppState) {
-    state.ingestor.record_inflight_metrics(&state.metrics);
-    state.ingestor.record_raw_spool_metrics(&state.metrics);
-    let arrow_write_buffers = state
-        .storage
-        .arrow_write_buffer_metrics()
-        .into_iter()
-        .map(|buffer| (buffer.storage_signal, buffer))
-        .collect::<HashMap<_, _>>();
     for storage_signal in [
         StorageSignal::Logs,
         StorageSignal::Spans,
         StorageSignal::MetricGauge,
         StorageSignal::MetricSum,
     ] {
-        let rows = arrow_write_buffers
-            .get(&storage_signal)
-            .map(|buffer| buffer.rows)
-            .unwrap_or(0);
-        let bytes = arrow_write_buffers
-            .get(&storage_signal)
-            .map(|buffer| buffer.bytes)
-            .unwrap_or(0);
-        let age_seconds = arrow_write_buffers
-            .get(&storage_signal)
-            .map(|buffer| buffer.age_seconds)
-            .unwrap_or(0.0);
         storage_signal_gauge(
             &state.metrics,
             MetricName::ArrowWriteBufferRows,
             storage_signal.as_str(),
-            rows as f64,
+            0.0,
         );
         storage_signal_gauge(
             &state.metrics,
             MetricName::ArrowWriteBufferBytes,
             storage_signal.as_str(),
-            bytes as f64,
+            0.0,
         );
         storage_signal_gauge(
             &state.metrics,
             MetricName::ArrowWriteBufferAgeSeconds,
             storage_signal.as_str(),
-            age_seconds,
+            0.0,
         );
     }
-    let maintenance = state.maintenance.health();
-    let paused = maintenance
-        .get("paused")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    state.metrics.gauge(
-        MetricName::MaintenancePaused,
-        &[],
-        if paused { 1.0 } else { 0.0 },
-    );
-    state.metrics.gauge(
-        MetricName::DucklakeMaintenanceEnabled,
-        &[],
-        if state.config.operator.ducklake_maintenance.enabled {
-            1.0
-        } else {
-            0.0
-        },
-    );
+    state
+        .metrics
+        .gauge(MetricName::DucklakeMaintenanceEnabled, &[], 0.0);
 }
 
 pub(crate) fn record_storage_operator_gauges(state: &AppState) {
@@ -516,31 +239,23 @@ pub(crate) fn record_storage_operator_gauges(state: &AppState) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Config, ServeRole};
+    use crate::config::Config;
     use tempfile::tempdir;
 
     #[test]
-    fn ingest_role_disables_every_registered_compat_route() {
+    fn ingest_route_is_not_served() {
         let dir = tempdir().unwrap();
-        let mut config = Config::test(dir.path().join("canardstack.duckdb"));
-        config.operator.serve_role = ServeRole::Ingest;
+        let config = Config::test(dir.path().join("canardstack.duckdb"));
         let state = AppState::new(config).unwrap();
 
-        for (method, path) in super::super::compat_routes::compat_route_examples_for_tests() {
-            let response = route(
-                &method,
-                &path,
-                &HashMap::new(),
-                &HashMap::new(),
-                &[],
-                &state,
-            );
-            assert_eq!(
-                response.status(),
-                404,
-                "{method} {path}: {}",
-                response.json_body()
-            );
-        }
+        let response = route(
+            "POST",
+            "/v1/logs",
+            &HashMap::new(),
+            &HashMap::new(),
+            &[],
+            &state,
+        );
+        assert_eq!(response.status(), 404, "{}", response.json_body());
     }
 }

@@ -26,7 +26,7 @@ fn log_startup_storage_mode(probe: &crate::storage::StorageProbe) {
     tracing::info!(
         event = "storage_mode",
         mode = probe.mode,
-        "telemetry lands through DuckDB Arrow append into DuckLake"
+        "serving queries from DuckLake"
     );
 }
 
@@ -41,10 +41,6 @@ pub fn serve_until(state: Arc<AppState>, shutdown: &AtomicBool) -> anyhow::Resul
     let probe = state.storage.probe();
     tracing::info!(event = "server_listening", addr = %addr);
     log_startup_storage_mode(&probe);
-    tracing::info!(
-        event = "ingest_acknowledgement",
-        "2xx means fsynced to the local raw spool and accepted for bounded processing"
-    );
     let active = Arc::new(AtomicUsize::new(0));
     let max_conns = state.config.operator.max_concurrent_connections;
     let read_timeout = state.config.operator.socket_read_timeout;

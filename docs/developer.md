@@ -1,398 +1,57 @@
-# Developer Guide
+# Developer Notes
 
-This guide covers contributor setup, local development workflows, and the
-implementation details that are useful when changing canardstack itself.
+canardstack is now a query-only Rust binary. It attaches DuckDB to a DuckLake
+catalog and serves bounded Prometheus, Loki, and Tempo-compatible HTTP routes.
 
-For a practitioner-focused overview, start with the [README](../README.md).
-
-## Architecture
-
-```text
-OTLP/HTTP -> cheap validation -> freshness-first admission -> fsynced local raw spool
-  -> ingest worker transform -> Arrow write buffer -> scheduler seal driver
-  -> DuckDB Arrow append -> DuckLake commit -> logical queries
-```
-
-canardstack is currently shaped as:
-
-- One Rust binary, `canardstack`.
-- Synchronous standard-library HTTP server on `CANARDSTACK_BIND`.
-- `otlp2records` for OTLP logs, traces, gauge metrics, and sum metrics.
-- Local raw spool for the `202` acceptance boundary, with append fsync completed
-  before acknowledgement.
-- Bounded per-storage-signal in-memory accounting with row, byte, age, and
-  pressure checks.
-- Admission primitives for freshness-budget ingest admission, protected seal,
-  cheap query, and heavy query traffic.
-- DuckDB through `duckdb-rs`.
-- DuckLake through DuckDB's official `ducklake` extension SQL surface. The
-  default local mode is a local DuckLake catalog and local DuckLake-managed data files.
-- Prometheus, Loki, and Tempo compatibility adapters over bounded query helpers.
-- HTTP routes for ingest, smoke checks, and compatibility queries.
-- Query execution with time range, limit, timeout, memory, and concurrency
-  enforcement.
-- Grafana is the only bundled UI; canardstack itself does not serve a custom
-  browser interface.
-- Whole-day retention execution for telemetry tables, followed by DuckLake
-  `CHECKPOINT` maintenance when canardstack DuckLake maintenance is enabled.
-- Storage health with freshness watermarks, logical row counts, and local
-  physical bytes on admin health and scheduler-maintained metric snapshots.
-- Prometheus-style operator metrics at `/metrics`, also snapshotted into the
-  metric store for Grafana dashboards. `/metrics` itself records only cheap
-  in-process gauges.
-
-## Configuration
-
-canardstack reads built-in defaults, then `config.toml`, then environment
-overrides. Set `CANARDSTACK_CONFIG=/path/to/config.toml` to load a different
-file. If `CANARDSTACK_CONFIG` is unset, `./config.toml` is loaded when it
-exists; otherwise the defaults are used.
-
-Start from `config/example.toml` for a full structured config grouped by
-operator concern: server, auth, paths, DuckDB, DuckLake, ingest, query, admission,
-retention, scheduler, and raw spool. Every public TOML setting has a matching
-`CANARDSTACK_*` environment variable, and env vars always win. Empty env vars
-clear optional string/path settings such as
-`CANARDSTACK_DUCKLAKE_ATTACH_URI`, `CANARDSTACK_POSTGRES_DSN`,
-`CANARDSTACK_DUCKDB_EXTENSION_DIR`, and
-`CANARDSTACK_PROCESS_MEMORY_LIMIT_BYTES`.
-
-Runtime diagnostics are emitted to stderr as logfmt-style structured events.
-Set `CANARDSTACK_LOG` or `RUST_LOG` to `error`, `warn`, `info`, `debug`,
-`trace`, or `off`; the default level is `info`.
-
-## Local DuckLake Mode
-
-Compose stores local metadata and files in the `canardstack-data` named volume
-mounted at `/var/lib/canardstack`.
-
-The default Compose environment is explicit and overrides any image-local
-config file:
-
-```text
-CANARDSTACK_BIND=0.0.0.0:4318
-CANARDSTACK_DATA_DIR=/var/lib/canardstack
-CANARDSTACK_DUCKDB_EXTENSION_DIR=/usr/local/lib/duckdb/extensions
-```
-
-With no `CANARDSTACK_POSTGRES_DSN`, DuckLake uses a local DuckDB-backed catalog
-under `CANARDSTACK_DATA_DIR` and local file storage under
-`CANARDSTACK_DATA_DIR/storage`. Postgres catalogs and object storage are later
-deployment modes, not required for the Docker quickstart.
-
-Default v0 writes prepared Arrow batches into an Arrow write buffer, then the
-scheduler flushes that buffer through DuckDB's Arrow appender into DuckLake
-tables inside an explicit transaction. `CANARDSTACK_ARROW_WRITE_BUFFER_TARGET_BYTES`
-defaults to 64 MiB and `CANARDSTACK_ARROW_WRITE_BUFFER_MAX_AGE_SECS` defaults to
-10 seconds. DuckLake physical maintenance is DuckDB/DuckLake-owned: canardstack
-configures DuckLake options at attach/startup and the scheduler runs `CHECKPOINT`
-after telemetry retention. Disable this with
-`CANARDSTACK_DUCKLAKE_MAINTENANCE_ENABLED=false`; row-level retention still runs,
-but canardstack will not trigger CHECKPOINT compaction, cleanup, or inlined-data
-flushing.
-
-The Docker image build runs `canardstack install-ducklake-extension` and stores
-the required DuckDB extensions under `/usr/local/lib/duckdb/extensions`. That
-build step needs network access to the DuckDB extension repository the first
-time the image is built. At runtime, startup first attempts to load the packaged
-extensions. If one is missing, startup fails loudly with guidance to fix the
-extension path or catalog configuration.
-
-`develop.watch` is intentionally not enabled. The Docker quickstart pulls the
-published GHCR image by default. Rust source edits should use the build override
-or the host workflow below.
-
-## Remote DuckLake
-
-For a remote DuckLake catalog, configure canardstack with a MotherDuck `md:`
-URI or another `ducklake:` URI instead of the default local DuckLake path:
+## Local Checks
 
 ```bash
-export MOTHERDUCK_TOKEN='<your-motherduck-token>'
-export CANARDSTACK_DUCKLAKE_ATTACH_URI='md:test-ducklake'
-docker compose up
+cargo check --all-targets
+cargo test
+cargo clippy --all-targets --all-features --locked -- -D warnings
+cargo fmt --all -- --check
 ```
 
-The attach URI must be the URI only, not a full SQL statement. For example, use
-`md:test-ducklake`, not `ATTACH 'md:test-ducklake';`.
-
-Keep `CANARDSTACK_POSTGRES_DSN` unset when
-`CANARDSTACK_DUCKLAKE_ATTACH_URI` is set. At startup, canardstack loads the
-needed extension and runs:
-
-```sql
-ATTACH 'md:test-ducklake' AS canardlake;
-USE canardlake;
-```
-
-and then creates or reuses the standard telemetry tables in that remote
-database. The local DuckDB file under `CANARDSTACK_DATA_DIR` still exists as
-the client-side file used to load extensions and establish query connections.
-
-Run the live remote DuckLake smoke test with credentials loaded:
-
-```bash
-set -a
-. ./.env
-set +a
-cargo test remote_ducklake_attach_uri_smoke -- --ignored --nocapture
-```
-
-The normal test suite does not contact remote services. It verifies the attach
-plan offline; the ignored smoke verifies startup, ingest, seal, and
-compatibility query visibility against the configured remote DuckLake.
-
-## Host Workflow
-
-Host Rust is useful for contributors, but is not required for Docker evaluation.
-The benchmark-only `otlp2records-observer` feature uses observer-based
-transform instrumentation from the crates.io `otlp2records` dependency.
-
-Start from the checked-in example:
+## Run Locally
 
 ```bash
 cp config/example.env .env
-```
-
-Load it in your shell, or export the variables directly:
-
-```bash
-set -a
-. ./.env
-set +a
-```
-
-For a PostgreSQL DuckLake metadata catalog:
-
-```bash
-createdb ducklake_catalog
-export CANARDSTACK_POSTGRES_DSN='dbname=ducklake_catalog host=localhost user=postgres password=postgres'
-```
-
-If `CANARDSTACK_POSTGRES_DSN` is unset, DuckLake uses a local DuckDB metadata
-catalog file under `CANARDSTACK_DATA_DIR`.
-
-Startup fails fast if DuckLake cannot attach; there is no non-DuckLake ingest
-fallback.
-
-Build and run:
-
-```bash
-cargo check
-cargo test
+set -a && . ./.env && set +a
 cargo run -- serve
+cargo run -- serve --listen 127.0.0.1:4320
+cargo run -- healthcheck --endpoint http://127.0.0.1:4320/healthz
 ```
 
-`serve` defaults to the all-in-one role. Route-only modes are available for
-split-process preparation:
+Telemetry writes are handled outside this binary. Use
+[duckdb-otlp](https://github.com/smithclay/duckdb-otlp) in a DuckDB process to
+write the DuckLake tables, then configure canardstack with the same catalog and
+data path.
+
+To validate the local extension checkout end to end:
 
 ```bash
-cargo run -- serve --role all
-cargo run -- serve --role ingest
-cargo run -- serve --role query
+scripts/e2e-duckdb-otlp-local.py
 ```
 
-`--role ingest` serves ingest and operator/control endpoints but not
-compatibility query routes. `--role query` serves query and operator/control
-endpoints but not ingest or maintenance mutation routes. The scheduler runs only
-in `all` and `ingest` roles.
+See [`docs/e2e-duckdb-otlp.md`](e2e-duckdb-otlp.md) for the exact shape and the
+local file-lock caveat.
 
-Then open:
+## Source Map
 
-```text
-http://127.0.0.1:4318/
-```
+- `src/main.rs` dispatches `serve`, `healthcheck`, and `--version`.
+- `src/http/` contains the synchronous std-library HTTP server and route table.
+- `src/compat/` adapts Prometheus, Loki, and Tempo-style HTTP requests.
+- `src/query/` builds bounded SQL over the DuckLake tables.
+- `src/storage/` owns DuckDB/DuckLake attach, health probes, schema fencing, and
+  per-query connection cloning.
+- `src/metadata.rs` serves discovery routes from `metadata_summary`.
+- `src/metrics.rs` renders the process-local `/metrics` surface.
 
-Run the in-process smoke command:
+## Constraints
 
-```bash
-cargo run -- smoke
-```
-
-The smoke command starts the app in-process, ingests representative OTLP JSON
-logs, traces, gauge metrics, and sum metrics, flushes buffered rows, calls
-representative compatibility query endpoints, and prints health.
-
-## Query Surface
-
-The primary v0 query surface is a set of compatibility adapters. They use the
-same bounded query engine as smoke tests and Grafana, with time ranges,
-limits, server-owned timeouts, DuckDB memory limits, and query concurrency
-guards.
-
-Prometheus-compatible metrics routes:
-
-- `GET/POST /api/v1/query`
-- `GET/POST /api/v1/query_range`
-- `GET /api/v1/labels`
-- `GET /api/v1/label/{name}/values`
-- `GET /api/v1/series`
-- `GET /api/v1/metadata`
-
-Loki-compatible logs routes:
-
-- `GET /loki/api/v1/query_range`
-- `GET /loki/api/v1/query`
-- `GET /loki/api/v1/labels`
-- `GET /loki/api/v1/label/{name}/values`
-- `GET /loki/api/v1/series`
-
-Tempo-compatible trace routes:
-
-- `GET /api/v2/traces/{traceID}`
-- `GET /api/traces/{traceID}`
-- `GET /api/search`
-- `GET /api/search/tags`
-- `GET /api/search/tag/{tag}/values`
-
-These are subset adapters, not full protocol implementations. Prometheus and
-Loki errors use `{"status":"error","errorType":"...","error":"..."}`. The
-normal HTTP API does not expose arbitrary SQL.
-
-Supported ingest response behavior:
-
-- `400` for cheap request validation failures such as content type or
-  compressed payload size. Decompression, OTLP transform, and timestamp-skew
-  checks run in ingest workers after `202`; terminal failures checkpoint the
-  raw-spool record instead of replaying it forever.
-- `401` for missing API key.
-- `403` for bad API key.
-- `429` for retryable raw-spool, queue, or process ingest pressure.
-- `429 freshness_budget_exceeded` before raw-spool append when projected seal
-  visibility exceeds the configured freshness SLA.
-- `503` when the raw spool is unavailable or storage dependencies are unhealthy.
-
-## Pre-commit Hooks
-
-Local checks are wired up through [prek](https://github.com/j178/prek), a Rust
-reimplementation of the `pre-commit` framework. The repo's
-`.pre-commit-config.yaml` runs `cargo fmt --all -- --check` and the same clippy
-invocation as CI (`cargo clippy --all-targets --all-features --locked --
--D warnings`) before each commit.
-
-Install once per checkout:
-
-```bash
-brew install prek   # or: cargo install --locked prek
-prek install
-```
-
-Run all hooks against the working tree without committing:
-
-```bash
-prek run --all-files
-```
-
-## Tests And Proofs
-
-Run the Rust test suite:
-
-```bash
-cargo test
-```
-
-Coverage currently includes auth, invalid payloads, timestamp skew,
-dependency-unhealthy mode, unauthenticated `/healthz`, raw-spool replay and
-full-spool rejection, in-flight admission pressure, query limit validation,
-compatibility auth/error envelopes, ingest-to-query visibility through
-Prometheus/Loki/Tempo subsets, the scheduled seal driver, removed
-dashboard/alert routes, and the retention executor.
-
-Docker-local checks are intentionally outside normal `cargo test`:
-
-```bash
-docker compose config
-docker compose -f compose.yaml -f compose.build.yaml build
-scripts/smoke-docker-local.sh
-```
-
-Those checks validate image build, Compose config, healthy container startup,
-OTLP fixture ingest through port `4318`, compatibility query responses from the
-running container, named-volume persistence across restart, and data removal
-after the documented reset.
-
-The CI-shaped Docker proof script builds the image, starts the service, runs
-the smoke, restarts the container to prove named-volume persistence, then
-removes the volume and verifies the fixture trace is gone:
-
-```bash
-scripts/smoke-docker-local.sh
-```
-
-## Background Scheduler
-
-The `serve` command spawns one background thread that closes the maintenance
-loop without operator action:
-
-- A single seal driver flushes the storage Arrow write buffer through DuckDB's
-  Arrow appender when per-signal size or age thresholds fire, or on the
-  freshness cadence, then checkpoints the raw spool after DuckLake commit.
-  Ingest workers insert Arrow batches into the Arrow write buffer; request
-  threads do not perform DuckDB/DuckLake writes inline.
-- A periodic seal writes Arrow buffers through DuckDB Arrow append and commits
-  DuckLake.
-- A checkpoint pass runs DuckDB/DuckLake `CHECKPOINT` as the single physical
-  maintenance primitive when DuckLake maintenance is enabled. `CHECKPOINT` owns
-  inlined-data flush, snapshot expiration, adjacent-file merge, delete-file
-  rewrite, cleanup, and orphan deletion.
-- A retention pass enforces the configured telemetry retention days, then runs
-  the same checkpoint path. Use `POST /api/admin/maintenance/checkpoint/run`
-  when you want physical compaction without logical telemetry deletes.
-
-`POST /api/admin/maintenance/pause` pauses scheduled jobs only; manual seal and
-retention endpoints remain available for repair workflows. The base cadence is
-configurable as `scheduler.maintenance_interval_secs` in `config.toml` or via
-`CANARDSTACK_MAINTENANCE_INTERVAL_SECS`.
-Set `scheduler.enabled = false` or `CANARDSTACK_SCHEDULER_ENABLED=false` to
-fall back to operator-triggered maintenance only. The scheduler shuts down
-cleanly when `serve` exits.
-
-## Admission Controller
-
-`src/admission_control.rs` owns seal admission, query admission, and freshness
-budget projection. It is intentionally not a generic scheduler. The request path
-asks it one direct question before raw-spool append: will the in-flight seal debt
-plus Arrow write-buffer visibility debt stay within
-`CANARDSTACK_FRESHNESS_BUDGET_SLA_SECS` or `_MS`?
-
-Seal jobs reserve seal admission before doing DuckDB/DuckLake work and record
-successful seal-byte drain into the EWMA. Compatibility routes reserve either
-cheap query admission (labels, metadata, probe, instant-ish queries) or heavy
-query admission (range/search/trace lookups). Heavy query capacity is reduced
-first under freshness debt and then rejected with the normal protocol error
-envelope when freshness is at risk. The controller records cached query-visible
-freshness lag from operator gauge refreshes as telemetry; ingest request threads
-never query DuckDB for admission.
-
-## V0 Gaps
-
-- The standard-library HTTP server is intentionally minimal.
-- OTLP/gRPC is intentionally not implemented.
-- Histograms and exponential histograms are decoded as unsupported for v0 and
-  not stored.
-- Custom dashboard and alert APIs have been removed from the v0 path; Grafana
-  provisioning is the supported dashboard surface.
-- Canardstack no longer presents a bespoke query protocol as a v0 product/API
-  surface. Use the Grafana-compatible Prometheus, Loki, and Tempo subsets for
-  HTTP workflows, or external DuckDB/MotherDuck/SQL clients for direct SQL.
-- Arrow IPC artifacts and embedded Perspective are not implemented.
-- Grafana discovery endpoints use daily metadata summaries over promoted
-  columns; full raw-attribute introspection remains outside the v0 HTTP API.
-- Retention is row-level `DELETE` against single tables as a documented v0
-  fallback; the day-tables-behind-views migration is the next storage-layout
-  proof gate.
-- The maintenance singleton lease is in-process; a Postgres-backed lease is
-  needed before splitting maintenance into its own role.
-- Query-only mode still uses the same binary and storage configuration; separate
-  writer/reader DuckDB processes remain a future proof gate.
-- The sustained MVP benchmark envelope is current for logs and traces. Metrics
-  performance remains TBD.
-
-## Related Docs
-
-- [V0 architecture](architecture/v0-architecture.md)
-- [Storage schema](architecture/storage-schema.md)
-- [Query API](architecture/query-api.md)
-- [Operator metrics](architecture/operator-metrics.md)
-- [Benchmark gates](planning/benchmark.md)
-- [Failure runbooks](https://smithclay.github.io/canardstack/operations/failure-runbooks/)
+- Keep the server synchronous; do not add an async runtime.
+- Do not add OTLP ingest, gRPC, Kafka, a bundled catalog service, or a second
+  long-running process to this binary.
+- Do not expose arbitrary SQL through the compatibility APIs.
+- Keep query paths bounded by time range, row limit, timeout, DuckDB memory
+  limit, and admission caps.

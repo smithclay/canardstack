@@ -1,7 +1,7 @@
-//! Optional in-binary TLS termination for public HTTP listeners. The main
-//! `serve` endpoint and the `serve-catalog` Quack endpoint both keep their
-//! plaintext HTTP backends; this module terminates TLS on a public address and
-//! forwards decrypted HTTP/1.1 bytes to the configured loopback backend.
+//! Optional in-binary TLS termination for the public `serve` listener. The
+//! query server keeps a plaintext HTTP backend; this module terminates TLS on a
+//! public address and forwards decrypted HTTP/1.1 bytes to the configured
+//! loopback backend.
 
 use anyhow::{Context, Result};
 use base64::Engine;

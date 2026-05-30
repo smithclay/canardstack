@@ -3,6 +3,7 @@ use crate::db::sql::{quote as sql_quote, span_row, time_predicate};
 use crate::query::plan::TimeBounds;
 use crate::query::trace::plan_tempo_search;
 use crate::semantic_labels::{self, LabelScope};
+use crate::signal::StorageSignal;
 use crate::validation::{ApiError, ApiResult};
 use crate::AppState;
 use chrono::Utc;
@@ -28,15 +29,15 @@ pub fn tempo_trace(state: &AppState, trace_id: &str) -> ApiResult<Value> {
     let from = to - chrono::Duration::days(7);
     let mut spans = Vec::new();
     state.queries.run_interactive(&state.storage, |conn, prefix| {
-        // v2 storage holds IDs as BLOBs (otlp2records 0.8.0 `FixedSizeBinary`)
-        // and durations as BIGINT nanoseconds (`duration_time_unix_nano`). The
-        // public span JSON keys stay stable (`timestamp`, `trace_id`,
-        // `span_name`, `duration`) so the Tempo adapter and `span_row` keep
-        // their existing positional contract.
+        // duckdb-otlp stores IDs as hex VARCHAR and durations as BIGINT
+        // nanoseconds (`duration_time_unix_nano`). The public span JSON keys
+        // stay stable (`timestamp`, `trace_id`, `span_name`, `duration`) so
+        // the Tempo adapter and `span_row` keep their positional contract.
         let sql = format!(
-            "SELECT start_time_unix_nano::VARCHAR, lower(hex(trace_id)), lower(hex(span_id)), lower(hex(parent_span_id)), service_name, name, duration_time_unix_nano, status_code, {} AS http_method, {} AS http_status_code FROM {prefix}spans WHERE trace_id = unhex({}) AND {} ORDER BY start_time_unix_nano ASC LIMIT 20000",
+            "SELECT start_time_unix_nano::VARCHAR, lower(trace_id), lower(span_id), lower(parent_span_id), service_name, name, duration_time_unix_nano, status_code, {} AS http_method, {} AS http_status_code FROM {prefix}{} WHERE lower(trace_id) = lower({}) AND {} ORDER BY start_time_unix_nano ASC LIMIT 20000",
             span_label("http_method"),
             span_label("http_status_code"),
+            StorageSignal::Spans.as_str(),
             sql_quote(trace_id),
             time_predicate("start_time_unix_nano", from, to)
         );
@@ -63,17 +64,18 @@ pub fn tempo_trace_proto(state: &AppState, trace_id: &str) -> ApiResult<Vec<u8>>
     let from = to - chrono::Duration::days(7);
     let mut spans = Vec::new();
     state.queries.run_interactive(&state.storage, |conn, prefix| {
-        // Same v2 mapping as the JSON sibling above: IDs come out as hex
-        // VARCHAR via `lower(hex(...))`, durations are nanoseconds, and the
-        // span_name column was renamed `name` while status_message became
+        // Same mapping as the JSON sibling above: IDs come out as lowercase
+        // hex VARCHAR, durations are nanoseconds, and the span_name column is
+        // `name` while status_message is
         // `status_status_message` in the OTAP schema.
         let sql = format!(
-            "SELECT start_time_unix_nano::VARCHAR, lower(hex(trace_id)), lower(hex(span_id)), lower(hex(parent_span_id)), service_name, name, duration_time_unix_nano, status_code, {} AS http_method, {} AS http_status_code, trace_state, kind, status_status_message, scope_name, scope_version, {} AS deployment_environment, {} AS http_route, {} AS exception_type FROM {prefix}spans WHERE trace_id = unhex({}) AND {} ORDER BY start_time_unix_nano ASC LIMIT 20000",
+            "SELECT start_time_unix_nano::VARCHAR, lower(trace_id), lower(span_id), lower(parent_span_id), service_name, name, duration_time_unix_nano, status_code, {} AS http_method, {} AS http_status_code, trace_state, kind, status_status_message, scope_name, scope_version, {} AS deployment_environment, {} AS http_route, {} AS exception_type FROM {prefix}{} WHERE lower(trace_id) = lower({}) AND {} ORDER BY start_time_unix_nano ASC LIMIT 20000",
             span_label("http_method"),
             span_label("http_status_code"),
             span_label("deployment_environment"),
             span_label("http_route"),
             span_label("exception_type"),
+            StorageSignal::Spans.as_str(),
             sql_quote(trace_id),
             time_predicate("start_time_unix_nano", from, to)
         );

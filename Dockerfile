@@ -17,7 +17,6 @@ WORKDIR /app
 FROM chef AS planner
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
-COPY benches ./benches
 RUN cargo chef prepare --recipe-path recipe.json
 
 FROM chef AS builder
@@ -37,16 +36,11 @@ RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry \
 
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
-COPY benches ./benches
 
 RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry \
     --mount=type=cache,id=cargo-git,target=/usr/local/cargo/git \
     cargo build --release --locked --features tls \
     && cp /app/target/release/canardstack /app/canardstack
-
-RUN mkdir -p /opt/duckdb/extensions \
-    && CANARDSTACK_DUCKDB_EXTENSION_DIR=/opt/duckdb/extensions \
-       /app/canardstack install-ducklake-extension
 
 FROM debian:bookworm-slim AS runtime
 
@@ -64,16 +58,14 @@ RUN apt-get update \
         --create-home \
         --shell /usr/sbin/nologin \
         canardstack \
-    && mkdir -p /usr/local/lib/duckdb/extensions /var/lib/canardstack/storage \
-    && chown -R canardstack:canardstack /var/lib/canardstack /usr/local/lib/duckdb
+    && mkdir -p /var/lib/canardstack/storage \
+    && chown -R canardstack:canardstack /var/lib/canardstack
 
 COPY --from=builder /app/canardstack /usr/local/bin/canardstack
-COPY --from=builder --chown=canardstack:canardstack /opt/duckdb/extensions /usr/local/lib/duckdb/extensions
 
 ENV HOME=/var/lib/canardstack \
     CANARDSTACK_BIND=0.0.0.0:4318 \
-    CANARDSTACK_DATA_DIR=/var/lib/canardstack \
-    CANARDSTACK_DUCKDB_EXTENSION_DIR=/usr/local/lib/duckdb/extensions
+    CANARDSTACK_DATA_DIR=/var/lib/canardstack
 
 USER 10001:10001
 EXPOSE 4318

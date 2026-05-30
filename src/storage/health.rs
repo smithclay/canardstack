@@ -124,20 +124,10 @@ impl Storage {
             for signal in StorageSignal::ALL {
                 let table = signal.as_str();
                 let ts = crate::storage::schema::table_timestamp_column(signal);
-                let sql = format!(
-                    "SELECT max({ts})::VARCHAR, epoch(max({ts})), max(ingested_at)::VARCHAR, epoch(max(ingested_at)) FROM {prefix}{table}"
-                );
-                let (
-                    event_watermark,
-                    event_watermark_epoch,
-                    ingest_watermark,
-                    ingest_watermark_epoch,
-                ): (Option<String>, Option<f64>, Option<String>, Option<f64>) =
-                    conn.query_row(&sql, [], |row| {
-                        Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-                    })?;
-                let ingest_lag_seconds = ingest_watermark_epoch
-                    .map(|epoch| Utc::now().timestamp_millis() as f64 / 1000.0 - epoch);
+                let sql =
+                    format!("SELECT max({ts})::VARCHAR, epoch(max({ts})) FROM {prefix}{table}");
+                let (event_watermark, event_watermark_epoch): (Option<String>, Option<f64>) =
+                    conn.query_row(&sql, [], |row| Ok((row.get(0)?, row.get(1)?)))?;
                 let event_lag_seconds = event_watermark_epoch
                     .map(|epoch| Utc::now().timestamp_millis() as f64 / 1000.0 - epoch);
                 map.insert(
@@ -146,9 +136,7 @@ impl Storage {
                         "timestamp": event_watermark,
                         "epoch_seconds": event_watermark_epoch,
                         "event_lag_seconds": event_lag_seconds,
-                        "ingested_at": ingest_watermark,
-                        "ingested_at_epoch_seconds": ingest_watermark_epoch,
-                        "lag_seconds": ingest_lag_seconds
+                        "lag_seconds": event_lag_seconds
                     }),
                 );
             }
@@ -159,7 +147,8 @@ impl Storage {
     pub fn logical_rows(&self) -> Result<Value> {
         self.with_conn(|conn, prefix| {
             let mut map = serde_json::Map::new();
-            for table in ["logs", "spans", "metric_gauge", "metric_sum"] {
+            for signal in StorageSignal::ALL {
+                let table = signal.as_str();
                 let sql = format!("SELECT count(*) FROM {prefix}{table}");
                 let rows: i64 = conn.query_row(&sql, [], |row| row.get(0))?;
                 map.insert(table.to_string(), json!(rows));
@@ -172,7 +161,11 @@ impl Storage {
         // Reader, not writer — a stuck seal must not hang /healthz.
         let conn = self.reader.lock_or_poisoned();
         conn.query_row("SELECT 1", [], |_| Ok(()))?;
-        let sql = format!("SELECT * FROM {}logs LIMIT 0", self.target_prefix);
+        let sql = format!(
+            "SELECT * FROM {}{} LIMIT 0",
+            self.target_prefix,
+            StorageSignal::Logs.as_str()
+        );
         let _stmt = conn.prepare(&sql)?;
         Ok(())
     }

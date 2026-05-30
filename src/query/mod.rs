@@ -11,6 +11,7 @@ use crate::query::plan::{
     TracePlan, TraceSort,
 };
 use crate::semantic_labels::{self, LabelScope};
+use crate::signal::StorageSignal;
 use crate::storage::{QueryTimeoutError, Storage};
 use crate::validation::{ApiError, ApiResult};
 use duckdb::Row;
@@ -54,7 +55,7 @@ impl QueryEngine {
         let where_sql = log_where_sql(plan)?;
         let projected = semantic_labels::projected_labels(LabelScope::Logs);
         let sql = log_select_sql(
-            "{prefix}logs",
+            &format!("{{prefix}}{}", StorageSignal::Logs.as_str()),
             &projected,
             &where_sql,
             plan.direction.sql(),
@@ -99,12 +100,12 @@ impl QueryEngine {
             TraceSort::DurationDesc => "7 DESC",
             TraceSort::TimestampDesc => "3 DESC",
         };
-        // v2 OTAP: `trace_id` is BLOB → hex VARCHAR for output; `timestamp` →
-        // `start_time_unix_nano`; `span_name` → `name`; `duration` →
-        // `duration_time_unix_nano` (BIGINT nanoseconds, downstream `tempo_*`
-        // converts to ms).
+        // duckdb-otlp: `timestamp` → `start_time_unix_nano`; `span_name` →
+        // `name`; `duration` → `duration_time_unix_nano` (BIGINT nanoseconds,
+        // downstream `tempo_*` converts to ms).
         let sql = format!(
-            "SELECT lower(hex(trace_id)), min(start_time_unix_nano)::VARCHAR, max(start_time_unix_nano)::VARCHAR, max(service_name), max(name), count(*), max(duration_time_unix_nano) FROM {{prefix}}spans WHERE {} GROUP BY trace_id ORDER BY {order} LIMIT {}",
+            "SELECT lower(trace_id), min(start_time_unix_nano)::VARCHAR, max(start_time_unix_nano)::VARCHAR, max(service_name), max(name), count(*), max(duration_time_unix_nano) FROM {{prefix}}{} WHERE {} GROUP BY trace_id ORDER BY {order} LIMIT {}",
+            StorageSignal::Spans.as_str(),
             where_sql.join(" AND "),
             limit + 1
         );
@@ -240,10 +241,6 @@ fn log_row(row: &Row<'_>, projected: &[(&str, String)]) -> duckdb::Result<Value>
         json!(row.get::<_, String>("timestamp")?),
     );
     obj.insert(
-        "ingested_at".to_string(),
-        json!(row.get::<_, String>("ingested_at")?),
-    );
-    obj.insert(
         "body".to_string(),
         json!(row.get::<_, Option<String>>("body")?),
     );
@@ -290,10 +287,9 @@ fn log_select_sql(
     limit: usize,
 ) -> String {
     let mut columns = vec![
-        // Alias the v2 `time_unix_nano` storage column back to the stable
+        // Alias the `time_unix_nano` storage column back to the stable
         // `timestamp` output column the log row reader pulls by name.
         "time_unix_nano::VARCHAR AS timestamp".to_string(),
-        "ingested_at::VARCHAR AS ingested_at".to_string(),
         "body".to_string(),
     ];
     // Project every registry label as VARCHAR so the row reader can pull each

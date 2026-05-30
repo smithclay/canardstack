@@ -1,18 +1,6 @@
-use crate::signal::StorageSignal;
-use crate::storage::Storage;
 use crate::LockExt;
-use anyhow::{Context, Result};
-use arrow58::array::{
-    ArrayRef, BooleanArray, Float64Array, Int32Array, StringArray, TimestampNanosecondArray,
-    UInt32Array,
-};
-use arrow58::datatypes::{DataType, Field, Schema, TimeUnit};
-use arrow58::record_batch::RecordBatch;
-use chrono::Utc;
-use serde_json::{json, Map, Value};
 use std::borrow::Cow;
 use std::collections::BTreeMap;
-use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Instant;
 
@@ -793,48 +781,6 @@ impl Metrics {
         }
         (counters, gauges)
     }
-
-    pub fn write_snapshot_to_storage(&self, storage: &Storage) -> Result<usize> {
-        let samples = self.snapshot();
-        if samples.is_empty() {
-            return Ok(0);
-        }
-        // Sanctioned internal producer: operator self-telemetry is queryable when
-        // enabled, but it has no raw-spool replay record and does not enter the
-        // external ingest write buffer.
-        let counters = samples
-            .iter()
-            .filter(|sample| sample.kind() == MetricKind::Counter)
-            .cloned()
-            .collect::<Vec<_>>();
-        let gauges = samples
-            .iter()
-            .filter(|sample| sample.kind() == MetricKind::Gauge)
-            .cloned()
-            .collect::<Vec<_>>();
-        let mut rows = 0;
-        if !counters.is_empty() {
-            let batch = metric_samples_batch(&counters, StorageSignal::MetricSum)?;
-            rows += storage
-                .commit_operator_metrics_snapshot(
-                    StorageSignal::MetricSum,
-                    &batch,
-                    "canardstack_operator_metrics",
-                )?
-                .rows;
-        }
-        if !gauges.is_empty() {
-            let batch = metric_samples_batch(&gauges, StorageSignal::MetricGauge)?;
-            rows += storage
-                .commit_operator_metrics_snapshot(
-                    StorageSignal::MetricGauge,
-                    &batch,
-                    "canardstack_operator_metrics",
-                )?
-                .rows;
-        }
-        Ok(rows)
-    }
 }
 
 pub struct Timer {
@@ -905,105 +851,6 @@ fn metric_labels_map(metric_id: &MetricId) -> BTreeMap<String, String> {
 
 fn escape_label_value(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
-}
-
-fn metric_samples_batch(samples: &[MetricSample], signal: StorageSignal) -> Result<RecordBatch> {
-    let rows = samples.len();
-    // v2 storage uses TIMESTAMP_NS for record-time columns and emits both
-    // `int_value`/`double_value`. Operator self-telemetry samples are all
-    // `f64`, so the int channel is left null and consumers reading the table
-    // coalesce to the double channel.
-    let timestamp_ns = Utc::now()
-        .timestamp_nanos_opt()
-        .unwrap_or_else(|| Utc::now().timestamp_micros() * 1_000);
-    let resource_attributes = json!({"service.name": "canardstack"}).to_string();
-    let mut fields = vec![
-        Field::new(
-            "time_unix_nano",
-            DataType::Timestamp(TimeUnit::Nanosecond, None),
-            true,
-        ),
-        Field::new(
-            "start_time_unix_nano",
-            DataType::Timestamp(TimeUnit::Nanosecond, None),
-            true,
-        ),
-        Field::new("name", DataType::Utf8, true),
-        Field::new("description", DataType::Utf8, true),
-        Field::new("unit", DataType::Utf8, true),
-        Field::new("int_value", DataType::Int64, true),
-        Field::new("double_value", DataType::Float64, true),
-        Field::new("service_name", DataType::Utf8, true),
-        Field::new("service_namespace", DataType::Utf8, true),
-        Field::new("service_instance_id", DataType::Utf8, true),
-        Field::new("resource_attributes", DataType::Utf8, true),
-        Field::new("scope_name", DataType::Utf8, true),
-        Field::new("scope_version", DataType::Utf8, true),
-        Field::new("scope_attributes", DataType::Utf8, true),
-        Field::new("metric_attributes", DataType::Utf8, true),
-        Field::new("flags", DataType::UInt32, true),
-        Field::new("exemplars_json", DataType::Utf8, true),
-    ];
-    let mut arrays: Vec<ArrayRef> = vec![
-        Arc::new(TimestampNanosecondArray::from(vec![
-            Some(timestamp_ns);
-            rows
-        ])),
-        Arc::new(TimestampNanosecondArray::from(vec![None::<i64>; rows])),
-        Arc::new(StringArray::from(
-            samples
-                .iter()
-                .map(|sample| Some(sample.name.clone()))
-                .collect::<Vec<_>>(),
-        )),
-        Arc::new(StringArray::from(vec![None::<String>; rows])),
-        Arc::new(StringArray::from(vec![None::<String>; rows])),
-        // int_value channel: unused for operator telemetry.
-        Arc::new(arrow58::array::Int64Array::from(vec![None::<i64>; rows])),
-        Arc::new(Float64Array::from(
-            samples
-                .iter()
-                .map(|sample| Some(sample.value))
-                .collect::<Vec<_>>(),
-        )),
-        Arc::new(StringArray::from(vec![
-            Some("canardstack".to_string());
-            rows
-        ])),
-        Arc::new(StringArray::from(vec![None::<String>; rows])),
-        Arc::new(StringArray::from(vec![None::<String>; rows])),
-        Arc::new(StringArray::from(vec![Some(resource_attributes); rows])),
-        Arc::new(StringArray::from(vec![
-            Some("canardstack".to_string());
-            rows
-        ])),
-        Arc::new(StringArray::from(vec![None::<String>; rows])),
-        Arc::new(StringArray::from(vec![Some("{}".to_string()); rows])),
-        Arc::new(StringArray::from(
-            samples
-                .iter()
-                .map(|sample| Some(labels_json(&sample.labels).to_string()))
-                .collect::<Vec<_>>(),
-        )),
-        Arc::new(UInt32Array::from(vec![None::<u32>; rows])),
-        Arc::new(StringArray::from(vec![None::<String>; rows])),
-    ];
-    if signal == StorageSignal::MetricSum {
-        fields.push(Field::new("aggregation_temporality", DataType::Int32, true));
-        fields.push(Field::new("is_monotonic", DataType::Boolean, true));
-        arrays.push(Arc::new(Int32Array::from(vec![Some(2); rows])));
-        arrays.push(Arc::new(BooleanArray::from(vec![Some(true); rows])));
-    }
-    RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
-        .context("build operator metrics RecordBatch")
-}
-
-fn labels_json(labels: &BTreeMap<String, String>) -> Value {
-    let mut map = Map::new();
-    for (k, v) in labels {
-        map.insert(k.clone(), Value::String(v.clone()));
-    }
-    Value::Object(map)
 }
 
 #[cfg(test)]

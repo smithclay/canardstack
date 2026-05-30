@@ -1,40 +1,26 @@
 use crate::config::Config;
-use crate::ingest::ReplayBackedRecordRef;
 use crate::signal::StorageSignal;
 use anyhow::{Context, Result};
-use arrow58::record_batch::RecordBatch;
 use duckdb::Connection;
 use serde::Serialize;
 use serde_json::Value;
-use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::Mutex;
 use std::time::Duration;
 
-mod arrow;
-mod arrow_write;
-mod arrow_write_buffer;
 mod ducklake;
 mod health;
-mod maintenance;
 mod metadata;
-mod metadata_refresh;
 mod query_conn;
 pub(crate) mod schema;
 
-pub use arrow_write::ArrowFlushOutcome;
-use arrow_write::ArrowWriteBuffer;
 use ducklake::{
     attach_ducklake_connection, configure_base_connection, configure_ducklake_maintenance_options,
     configure_write_connection, ducklake_attach_plan, DUCKLAKE_CATALOG_NAME,
     DUCKLAKE_TARGET_PREFIX,
 };
-pub use ducklake::{
-    configure_object_store_for_data_path, install_ducklake_extension, open_quack_catalog_connection,
-};
-pub use metadata::MetadataRefreshOutcome;
 use schema::{create_tables_on, enforce_schema_version_on};
 
 #[derive(Clone, Debug, Serialize)]
@@ -56,33 +42,6 @@ pub struct StorageProbe {
     pub healthy: bool,
     pub mode: String,
     pub last_error: Option<String>,
-}
-
-pub(crate) struct CommittedReplayRefs(Vec<ReplayBackedRecordRef>);
-
-impl CommittedReplayRefs {
-    pub(crate) fn len(&self) -> usize {
-        self.0.len()
-    }
-
-    pub(crate) fn as_slice(&self) -> &[ReplayBackedRecordRef] {
-        &self.0
-    }
-
-    // Module-private on purpose: a committed-replay-refs token may be minted ONLY
-    // by the `storage` commit path, so holding one is proof the rows were
-    // DuckLake-committed. Do NOT widen to `pub(super)`/`pub(crate)` — `storage`
-    // is a depth-1 module, so either would make the token forgeable from any
-    // in-crate module (e.g. `seal`/`ingest`) and break the checkpoint-after-commit
-    // guarantee. The mint sites live in `storage`'s descendant modules
-    // (`arrow_write`, `arrow_write_buffer`), which can reach a private constructor.
-    fn new(replay_refs: Vec<ReplayBackedRecordRef>) -> Self {
-        Self(replay_refs)
-    }
-
-    fn empty() -> Self {
-        Self(Vec::new())
-    }
 }
 
 impl StorageProbe {
@@ -115,25 +74,9 @@ pub struct ArrowWriteBufferMetric {
     pub age_seconds: f64,
 }
 
-/// Folded Arrow write-buffer aggregates the ingest admission freshness
-/// projection consumes (the three [`crate::admission_control::FreshnessBudgetInputs`]
-/// buffer scalars), produced by [`Storage::arrow_write_buffer_freshness`] under a
-/// single lock without the per-signal [`ArrowWriteBufferMetric`] vec.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct ArrowWriteBufferFreshness {
-    pub buffered_bytes: usize,
-    pub buffered_active_count: usize,
-    pub oldest_buffer_age_seconds: f64,
-}
-
 pub struct Storage {
-    /// Write-side connection. Held for inserts, DDL, and DuckLake maintenance.
-    /// Reader path never touches this mutex — that decoupling keeps /healthz,
-    /// /metrics, and queries responsive while a seal is in flight.
-    writer: Mutex<Connection>,
-    /// Cloned from `writer` at startup after ATTACH + DDL; shares the
-    /// underlying Database (attached schemas survive `try_clone`). Source of
-    /// per-query clones in `with_query_conn`.
+    /// Attached DuckDB connection used for probes and as the parent for
+    /// per-query cloned connections.
     reader: Mutex<Connection>,
     target_prefix: String,
     mode: String,
@@ -145,24 +88,11 @@ pub struct Storage {
     ducklake_maintenance_enabled: bool,
     ducklake_maintenance_options_supported: bool,
     ducklake_checkpoint_supported: AtomicBool,
-    ducklake_maintenance_capability_reason: Mutex<Option<String>>,
-    arrow_write_buffers: Mutex<BTreeMap<StorageSignal, ArrowWriteBuffer>>,
-    write_memory_limit: String,
     last_error: Mutex<Option<String>>,
-    /// Cache-invalidation token for discovery metadata. Bumped only after a
-    /// committed `metadata_summary` change (refresh or retention); discovery
-    /// caches in `Metadata` key entries on this value and drop them on a bump.
+    /// Cache-invalidation token for discovery metadata. In query-only mode this
+    /// process does not maintain `metadata_summary`, so the token is stable for
+    /// the lifetime of the process.
     metadata_generation: AtomicU64,
-    /// StorageSignal/event-date buckets whose `metadata_summary` rows are stale after
-    /// a committed insert. Drained by the `metadata_refresh` scheduler job so
-    /// the day-partition re-aggregation stays off the ingest commit path.
-    dirty_metadata: Mutex<BTreeMap<StorageSignal, BTreeSet<String>>>,
-}
-
-pub struct RetentionPolicy {
-    pub logs_days: i64,
-    pub spans_days: i64,
-    pub metrics_days: i64,
 }
 
 /// Typed timeout from `with_query_conn`. Downcastable so callers can classify
@@ -180,72 +110,6 @@ impl std::fmt::Display for QueryTimeoutError {
 
 impl std::error::Error for QueryTimeoutError {}
 
-pub(crate) struct ReplayBackedArrowBatch<'a> {
-    pub(crate) storage_signal: StorageSignal,
-    pub(crate) batch: &'a RecordBatch,
-    pub(crate) source_format: &'a str,
-    pub(crate) replay_ref: ReplayBackedRecordRef,
-}
-
-#[derive(Clone, Debug)]
-pub struct InternalTelemetryCommitResult {
-    pub rows: usize,
-    pub timings: Vec<ArrowBatchBufferTiming>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum TimingPhase {
-    Coalesce,
-    Prepare,
-    ArrowWriteCoalesce,
-    ArrowWriteBuffer,
-    DuckdbArrowAppend,
-    DucklakeCommit,
-    WriterLockWait,
-}
-
-impl TimingPhase {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            TimingPhase::Coalesce => "storage_coalesce",
-            TimingPhase::Prepare => "storage_prepare",
-            TimingPhase::ArrowWriteCoalesce => "storage_arrow_write_coalesce",
-            TimingPhase::ArrowWriteBuffer => "storage_arrow_write_buffer",
-            TimingPhase::DuckdbArrowAppend => "storage_duckdb_arrow_append",
-            TimingPhase::DucklakeCommit => "storage_ducklake_commit",
-            TimingPhase::WriterLockWait => "writer_lock_wait",
-        }
-    }
-}
-
-impl std::fmt::Display for TimingPhase {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct ArrowBatchBufferTiming {
-    pub storage_signal: StorageSignal,
-    pub phase: TimingPhase,
-    pub rows: usize,
-    pub seconds: f64,
-}
-
-#[derive(Clone, Debug)]
-pub struct ArrowBatchBufferResult {
-    pub rows: usize,
-    pub timings: Vec<ArrowBatchBufferTiming>,
-}
-
-struct PreparedArrowBatch {
-    pub(super) storage_signal: StorageSignal,
-    pub(super) batch: RecordBatch,
-    pub(super) rows: usize,
-    pub(super) timestamp_days: Vec<String>,
-    pub(super) replay_refs: BTreeSet<ReplayBackedRecordRef>,
-}
-
 impl Storage {
     pub fn open(config: &Config) -> Result<Self> {
         if let Some(parent) = config.operator.duckdb_path.parent() {
@@ -253,37 +117,29 @@ impl Storage {
         }
         fs::create_dir_all(&config.operator.local_storage_dir)?;
 
-        let writer = Connection::open(&config.operator.duckdb_path).with_context(|| {
+        let conn = Connection::open(&config.operator.duckdb_path).with_context(|| {
             format!("open DuckDB file {}", config.operator.duckdb_path.display())
         })?;
-        configure_base_connection(&writer)?;
-        configure_write_connection(&writer, &config.operator.duckdb_write_memory_limit)?;
+        configure_base_connection(&conn)?;
+        configure_write_connection(&conn, &config.operator.duckdb_write_memory_limit)?;
 
-        attach_ducklake_connection(&writer, config).context(
+        attach_ducklake_connection(&conn, config).context(
             "DuckLake attach failed. Fix the catalog config (URI, token, network, or extension path) and restart.",
         )?;
         let target_prefix = DUCKLAKE_TARGET_PREFIX.to_string();
         let plan = ducklake_attach_plan(config)?;
         let mode = format!("{}_arrow_append", plan.mode);
         let ducklake_maintenance_capability =
-            configure_ducklake_maintenance_options(&writer, &config.operator.ducklake_maintenance)
+            configure_ducklake_maintenance_options(&conn, &config.operator.ducklake_maintenance)
                 .context("configure DuckLake maintenance options")?;
 
-        create_tables_on(&writer, &target_prefix)?;
+        create_tables_on(&conn, &target_prefix)?;
         // Fail-closed if this binary cannot safely operate on the catalog's
         // schema generation; stamp it on a fresh/legacy catalog.
-        enforce_schema_version_on(&writer, &target_prefix)?;
-
-        // Reader must be cloned AFTER attach + create_tables so the new
-        // session inherits the catalog.
-        let reader = writer
-            .try_clone()
-            .context("clone writer connection for reader pool")?;
-        configure_base_connection(&reader)?;
+        enforce_schema_version_on(&conn, &target_prefix)?;
 
         Ok(Self {
-            writer: Mutex::new(writer),
-            reader: Mutex::new(reader),
+            reader: Mutex::new(conn),
             target_prefix,
             mode,
             catalog_name: DUCKLAKE_CATALOG_NAME.to_string(),
@@ -297,33 +153,21 @@ impl Storage {
             ducklake_checkpoint_supported: AtomicBool::new(
                 ducklake_maintenance_capability.checkpoint_supported,
             ),
-            ducklake_maintenance_capability_reason: Mutex::new(
-                ducklake_maintenance_capability.reason,
-            ),
-            arrow_write_buffers: Mutex::new(BTreeMap::new()),
-            write_memory_limit: config.operator.duckdb_write_memory_limit.clone(),
             last_error: Mutex::new(None),
             metadata_generation: AtomicU64::new(0),
-            dirty_metadata: Mutex::new(BTreeMap::new()),
         })
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::arrow::batch_timestamp_days;
+    use super::ducklake::configure_object_store_for_data_path;
     use super::ducklake::{
         build_ducklake_attach_plan, ducklake_maintenance_options_sql, object_store_kind,
         object_store_secret_sql, ObjectStore,
     };
-    use super::metadata_refresh::metadata_refresh_sql;
     use super::*;
     use crate::config::DuckLakeMaintenanceConfig;
-    use arrow58::array as arrow58_array;
-    use arrow58::datatypes as arrow58_types;
-    use arrow58::record_batch::RecordBatch;
-    use chrono::{DateTime, NaiveDate, Utc};
-    use std::sync::Arc;
     use tempfile::tempdir;
 
     #[test]
@@ -588,12 +432,10 @@ mod tests {
     #[test]
     fn configure_object_store_for_data_path_skips_local() {
         // A local data path needs no object-store secret, so the helper is a
-        // no-op (returns None) without loading httpfs/aws -- this keeps the
-        // serve-catalog server offline-safe when DATA_PATH is a local directory.
+        // no-op (returns None) without loading httpfs/aws.
         let conn = duckdb::Connection::open_in_memory().unwrap();
         assert_eq!(
-            super::configure_object_store_for_data_path(&conn, "/var/lib/canardstack/storage")
-                .unwrap(),
+            configure_object_store_for_data_path(&conn, "/var/lib/canardstack/storage").unwrap(),
             None
         );
     }
@@ -784,67 +626,5 @@ mod tests {
         assert!(err
             .to_string()
             .contains("CANARDSTACK_DUCKLAKE_DATA_PATH cannot be set"));
-    }
-
-    #[test]
-    fn metadata_refresh_uses_one_insert_per_signal_bucket() {
-        // Counts exclude high-cardinality id labels (trace_id, span_id,
-        // service_instance_id), which stay filterable but are not materialized.
-        for (signal, select_count) in [
-            (StorageSignal::Logs, 9),
-            (StorageSignal::Spans, 16),
-            (StorageSignal::MetricGauge, 5),
-            (StorageSignal::MetricSum, 5),
-        ] {
-            let sql = metadata_refresh_sql("canardlake.", signal, "2026-05-16").unwrap();
-            assert_eq!(
-                sql.matches("INSERT INTO canardlake.metadata_summary")
-                    .count(),
-                1
-            );
-            assert_eq!(sql.matches("UNION ALL").count(), select_count - 1);
-        }
-    }
-
-    #[test]
-    fn arrow_write_buffer_tracks_distinct_timestamp_days() {
-        fn timestamp_nanos(year: i32, month: u32, day: u32, hour: u32) -> i64 {
-            DateTime::<Utc>::from_naive_utc_and_offset(
-                NaiveDate::from_ymd_opt(year, month, day)
-                    .unwrap()
-                    .and_hms_opt(hour, 0, 0)
-                    .unwrap(),
-                Utc,
-            )
-            .timestamp_nanos_opt()
-            .unwrap()
-        }
-
-        // Logs use `time_unix_nano` as the storage timestamp column (see
-        // `table_timestamp_column`); v2 stores nanosecond precision directly.
-        let schema = Arc::new(arrow58_types::Schema::new(vec![
-            arrow58_types::Field::new(
-                "time_unix_nano",
-                arrow58_types::DataType::Timestamp(arrow58_types::TimeUnit::Nanosecond, None),
-                true,
-            ),
-            arrow58_types::Field::new("int_value", arrow58_types::DataType::Int64, true),
-        ]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(arrow58_array::TimestampNanosecondArray::from(vec![
-                    Some(timestamp_nanos(2026, 5, 16, 0)),
-                    Some(timestamp_nanos(2026, 5, 16, 1)),
-                    Some(timestamp_nanos(2026, 5, 17, 0)),
-                ])),
-                Arc::new(arrow58_array::Int64Array::from(vec![1, 2, 3])),
-            ],
-        )
-        .unwrap();
-
-        let days = batch_timestamp_days(StorageSignal::Logs, &batch).unwrap();
-
-        assert_eq!(days, vec!["2026-05-16", "2026-05-17"]);
     }
 }

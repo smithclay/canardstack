@@ -7,20 +7,12 @@ max_connections = 1024
 socket_read_timeout_secs = 30
 socket_write_timeout_secs = 30
 
-# Optional in-binary TLS for the public serve endpoint. This requires a build
-# with `--features tls`. File mode follows common observability config shape:
-# cert_file/key_file are PEM files, typically managed by ACME/cert-manager.
 # [server.tls]
 # enabled = true
 # mode = "file"
 # cert_file = "/etc/canardstack/tls/fullchain.pem"
 # key_file = "/etc/canardstack/tls/privkey.pem"
 # backend_bind = "127.0.0.1:4319"
-#
-# Explicit single-binary dev/service-to-service mode. This encrypts traffic but
-# clients must trust the generated cert or skip verification.
-# enabled = true
-# mode = "ephemeral_self_signed"
 
 [auth]
 api_key = "dev-canardstack-key"
@@ -34,57 +26,16 @@ data_dir = ".canardstack"
 memory_limit = "1GiB"
 
 [ducklake]
-# With no remote attach URI or PostgreSQL DSN, canardstack uses a local DuckLake
-# catalog and local data files under data_dir.
-# postgres_dsn = "dbname=ducklake_catalog host=localhost user=postgres password=postgres"
-# attach_uri = "md:test-ducklake"
-# Optional local DuckDB-backed DuckLake metadata catalog file override.
-# catalog_path = "/var/lib/canardstack/catalog/canardstack.ducklake"
-# Optional DuckLake DATA_PATH override for object storage, e.g. s3:// or gcs://.
-# data_path = "s3://canardstack-data/prod/"
-# Required when attach_uri points at a ducklake:quack: catalog.
-# quack_token = "replace-with-catalog-token"
-# Optional local/single-node live catalog endpoint. This starts an in-process
-# loopback Quack catalog endpoint and makes canardstack attach through it via
-# ducklake:quack:<listen>, so DuckDB clients can inspect the local DuckLake
-# while canardstack keeps running. The endpoint is loopback-only and always
-# plaintext; CANARDSTACK_CATALOG_TLS_* env vars apply only to the separate
-# serve-catalog role and have no effect here.
-# local_catalog_enabled = true
-# local_catalog_listen = "127.0.0.1:9494"
+# Point this at the DuckLake catalog written by duckdb-otlp.
+# attach_uri = "ducklake:/var/lib/canardstack/catalog.ducklake"
+# data_path = "/var/lib/canardstack/storage"
 #
-# TLS for the separate `serve-catalog` role is environment-only (no TOML
-# binding), since it is set on the catalog container/process, not on the
-# app config. Use CANARDSTACK_CATALOG_TLS_ENABLED / _MODE / _CERT_FILE /
-# _KEY_FILE on the serve-catalog process; see config/example.env.
-# canardstack-owned DuckLake maintenance runs CHECKPOINT after logical retention
-# and can be triggered directly via /api/admin/maintenance/checkpoint/run.
-maintenance_enabled = true
-# DuckLake's documented default is 10 rows. Set to 0 when maintenance is disabled
-# to avoid accumulating inlined metadata that canardstack will not flush.
-data_inlining_row_limit = 10
-# Snapshot expiration follows canardstack telemetry retention by default.
-# expire_older_than_days = 14
-# Delay physical file deletion after expiration to leave a conservative repair window.
-delete_older_than_secs = 86400
-
-[ingest]
-max_body_bytes = 8388608
-# process_memory_limit_bytes = 3221225472
-# Parallel transform across OS threads; the scheduler is the single seal driver.
-# workers = 4
-
-[validation]
-accept_late_secs = 86400
-accept_future_secs = 600
-
-[storage]
-arrow_write_buffer_target_bytes = 67108864
-arrow_write_buffer_max_age_secs = 10
-
-[raw_spool]
-capacity_bytes = 1073741824
-group_commit_ms = 1
+# Other supported catalog shapes:
+# attach_uri = "md:test-ducklake"
+# postgres_dsn = "dbname=ducklake_catalog host=localhost user=postgres password=postgres"
+#
+# Object storage examples:
+# data_path = "s3://canardstack-data/prod/"
 
 [query]
 concurrency = 4
@@ -93,29 +44,8 @@ memory_limit = "1GiB"
 admission_wait_ms = 1000
 
 [admission]
-seal_capacity = 1
 cheap_query_capacity = 1
 heavy_query_degraded_capacity = 1
-freshness_budget_sla_secs = 15
 
 [retention]
 days = 14
-
-[scheduler]
-enabled = true
-maintenance_interval_secs = 30
-# Seal cadence for the single seal driver. Keep well under the freshness SLA so
-# Arrow write-buffer age never approaches the freshness-budget reject threshold (default 1000ms).
-# seal_interval_ms = 1000
-
-[metrics]
-# Persist a snapshot of operator metrics into the metric_gauge / metric_sum
-# storage tables so canardstack's own metrics are queryable via the compat
-# path. Off by default to avoid the extra write load and the
-# canardstack_operator_metrics rows; /metrics still serves the live surface.
-# operator_metrics_to_storage = false
-#
-# Fine-grained spool phase micro-timings (raw_spool_append_*/raw_spool_checkpoint_*)
-# are a compile-time opt-in, not a config knob: build with
-# `cargo build --features detailed-metrics` to emit them. The coarse phases are
-# always on.

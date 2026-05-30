@@ -74,22 +74,14 @@ pub(crate) fn table_timestamp_column(signal: StorageSignal) -> &'static str {
         StorageSignal::MetricGauge | StorageSignal::MetricSum => "time_unix_nano",
     }
 }
-// v0 storage uses the otlp2records 0.8.0 OTAP field names and types verbatim,
-// so the storage shim doesn't translate at all — it copies the otlp2records
-// output batch straight through and only synthesizes the two book-keeping
-// columns (`ingested_at`, `source_format`). The DuckDB types below are the
-// `expected_duckdb_type` mapping the alignment test pins. Integer ID columns
-// are BLOB (raw bytes from `FixedSizeBinary{8,16}`) and rendered as hex in
-// compatibility-layer SELECTs via `lower(hex(col))`; durations are BIGINT
-// nanoseconds (Arrow `Duration(Nanosecond)`); record timestamps are
-// `TIMESTAMP_NS` so partition expressions stay cheap.
+// The read-side table contract follows duckdb-otlp's DuckDB-facing schema.
+// The extension renders trace/span IDs as lowercase hex VARCHAR columns and
+// does not add canardstack-owned writer bookkeeping columns.
 pub(super) const LOGS_COLUMNS: &[(&str, &str)] = &[
     ("time_unix_nano", "TIMESTAMP_NS"),
     ("observed_time_unix_nano", "TIMESTAMP_NS"),
-    ("ingested_at", "TIMESTAMP"),
-    ("source_format", "VARCHAR"),
-    ("trace_id", "BLOB"),
-    ("span_id", "BLOB"),
+    ("trace_id", "VARCHAR"),
+    ("span_id", "VARCHAR"),
     ("service_name", "VARCHAR"),
     ("service_namespace", "VARCHAR"),
     ("service_instance_id", "VARCHAR"),
@@ -109,11 +101,9 @@ pub(super) const LOGS_COLUMNS: &[(&str, &str)] = &[
 pub(super) const SPANS_COLUMNS: &[(&str, &str)] = &[
     ("start_time_unix_nano", "TIMESTAMP_NS"),
     ("duration_time_unix_nano", "BIGINT"),
-    ("ingested_at", "TIMESTAMP"),
-    ("source_format", "VARCHAR"),
-    ("trace_id", "BLOB"),
-    ("span_id", "BLOB"),
-    ("parent_span_id", "BLOB"),
+    ("trace_id", "VARCHAR"),
+    ("span_id", "VARCHAR"),
+    ("parent_span_id", "VARCHAR"),
     ("trace_state", "VARCHAR"),
     ("service_name", "VARCHAR"),
     ("service_namespace", "VARCHAR"),
@@ -138,8 +128,6 @@ pub(super) const SPANS_COLUMNS: &[(&str, &str)] = &[
 pub(super) const METRIC_GAUGE_COLUMNS: &[(&str, &str)] = &[
     ("time_unix_nano", "TIMESTAMP_NS"),
     ("start_time_unix_nano", "TIMESTAMP_NS"),
-    ("ingested_at", "TIMESTAMP"),
-    ("source_format", "VARCHAR"),
     ("name", "VARCHAR"),
     ("description", "VARCHAR"),
     ("unit", "VARCHAR"),
@@ -160,8 +148,6 @@ pub(super) const METRIC_GAUGE_COLUMNS: &[(&str, &str)] = &[
 pub(super) const METRIC_SUM_COLUMNS: &[(&str, &str)] = &[
     ("time_unix_nano", "TIMESTAMP_NS"),
     ("start_time_unix_nano", "TIMESTAMP_NS"),
-    ("ingested_at", "TIMESTAMP"),
-    ("source_format", "VARCHAR"),
     ("name", "VARCHAR"),
     ("description", "VARCHAR"),
     ("unit", "VARCHAR"),
@@ -221,19 +207,16 @@ pub(super) fn create_table_sql(prefix: &str, name: &str, cols: &[(&str, &str)]) 
 /// The storage schema generation this binary WRITES. Bump when a `*_COLUMNS`
 /// set or the partitioning changes (see the module doc on schema evolution).
 ///
-/// v2 is the otlp2records 0.8.0 OTAP cutover: every typed column was renamed
-/// or retyped (`timestamp` → `time_unix_nano`/`start_time_unix_nano`,
-/// `metric_*` → `name`/`description`/`unit`, `value DOUBLE` split into
-/// `int_value BIGINT` + `double_value DOUBLE`, ID columns flipped from
-/// VARCHAR hex to BLOB raw bytes, counts to UINTEGER/UBIGINT). This is a
-/// hard, expand-only break — there is no in-place migration from v1.
-pub(super) const SCHEMA_VERSION: u32 = 2;
+/// v3 is the query-only cutover to duckdb-otlp-owned tables: physical table
+/// names use the `otlp_*` prefix, trace/span IDs are hex VARCHAR, and
+/// canardstack no longer owns `ingested_at`/`source_format` bookkeeping columns.
+pub(super) const SCHEMA_VERSION: u32 = 3;
 /// The oldest catalog schema generation this binary can safely operate on. Keep
 /// it equal to [`SCHEMA_VERSION`] for a breaking change; an additive,
 /// schema-on-read-tolerant (expand/contract) change can leave this low so a
 /// newer binary still opens an older catalog. This is the min-reader/min-writer
 /// window the lakehouse formats (Delta/Iceberg) use, scaled to v0.
-pub(super) const MIN_COMPATIBLE_SCHEMA_VERSION: u32 = 2;
+pub(super) const MIN_COMPATIBLE_SCHEMA_VERSION: u32 = 3;
 
 const META_TABLE: &str = "canardstack_meta";
 const META_COLUMNS: &[(&str, &str)] = &[("key", "VARCHAR"), ("value", "VARCHAR")];
@@ -417,12 +400,6 @@ mod tests {
         );
     }
 
-    /// Columns `storage_duckdb_batch` synthesizes locally instead of copying from
-    /// the otlp2records output batch, so they are exempt from the otlp2records
-    /// alignment check below. See `crate::storage::arrow::storage_duckdb_batch`.
-    const SYNTHESIZED_COLUMNS: &[(&str, &str)] =
-        &[("ingested_at", "TIMESTAMP"), ("source_format", "VARCHAR")];
-
     /// Map a storage signal to the otlp2records schema it is built from.
     fn otlp2records_schema_name(signal: StorageSignal) -> &'static str {
         match signal {
@@ -433,14 +410,11 @@ mod tests {
         }
     }
 
-    /// The DuckDB column type canardstack declares to store an otlp2records field
-    /// of the given type. JSON attribute fields are stored as VARCHAR (see the
-    /// `schema` module doc). Duration columns are stored as BIGINT nanoseconds
-    /// because that's what `Arrow::Duration(Nanosecond)` represents at the wire
-    /// level. ID columns (`FixedSizeBinary{8,16}`) are stored as BLOB; the
-    /// compatibility layer renders them as hex with `lower(hex(col))` in
-    /// SELECTs. List columns are only present on the histogram tables, which
-    /// v0 does not store.
+    /// The DuckDB column type canardstack declares to read an otlp2records field
+    /// of the given type after duckdb-otlp has materialized it. JSON attribute
+    /// fields and trace/span fixed-size binary IDs are stored as VARCHAR by the
+    /// extension. List columns are only present on the histogram tables, which
+    /// this query service does not expose.
     fn expected_duckdb_type(field_type: FieldType) -> &'static str {
         match field_type {
             FieldType::Timestamp => "TIMESTAMP_NS",
@@ -453,7 +427,7 @@ mod tests {
             FieldType::Bool => "BOOLEAN",
             FieldType::String => "VARCHAR",
             FieldType::Json => "VARCHAR",
-            FieldType::FixedSizeBinary16 | FieldType::FixedSizeBinary8 => "BLOB",
+            FieldType::FixedSizeBinary16 | FieldType::FixedSizeBinary8 => "VARCHAR",
             // List columns only appear on histogram/exp_histogram schemas, which
             // canardstack v0 rejects at ingest — keep the variants explicit so a
             // future histogram column trips the alignment test.
@@ -461,14 +435,9 @@ mod tests {
         }
     }
 
-    /// Pin the implicit canardstack <-> otlp2records column contract. Every stored
-    /// column that `storage_duckdb_batch` copies by name from the otlp2records
-    /// output batch must exist in the matching `otlp2records::schema_def`, with a
-    /// DuckDB type canardstack declares compatibly. An otlp2records upgrade that
-    /// renames, drops, or retypes an emitted column trips THIS test (at
-    /// `cargo test`) with a precise message, instead of silently failing every
-    /// ingest at the `copy_arrow_column` name lookup. When it trips, bump the
-    /// stored schema version and plan a catalog migration before upgrading.
+    /// Pin the read-side table contract against the otlp2records schema shape
+    /// that duckdb-otlp materializes. A rename, drop, or incompatible type
+    /// change trips this test before query adapters fail at runtime.
     #[test]
     fn stored_columns_align_with_otlp2records_output() {
         for signal in StorageSignal::ALL {
@@ -477,15 +446,6 @@ mod tests {
                 panic!("otlp2records no longer defines a '{schema_name}' schema for {signal}")
             });
             for &(col, declared_ty) in table_columns(signal) {
-                if let Some((_, synth_ty)) =
-                    SYNTHESIZED_COLUMNS.iter().find(|(name, _)| *name == col)
-                {
-                    assert_eq!(
-                        declared_ty, *synth_ty,
-                        "{signal} synthesized column {col} is declared {declared_ty}, expected {synth_ty}"
-                    );
-                    continue;
-                }
                 let otlp_field = def
                     .fields
                     .iter()

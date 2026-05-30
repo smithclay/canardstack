@@ -9,38 +9,6 @@ const DUCKDB_THREADS: usize = 1;
 pub(super) const DUCKLAKE_CATALOG_NAME: &str = "canardlake";
 pub(super) const DUCKLAKE_TARGET_PREFIX: &str = "canardlake.";
 
-pub fn install_ducklake_extension(extension_dir: Option<&Path>) -> Result<()> {
-    let conn = Connection::open_in_memory()?;
-    configure_extension_directory(&conn, extension_dir)?;
-    conn.execute_batch(
-        "INSTALL ducklake; LOAD ducklake; INSTALL json; LOAD json; INSTALL quack; LOAD quack; \
-         INSTALL httpfs; LOAD httpfs; INSTALL aws; LOAD aws;",
-    )?;
-    Ok(())
-}
-
-/// Open a DuckDB connection that serves a local catalog file over the Quack
-/// protocol for the `serve-catalog` role. Unlike [`attach_ducklake_connection`],
-/// this performs no DuckLake `ATTACH`: the catalog process is plain DuckDB plus
-/// Quack, and remote clients attach DuckLake over Quack against the served file.
-pub fn open_quack_catalog_connection(
-    db_path: &Path,
-    extension_dir: Option<&Path>,
-) -> Result<Connection> {
-    if let Some(parent) = db_path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        fs::create_dir_all(parent)?;
-    }
-    let conn = Connection::open(db_path)?;
-    configure_extension_directory(&conn, extension_dir)?;
-    configure_base_connection(&conn)?;
-    if conn.execute_batch("LOAD quack;").is_err() {
-        conn.execute_batch("INSTALL quack; LOAD quack;")?;
-    }
-    Ok(conn)
-}
 pub(super) fn sql_path(path: &Path) -> String {
     path.to_string_lossy().replace('\'', "''")
 }
@@ -136,15 +104,10 @@ fn object_store_region() -> Option<String> {
     .filter(|value| !value.is_empty())
 }
 
-/// Configure object-store credentials on a standalone connection (e.g. the
-/// `serve-catalog` Quack server) from the DuckLake `DATA_PATH`.
-///
-/// DuckLake CHECKPOINT over a Quack catalog runs its file-deletion scan as
-/// catalog-side SQL (`read_blob` over the data path) on the Quack server, so that
-/// connection must authenticate to the object store just like the ingest/query
-/// writer does -- otherwise the scan reaches S3 unsigned and the catalog node's
-/// IAM role denies it, aborting CHECKPOINT before any compaction or cleanup runs.
-/// Returns the configured store scheme, or `None` for a local data path.
+/// Configure object-store credentials on a standalone DuckDB connection from a
+/// DuckLake `DATA_PATH`. Returns the configured store scheme, or `None` for a
+/// local data path.
+#[cfg(test)]
 pub fn configure_object_store_for_data_path(
     conn: &Connection,
     data_path: &str,
@@ -176,7 +139,6 @@ pub(super) struct DuckLakeAttachPlan {
 pub(super) struct DuckLakeMaintenanceCapability {
     pub(super) options_supported: bool,
     pub(super) checkpoint_supported: bool,
-    pub(super) reason: Option<String>,
 }
 
 pub(super) fn ducklake_attach_plan(config: &Config) -> Result<DuckLakeAttachPlan> {
@@ -247,11 +209,11 @@ pub(super) fn build_ducklake_attach_plan(
                     )
                 })?;
             let scope = uri.strip_prefix("ducklake:").unwrap_or(uri);
-            // When the catalog is fronted by TLS with a self-signed cert (the
-            // serve-catalog `tls` shim), the Quack client assumes HTTPS
-            // for the non-local host and would reject the cert. A scoped HTTP
-            // secret with VERIFY_SSL 0 skips verification for the catalog URL only
-            // (S3/other HTTPS still verifies); the Quack token still authenticates.
+            // When a Quack catalog is fronted by TLS with a self-signed cert,
+            // the Quack client assumes HTTPS for the non-local host and would
+            // reject the cert. A scoped HTTP secret with VERIFY_SSL 0 skips
+            // verification for the catalog URL only (S3/other HTTPS still
+            // verifies); the Quack token still authenticates.
             // `DISABLE_SSL` is intentionally not used — DuckLake rejects it, and the
             // quack secret has no SSL parameter.
             let insecure_tls_sql = if quack_insecure_tls {
@@ -357,13 +319,15 @@ pub(super) fn configure_ducklake_maintenance_options(
         Ok(()) => Ok(DuckLakeMaintenanceCapability {
             options_supported: true,
             checkpoint_supported: true,
-            reason: None,
         }),
         Err(err) if is_unsupported_ducklake_maintenance_error(&err.to_string()) => {
+            tracing::warn!(
+                event = "ducklake_maintenance_options_unsupported",
+                error = %err
+            );
             Ok(DuckLakeMaintenanceCapability {
                 options_supported: false,
                 checkpoint_supported: false,
-                reason: Some(err.to_string()),
             })
         }
         Err(err) => Err(err.into()),
