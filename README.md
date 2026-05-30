@@ -32,7 +32,7 @@ canardstack serve --listen 127.0.0.1:4320
 canardstack healthcheck --endpoint http://127.0.0.1:4320/healthz
 ```
 
-## Ingest
+## Write Telemetry
 
 Use `duckdb-otlp` for ingestion:
 

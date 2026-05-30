@@ -7,7 +7,6 @@ use chrono::Utc;
 use duckdb::Connection;
 use serde_json::{json, Value};
 use std::fs;
-use std::sync::atomic::Ordering;
 
 impl Storage {
     pub fn healthy(&self) -> bool {
@@ -23,23 +22,6 @@ impl Storage {
         }
     }
 
-    pub fn accepts_memory_ingest(&self) -> bool {
-        #[cfg(debug_assertions)]
-        {
-            !self.force_dependency_unhealthy.load(Ordering::Acquire)
-        }
-        #[cfg(not(debug_assertions))]
-        {
-            true
-        }
-    }
-
-    #[cfg(debug_assertions)]
-    pub fn set_dependency_unhealthy_for_tests(&self, unhealthy: bool) {
-        self.force_dependency_unhealthy
-            .store(unhealthy, Ordering::SeqCst);
-    }
-
     pub fn health(&self) -> StorageHealth {
         StorageHealth {
             healthy: self.healthy(),
@@ -48,14 +30,8 @@ impl Storage {
             postgres_catalog_configured: self.postgres_catalog_configured,
             last_error: self.last_error.lock_or_poisoned().clone(),
             capabilities: StorageCapabilities {
-                insert: true,
+                insert: false,
                 query: true,
-                ducklake_maintenance_enabled: self.ducklake_maintenance_enabled,
-                ducklake_checkpoint_maintenance: self
-                    .ducklake_checkpoint_supported
-                    .load(Ordering::SeqCst),
-                ducklake_maintenance_options: self.ducklake_maintenance_options_supported,
-                whole_day_retention: true,
             },
             freshness_watermarks: self
                 .freshness_watermarks()

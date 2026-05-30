@@ -1,12 +1,11 @@
 use crate::config::Config;
-use crate::signal::StorageSignal;
 use anyhow::{Context, Result};
 use duckdb::Connection;
 use serde::Serialize;
 use serde_json::Value;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::sync::atomic::AtomicU64;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -17,9 +16,8 @@ mod query_conn;
 pub(crate) mod schema;
 
 use ducklake::{
-    attach_ducklake_connection, configure_base_connection, configure_ducklake_maintenance_options,
-    configure_write_connection, ducklake_attach_plan, DUCKLAKE_CATALOG_NAME,
-    DUCKLAKE_TARGET_PREFIX,
+    attach_ducklake_connection, configure_base_connection, configure_write_connection,
+    ducklake_attach_plan, DUCKLAKE_CATALOG_NAME, DUCKLAKE_TARGET_PREFIX,
 };
 use schema::{create_tables_on, enforce_schema_version_on};
 
@@ -60,18 +58,6 @@ impl StorageHealth {
 pub struct StorageCapabilities {
     pub insert: bool,
     pub query: bool,
-    pub ducklake_maintenance_enabled: bool,
-    pub ducklake_checkpoint_maintenance: bool,
-    pub ducklake_maintenance_options: bool,
-    pub whole_day_retention: bool,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct ArrowWriteBufferMetric {
-    pub storage_signal: StorageSignal,
-    pub rows: usize,
-    pub bytes: usize,
-    pub age_seconds: f64,
 }
 
 pub struct Storage {
@@ -81,13 +67,8 @@ pub struct Storage {
     target_prefix: String,
     mode: String,
     catalog_name: String,
-    #[cfg(debug_assertions)]
-    force_dependency_unhealthy: AtomicBool,
     postgres_catalog_configured: bool,
     local_storage_dir: PathBuf,
-    ducklake_maintenance_enabled: bool,
-    ducklake_maintenance_options_supported: bool,
-    ducklake_checkpoint_supported: AtomicBool,
     last_error: Mutex<Option<String>>,
     /// Cache-invalidation token for discovery metadata. In query-only mode this
     /// process does not maintain `metadata_summary`, so the token is stable for
@@ -128,10 +109,7 @@ impl Storage {
         )?;
         let target_prefix = DUCKLAKE_TARGET_PREFIX.to_string();
         let plan = ducklake_attach_plan(config)?;
-        let mode = format!("{}_arrow_append", plan.mode);
-        let ducklake_maintenance_capability =
-            configure_ducklake_maintenance_options(&conn, &config.operator.ducklake_maintenance)
-                .context("configure DuckLake maintenance options")?;
+        let mode = format!("{}_query", plan.mode);
 
         create_tables_on(&conn, &target_prefix)?;
         // Fail-closed if this binary cannot safely operate on the catalog's
@@ -143,16 +121,8 @@ impl Storage {
             target_prefix,
             mode,
             catalog_name: DUCKLAKE_CATALOG_NAME.to_string(),
-            #[cfg(debug_assertions)]
-            force_dependency_unhealthy: AtomicBool::new(false),
             postgres_catalog_configured: config.operator.postgres_dsn.is_some(),
             local_storage_dir: config.operator.local_storage_dir.clone(),
-            ducklake_maintenance_enabled: config.operator.ducklake_maintenance.enabled,
-            ducklake_maintenance_options_supported: ducklake_maintenance_capability
-                .options_supported,
-            ducklake_checkpoint_supported: AtomicBool::new(
-                ducklake_maintenance_capability.checkpoint_supported,
-            ),
             last_error: Mutex::new(None),
             metadata_generation: AtomicU64::new(0),
         })
@@ -163,11 +133,9 @@ impl Storage {
 mod tests {
     use super::ducklake::configure_object_store_for_data_path;
     use super::ducklake::{
-        build_ducklake_attach_plan, ducklake_maintenance_options_sql, object_store_kind,
-        object_store_secret_sql, ObjectStore,
+        build_ducklake_attach_plan, object_store_kind, object_store_secret_sql, ObjectStore,
     };
     use super::*;
-    use crate::config::DuckLakeMaintenanceConfig;
     use tempfile::tempdir;
 
     #[test]
@@ -540,34 +508,6 @@ mod tests {
             plan.sql,
             "ATTACH 'ducklake:/catalog/canardstack.ducklake' AS canardlake (DATA_PATH 'gcs://canardstack-data/prod/'); USE canardlake;"
         );
-    }
-
-    #[test]
-    fn ducklake_maintenance_options_enable_checkpoint_owned_defaults() {
-        let sql = ducklake_maintenance_options_sql(&DuckLakeMaintenanceConfig {
-            enabled: true,
-            data_inlining_row_limit: 10,
-            expire_older_than_days: 14,
-            delete_older_than_secs: 86_400,
-        });
-
-        assert!(sql.contains("set_option('data_inlining_row_limit', 10)"));
-        assert!(sql.contains("set_option('auto_compact', true)"));
-        assert!(sql.contains("set_option('expire_older_than', '14 days')"));
-        assert!(sql.contains("set_option('delete_older_than', '86400 seconds')"));
-    }
-
-    #[test]
-    fn ducklake_maintenance_options_disable_compaction_and_inlining() {
-        let sql = ducklake_maintenance_options_sql(&DuckLakeMaintenanceConfig {
-            enabled: false,
-            data_inlining_row_limit: 0,
-            expire_older_than_days: 14,
-            delete_older_than_secs: 86_400,
-        });
-
-        assert!(sql.contains("set_option('data_inlining_row_limit', 0)"));
-        assert!(sql.contains("set_option('auto_compact', false)"));
     }
 
     #[test]

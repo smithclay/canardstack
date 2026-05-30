@@ -165,7 +165,6 @@ fn is_socket_timeout(err: &anyhow::Error) -> bool {
 
 fn handle_stream(mut stream: TcpStream, state: Arc<AppState>) -> anyhow::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
-    let keepalive_enabled = state.config.test_overrides.bench_http_keepalive;
     let mut requests = 0usize;
     loop {
         let mut first = String::new();
@@ -257,8 +256,7 @@ fn handle_stream(mut stream: TcpStream, state: Arc<AppState>) -> anyhow::Result<
             .get("connection")
             .is_some_and(|value| value.eq_ignore_ascii_case("close"));
         let reached_request_limit = requests >= KEEPALIVE_REQUEST_LIMIT;
-        let keep_alive =
-            should_keep_connection_alive(keepalive_enabled, client_requested_close, requests);
+        let keep_alive = should_keep_connection_alive(client_requested_close, requests);
         state.metrics.inc(
             MetricName::HttpConnectionRequestsTotal,
             &[(
@@ -285,12 +283,8 @@ fn handle_stream(mut stream: TcpStream, state: Arc<AppState>) -> anyhow::Result<
     }
 }
 
-fn should_keep_connection_alive(
-    keepalive_enabled: bool,
-    client_requested_close: bool,
-    requests_served: usize,
-) -> bool {
-    keepalive_enabled && !client_requested_close && requests_served < KEEPALIVE_REQUEST_LIMIT
+fn should_keep_connection_alive(client_requested_close: bool, requests_served: usize) -> bool {
+    !client_requested_close && requests_served < KEEPALIVE_REQUEST_LIMIT
 }
 
 fn header_limit_response() -> HttpResponse {
@@ -314,7 +308,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut config = Config::test(dir.path().join("canardstack.duckdb"));
         config.operator.local_storage_dir = dir.path().join("storage");
-        config.test_overrides.bench_http_keepalive = true;
         let state = Arc::new(AppState::new(config).unwrap());
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -355,17 +348,14 @@ mod tests {
     #[test]
     fn keepalive_request_limit_marks_final_response_connection_close() {
         assert!(should_keep_connection_alive(
-            true,
             false,
             KEEPALIVE_REQUEST_LIMIT - 1
         ));
         assert!(!should_keep_connection_alive(
-            true,
             false,
             KEEPALIVE_REQUEST_LIMIT
         ));
         assert!(!should_keep_connection_alive(
-            true,
             true,
             KEEPALIVE_REQUEST_LIMIT - 1
         ));

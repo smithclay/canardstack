@@ -32,7 +32,6 @@ fn healthz_reports_storage_readiness() {
     assert!(response.json_body()["storage"]["healthy"]
         .as_bool()
         .unwrap());
-    assert!(response.json_body().get("raw_spool_healthy").is_none());
 }
 
 #[test]

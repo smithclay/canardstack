@@ -3,6 +3,7 @@
 
 [server]
 bind = "127.0.0.1:4318"
+max_body_bytes = 8388608
 max_connections = 1024
 socket_read_timeout_secs = 30
 socket_write_timeout_secs = 30
@@ -45,7 +46,3 @@ admission_wait_ms = 1000
 
 [admission]
 cheap_query_capacity = 1
-heavy_query_degraded_capacity = 1
-
-[retention]
-days = 14

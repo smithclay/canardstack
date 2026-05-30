@@ -1,4 +1,4 @@
-use crate::config::{Config, DuckLakeMaintenanceConfig};
+use crate::config::Config;
 use crate::db::sql::escape_value;
 use anyhow::Result;
 use duckdb::Connection;
@@ -133,12 +133,6 @@ pub(super) struct DuckLakeAttachPlan {
     pub(super) needs_quack: bool,
     pub(super) needs_postgres: bool,
     pub(super) object_store: Option<ObjectStore>,
-}
-
-#[derive(Clone, Debug)]
-pub(super) struct DuckLakeMaintenanceCapability {
-    pub(super) options_supported: bool,
-    pub(super) checkpoint_supported: bool,
 }
 
 pub(super) fn ducklake_attach_plan(config: &Config) -> Result<DuckLakeAttachPlan> {
@@ -308,60 +302,6 @@ pub(super) fn build_ducklake_attach_plan(
 
 fn sql_string(value: &str) -> String {
     value.replace('\'', "''")
-}
-
-pub(super) fn configure_ducklake_maintenance_options(
-    conn: &Connection,
-    config: &DuckLakeMaintenanceConfig,
-) -> Result<DuckLakeMaintenanceCapability> {
-    let sql = ducklake_maintenance_options_sql(config);
-    match conn.execute_batch(&sql) {
-        Ok(()) => Ok(DuckLakeMaintenanceCapability {
-            options_supported: true,
-            checkpoint_supported: true,
-        }),
-        Err(err) if is_unsupported_ducklake_maintenance_error(&err.to_string()) => {
-            tracing::warn!(
-                event = "ducklake_maintenance_options_unsupported",
-                error = %err
-            );
-            Ok(DuckLakeMaintenanceCapability {
-                options_supported: false,
-                checkpoint_supported: false,
-            })
-        }
-        Err(err) => Err(err.into()),
-    }
-}
-
-pub(super) fn ducklake_maintenance_options_sql(config: &DuckLakeMaintenanceConfig) -> String {
-    let auto_compact = if config.enabled { "true" } else { "false" };
-    format!(
-        "\
-        CALL {DUCKLAKE_CATALOG_NAME}.set_option('data_inlining_row_limit', {});\n\
-        CALL {DUCKLAKE_CATALOG_NAME}.set_option('auto_compact', {auto_compact});\n\
-        CALL {DUCKLAKE_CATALOG_NAME}.set_option('expire_older_than', '{} days');\n\
-        CALL {DUCKLAKE_CATALOG_NAME}.set_option('delete_older_than', '{} seconds');",
-        config.data_inlining_row_limit,
-        config.expire_older_than_days,
-        config.delete_older_than_secs,
-    )
-}
-
-pub(super) fn is_unsupported_ducklake_maintenance_error(error: &str) -> bool {
-    let lower = error.to_ascii_lowercase();
-    (lower.contains("checkpoint")
-        || lower.contains("set_option")
-        || lower.contains("ducklake")
-        || lower.contains("auto_compact")
-        || lower.contains("data_inlining_row_limit"))
-        && (lower.contains("not implemented")
-            || lower.contains("not supported")
-            || lower.contains("unsupported")
-            || lower.contains("does not support")
-            || lower.contains("does not exist")
-            || lower.contains("catalog error")
-            || lower.contains("unknown function"))
 }
 
 pub(super) fn configure_extension_directory(

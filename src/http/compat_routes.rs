@@ -376,7 +376,6 @@ fn with_query_admission<T>(
         QueryAdmission::Cheap => {
             let _guard = state.admission.reserve_query_with_wait(
                 QueryClass::Cheap,
-                Default::default(),
                 state.config.operator.query_admission_wait,
                 &state.metrics,
             )?;
@@ -385,7 +384,6 @@ fn with_query_admission<T>(
         QueryAdmission::Heavy => {
             let _guard = state.admission.reserve_query_with_wait(
                 QueryClass::Heavy,
-                Default::default(),
                 state.config.operator.query_admission_wait,
                 &state.metrics,
             )?;

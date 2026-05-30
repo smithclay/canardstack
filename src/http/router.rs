@@ -1,5 +1,4 @@
 use crate::metrics::{MetricName, Metrics};
-use crate::signal::StorageSignal;
 use crate::validation::{self, ApiError};
 use crate::AppState;
 use serde_json::{json, Value};
@@ -81,7 +80,7 @@ fn route_inner(
             return HttpResponse::json(if ok { 200 } else { 503 }, body);
         }
         ("GET", "/metrics") => {
-            record_operator_gauges(state);
+            state.admission.record_metrics(&state.metrics);
             record_storage_operator_gauges(state);
             return HttpResponse::text(
                 200,
@@ -100,7 +99,7 @@ fn route_inner(
                 // Queries are only as healthy as DuckDB; 200 here while
                 // storage is wedged would mislead the runbook step.
                 let mut health = state.queries.health();
-                health["admission"] = json!(state.admission.snapshot_for(Default::default()));
+                health["admission"] = json!(state.admission.snapshot());
                 (state.storage.probe().is_ready(), health)
             });
         }
@@ -130,48 +129,8 @@ fn storage_signal_gauge(metrics: &Metrics, name: MetricName, storage_signal: &st
     metrics.gauge(name, &[("storage_signal", storage_signal)], value);
 }
 
-pub(crate) fn record_operator_gauges(state: &AppState) {
-    for storage_signal in [
-        StorageSignal::Logs,
-        StorageSignal::Spans,
-        StorageSignal::MetricGauge,
-        StorageSignal::MetricSum,
-    ] {
-        storage_signal_gauge(
-            &state.metrics,
-            MetricName::ArrowWriteBufferRows,
-            storage_signal.as_str(),
-            0.0,
-        );
-        storage_signal_gauge(
-            &state.metrics,
-            MetricName::ArrowWriteBufferBytes,
-            storage_signal.as_str(),
-            0.0,
-        );
-        storage_signal_gauge(
-            &state.metrics,
-            MetricName::ArrowWriteBufferAgeSeconds,
-            storage_signal.as_str(),
-            0.0,
-        );
-    }
-    state
-        .metrics
-        .gauge(MetricName::DucklakeMaintenanceEnabled, &[], 0.0);
-}
-
 pub(crate) fn record_storage_operator_gauges(state: &AppState) {
     let storage = state.storage.health();
-    state.metrics.gauge(
-        MetricName::DucklakeCheckpointSupported,
-        &[],
-        if storage.capabilities.ducklake_checkpoint_maintenance {
-            1.0
-        } else {
-            0.0
-        },
-    );
     storage_signal_gauge(
         &state.metrics,
         MetricName::StoragePhysicalBytes,
@@ -209,7 +168,6 @@ pub(crate) fn record_storage_operator_gauges(state: &AppState) {
             }
         }
     }
-    let mut max_freshness_lag = 0.0f64;
     if let Some(watermarks) = storage.freshness_watermarks.as_object() {
         for (table, value) in watermarks {
             if let Some(epoch) = value.get("epoch_seconds").and_then(Value::as_f64) {
@@ -220,20 +178,8 @@ pub(crate) fn record_storage_operator_gauges(state: &AppState) {
                     epoch,
                 );
             }
-            if let Some(lag) = value.get("lag_seconds").and_then(Value::as_f64) {
-                max_freshness_lag = max_freshness_lag.max(lag.max(0.0));
-                storage_signal_gauge(
-                    &state.metrics,
-                    MetricName::IngestToQueryLagSeconds,
-                    table.as_str(),
-                    lag.max(0.0),
-                );
-            }
         }
     }
-    state
-        .admission
-        .record_observed_freshness_lag(max_freshness_lag, &state.metrics);
 }
 
 #[cfg(test)]
