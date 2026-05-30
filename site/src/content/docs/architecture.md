@@ -34,10 +34,9 @@ flowchart LR
     DuckDB -->|"SQL over attached catalog"| Lake
 ```
 
-The binary does not include OTLP ingest, gRPC, Kafka, raw-spool durability,
-background sealing, or a bundled DuckLake catalog service. Those concerns now
-belong to the DuckDB writer process and the catalog deployment chosen around
-DuckLake.
+The binary does not include OTLP ingest, gRPC, Kafka, ingest durability, table
+maintenance, or a bundled DuckLake catalog service. Those concerns belong to
+the DuckDB writer process and the catalog deployment chosen around DuckLake.
 
 For a deeper implementation map, use the
 [repository architecture docs](https://github.com/smithclay/canardstack/tree/main/docs/architecture).

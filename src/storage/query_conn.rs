@@ -65,7 +65,6 @@ impl Storage {
     }
 
     fn open_scoped_query_connection(&self) -> Result<Connection> {
-        // Clone from `reader`, not `writer`: queries don't block on seals.
         // Attached schemas + extensions are inherited; only per-conn PRAGMAs
         // are reapplied here.
         let cloned = {

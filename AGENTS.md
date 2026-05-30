@@ -1,12 +1,12 @@
 # Repository Instructions
 
-This file is durable guidance for coding agents working in this repository. Keep it short, concrete, and updated when repeated mistakes show up.
+This file is durable guidance for coding agents working in this repository. Keep it short, concrete, and update it when repeated mistakes show up.
 
 ## Project Context
 
-canardstack is a single-binary, experimental observability backend written in Rust. It accepts OpenTelemetry logs, traces, gauge metrics, and sum metrics over OTLP/HTTP, normalizes them through `otlp2records` into Arrow `RecordBatch`es, stores them in DuckLake-managed DuckDB tables, and exposes bounded Prometheus/Loki/Tempo compatibility APIs for Grafana-style clients.
+canardstack is a single-binary, experimental observability query server written in Rust. It attaches DuckDB to DuckLake tables populated by an external writer, usually `duckdb-otlp`, and exposes bounded Prometheus, Loki, and Tempo-compatible HTTP APIs for Grafana-style clients.
 
-There is exactly one binary (`canardstack`), one synchronous std-library HTTP server, and one DuckDB process per role. There is no async runtime, no OTLP/gRPC endpoint, no Kafka, and no separate hot store. The same binary also has a `serve-catalog` role (`src/cli/serve_catalog.rs`) that runs plain DuckDB + the Quack extension to serve a DuckLake catalog DuckDB file over the network; the cloud deploy examples use it so the app and the remote catalog share one image. It runs no ingest/query pipeline. The optional `tls` cargo feature (deps `rustls` + `rcgen`, off by default, enabled in the Docker image) adds a synchronous in-binary TLS terminator in front of Quack for platforms without managed TLS (e.g. ECS behind Cloud Map) when `CANARDSTACK_CATALOG_TLS_ENABLED=true`; clients reach it over HTTPS and skip self-signed cert verification via `CANARDSTACK_DUCKLAKE_QUACK_INSECURE_TLS` (a scoped `TYPE HTTP, VERIFY_SSL 0` secret — DuckLake/Quack reject `DISABLE_SSL`). On managed-TLS platforms (Cloud Run) the catalog stays plaintext and the platform provides the real cert. Because DuckLake CHECKPOINT over a Quack catalog runs its file-deletion scan as catalog-side SQL (`read_blob` over the data path), `serve-catalog` also configures object-store credentials from `CANARDSTACK_DUCKLAKE_DATA_PATH`, so the catalog node needs object-store IAM, not just the app.
+There is exactly one binary (`canardstack`), one synchronous std-library HTTP server, and one DuckDB process inside canardstack. There is no async runtime, no OTLP ingest endpoint, no OTLP/gRPC endpoint, no Kafka, no bundled catalog service, and no separate hot store. The optional `tls` cargo feature (deps `rustls` + `rcgen`, off by default, enabled in the Docker image) adds a synchronous in-binary TLS terminator for the public `serve` endpoint.
 
 ## Commands
 
@@ -17,81 +17,61 @@ Prefer the narrowest command that proves the change.
 cargo check
 cargo build --all-targets --locked
 
-# Tests (offline; does not touch MotherDuck)
+# Tests
 cargo test
 cargo test <test_name>
-cargo test remote_ducklake_attach_uri_smoke -- --ignored --nocapture  # live remote DuckLake smoke; requires credentials
 
-# Lint and formatting (CI treats warnings as errors)
+# Lint and formatting
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features --locked -- -D warnings
 
-# Pre-commit, matching CI shape
-prek install
-prek run --all-files
+# Site
+cd site && ASTRO_TELEMETRY_DISABLED=1 npm run build
+cd site && ASTRO_TELEMETRY_DISABLED=1 npm run check
 
 # Local server workflow
 cp config/example.env .env && set -a && . ./.env && set +a
-cargo run -- serve              # serves on CANARDSTACK_BIND, default 127.0.0.1:4318
+cargo run -- serve
 cargo run -- serve --listen 127.0.0.1:4320
-cargo run -- serve --role ingest # ingest routes plus operator endpoints; no query routes
-cargo run -- serve --role query  # query routes plus operator endpoints; no ingest routes
-cargo run -- serve --local-catalog --catalog-listen 127.0.0.1:9494  # live local DuckLake inspection over Quack
-cargo run -- serve-catalog      # catalog role: serve the DuckLake catalog DuckDB file over Quack (no pipeline)
-cargo run -- smoke              # in-process smoke: starts app, ingests fixtures, queries, prints health
-cargo run -- smoke-http --endpoint <url>   # smoke against an already-running server
-cargo run -- healthcheck --endpoint <url>  # used as the Docker healthcheck
+cargo run -- healthcheck --endpoint http://127.0.0.1:4318/healthz
 
-# Docker quickstart
+# Local duckdb-otlp integration smoke
+scripts/e2e-duckdb-otlp-local.py
+
+# Docker
 docker compose up --build
-docker compose run --rm smoke
-scripts/smoke-docker-local.sh
-
-# Bench
-cargo bench --bench throughput_iteration
 ```
 
-DuckLake is the only ingest storage mode and requires the DuckLake DuckDB extension; startup should fail loudly if it is not loadable. With no remote catalog configuration, canardstack uses a local DuckLake catalog and local data files.
-
-For the reusable 10 minute mixed-query performance smoke, use
-`docs/BENCHMARKING.md`.
+DuckLake is the only storage target canardstack queries. Startup should fail loudly if DuckDB cannot attach the configured catalog or load required extensions. With no remote catalog configuration, canardstack uses a local DuckLake catalog and local data files.
 
 ## Architecture
 
 Data flow:
 
 ```text
-OTLP/HTTP (JSON or protobuf, optional gzip)
-  -> validation (auth, content type, size, timestamp skew)
-  -> local fsync raw spool
-  -> otlp2records -> Arrow RecordBatch grouped by storage signal
-  -> freshness-first admission (freshness budget; per-storage-signal in-flight bytes are pure accounting that feeds the freshness total)
-  -> ingest worker pool inserts into the Arrow write buffer
-  -> scheduler single seal driver -> immutable Parquet segment files registered with DuckLake
-  -> bounded compat query adapters for Prometheus / Loki / Tempo subsets
+OpenTelemetry producers
+  -> external DuckDB writer with duckdb-otlp
+  -> DuckLake otlp_* tables
+  -> canardstack QueryEngine
+  -> bounded Prometheus / Loki / Tempo compatibility APIs
 ```
 
-Storage signals are `Logs`, `Spans`, `MetricGauge`, and `MetricSum`. Histograms and exponential histograms are intentionally rejected in v0.
+Storage signals are `Logs`, `Spans`, `MetricGauge`, and `MetricSum`. Histograms and exponential histograms are not part of the v0 query surface.
 
 ## Source Map
 
-Top-level modules map to pipeline stages or boundaries. Subdirectories group helper code by ownership while preserving the public root module shims where they already exist.
-
-- `src/main.rs` - argv dispatch for `serve`, `serve-catalog`, `smoke`, `smoke-http`, `healthcheck`, and `install-ducklake-extension`; installs SIGINT/SIGTERM handlers.
-- `src/lib.rs` - re-exports `AppState`, `Config`, and `Scheduler`; defines `log_event` and `LockExt::lock_or_poisoned`.
+- `src/main.rs` - argv dispatch for `serve`, `healthcheck`, and `--version`; installs SIGINT/SIGTERM handlers.
+- `src/lib.rs` - re-exports `AppState` and `Config`; defines `log_event` and `LockExt::lock_or_poisoned`.
 - `src/app.rs` - wires long-lived components into shared `Arc<AppState>`.
 - `src/config.rs` - reads `CANARDSTACK_*` env vars into one `Config`; startup calls `Config::validate()`.
-- `src/http.rs` - hand-rolled std-library HTTP/1.1 server with bounded per-connection threads and non-blocking accept shutdown.
-- `src/validation.rs` - auth, content-type, size, compression, timestamp-skew checks, `ApiError`, and error envelopes.
-- `src/otlp.rs` - OTLP JSON/protobuf decode and `Transformed` payload construction.
-- `src/signal.rs` - shared `StorageSignal` physical signal/table vocabulary (one variant per DuckLake table) used across ingest, storage, query, metrics, validation, and metadata.
-- `src/ingest/` - request flow (`OtlpRequestKind`), freshness-first admission, per-signal in-flight accounting, the durable raw spool, and the ingest worker pool that inserts into the Arrow write buffer.
-- `src/admission_control.rs` - seal admission, freshness-budget ingest admission, and cheap/heavy query admission.
-- `src/storage/` - DuckDB lifecycle, DuckLake `ATTACH`, extension install, immutable segment writes, `StorageProbe`, retention, and maintenance SQL.
+- `src/http.rs` and `src/http/` - hand-rolled std-library HTTP/1.1 server, routing, auth, parsing, and responses.
+- `src/validation.rs` - shared auth, request bounds, `ApiError`, and error envelopes.
+- `src/signal.rs` - shared `StorageSignal` physical signal/table vocabulary.
+- `src/admission_control.rs` - cheap/heavy query admission.
+- `src/storage/` - DuckDB/DuckLake attach, schema fencing, health probes, metadata helpers, and scoped query connections.
 - `src/query/` - bounded query helpers, shared query plans, and Prometheus/Loki/Tempo selector parsing.
 - `src/compat/` - Prometheus/Loki/Tempo route adapters and the v0 public query surface.
-- `src/metadata.rs` - bounded discovery-metadata adapters over `metadata_summary`, with a generation-keyed in-process cache.
-- `src/maintenance.rs` - `Scheduler` background thread for seal, metadata refresh, operator-metrics snapshot, compaction, retention, and maintenance pause.
+- `src/metadata.rs` - bounded discovery-metadata adapters over visible DuckLake rows, with an in-process cache.
 - `src/metrics.rs` - Prometheus-style operator metrics at `/metrics`.
 - `src/db/sql.rs` - shared SQL fragment helpers used by `storage`, `query`, and `compat`.
 - `src/runtime/memory.rs` - runtime memory-pressure probing.
@@ -101,21 +81,17 @@ Top-level modules map to pipeline stages or boundaries. Subdirectories group hel
 
 - Keep the code synchronous. Do not add `tokio`, `async fn`, gRPC, Kafka, a second binary, or another long-running service unless the task explicitly changes the architecture.
 - Use OS threads plus `Arc<Mutex<_>>`. Prefer `LockExt::lock_or_poisoned()` over `.lock().unwrap()` for shared state.
-- Treat ingest as at-least-once after local durable spool: a 2xx response means the raw request was fsynced to the local raw spool and accepted for bounded processing. It does not mean the rows are DuckLake-committed or query-visible yet. Because the raw-spool checkpoint follows the DuckLake commit, a crash between commit and checkpoint replays records as duplicate rows that v0 surfaces to queries without dedup.
-- Preserve pressure behavior: ingest admission returns 429 under pressure, and storage/dependency failures surface as 503 where appropriate.
-- Preserve freshness-first admission: request-path checks may reject with 429 before raw-spool append when projected seal visibility exceeds the configured freshness SLA.
-- Preserve seal/query admission priority: seal capacity is reserved before query capacity; cheap metadata/probe/discovery/instant-ish queries keep protected admission, and heavy range/search queries degrade or reject first under freshness debt.
 - Keep query routes bounded by time range, row limit, timeout, DuckDB memory limit, and concurrency caps through `QueryEngine`.
 - Do not expose arbitrary SQL through the compatibility APIs. Direct SQL is intentionally an external DuckDB CLI / MotherDuck path.
 - Preserve the Prometheus/Loki error envelope shape: `{"status":"error","errorType":"...","error":"..."}`.
-- Assume one in-process scheduler and single writer. There is no Postgres-backed maintenance lease yet.
-- The storage schema is static and version-fenced. The DuckLake catalog carries a `schema_version` in `canardstack_meta`; `Storage::open` fails boot when it is outside `[MIN_COMPATIBLE_SCHEMA_VERSION, SCHEMA_VERSION]` (`src/storage/schema.rs`). Changing a `*_COLUMNS` set (or partitioning) means bumping `SCHEMA_VERSION` — additive/expand-contract keeps `MIN_COMPATIBLE` low; a breaking change raises both. The `*_COLUMNS`↔`otlp2records` contract is pinned by the `stored_columns_align_with_otlp2records_output` test, so an `otlp2records` bump that changes emitted columns fails `cargo test`, not ingest.
+- canardstack does not own ingestion durability or visibility timing. It queries whatever rows are visible in the attached DuckLake catalog.
+- The storage schema is static and version-fenced. The DuckLake catalog carries a `schema_version` in `canardstack_meta`; `Storage::open` fails boot when it is outside `[MIN_COMPATIBLE_SCHEMA_VERSION, SCHEMA_VERSION]` (`src/storage/schema.rs`). Changing a `*_COLUMNS` set means bumping `SCHEMA_VERSION`; additive/expand-contract keeps `MIN_COMPATIBLE` low, while a breaking change raises both.
 
 ## Testing Expectations
 
 - Add or update tests for behavior changes when practical.
-- End-to-end tests usually belong in `tests/integration.rs` with shared fixtures under `tests/common/`; do not create a new test crate without a clear reason.
-- For storage-mode changes, cover local DuckLake plus relevant `CANARDSTACK_POSTGRES_DSN` and `CANARDSTACK_DUCKLAKE_ATTACH_URI` combinations, or explain why a live smoke is required.
+- End-to-end query tests usually belong in `tests/integration.rs`; do not create a new test crate without a clear reason.
+- For storage attach changes, cover local DuckLake plus relevant `CANARDSTACK_DUCKLAKE_ATTACH_URI` combinations, or explain why a live smoke is required.
 - For compatibility API changes, verify both success payloads and protocol-specific error envelopes.
 - If a check cannot be run locally, say exactly which command was skipped and why.
 
@@ -136,21 +112,15 @@ Before handing work back, confirm the requested behavior is implemented and the 
 - CI treats clippy warnings as errors with `-D warnings`; match that locally before pushing.
 - Prefer existing module patterns and helper APIs over new abstractions.
 - Keep edits scoped. Do not refactor unrelated code while fixing a narrow issue.
-- Vocabulary: "queue" means exactly one thing — a bounded mpsc channel (the spool
-  writer command channel and the worker handoff). The single per-signal metric
-  label for the ingest/raw-spool surface is `request_kind` (`logs`/`traces`/`metrics`);
-  `spool_lane` was retired. Fine spool phase micro-timings are gated behind the
-  `detailed-metrics` cargo feature (off by default). See
-  `docs/architecture/glossary.md` for one definition per core term.
 
 Examples:
 
 ```text
-feat(ingest): queue Arrow batches for metrics
-perf(storage): append RecordBatches through DuckDB
-docs: document commit message convention
+feat(query): add bounded metric discovery
+fix(storage): reject unsupported schema versions
+docs: document duckdb-otlp smoke
 ```
 
 ## Further Reading
 
-The `docs/` tree is the canonical longer-form reference. Start with `docs/developer.md`; architecture details are under `docs/architecture/`, benchmark gates are in `docs/planning/benchmark.md`, and operator procedures are under `docs/runbooks/`.
+The `docs/` tree is the canonical longer-form reference. Start with `docs/developer.md`; architecture details are under `docs/architecture/`, and the local duckdb-otlp integration smoke is documented in `docs/e2e-duckdb-otlp.md`.

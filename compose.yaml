@@ -10,7 +10,7 @@ services:
       CANARDSTACK_DATA_DIR: /var/lib/canardstack
       CANARDSTACK_DUCKLAKE_ATTACH_URI: ${CANARDSTACK_DUCKLAKE_ATTACH_URI:-}
       CANARDSTACK_DUCKLAKE_DATA_PATH: ${CANARDSTACK_DUCKLAKE_DATA_PATH:-}
-      motherduck_token: ${motherduck_token:-${MOTHERDUCK_TOKEN:-}}
+      motherduck_token: ${motherduck_token:-}
     volumes:
       - canardstack-data:/var/lib/canardstack
     healthcheck:
@@ -37,7 +37,6 @@ services:
     volumes:
       - grafana-data:/var/lib/grafana
       - ./config/grafana/provisioning:/etc/grafana/provisioning:ro
-      - ./config/grafana/dashboards:/etc/grafana/dashboards:ro
 
 volumes:
   canardstack-data:

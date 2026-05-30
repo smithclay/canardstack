@@ -29,9 +29,8 @@ full PromQL, LogQL, TraceQL, Prometheus, Loki, or Tempo implementation.
 - OTLP/gRPC
 - Kafka
 - arbitrary SQL over HTTP
-- canardstack-owned raw spool durability
-- canardstack-owned background sealing
-- bundled `serve-catalog`
+- canardstack-owned ingest durability or table maintenance
+- bundled DuckLake catalog service
 - histograms and exponential histograms through the compatibility APIs
 
 Use direct DuckDB SQL for analysis outside the compatibility surface.

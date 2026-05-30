@@ -48,5 +48,5 @@ Use `--keep-temp` to inspect the generated catalog and logs after the run.
 ## Next
 
 - [Serve DuckLake](/quickstart/serve/) shows the smallest server command.
-- [Query with Grafana](/guides/query-with-grafana/) connects dashboards.
+- [Query with Grafana](/guides/query-with-grafana/) connects Grafana datasources.
 - [Schema Reference](/reference/schema/) lists the table contract.
