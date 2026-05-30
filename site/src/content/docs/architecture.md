@@ -1,41 +1,43 @@
 ---
 title: Architecture
-description: High-level canardstack data flow.
+description: High-level canardstack query-only data flow.
 ---
 
-canardstack is one synchronous Rust process backed by one DuckDB process. It
-accepts OTLP over HTTP, normalizes telemetry into Arrow record batches, flushes
-the Arrow write buffer through DuckDB's Arrow appender into DuckLake tables, and
-serves bounded compatibility query APIs over the same tables.
+canardstack is one synchronous Rust process backed by DuckDB. It attaches to a
+DuckLake catalog that another DuckDB process writes through `duckdb-otlp`, then
+serves bounded compatibility query APIs over the visible tables.
 
 ```mermaid
 flowchart LR
-    Apps["Apps / collectors"]
-    Clients["Grafana / SQL clients"]
+    Producers["Apps / OpenTelemetry Collectors"]
+    Writer["DuckDB + duckdb-otlp"]
+    Lake[("DuckLake tables")]
+    Clients["Grafana / API clients"]
 
-    subgraph Canardstack["canardstack (one process)"]
+    subgraph Canardstack["canardstack query server"]
         direction TB
-        Ingest["OTLP/HTTP ingest + validation"]
-        Admission["freshness-first admission"]
-        Spool["fsynced raw spool"]
-        Workers["worker pool: OTLP to Arrow"]
-        Buffer["Arrow write buffer"]
-        Seal["scheduler seal"]
+        Http["std-library HTTP server"]
+        Auth["auth + validation"]
+        Admission["query admission"]
         Adapters["Prometheus / Loki / Tempo adapters"]
+        DuckDB["DuckDB query connections"]
 
-        Ingest --> Admission
-        Admission --> Spool
-        Spool --> Workers
-        Workers --> Buffer
-        Buffer --> Seal
+        Http --> Auth
+        Auth --> Admission
+        Admission --> Adapters
+        Adapters --> DuckDB
     end
 
-    Apps -->|logs / traces / metrics| Ingest
-    Admission -.->|429 under pressure| Apps
-    Seal -->|DuckDB Arrow append| Lake[("DuckLake tables")]
-    Adapters --> Lake
-    Clients -->|queries| Adapters
+    Producers -->|"OTLP/HTTP"| Writer
+    Writer -->|"append / flush"| Lake
+    Clients -->|"bounded query APIs"| Http
+    DuckDB -->|"SQL over attached catalog"| Lake
 ```
+
+The binary does not include OTLP ingest, gRPC, Kafka, raw-spool durability,
+background sealing, or a bundled DuckLake catalog service. Those concerns now
+belong to the DuckDB writer process and the catalog deployment chosen around
+DuckLake.
 
 For a deeper implementation map, use the
 [repository architecture docs](https://github.com/smithclay/canardstack/tree/main/docs/architecture).

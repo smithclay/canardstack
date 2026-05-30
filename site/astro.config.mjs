@@ -8,7 +8,7 @@ export default defineConfig({
   integrations: [
     starlight({
       title: 'canardstack',
-      description: 'OpenTelemetry logs, traces, and metrics stored in DuckLake.',
+      description: 'Query OpenTelemetry-shaped data stored in DuckLake.',
       logo: {
         src: './src/assets/canardstack.png',
         alt: 'canardstack logo',
@@ -30,26 +30,16 @@ export default defineConfig({
           label: 'Start Here',
           items: [
             { label: 'Overview', link: '/' },
-            { label: 'Demo', link: '/demo/' },
             { label: 'Architecture', link: '/architecture/' },
-          ],
-        },
-        {
-          label: 'Deployment',
-          items: [
-            { label: 'Overview', link: '/deployment/' },
-            { label: 'Send Telemetry', link: '/deployment/send-telemetry/' },
-            { label: 'MotherDuck', link: '/deployment/motherduck/' },
-            { label: 'GCP Cloud Run', link: '/deployment/gcp-cloud-run/' },
-            { label: 'AWS ECS/Fargate', link: '/deployment/aws-ecs-fargate/' },
+            {
+              label: 'Local E2E Smoke',
+              link: 'https://github.com/smithclay/canardstack/blob/main/docs/e2e-duckdb-otlp.md',
+            },
           ],
         },
         {
           label: 'Operations',
-          items: [
-            { label: 'Overview', link: '/operations/' },
-            { label: 'Failure Runbooks', link: '/operations/failure-runbooks/' },
-          ],
+          items: [{ label: 'Overview', link: '/operations/' }],
         },
         {
           label: 'Query Data',

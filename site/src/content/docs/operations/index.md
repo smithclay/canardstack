@@ -1,21 +1,19 @@
 ---
 title: Operations
-description: Operator notes, configuration, diagnostics, and failure response guidance.
+description: Operator notes for the query-only canardstack binary.
 ---
 
-canardstack is experimental and not production-ready. The v0 operator surface is
+canardstack is experimental and not production-ready. The operator surface is
 small and intentionally explicit.
 
-| Area | V0 behavior |
+| Area | Behavior |
 | --- | --- |
-| Process model | One synchronous Rust binary, one DuckDB process, no async runtime. |
-| Ingest | OTLP/HTTP JSON and protobuf for logs, traces, gauge metrics, and sum metrics. |
-| Durability | A `2xx` ingest response means the raw request was fsynced to the local spool and accepted for bounded processing. It does not mean rows are committed to DuckLake or query-visible yet. |
-| Backpressure | Ingest admission returns `429` under pressure. Storage dependency failures surface as `503`. |
-| Storage | DuckLake-backed DuckDB tables. Local DuckLake is the default quickstart path; MotherDuck and Postgres-catalog DuckLake are supported paths. |
+| Process model | One synchronous Rust binary, one embedded DuckDB client process, no async runtime. |
+| Ingest | Not served by canardstack. Write telemetry with `duckdb-otlp` or another DuckLake writer. |
+| Storage | DuckLake-backed DuckDB tables created by the writer process. |
 | Query | Compatibility subsets with server-side time range, row limit, timeout, memory, and concurrency guards. |
 | UI | Grafana only. canardstack does not serve a custom browser UI. |
-| Retention | Whole-day retention on telemetry tables, followed by DuckLake cleanup hooks when attached. |
+| Maintenance | Catalog/file maintenance is owned by DuckLake and the writer/catalog deployment. |
 
 ## Configuration
 
@@ -25,15 +23,39 @@ or `config/example.env` for host development. Environment variables override
 the file. Set `CANARDSTACK_CONFIG=/path/to/config.toml` to load a different
 config file.
 
+At minimum, point canardstack at a DuckLake catalog:
+
+```bash
+CANARDSTACK_DUCKLAKE_ATTACH_URI=ducklake:/path/to/catalog.ducklake
+CANARDSTACK_DUCKLAKE_DATA_PATH=/path/to/ducklake-data
+CANARDSTACK_API_KEY=dev-canardstack-key
+```
+
 Diagnostics are logfmt-style structured events on stderr. Set
 `CANARDSTACK_LOG=debug` or use `RUST_LOG` to adjust verbosity.
 
-## Response Guides
+## Health
 
-Use the [failure runbooks](/operations/failure-runbooks/) for page-worthy
-health states, stuck seals, query OOM, object storage incidents, ingest
-overload, replay backlog, and retention cleanup failures.
+The basic health endpoint checks that canardstack can attach to DuckLake and
+prepare a read query against the expected telemetry tables:
 
-Use the
-[operator metrics reference](https://github.com/smithclay/canardstack/blob/main/docs/architecture/operator-metrics.md)
-for emitted metric names and labels.
+```bash
+canardstack healthcheck --endpoint http://127.0.0.1:4318/healthz
+```
+
+Admin health endpoints expose storage capabilities, row counts, freshness
+watermarks, and query configuration. Query routes and admin routes can use
+separate bearer tokens through `CANARDSTACK_API_KEY` and
+`CANARDSTACK_ADMIN_API_KEY`.
+
+## Query Incidents
+
+When query routes fail, first check:
+
+- the DuckLake catalog URI and data path match the writer
+- the writer created the expected `otlp_*` tables
+- the requested time range contains visible data
+- the query limit, timeout, memory limit, and concurrency settings are not too low
+- direct DuckDB SQL can read the same rows from the same catalog
+
+Use the [DuckDB SQL guide](/query-data/duckdb/) for direct catalog inspection.
