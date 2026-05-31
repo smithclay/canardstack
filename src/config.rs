@@ -137,7 +137,7 @@ impl OperatorConfig {
         Ok(Self {
             bind: env_string("CANARDSTACK_BIND")?
                 .or(file.string(&["server", "bind"])?)
-                .unwrap_or_else(|| "127.0.0.1:4318".to_string()),
+                .unwrap_or_else(|| "127.0.0.1:9090".to_string()),
             tls: TlsServerConfig {
                 enabled: env_bool("CANARDSTACK_TLS_ENABLED")?
                     .or(file.bool(&["server", "tls", "enabled"])?)

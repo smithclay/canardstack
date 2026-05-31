@@ -64,13 +64,13 @@ RUN apt-get update \
 COPY --from=builder /app/canardstack /usr/local/bin/canardstack
 
 ENV HOME=/var/lib/canardstack \
-    CANARDSTACK_BIND=0.0.0.0:4318 \
+    CANARDSTACK_BIND=0.0.0.0:9090 \
     CANARDSTACK_DATA_DIR=/var/lib/canardstack
 
 USER 10001:10001
-EXPOSE 4318
+EXPOSE 9090
 
 HEALTHCHECK --interval=5s --timeout=5s --start-period=20s --retries=12 \
-    CMD ["canardstack", "healthcheck", "--endpoint", "http://127.0.0.1:4318/healthz"]
+    CMD ["canardstack", "healthcheck", "--endpoint", "http://127.0.0.1:9090/healthz"]
 
 CMD ["canardstack", "serve"]

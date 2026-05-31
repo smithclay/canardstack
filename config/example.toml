@@ -2,7 +2,7 @@
 # Environment variables override matching settings.
 
 [server]
-bind = "127.0.0.1:4318"
+bind = "127.0.0.1:9090"
 max_body_bytes = 8388608
 max_connections = 1024
 socket_read_timeout_secs = 30

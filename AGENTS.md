@@ -33,7 +33,7 @@ cd site && ASTRO_TELEMETRY_DISABLED=1 npm run check
 cp config/example.env .env && set -a && . ./.env && set +a
 cargo run -- serve
 cargo run -- serve --listen 127.0.0.1:4320
-cargo run -- healthcheck --endpoint http://127.0.0.1:4318/healthz
+cargo run -- healthcheck --endpoint http://127.0.0.1:9090/healthz
 
 # Local duckdb-otlp integration smoke
 scripts/e2e-duckdb-otlp-local.py

@@ -44,7 +44,8 @@ local file-lock caveat.
 - `src/query/` builds bounded SQL over the DuckLake tables.
 - `src/storage/` owns DuckDB/DuckLake attach, health probes, schema fencing, and
   per-query connection cloning.
-- `src/metadata.rs` serves discovery routes from `metadata_summary`.
+- `src/metadata.rs` serves discovery routes from `metadata_summary`, with a
+  bounded raw-table fallback for Prometheus metric discovery.
 - `src/metrics.rs` renders the process-local `/metrics` surface.
 
 ## Constraints
