@@ -1,11 +1,11 @@
 //! Derived metadata refresh stage (the read side).
 //!
 //! These are the bounded discovery adapters for the Prometheus, Loki, and Tempo
-//! compatibility surfaces (label/tag values, series, metric metadata). They read
-//! the pre-aggregated `metadata_summary` table that the derived metadata refresh
-//! stage maintains off the commit path (see
-//! [`crate::storage::metadata_refresh`]); they never scan the raw telemetry
-//! tables or run unbounded discovery scans.
+//! compatibility surfaces (label/tag values, series, metric metadata). They
+//! prefer the pre-aggregated `metadata_summary` table when a writer maintains
+//! it. Prometheus metric label and series discovery falls back to bounded raw
+//! metric-table scans so query-only deployments backed by external OTLP writers
+//! still expose usable metric discovery.
 //!
 //! Reads are served through a small generation-keyed in-process cache. Each
 //! cached entry is tagged with the storage `metadata_generation`; the refresh
@@ -13,7 +13,7 @@
 //! a generation mismatch invalidates the cached answer and the adapter rebuilds
 //! it from the latest summary rows.
 
-use crate::db::sql::quote as sql_quote;
+use crate::db::sql::{quote as sql_quote, time_predicate};
 use crate::query::QueryEngine;
 use crate::semantic_labels::{self, LabelScope};
 use crate::signal::StorageSignal;
@@ -70,7 +70,7 @@ impl Metadata {
             to,
         );
         let value = self.cached(storage, key, || {
-            label_values(
+            let values = label_values(
                 queries,
                 storage,
                 &[StorageSignal::MetricGauge, StorageSignal::MetricSum],
@@ -78,8 +78,13 @@ impl Metadata {
                 metadata_name,
                 from,
                 to,
-            )
-            .map(|values| json!(values))
+            )?;
+            if values.is_empty() {
+                prometheus_raw_label_values(queries, storage, metadata_name, from, to)
+                    .map(|values| json!(values))
+            } else {
+                Ok(json!(values))
+            }
         })?;
         Ok(string_array(value))
     }
@@ -130,7 +135,11 @@ impl Metadata {
                 }
                 Ok(())
             })?;
-            Ok(json!(out))
+            if out.is_empty() {
+                prometheus_raw_series(queries, storage, from, to)
+            } else {
+                Ok(json!(out))
+            }
         })
     }
 
@@ -463,12 +472,116 @@ fn label_values(
     Ok(values.into_iter().collect())
 }
 
+fn prometheus_raw_label_values(
+    queries: &QueryEngine,
+    storage: &Storage,
+    metadata_name: &str,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+) -> ApiResult<Vec<String>> {
+    let label_expr = if metadata_name == "__name__" {
+        "name".to_string()
+    } else if let Some(expr) = semantic_labels::label_expr(LabelScope::Metrics, metadata_name) {
+        expr
+    } else {
+        return Ok(Vec::new());
+    };
+    let sql = format!(
+        "\
+        WITH raw_values AS ( \
+            SELECT cast({label_expr} AS VARCHAR) AS value, time_unix_nano \
+            FROM {{prefix}}{} \
+            UNION ALL \
+            SELECT cast({label_expr} AS VARCHAR) AS value, time_unix_nano \
+            FROM {{prefix}}{} \
+        ) \
+        SELECT DISTINCT value \
+        FROM raw_values \
+        WHERE value IS NOT NULL \
+          AND value <> '' \
+          AND {} \
+        ORDER BY value \
+        LIMIT {DISCOVERY_LIMIT}",
+        StorageSignal::MetricGauge.as_str(),
+        StorageSignal::MetricSum.as_str(),
+        raw_time_predicate(from, to)
+    );
+    let mut out = Vec::new();
+    queries.run_interactive(storage, |conn, prefix| {
+        let mut stmt = conn.prepare(&sql.replace("{prefix}", prefix))?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(())
+    })?;
+    Ok(out)
+}
+
+fn prometheus_raw_series(
+    queries: &QueryEngine,
+    storage: &Storage,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+) -> ApiResult<Value> {
+    let deployment_environment =
+        semantic_labels::label_expr(LabelScope::Metrics, "deployment_environment")
+            .unwrap_or_else(|| "NULL".to_string());
+    let sql = format!(
+        "\
+        WITH raw_series AS ( \
+            SELECT name, service_name, {deployment_environment} AS deployment_environment, time_unix_nano \
+            FROM {{prefix}}{} \
+            UNION ALL \
+            SELECT name, service_name, {deployment_environment} AS deployment_environment, time_unix_nano \
+            FROM {{prefix}}{} \
+        ) \
+        SELECT name, service_name, deployment_environment, count(*) AS rows \
+        FROM raw_series \
+        WHERE {} \
+        GROUP BY 1,2,3 \
+        ORDER BY rows DESC, name, service_name, deployment_environment \
+        LIMIT {DISCOVERY_LIMIT}",
+        StorageSignal::MetricGauge.as_str(),
+        StorageSignal::MetricSum.as_str(),
+        raw_time_predicate(from, to)
+    );
+    let mut out = Vec::new();
+    queries.run_interactive(storage, |conn, prefix| {
+        let mut stmt = conn.prepare(&sql.replace("{prefix}", prefix))?;
+        let rows = stmt.query_map([], |row| {
+            let mut labels = Map::new();
+            labels.insert("__name__".to_string(), json!(row.get::<_, String>(0)?));
+            insert_opt(
+                &mut labels,
+                "service_name",
+                row.get::<_, Option<String>>(1)?,
+            );
+            insert_opt(
+                &mut labels,
+                "deployment_environment",
+                row.get::<_, Option<String>>(2)?,
+            );
+            Ok(Value::Object(labels))
+        })?;
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(())
+    })?;
+    Ok(json!(out))
+}
+
 fn metadata_time_predicate(from: DateTime<Utc>, to: DateTime<Utc>) -> String {
     format!(
         "first_seen < TIMESTAMP {} AND last_seen >= TIMESTAMP {}",
         sql_quote(&to.format("%Y-%m-%d %H:%M:%S%.3f").to_string()),
         sql_quote(&from.format("%Y-%m-%d %H:%M:%S%.3f").to_string())
     )
+}
+
+fn raw_time_predicate(from: DateTime<Utc>, to: DateTime<Utc>) -> String {
+    time_predicate("time_unix_nano", from, to)
 }
 
 fn cache_time(time: DateTime<Utc>) -> String {

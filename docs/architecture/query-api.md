@@ -19,11 +19,14 @@ whatever rows are visible in the attached DuckLake catalog.
 ## Discovery Metadata Spine
 
 Prometheus label values, Prometheus series, Prometheus metric metadata, Loki
-label values, Loki series, and Tempo tag values read from the shared
-`metadata_summary` table maintained by the writer side. The query server reads
-canonical OTAP-style columns directly where available and derives compatibility
-labels such as `deployment_environment`, `http_route`, and `http_method` from
-canonical JSON attribute columns.
+label values, Loki series, and Tempo tag values prefer the shared
+`metadata_summary` table when the writer side maintains it. Prometheus metric
+label and series discovery can fall back to bounded raw `otlp_metrics_*` table
+scans so query-only deployments backed by external OTLP writers still expose
+usable metric discovery. The query server reads canonical OTAP-style columns
+directly where available and derives compatibility labels such as
+`deployment_environment`, `http_route`, and `http_method` from canonical JSON
+attribute columns.
 
 These reads still run through the bounded `QueryEngine` path with normal
 concurrency, timeout, memory, range, and result-limit controls. An in-process

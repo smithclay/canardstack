@@ -90,8 +90,8 @@ canardstack, plus a `Canardstack OTel Demo` dashboard:
 http://localhost:3000/d/canardstack-otel-demo/canardstack-otel-demo
 ```
 
-The dashboard includes a process CPU metric panel, recent logs, and frontend
-trace search results from the OTel demo.
+The dashboard includes OTel demo activity metrics, service memory, recent logs,
+and frontend trace search results.
 
 ## Query Directly
 
