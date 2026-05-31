@@ -34,25 +34,11 @@ canardstack serve --listen 127.0.0.1:4320
 canardstack healthcheck --endpoint http://127.0.0.1:4320/healthz
 ```
 
+For an end-to-end getting example with real metrics, logs and traces: read (this tutorial that uses the OpenTelemetry Demo app)[https://smithclay.github.io/canardstack/tutorials/local-observability-stack/].
+
 ## Write Telemetry
 
-Use `duckdb-otlp` for ingestion:
-
-```sql
-INSTALL ducklake;
-LOAD ducklake;
-INSTALL otlp FROM 'https://smithclay.github.io/duckdb-otlp';
-LOAD otlp;
-
-ATTACH 'ducklake:/path/to/catalog.ducklake' AS canardlake
-  (DATA_PATH '/path/to/ducklake-data');
-USE canardlake;
-
--- See duckdb-otlp for OTLP server and table setup details.
-```
-
-For a local end-to-end smoke against a sibling `../duckdb-otlp` checkout, see
-[`docs/e2e-duckdb-otlp.md`](docs/e2e-duckdb-otlp.md).
+Use the `duckdb-otlp` duckdb extension for ingestion, [documented here](https://smithclay.github.io/duckdb-otlp/quickstart/serve/).
 
 ## Docker Compose
 
