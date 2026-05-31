@@ -207,9 +207,10 @@
             "uid": "canardstack-tempo"
           },
           "limit": 20,
-          "queryType": "search",
+          "query": "{ resource.service.name = \"frontend\" }",
+          "queryType": "traceql",
           "refId": "A",
-          "serviceName": "frontend"
+          "tableType": "traces"
         }
       ],
       "title": "Frontend Traces",
