@@ -8,7 +8,8 @@ export default defineConfig({
   redirects: {
     '/get-started': '/tutorials/local-observability-stack',
     '/quickstart/serve': '/how-to/serve-ducklake',
-    '/guides/lakehouse-ingest': '/how-to/write-with-duckdb-otlp',
+    '/guides/lakehouse-ingest': 'https://smithclay.github.io/duckdb-otlp/',
+    '/how-to/write-with-duckdb-otlp': 'https://smithclay.github.io/duckdb-otlp/',
     '/guides/query-with-grafana': '/how-to/connect-grafana',
     '/guides/query-with-duckdb': '/how-to/query-ducklake-with-sql',
     '/reference/api': '/reference/http-api',
@@ -52,7 +53,6 @@ export default defineConfig({
           label: 'How-to Guides',
           items: [
             { label: 'Serve an existing DuckLake catalog', link: '/how-to/serve-ducklake/' },
-            { label: 'Write telemetry with duckdb-otlp', link: '/how-to/write-with-duckdb-otlp/' },
             { label: 'Connect Grafana', link: '/how-to/connect-grafana/' },
             { label: 'Query DuckLake with SQL', link: '/how-to/query-ducklake-with-sql/' },
           ],
@@ -81,6 +81,10 @@ export default defineConfig({
             {
               label: 'Architecture Docs',
               link: 'https://github.com/smithclay/canardstack/tree/main/docs/architecture',
+            },
+            {
+              label: 'duckdb-otlp Docs',
+              link: 'https://smithclay.github.io/duckdb-otlp/',
             },
           ],
         },

@@ -1,15 +1,22 @@
-x-duckdb-service-image: &duckdb-service-image
+x-duckdb-catalog-image: &duckdb-catalog-image
+  platform: ${DUCKDB_OTLP_PLATFORM:-linux/amd64}
   build:
     context: .
-    dockerfile: Dockerfile.duckdb-service
+    dockerfile: Dockerfile.duckdb-catalog
     args:
-      DUCKDB_IMAGE: ${DUCKDB_IMAGE:-duckdb/duckdb:latest}
-  image: ${DUCKDB_SERVICE_IMAGE:-canardstack-duckdb:local}
+      DUCKDB_CATALOG_BASE_IMAGE: ${DUCKDB_CATALOG_BASE_IMAGE:-ghcr.io/smithclay/duckdb-otlp:latest}
+  image: ${DUCKDB_CATALOG_IMAGE:-canardstack-duckdb-catalog:local}
+
+x-duckdb-otlp-image: &duckdb-otlp-image
+  platform: ${DUCKDB_OTLP_PLATFORM:-linux/amd64}
+  image: ${DUCKDB_OTLP_IMAGE:-ghcr.io/smithclay/duckdb-otlp:latest}
 
 services:
   ducklake-catalog:
-    <<: *duckdb-service-image
+    <<: *duckdb-catalog-image
     entrypoint: ["/bin/sh", "/usr/local/bin/duckdb-quack-catalog.sh"]
+    healthcheck:
+      disable: true
     ports:
       - "${QUACK_PORT:-9494}:9494"
     environment:
@@ -25,7 +32,7 @@ services:
     restart: unless-stopped
 
   ingest:
-    <<: *duckdb-service-image
+    <<: *duckdb-otlp-image
     entrypoint: ["/bin/sh", "/usr/local/bin/duckdb-otlp-ingest.sh"]
     depends_on:
       - ducklake-catalog

@@ -39,7 +39,7 @@ cargo run -- healthcheck --endpoint http://127.0.0.1:9090/healthz
 scripts/e2e-duckdb-otlp-local.py
 
 # Docker
-docker compose up --build
+docker compose up
 ```
 
 DuckLake is the only storage target canardstack queries. Startup should fail loudly if DuckDB cannot attach the configured catalog or load required extensions. With no remote catalog configuration, canardstack uses a local DuckLake catalog and local data files.

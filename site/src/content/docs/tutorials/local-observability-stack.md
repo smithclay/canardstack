@@ -12,6 +12,9 @@ OpenTelemetry Demo -> duckdb-otlp OTLP writer -> Quack DuckLake catalog -> canar
 You will send OpenTelemetry Demo telemetry to `duckdb-otlp`, query it through
 canardstack, and open a provisioned Grafana dashboard.
 
+For `duckdb-otlp` writer configuration outside this Compose stack, use the
+[duckdb-otlp documentation](https://smithclay.github.io/duckdb-otlp/).
+
 ![Grafana dashboard showing OTel demo data queried through canardstack](../../../assets/grafana-dash-demo.png)
 
 ## Prerequisites
@@ -24,17 +27,24 @@ canardstack, and open a provisioned Grafana dashboard.
 From the canardstack repository root:
 
 ```bash
-docker compose -f compose.yaml -f compose.build.yaml up --build
+docker compose up
 ```
 
 This starts:
 
 - DuckDB serving a DuckLake catalog over Quack
-- DuckDB running `duckdb-otlp` OTLP/HTTP ingest on `localhost:4318`
+- the published `duckdb-otlp` image running OTLP/HTTP ingest on
+  `localhost:4318`
 - canardstack on `localhost:9090`
 - Grafana on `localhost:3000`
 
 Grafana and canardstack are ready when the containers finish starting.
+
+To test local canardstack image changes, add the build override:
+
+```bash
+docker compose -f compose.yaml -f compose.build.yaml up --build
+```
 
 ## Connect the OpenTelemetry Demo
 
@@ -111,27 +121,6 @@ curl -sS -G http://localhost:9090/loki/api/v1/query_range \
 You should receive a Loki success response once demo logs have been flushed
 into DuckLake.
 
-## Optional Log Smoke
-
-Post the sample logs from a sibling `../duckdb-otlp` checkout:
-
-```bash
-curl -sS -X POST http://localhost:4318/v1/logs \
-  -H 'Authorization: Bearer dev-otlp-token-123456' \
-  -H 'Content-Type: application/x-ndjson' \
-  --data-binary @../duckdb-otlp/test/data/logs_simple.jsonl
-```
-
-For the small sample payload, force the buffered writer to commit before
-querying:
-
-```bash
-docker compose exec ingest sh -c \
-  "printf '%s\n' \"SELECT * FROM otlp_flush('otlp:0.0.0.0:4318');\" > /tmp/duckdb-otlp-ingest.sql"
-```
-
-The rows are now visible in the DuckLake catalog.
-
 ## Next
 
 - [Serve an existing DuckLake catalog](/how-to/serve-ducklake/) shows the
@@ -139,3 +128,5 @@ The rows are now visible in the DuckLake catalog.
 - [Connect Grafana](/how-to/connect-grafana/) shows the datasource settings.
 - [Storage schema reference](/reference/storage-schema/) lists the table
   contract.
+- [duckdb-otlp documentation](https://smithclay.github.io/duckdb-otlp/) covers
+  writer setup and OTLP ingest details.

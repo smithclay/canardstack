@@ -45,12 +45,18 @@ Use the `duckdb-otlp` duckdb extension for ingestion, [documented here](https://
 The default Compose stack runs the full query-only architecture:
 
 ```bash
-docker compose -f compose.yaml -f compose.build.yaml up --build
+docker compose up
 ```
 
-It starts a DuckDB Quack catalog, a DuckDB `duckdb-otlp` ingest process,
+It starts a DuckDB Quack catalog, the published `duckdb-otlp` ingest image,
 canardstack, and Grafana. The OTLP/HTTP ingest endpoint is on `localhost:4318`,
 canardstack is on `localhost:9090`, and Grafana is on `localhost:3000`.
+
+To run the stack against a locally built canardstack image:
+
+```bash
+docker compose -f compose.yaml -f compose.build.yaml up --build
+```
 
 Run a Compose-local logs ingest benchmark:
 

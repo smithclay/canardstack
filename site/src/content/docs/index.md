@@ -20,9 +20,9 @@ canardstack is an experimental query server for observability data stored in
 Tempo-compatible HTTP APIs for Grafana-style clients.
 
 Telemetry writes are handled outside canardstack. Use
-[`duckdb-otlp`](https://github.com/smithclay/duckdb-otlp) in a DuckDB process to
-write OpenTelemetry data into DuckLake tables, then point canardstack at that
-catalog for query serving.
+[`duckdb-otlp`](https://smithclay.github.io/duckdb-otlp/) to write
+OpenTelemetry data into DuckLake tables, then point canardstack at that catalog
+for query serving.
 
 ## Choose a path
 
@@ -30,7 +30,7 @@ catalog for query serving.
 | --- | --- |
 | Learn the local flow by running it | [Local observability stack tutorial](/tutorials/local-observability-stack/) |
 | Run canardstack against existing data | [Serve an existing DuckLake catalog](/how-to/serve-ducklake/) |
-| Populate DuckLake for canardstack | [Write telemetry with duckdb-otlp](/how-to/write-with-duckdb-otlp/) |
+| Populate DuckLake for canardstack | [duckdb-otlp documentation](https://smithclay.github.io/duckdb-otlp/) |
 | Connect Grafana or query directly | [How-to guides](/how-to/connect-grafana/) |
 | Look up exact contracts | [HTTP API reference](/reference/http-api/) |
 | Understand the query-only design | [Query-only architecture](/explanation/query-only-architecture/) |

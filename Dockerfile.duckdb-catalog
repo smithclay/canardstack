@@ -1,0 +1,9 @@
+ARG DUCKDB_CATALOG_BASE_IMAGE=ghcr.io/smithclay/duckdb-otlp:latest
+
+FROM ${DUCKDB_CATALOG_BASE_IMAGE}
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends openssl socat \
+    && rm -rf /var/lib/apt/lists/*
+
+ENTRYPOINT ["duckdb"]
