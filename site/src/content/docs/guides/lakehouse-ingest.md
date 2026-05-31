@@ -9,13 +9,14 @@ DuckLake catalog.
 ## Start a Local Writer
 
 ```bash
-../duckdb-otlp/build/release/duckdb -unsigned /tmp/canardstack-e2e/writer.duckdb
+duckdb -unsigned /tmp/canardstack-e2e/writer.duckdb
 ```
 
 ```sql
-LOAD '../duckdb-otlp/build/release/extension/otlp/otlp.duckdb_extension';
 INSTALL ducklake;
 LOAD ducklake;
+INSTALL otlp FROM 'https://smithclay.github.io/duckdb-otlp';
+LOAD otlp;
 
 ATTACH 'ducklake:/tmp/canardstack-e2e/metadata.ducklake' AS lake
   (DATA_PATH '/tmp/canardstack-e2e/data/');

@@ -3,47 +3,67 @@ title: Get Started
 description: Run the local duckdb-otlp to canardstack query flow.
 ---
 
-This tutorial validates the query-only shape on your machine:
+This tutorial validates the query-only shape on your machine with Docker:
 
 ```text
-duckdb-otlp OTLP writer -> DuckLake tables -> canardstack query APIs
+duckdb-otlp OTLP writer -> Quack DuckLake catalog -> canardstack query APIs
 ```
 
 ## Prerequisites
 
-- Rust and Cargo
-- Node is only needed for editing this docs site
-- A sibling `../duckdb-otlp` checkout with release artifacts:
+- Docker Compose
 
-```text
-../duckdb-otlp/build/release/duckdb
-../duckdb-otlp/build/release/extension/otlp/otlp.duckdb_extension
-```
-
-## Run the E2E Smoke
+## Start the Stack
 
 From the canardstack repository root:
 
 ```bash
-scripts/e2e-duckdb-otlp-local.py
+docker compose -f compose.yaml -f compose.build.yaml up --build
 ```
 
-The smoke:
+This starts:
 
-1. Starts DuckDB with the local `duckdb-otlp` extension.
-2. Creates a temporary DuckLake catalog.
-3. Posts sample OTLP logs to the extension's `/v1/logs` endpoint.
-4. Flushes the writer.
-5. Starts canardstack against the same catalog.
-6. Queries the rows through Loki `query_range`.
+- DuckDB serving a DuckLake catalog over Quack
+- DuckDB running `duckdb-otlp` ingest on `localhost:4319`
+- canardstack on `localhost:4318`
+- Grafana on `localhost:3000`
 
-Expected output:
+## Send Logs
 
-```text
-ok: duckdb-otlp wrote 3 OTLP log rows to DuckLake; canardstack queried them through Loki query_range
+Use any OTLP/HTTP exporter, or post the sample logs from a sibling
+`../duckdb-otlp` checkout:
+
+```bash
+curl -sS -X POST http://localhost:4319/v1/logs \
+  -H 'Authorization: Bearer dev-otlp-token-123456' \
+  -H 'Content-Type: application/x-ndjson' \
+  --data-binary @../duckdb-otlp/test/data/logs_simple.jsonl
 ```
 
-Use `--keep-temp` to inspect the generated catalog and logs after the run.
+For the small sample payload, force the buffered writer to commit before
+querying:
+
+```bash
+docker compose exec ingest sh -c \
+  "printf '%s\n' \"SELECT * FROM otlp_flush('otlp:0.0.0.0:4319');\" > /tmp/duckdb-otlp-ingest.sql"
+```
+
+## Query Logs
+
+Grafana is provisioned with Prometheus, Loki, and Tempo datasources pointing at
+canardstack. You can also call the Loki API directly:
+
+```bash
+curl -sS -G http://localhost:4318/loki/api/v1/query_range \
+  -H 'Authorization: Bearer dev-canardstack-key' \
+  --data-urlencode 'query={service_name="test-service"}' \
+  --data-urlencode 'start=1640000000000000000' \
+  --data-urlencode 'end=1640000030000000000' \
+  --data-urlencode 'limit=10'
+```
+
+For the local single-process smoke against a sibling `../duckdb-otlp` checkout,
+run `scripts/e2e-duckdb-otlp-local.py`.
 
 ## Next
 

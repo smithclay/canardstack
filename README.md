@@ -39,7 +39,7 @@ Use `duckdb-otlp` for ingestion:
 ```sql
 INSTALL ducklake;
 LOAD ducklake;
-INSTALL otlp FROM community;
+INSTALL otlp FROM 'https://smithclay.github.io/duckdb-otlp';
 LOAD otlp;
 
 ATTACH 'ducklake:/path/to/catalog.ducklake' AS canardlake
@@ -51,6 +51,18 @@ USE canardlake;
 
 For a local end-to-end smoke against a sibling `../duckdb-otlp` checkout, see
 [`docs/e2e-duckdb-otlp.md`](docs/e2e-duckdb-otlp.md).
+
+## Docker Compose
+
+The default Compose stack runs the full query-only architecture:
+
+```bash
+docker compose -f compose.yaml -f compose.build.yaml up --build
+```
+
+It starts a DuckDB Quack catalog, a DuckDB `duckdb-otlp` ingest process,
+canardstack, and Grafana. The ingest endpoint is on `localhost:4319`,
+canardstack is on `localhost:4318`, and Grafana is on `localhost:3000`.
 
 ## Query
 
