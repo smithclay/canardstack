@@ -14,6 +14,8 @@ canardstack is an experimental query server for observability data stored in [Du
 
 Write telemetry with [duckdb-otlp](https://github.com/smithclay/duckdb-otlp) in a DuckDB process, then point canardstack at the resulting DuckLake catalog for query serving in Grafana.
 
+![Grafana dashboard showing OTel demo data queried through canardstack](site/src/assets/grafana-dash-demo.png)
+
 ## Quick Start
 
 ```bash

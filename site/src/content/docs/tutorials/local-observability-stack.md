@@ -12,6 +12,8 @@ OpenTelemetry Demo -> duckdb-otlp OTLP writer -> Quack DuckLake catalog -> canar
 You will send OpenTelemetry Demo telemetry to `duckdb-otlp`, query it through
 canardstack, and open a provisioned Grafana dashboard.
 
+![Grafana dashboard showing OTel demo data queried through canardstack](../../../assets/grafana-dash-demo.png)
+
 ## Prerequisites
 
 - Docker Compose
