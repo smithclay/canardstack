@@ -5,10 +5,22 @@ import starlightClientMermaid from '@pasqal-io/starlight-client-mermaid';
 export default defineConfig({
   site: 'https://smithclay.github.io',
   base: '/canardstack',
+  redirects: {
+    '/get-started': '/tutorials/local-observability-stack',
+    '/quickstart/serve': '/how-to/serve-ducklake',
+    '/guides/lakehouse-ingest': '/how-to/write-with-duckdb-otlp',
+    '/guides/query-with-grafana': '/how-to/connect-grafana',
+    '/guides/query-with-duckdb': '/how-to/query-ducklake-with-sql',
+    '/reference/api': '/reference/http-api',
+    '/reference/schema': '/reference/storage-schema',
+    '/reference/server': '/reference/runtime',
+    '/reference/operational-limits': '/reference/runtime',
+    '/architecture': '/explanation/query-only-architecture',
+  },
   integrations: [
     starlight({
       title: 'canardstack',
-      description: 'OpenTelemetry logs, traces, and metrics stored in DuckLake.',
+      description: 'Query OpenTelemetry-shaped data stored in DuckLake.',
       logo: {
         src: './src/assets/canardstack.png',
         alt: 'canardstack logo',
@@ -27,35 +39,36 @@ export default defineConfig({
       plugins: [starlightClientMermaid()],
       sidebar: [
         {
-          label: 'Start Here',
+          label: 'Start',
           items: [
             { label: 'Overview', link: '/' },
-            { label: 'Demo', link: '/demo/' },
-            { label: 'Architecture', link: '/architecture/' },
+            {
+              label: 'Tutorial: local observability stack',
+              link: '/tutorials/local-observability-stack/',
+            },
           ],
         },
         {
-          label: 'Deployment',
+          label: 'How-to Guides',
           items: [
-            { label: 'Overview', link: '/deployment/' },
-            { label: 'Send Telemetry', link: '/deployment/send-telemetry/' },
-            { label: 'MotherDuck', link: '/deployment/motherduck/' },
-            { label: 'GCP Cloud Run', link: '/deployment/gcp-cloud-run/' },
-            { label: 'AWS ECS/Fargate', link: '/deployment/aws-ecs-fargate/' },
+            { label: 'Serve an existing DuckLake catalog', link: '/how-to/serve-ducklake/' },
+            { label: 'Write telemetry with duckdb-otlp', link: '/how-to/write-with-duckdb-otlp/' },
+            { label: 'Connect Grafana', link: '/how-to/connect-grafana/' },
+            { label: 'Query DuckLake with SQL', link: '/how-to/query-ducklake-with-sql/' },
           ],
         },
         {
-          label: 'Operations',
+          label: 'Reference',
           items: [
-            { label: 'Overview', link: '/operations/' },
-            { label: 'Failure Runbooks', link: '/operations/failure-runbooks/' },
+            { label: 'HTTP API', link: '/reference/http-api/' },
+            { label: 'Storage schema', link: '/reference/storage-schema/' },
+            { label: 'Runtime contract', link: '/reference/runtime/' },
           ],
         },
         {
-          label: 'Query Data',
+          label: 'Explanation',
           items: [
-            { label: 'Grafana Datasources', link: '/query-data/grafana/' },
-            { label: 'DuckDB SQL', link: '/query-data/duckdb/' },
+            { label: 'Query-only architecture', link: '/explanation/query-only-architecture/' },
           ],
         },
         {

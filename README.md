@@ -7,148 +7,88 @@
 [![CI](https://github.com/smithclay/canardstack/actions/workflows/ci.yml/badge.svg)](https://github.com/smithclay/canardstack/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![DuckLake](https://img.shields.io/badge/storage-DuckLake-fff000.svg?logo=duckdb&logoColor=black)](https://ducklake.select/)
-[![OpenTelemetry](https://img.shields.io/badge/OTLP-HTTP-425cc7.svg?logo=opentelemetry&logoColor=white)](https://opentelemetry.io/)
 
-> OpenTelemetry logs, traces, and metrics stored in DuckLake, visualized in Grafana.
+> Query OpenTelemetry-shaped logs, traces, and metrics stored in DuckLake.
 
-canardstack is an experimental project that makes it possible to stream OpenTelemetry data to [DuckLake](https://ducklake.select/), a lakehouse standard from the creators of duckdb. The project goal is to explore cheap and simple ways to query terabytes of observability data *from a single node* stored in open formats on object storage.
+canardstack is an experimental query server for observability data stored in [DuckLake](https://ducklake.select/). It exposes bounded Prometheus, Loki, and Tempo-compatible HTTP APIs for Grafana-style clients.
 
-Builds on prior work from [otlp2parquet](https://github.com/smithclay/otlp2parquet), [otlp2pipeline](https://github.com/smithclay/otlp2pipeline), and [duckdb-otlp](https://github.com/smithclay/duckdb-otlp).
-
-## Contents
-
-- [Quickstart](#quick-start)
-- [Demo](#demo)
-- [Why canardstack?](#why-canardstack)
-- [Send Telemetry](#send-telemetry)
-- [Query Data](#query-data)
-- [Deployment](#deployment)
-- [Architecture](#architecture)
-- [Operations](#operations)
-- [Limits](#limits)
-- [For Developers](#for-developers)
-- [Documentation](#documentation)
+Write telemetry with [duckdb-otlp](https://github.com/smithclay/duckdb-otlp) in a DuckDB process, then point canardstack at the resulting DuckLake catalog for query serving in Grafana.
 
 ## Quick Start
 
-You can get started by installing canardstack with `cargo` and connecting to a local Ducklake catalog using the [new Quack protocol](https://duckdb.org/quack/).
-
-
 ```bash
-# requires rust toolchain: `curl https://sh.rustup.rs -sSf | sh`
 cargo install --locked canardstack
 
-# starts server on 127.0.0.1:4318 with a Ducklake catalog accessible over Quack
-CANARDSTACK_DUCKLAKE_QUACK_TOKEN=dev-quack-token canardstack serve --local-catalog
+CANARDSTACK_DUCKLAKE_ATTACH_URI=ducklake:/path/to/catalog.ducklake \
+CANARDSTACK_DUCKLAKE_DATA_PATH=/path/to/ducklake-data \
+canardstack serve
 ```
 
-In another terminal, send one OTLP/HTTP JSON log:
+The HTTP server listens on `127.0.0.1:4318` by default. Use `--listen` or
+`CANARDSTACK_BIND` to change it.
 
 ```bash
-OTLP_TIME_UNIX_NANO="$(date +%s)000000000"
-curl -sS -X POST http://127.0.0.1:4318/v1/logs \
-  -H 'Authorization: Bearer dev-canardstack-key' \
-  -H 'Content-Type: application/json' \
-  --data "{\"resourceLogs\":[{\"resource\":{\"attributes\":[{\"key\":\"service.name\",\"value\":{\"stringValue\":\"quickstart\"}}]},\"scopeLogs\":[{\"logRecords\":[{\"timeUnixNano\":\"${OTLP_TIME_UNIX_NANO}\",\"body\":{\"stringValue\":\"hello world\"}}]}]}]}"
+canardstack serve --listen 127.0.0.1:4320
+canardstack healthcheck --endpoint http://127.0.0.1:4320/healthz
 ```
 
-canardstack acknowledges ingest after the raw request is fsynced locally. By default, the scheduler seals buffered rows within about 10 seconds; wait a moment, then attach to the Ducklake in duckdb 1.5.3+ or higher:
+## Write Telemetry
 
-```bash
-duckdb --version
-duckdb
-```
+Use `duckdb-otlp` for ingestion:
 
 ```sql
 INSTALL ducklake;
 LOAD ducklake;
-INSTALL quack;
-LOAD quack;
+INSTALL otlp FROM 'https://smithclay.github.io/duckdb-otlp';
+LOAD otlp;
 
-CREATE OR REPLACE SECRET canardstack_ducklake_quack
-  (TYPE quack, SCOPE 'quack:127.0.0.1:9494', TOKEN 'dev-quack-token');
-
-ATTACH 'ducklake:quack:127.0.0.1:9494' AS canardlake;
+ATTACH 'ducklake:/path/to/catalog.ducklake' AS canardlake
+  (DATA_PATH '/path/to/ducklake-data');
 USE canardlake;
 
-SELECT * FROM logs;
-┌─────────────────────┬────────────────────────────┬───────────────┬───┬──────────────────┬────────────────┐
-│      timestamp      │        ingested_at         │ source_format │ … │ scope_attributes │ log_attributes │
-│      timestamp      │         timestamp          │    varchar    │ … │     varchar      │    varchar     │
-├─────────────────────┼────────────────────────────┼───────────────┼───┼──────────────────┼────────────────┤
-│ 2026-05-27 00:14:12 │ 2026-05-27 00:14:12.086916 │ otlp_json     │ … │ NULL             │ NULL           │
-└─────────────────────┴────────────────────────────┴───────────────┴───┴──────────────────┴────────────────┘
+-- See duckdb-otlp for OTLP server and table setup details.
 ```
 
-You just streamed an OTLP log to Ducklake! For a more comprehensive example, see the demo below or review cloud [deployment examples](https://smithclay.github.io/canardstack/deployment/).
+For a local end-to-end smoke against a sibling `../duckdb-otlp` checkout, see
+[`docs/e2e-duckdb-otlp.md`](docs/e2e-duckdb-otlp.md).
 
-## Demo
+## Docker Compose
 
-Run canardstack with the full [OpenTelemetry demo](https://github.com/open-telemetry/opentelemetry-demo) using
-the [demo guide](https://smithclay.github.io/canardstack/demo/).
+The default Compose stack runs the full query-only architecture:
 
-![Grafana dashboard showing canardstack OpenTelemetry demo data](site/src/assets/grafana-dash-demo.png)
+```bash
+docker compose -f compose.yaml -f compose.build.yaml up --build
+```
 
-## Why canardstack?
+It starts a DuckDB Quack catalog, a DuckDB `duckdb-otlp` ingest process,
+canardstack, and Grafana. The ingest endpoint is on `localhost:4319`,
+canardstack is on `localhost:4318`, and Grafana is on `localhost:3000`.
 
-canardstack's goal is to make it easy and cheap for anyone to store and query terabytes of observability data on cheap hardware using vendor-neutral stanards with few moving pieces. There are many high-quality open-source observability solutions like [ClickStack](https://clickhouse.com/docs/use-cases/observability/clickstack) and [SigNoz](https://github.com/SigNoz/signoz), canardstack's primary difference is the deep integration with duckdb/DuckLake and (intentionally) simple single-node architecture.
+Run a Compose-local logs ingest benchmark:
 
-See the [overview docs](https://smithclay.github.io/canardstack/) for more information.
+```bash
+scripts/bench-compose-logs.py --targets 10000 --duration 60 --flush
+```
 
-## Send Telemetry
+The benchmark reports accepted log datapoints/second, accepted `202`
+responses/second, and average Docker CPU percentage for ingest, catalog, and
+canardstack containers.
 
-Configure OTLP/HTTP producers and OpenTelemetry Collectors with the
-[send telemetry guide](https://smithclay.github.io/canardstack/deployment/send-telemetry/).
+## Query
 
-## Query Data
+canardstack serves:
 
-- [Query with DuckDB](https://smithclay.github.io/canardstack/query-data/duckdb/)
-- [Query with Grafana](https://smithclay.github.io/canardstack/query-data/grafana/)
+- Prometheus-compatible query and discovery routes under `/api/v1/...`
+- Loki-compatible routes under `/loki/api/v1/...`
+- Tempo-compatible search and trace routes under `/api/...`
+- Operational endpoints at `/healthz`, `/metrics`, and `/api/admin/health/...`
 
-## Deployment
+Set `CANARDSTACK_API_KEY` for query routes and
+`CANARDSTACK_ADMIN_API_KEY` for admin health routes.
 
-- [Deployment overview](https://smithclay.github.io/canardstack/deployment/)
-- [Send telemetry](https://smithclay.github.io/canardstack/deployment/send-telemetry/)
-- [MotherDuck](https://smithclay.github.io/canardstack/deployment/motherduck/)
-- [GCP Cloud Run](https://smithclay.github.io/canardstack/deployment/gcp-cloud-run/)
-- [AWS ECS/Fargate](https://smithclay.github.io/canardstack/deployment/aws-ecs-fargate/)
+## Status
 
-## Architecture
-
-The current high-level data-flow diagram lives in the
-[architecture guide in docs](https://smithclay.github.io/canardstack/architecture/).
-
-## Operations
-
-Operator notes, configuration guidance, diagnostics, and failure response
-runbooks live in the [operations docs](https://smithclay.github.io/canardstack/operations/).
-
-## Limits
-
-canardstack is experimental and not production-ready. The schema may drift and query performance is uncertain.
-
-Other limits:
-
-- Current single-node throughput is in the ballpark of `23.1 MB/s` accepted decoded
-  throughput without `429`/`503` or query failures.
-- Data weirdness possible: A crash after a `2xx` should replay a
-  fsynced raw-spool record if it was not checkpointed, but duplicate replay can
-  occur when storage commit succeeds before raw-spool checkpoint.
-- No histograms or exponential histograms metric support yet.
-- No full PromQL, LogQL, TraceQL, Prometheus, Loki, or Tempo implementation.
-- It takes time between data being accepted for it to appear in the DuckLake, this is configurable but at least several seconds.
-
-## For Developers
-
-Contributor setup and implementation details live in
-[docs/developer.md](docs/developer.md). Start there when changing canardstack
-itself.
-
-## Documentation
-
-Docs are published at [https://smithclay.github.io/canardstack/](https://smithclay.github.io/canardstack/).
-
-## Acknowledgements
-
-Thanks to @hanorigins, Tyler Hillery, and @decalek from the DuckDB Discord for
-starting a discussion that led to this proof of concept.
+This project is experimental. The compatibility APIs are intentionally bounded:
+there is no arbitrary SQL endpoint, no full PromQL/LogQL/TraceQL
+implementation, and query paths are constrained by time range, row limit,
+timeout, memory limit, and admission caps.

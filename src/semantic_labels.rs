@@ -92,6 +92,7 @@ pub fn canonical_for_alias(scope: LabelScope, raw: &str) -> Option<&'static str>
         })
 }
 
+#[cfg(test)]
 pub fn metadata_labels(scope: LabelScope) -> Vec<(&'static str, String)> {
     LABELS
         .iter()
@@ -156,11 +157,13 @@ pub fn prometheus_label_names() -> Vec<String> {
 /// per-protocol surface flags (`loki_stream` / `tempo_tag` / `prom_promoted`):
 /// protocol membership decides what is selectable and name-discoverable;
 /// `HIGH_CARDINALITY` independently vetoes value materialization.
+#[cfg(test)]
 const HIGH_CARDINALITY: &[&str] = &["trace_id", "span_id", "service_instance_id"];
 
 /// A label's distinct values are materialized into `metadata_summary` (and so
 /// returned by `/label/<name>/values`) when it is part of the scope's protocol
 /// surface *and* bounded enough to enumerate. See [`HIGH_CARDINALITY`].
+#[cfg(test)]
 fn metadata_label_allowed(scope: LabelScope, label: &LabelDef) -> bool {
     if HIGH_CARDINALITY.contains(&label.canonical) {
         return false;
@@ -358,9 +361,8 @@ const LOG_SEVERITY_SOURCES: &[ScopedLabelSource] = &[ScopedLabelSource {
     source: LabelSource::Column("severity_text"),
 }];
 
-// v2 stores trace/span IDs as BLOB; label matching and projection need them as
-// lowercase hex strings to stay round-trippable with client query input, so the
-// source is the `lower(hex(...))` SQL expression rather than the raw column.
+// duckdb-otlp stores trace/span IDs as hex strings. Label matching and
+// projection lower-case them so client input round-trips consistently.
 const TRACE_ID_SOURCES: &[ScopedLabelSource] = &[
     ScopedLabelSource {
         scope: LabelScope::Logs,

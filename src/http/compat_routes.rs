@@ -11,17 +11,6 @@ use super::parser::percent_decode;
 use super::response::HttpResponse;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum CompatRoleCategory {
-    Query,
-}
-
-impl CompatRoleCategory {
-    pub(super) fn serves_queries(self) -> bool {
-        matches!(self, Self::Query)
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AuthRequirement {
     Api,
 }
@@ -70,7 +59,6 @@ struct CompatRoute {
     methods: &'static [&'static str],
     template: &'static str,
     pattern: RoutePattern,
-    role_category: CompatRoleCategory,
     auth: AuthRequirement,
     admission: QueryAdmission,
     handler: CompatHandler,
@@ -80,12 +68,6 @@ struct CompatRoute {
 pub(super) struct CompatRouteMatch<'a> {
     route: &'static CompatRoute,
     param: Option<&'a str>,
-}
-
-impl CompatRouteMatch<'_> {
-    pub(super) fn role_category(self) -> CompatRoleCategory {
-        self.route.role_category
-    }
 }
 
 const COMPAT_ROUTES: &[CompatRoute] = &[
@@ -251,7 +233,6 @@ const fn compat_route(
         methods,
         template,
         pattern,
-        role_category: CompatRoleCategory::Query,
         auth: AuthRequirement::Api,
         admission,
         handler,
@@ -265,33 +246,6 @@ pub(super) fn match_compat_route<'a>(method: &str, path: &'a str) -> Option<Comp
         }
         match_route_path(route.pattern, path).map(|param| CompatRouteMatch { route, param })
     })
-}
-
-#[cfg(test)]
-pub(super) fn compat_route_examples_for_tests() -> Vec<(String, String)> {
-    COMPAT_ROUTES
-        .iter()
-        .flat_map(|route| {
-            let path = match route.pattern {
-                RoutePattern::Exact(path) => path.to_string(),
-                RoutePattern::PrefixParam { prefix } => {
-                    format!("{prefix}11111111111111111111111111111111")
-                }
-                RoutePattern::PrefixSuffixParam { prefix, suffix } => {
-                    let param = if route.template.contains(":tag") {
-                        "service.name"
-                    } else {
-                        "service_name"
-                    };
-                    format!("{prefix}{param}{suffix}")
-                }
-            };
-            route
-                .methods
-                .iter()
-                .map(move |method| ((*method).to_string(), path.clone()))
-        })
-        .collect()
 }
 
 pub(super) fn route_compat(
@@ -420,20 +374,16 @@ fn with_query_admission<T>(
     match admission {
         QueryAdmission::None => run(),
         QueryAdmission::Cheap => {
-            let inputs = state.ingestor.freshness_budget_inputs(&state.storage);
             let _guard = state.admission.reserve_query_with_wait(
                 QueryClass::Cheap,
-                inputs,
                 state.config.operator.query_admission_wait,
                 &state.metrics,
             )?;
             run()
         }
         QueryAdmission::Heavy => {
-            let inputs = state.ingestor.freshness_budget_inputs(&state.storage);
             let _guard = state.admission.reserve_query_with_wait(
                 QueryClass::Heavy,
-                inputs,
                 state.config.operator.query_admission_wait,
                 &state.metrics,
             )?;

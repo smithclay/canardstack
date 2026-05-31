@@ -26,10 +26,10 @@ impl StorageSignal {
 
     pub fn as_str(self) -> &'static str {
         match self {
-            StorageSignal::Logs => "logs",
-            StorageSignal::Spans => "spans",
-            StorageSignal::MetricGauge => "metric_gauge",
-            StorageSignal::MetricSum => "metric_sum",
+            StorageSignal::Logs => "otlp_logs",
+            StorageSignal::Spans => "otlp_traces",
+            StorageSignal::MetricGauge => "otlp_metrics_gauge",
+            StorageSignal::MetricSum => "otlp_metrics_sum",
         }
     }
 }

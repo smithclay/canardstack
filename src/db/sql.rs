@@ -82,16 +82,14 @@ pub fn metrics_deployment_environment_expr() -> String {
     json_attr("resource_attributes", "deployment.environment")
 }
 
-/// Render the BLOB `trace_id` storage column as a lowercase hex string for
-/// label matching/projection. v2 ID columns are `FixedSizeBinary` (BLOB) but
-/// client query input is hex, so every label path that compares or projects
-/// `trace_id`/`span_id` goes through these helpers.
+/// Render trace/span IDs as lowercase hex strings for label
+/// matching/projection. duckdb-otlp stores these as hex VARCHAR columns.
 pub fn trace_id_hex_expr() -> String {
-    "lower(hex(trace_id))".to_string()
+    "lower(trace_id)".to_string()
 }
 
 pub fn span_id_hex_expr() -> String {
-    "lower(hex(span_id))".to_string()
+    "lower(span_id)".to_string()
 }
 
 pub fn span_row(row: &Row<'_>) -> duckdb::Result<Value> {

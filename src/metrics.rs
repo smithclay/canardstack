@@ -1,24 +1,9 @@
-use crate::signal::StorageSignal;
-use crate::storage::Storage;
 use crate::LockExt;
-use anyhow::{Context, Result};
-use arrow58::array::{
-    ArrayRef, BooleanArray, Float64Array, Int32Array, StringArray, TimestampNanosecondArray,
-    UInt32Array,
-};
-use arrow58::datatypes::{DataType, Field, Schema, TimeUnit};
-use arrow58::record_batch::RecordBatch;
-use chrono::Utc;
-use serde_json::{json, Map, Value};
 use std::borrow::Cow;
 use std::collections::BTreeMap;
-use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Instant;
 
-/// Number of independent lock shards. A power of two so shard selection is a
-/// cheap mask. Sized to cover the connection-thread + ingest-worker fan-out so
-/// the hot ingest path stops serializing on a single metrics mutex.
 const METRICS_SHARDS: usize = 16;
 
 pub struct Metrics {
@@ -97,25 +82,17 @@ impl MetricSample {
         }
     }
 
-    /// Discriminates how `value` is interpreted: a `Counter` is cumulative and
-    /// routes to `metric_sum`, a `Gauge` is instantaneous and routes to
-    /// `metric_gauge`.
     pub fn kind(&self) -> MetricKind {
         self.kind
     }
 }
 
-/// Storage routing for rendered operator metric samples. Counters are written as
-/// OTLP sums; gauges are written as OTLP gauges.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MetricKind {
     Counter,
     Gauge,
 }
 
-/// Registry-time shape of an emitted metric name. Observations render as the
-/// Prometheus `_count` counter plus `_sum` gauge pair, so this is distinct from
-/// [`MetricKind`]'s storage routing role.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MetricShape {
     Counter,
@@ -127,80 +104,17 @@ enum MetricShape {
 pub enum MetricName {
     AdmissionCapacity,
     AdmissionInUse,
-    AdmissionReductionsTotal,
     AdmissionRejectionsTotal,
-    ArrowFlushRowsTotal,
-    ArrowFlushesTotal,
-    ArrowWriteBufferAgeSeconds,
-    ArrowWriteBufferBytes,
-    ArrowWriteBufferRows,
-    DuckdbArrowAppendedRowsTotal,
-    DuckdbArrowAppendsTotal,
     DucklakeActiveDataFileRows,
     DucklakeActiveDataFiles,
-    DucklakeCheckpointRunsTotal,
-    DucklakeCheckpointSupported,
-    DucklakeMaintenanceEnabled,
     FreshnessWatermarkTimestamp,
     HttpConnectionClosesTotal,
     HttpConnectionErrorsTotal,
     HttpConnectionRequestsTotal,
-    IngestBufferedBytesTotal,
-    IngestBufferedRowsTotal,
-    IngestDecodedBytesTotal,
-    IngestInflightBytes,
-    IngestInflightMemoryBoundBytes,
-    IngestRecordsTotal,
-    IngestRequestBytesTotal,
-    IngestRequestsTotal,
-    IngestRuntimeMemoryUnknownTotal,
-    IngestSealStageTotal,
-    IngestStageTotal,
-    IngestStorageInsertTotal,
-    IngestToQueryLagSeconds,
-    IngestTransformedRowsTotal,
-    IngestUnsupportedHistogramsTotal,
-    IngestWorkerCompletedTotal,
-    IngestWorkerDispatchTotal,
-    IngestWorkerQueueCapacity,
-    MaintenanceConsecutiveFailures,
-    MaintenanceDurationSeconds,
-    MaintenanceFailuresTotal,
-    MaintenancePaused,
-    MaintenanceRunsTotal,
-    ObservedFreshnessLagSeconds,
-    Otlp2recordsTransformEventsTotal,
     PhaseDurationSeconds,
-    ProjectedBufferSeconds,
-    ProjectedSealSeconds,
-    ProjectedVisibilitySeconds,
     QueryDurationSeconds,
     QueryRequestsTotal,
     QueryTimeoutsTotal,
-    RawSpoolAppendBatchEncodedBytesTotal,
-    RawSpoolAppendBatchRecordsTotal,
-    RawSpoolAppendBatchesTotal,
-    RawSpoolAppendFileFsyncsTotal,
-    RawSpoolAppendSyncFailuresTotal,
-    RawSpoolAppendSyncsTotal,
-    RawSpoolBytesTotal,
-    RawSpoolCheckpointBatchCommandsTotal,
-    RawSpoolCheckpointBatchRecordsTotal,
-    RawSpoolCheckpointBatchesTotal,
-    RawSpoolCheckpointedRecordsTotal,
-    RawSpoolHealthy,
-    RawSpoolPendingBytes,
-    RawSpoolPendingRecords,
-    RawSpoolRecordsTotal,
-    RawSpoolReplayedRecordsTotal,
-    RawSpoolSegmentBytes,
-    RawSpoolSegments,
-    RawSpoolUnsyncedAgeSeconds,
-    RawSpoolUnsyncedBytes,
-    RawSpoolUnsyncedRecords,
-    RuntimeMemoryLimitBytes,
-    RuntimeRssBytes,
-    SealEwmaBytesPerSecond,
     StorageLogicalRows,
     StoragePhysicalBytes,
 }
@@ -210,80 +124,17 @@ impl MetricName {
     const ALL: &'static [Self] = &[
         Self::AdmissionCapacity,
         Self::AdmissionInUse,
-        Self::AdmissionReductionsTotal,
         Self::AdmissionRejectionsTotal,
-        Self::ArrowFlushRowsTotal,
-        Self::ArrowFlushesTotal,
-        Self::ArrowWriteBufferAgeSeconds,
-        Self::ArrowWriteBufferBytes,
-        Self::ArrowWriteBufferRows,
-        Self::DuckdbArrowAppendedRowsTotal,
-        Self::DuckdbArrowAppendsTotal,
         Self::DucklakeActiveDataFileRows,
         Self::DucklakeActiveDataFiles,
-        Self::DucklakeCheckpointRunsTotal,
-        Self::DucklakeCheckpointSupported,
-        Self::DucklakeMaintenanceEnabled,
         Self::FreshnessWatermarkTimestamp,
         Self::HttpConnectionClosesTotal,
         Self::HttpConnectionErrorsTotal,
         Self::HttpConnectionRequestsTotal,
-        Self::IngestBufferedBytesTotal,
-        Self::IngestBufferedRowsTotal,
-        Self::IngestDecodedBytesTotal,
-        Self::IngestInflightBytes,
-        Self::IngestInflightMemoryBoundBytes,
-        Self::IngestRecordsTotal,
-        Self::IngestRequestBytesTotal,
-        Self::IngestRequestsTotal,
-        Self::IngestRuntimeMemoryUnknownTotal,
-        Self::IngestSealStageTotal,
-        Self::IngestStageTotal,
-        Self::IngestStorageInsertTotal,
-        Self::IngestToQueryLagSeconds,
-        Self::IngestTransformedRowsTotal,
-        Self::IngestUnsupportedHistogramsTotal,
-        Self::IngestWorkerCompletedTotal,
-        Self::IngestWorkerDispatchTotal,
-        Self::IngestWorkerQueueCapacity,
-        Self::MaintenanceConsecutiveFailures,
-        Self::MaintenanceDurationSeconds,
-        Self::MaintenanceFailuresTotal,
-        Self::MaintenancePaused,
-        Self::MaintenanceRunsTotal,
-        Self::ObservedFreshnessLagSeconds,
-        Self::Otlp2recordsTransformEventsTotal,
         Self::PhaseDurationSeconds,
-        Self::ProjectedBufferSeconds,
-        Self::ProjectedSealSeconds,
-        Self::ProjectedVisibilitySeconds,
         Self::QueryDurationSeconds,
         Self::QueryRequestsTotal,
         Self::QueryTimeoutsTotal,
-        Self::RawSpoolAppendBatchEncodedBytesTotal,
-        Self::RawSpoolAppendBatchRecordsTotal,
-        Self::RawSpoolAppendBatchesTotal,
-        Self::RawSpoolAppendFileFsyncsTotal,
-        Self::RawSpoolAppendSyncFailuresTotal,
-        Self::RawSpoolAppendSyncsTotal,
-        Self::RawSpoolBytesTotal,
-        Self::RawSpoolCheckpointBatchCommandsTotal,
-        Self::RawSpoolCheckpointBatchRecordsTotal,
-        Self::RawSpoolCheckpointBatchesTotal,
-        Self::RawSpoolCheckpointedRecordsTotal,
-        Self::RawSpoolHealthy,
-        Self::RawSpoolPendingBytes,
-        Self::RawSpoolPendingRecords,
-        Self::RawSpoolRecordsTotal,
-        Self::RawSpoolReplayedRecordsTotal,
-        Self::RawSpoolSegmentBytes,
-        Self::RawSpoolSegments,
-        Self::RawSpoolUnsyncedAgeSeconds,
-        Self::RawSpoolUnsyncedBytes,
-        Self::RawSpoolUnsyncedRecords,
-        Self::RuntimeMemoryLimitBytes,
-        Self::RuntimeRssBytes,
-        Self::SealEwmaBytesPerSecond,
         Self::StorageLogicalRows,
         Self::StoragePhysicalBytes,
     ];
@@ -292,102 +143,17 @@ impl MetricName {
         match self {
             Self::AdmissionCapacity => "canardstack_admission_capacity",
             Self::AdmissionInUse => "canardstack_admission_in_use",
-            Self::AdmissionReductionsTotal => "canardstack_admission_reductions_total",
             Self::AdmissionRejectionsTotal => "canardstack_admission_rejections_total",
-            Self::ArrowFlushRowsTotal => "canardstack_arrow_flush_rows_total",
-            Self::ArrowFlushesTotal => "canardstack_arrow_flushes_total",
-            Self::ArrowWriteBufferAgeSeconds => "canardstack_arrow_write_buffer_age_seconds",
-            Self::ArrowWriteBufferBytes => "canardstack_arrow_write_buffer_bytes",
-            Self::ArrowWriteBufferRows => "canardstack_arrow_write_buffer_rows",
-            Self::DuckdbArrowAppendedRowsTotal => "canardstack_duckdb_arrow_appended_rows_total",
-            Self::DuckdbArrowAppendsTotal => "canardstack_duckdb_arrow_appends_total",
             Self::DucklakeActiveDataFileRows => "canardstack_ducklake_active_data_file_rows",
             Self::DucklakeActiveDataFiles => "canardstack_ducklake_active_data_files",
-            Self::DucklakeCheckpointRunsTotal => "canardstack_ducklake_checkpoint_runs_total",
-            Self::DucklakeCheckpointSupported => "canardstack_ducklake_checkpoint_supported",
-            Self::DucklakeMaintenanceEnabled => "canardstack_ducklake_maintenance_enabled",
             Self::FreshnessWatermarkTimestamp => "canardstack_freshness_watermark_timestamp",
             Self::HttpConnectionClosesTotal => "canardstack_http_connection_closes_total",
             Self::HttpConnectionErrorsTotal => "canardstack_http_connection_errors_total",
             Self::HttpConnectionRequestsTotal => "canardstack_http_connection_requests_total",
-            Self::IngestBufferedBytesTotal => "canardstack_ingest_buffered_bytes_total",
-            Self::IngestBufferedRowsTotal => "canardstack_ingest_buffered_rows_total",
-            Self::IngestDecodedBytesTotal => "canardstack_ingest_decoded_bytes_total",
-            Self::IngestInflightBytes => "canardstack_ingest_inflight_bytes",
-            Self::IngestInflightMemoryBoundBytes => {
-                "canardstack_ingest_inflight_memory_bound_bytes"
-            }
-            Self::IngestRecordsTotal => "canardstack_ingest_records_total",
-            Self::IngestRequestBytesTotal => "canardstack_ingest_request_bytes_total",
-            Self::IngestRequestsTotal => "canardstack_ingest_requests_total",
-            Self::IngestRuntimeMemoryUnknownTotal => {
-                "canardstack_ingest_runtime_memory_unknown_total"
-            }
-            Self::IngestSealStageTotal => "canardstack_ingest_seal_stage_total",
-            Self::IngestStageTotal => "canardstack_ingest_stage_total",
-            Self::IngestStorageInsertTotal => "canardstack_ingest_storage_insert_total",
-            Self::IngestToQueryLagSeconds => "canardstack_ingest_to_query_lag_seconds",
-            Self::IngestTransformedRowsTotal => "canardstack_ingest_transformed_rows_total",
-            Self::IngestUnsupportedHistogramsTotal => {
-                "canardstack_ingest_unsupported_histograms_total"
-            }
-            Self::IngestWorkerCompletedTotal => "canardstack_ingest_worker_completed_total",
-            Self::IngestWorkerDispatchTotal => "canardstack_ingest_worker_dispatch_total",
-            Self::IngestWorkerQueueCapacity => "canardstack_ingest_worker_queue_capacity",
-            Self::MaintenanceConsecutiveFailures => "canardstack_maintenance_consecutive_failures",
-            Self::MaintenanceDurationSeconds => "canardstack_maintenance_duration_seconds",
-            Self::MaintenanceFailuresTotal => "canardstack_maintenance_failures_total",
-            Self::MaintenancePaused => "canardstack_maintenance_paused",
-            Self::MaintenanceRunsTotal => "canardstack_maintenance_runs_total",
-            Self::ObservedFreshnessLagSeconds => "canardstack_observed_freshness_lag_seconds",
-            Self::Otlp2recordsTransformEventsTotal => {
-                "canardstack_otlp2records_transform_events_total"
-            }
             Self::PhaseDurationSeconds => "canardstack_phase_duration_seconds",
-            Self::ProjectedBufferSeconds => "canardstack_projected_buffer_seconds",
-            Self::ProjectedSealSeconds => "canardstack_projected_seal_seconds",
-            Self::ProjectedVisibilitySeconds => "canardstack_projected_visibility_seconds",
             Self::QueryDurationSeconds => "canardstack_query_duration_seconds",
             Self::QueryRequestsTotal => "canardstack_query_requests_total",
             Self::QueryTimeoutsTotal => "canardstack_query_timeouts_total",
-            Self::RawSpoolAppendBatchEncodedBytesTotal => {
-                "canardstack_raw_spool_append_batch_encoded_bytes_total"
-            }
-            Self::RawSpoolAppendBatchRecordsTotal => {
-                "canardstack_raw_spool_append_batch_records_total"
-            }
-            Self::RawSpoolAppendBatchesTotal => "canardstack_raw_spool_append_batches_total",
-            Self::RawSpoolAppendFileFsyncsTotal => "canardstack_raw_spool_append_file_fsyncs_total",
-            Self::RawSpoolAppendSyncFailuresTotal => {
-                "canardstack_raw_spool_append_sync_failures_total"
-            }
-            Self::RawSpoolAppendSyncsTotal => "canardstack_raw_spool_append_syncs_total",
-            Self::RawSpoolBytesTotal => "canardstack_raw_spool_bytes_total",
-            Self::RawSpoolCheckpointBatchCommandsTotal => {
-                "canardstack_raw_spool_checkpoint_batch_commands_total"
-            }
-            Self::RawSpoolCheckpointBatchRecordsTotal => {
-                "canardstack_raw_spool_checkpoint_batch_records_total"
-            }
-            Self::RawSpoolCheckpointBatchesTotal => {
-                "canardstack_raw_spool_checkpoint_batches_total"
-            }
-            Self::RawSpoolCheckpointedRecordsTotal => {
-                "canardstack_raw_spool_checkpointed_records_total"
-            }
-            Self::RawSpoolHealthy => "canardstack_raw_spool_healthy",
-            Self::RawSpoolPendingBytes => "canardstack_raw_spool_pending_bytes",
-            Self::RawSpoolPendingRecords => "canardstack_raw_spool_pending_records",
-            Self::RawSpoolRecordsTotal => "canardstack_raw_spool_records_total",
-            Self::RawSpoolReplayedRecordsTotal => "canardstack_raw_spool_replayed_records_total",
-            Self::RawSpoolSegmentBytes => "canardstack_raw_spool_segment_bytes",
-            Self::RawSpoolSegments => "canardstack_raw_spool_segments",
-            Self::RawSpoolUnsyncedAgeSeconds => "canardstack_raw_spool_unsynced_age_seconds",
-            Self::RawSpoolUnsyncedBytes => "canardstack_raw_spool_unsynced_bytes",
-            Self::RawSpoolUnsyncedRecords => "canardstack_raw_spool_unsynced_records",
-            Self::RuntimeMemoryLimitBytes => "canardstack_runtime_memory_limit_bytes",
-            Self::RuntimeRssBytes => "canardstack_runtime_rss_bytes",
-            Self::SealEwmaBytesPerSecond => "canardstack_seal_ewma_bytes_per_second",
             Self::StorageLogicalRows => "canardstack_storage_logical_rows",
             Self::StoragePhysicalBytes => "canardstack_storage_physical_bytes",
         }
@@ -397,41 +163,18 @@ impl MetricName {
         match self {
             Self::AdmissionCapacity
             | Self::AdmissionInUse
-            | Self::ArrowWriteBufferAgeSeconds
-            | Self::ArrowWriteBufferBytes
-            | Self::ArrowWriteBufferRows
             | Self::DucklakeActiveDataFileRows
             | Self::DucklakeActiveDataFiles
-            | Self::DucklakeCheckpointSupported
-            | Self::DucklakeMaintenanceEnabled
             | Self::FreshnessWatermarkTimestamp
-            | Self::IngestInflightBytes
-            | Self::IngestInflightMemoryBoundBytes
-            | Self::IngestToQueryLagSeconds
-            | Self::IngestWorkerQueueCapacity
-            | Self::MaintenanceConsecutiveFailures
-            | Self::MaintenancePaused
-            | Self::ObservedFreshnessLagSeconds
-            | Self::ProjectedBufferSeconds
-            | Self::ProjectedSealSeconds
-            | Self::ProjectedVisibilitySeconds
-            | Self::RawSpoolHealthy
-            | Self::RawSpoolPendingBytes
-            | Self::RawSpoolPendingRecords
-            | Self::RawSpoolSegmentBytes
-            | Self::RawSpoolSegments
-            | Self::RawSpoolUnsyncedAgeSeconds
-            | Self::RawSpoolUnsyncedBytes
-            | Self::RawSpoolUnsyncedRecords
-            | Self::RuntimeMemoryLimitBytes
-            | Self::RuntimeRssBytes
-            | Self::SealEwmaBytesPerSecond
             | Self::StorageLogicalRows
             | Self::StoragePhysicalBytes => MetricShape::Gauge,
-            Self::MaintenanceDurationSeconds
-            | Self::PhaseDurationSeconds
-            | Self::QueryDurationSeconds => MetricShape::Observation,
-            _ => MetricShape::Counter,
+            Self::PhaseDurationSeconds | Self::QueryDurationSeconds => MetricShape::Observation,
+            Self::AdmissionRejectionsTotal
+            | Self::HttpConnectionClosesTotal
+            | Self::HttpConnectionErrorsTotal
+            | Self::HttpConnectionRequestsTotal
+            | Self::QueryRequestsTotal
+            | Self::QueryTimeoutsTotal => MetricShape::Counter,
         }
     }
 
@@ -439,63 +182,13 @@ impl MetricName {
         match self {
             Self::AdmissionCapacity | Self::AdmissionInUse => &["admission"],
             Self::AdmissionRejectionsTotal => &["admission", "reason"],
-            Self::ArrowFlushRowsTotal
-            | Self::ArrowFlushesTotal
-            | Self::ArrowWriteBufferAgeSeconds
-            | Self::ArrowWriteBufferBytes
-            | Self::ArrowWriteBufferRows
-            | Self::DuckdbArrowAppendedRowsTotal
-            | Self::DuckdbArrowAppendsTotal
-            | Self::IngestBufferedBytesTotal
-            | Self::IngestBufferedRowsTotal
-            | Self::IngestInflightBytes => &["storage_signal"],
             Self::DucklakeActiveDataFileRows
             | Self::DucklakeActiveDataFiles
             | Self::FreshnessWatermarkTimestamp
-            | Self::IngestToQueryLagSeconds
             | Self::StorageLogicalRows
             | Self::StoragePhysicalBytes => &["storage_signal"],
             Self::HttpConnectionClosesTotal | Self::HttpConnectionErrorsTotal => &["reason"],
             Self::HttpConnectionRequestsTotal => &["mode"],
-            Self::IngestDecodedBytesTotal | Self::IngestRequestBytesTotal => {
-                &["request_kind", "encoding"]
-            }
-            Self::IngestRecordsTotal
-            | Self::IngestRuntimeMemoryUnknownTotal
-            | Self::IngestUnsupportedHistogramsTotal
-            | Self::RawSpoolAppendBatchEncodedBytesTotal
-            | Self::RawSpoolAppendBatchRecordsTotal
-            | Self::RawSpoolAppendBatchesTotal
-            | Self::RawSpoolAppendFileFsyncsTotal
-            | Self::RawSpoolAppendSyncFailuresTotal
-            | Self::RawSpoolAppendSyncsTotal
-            | Self::RawSpoolBytesTotal
-            | Self::RawSpoolCheckpointBatchCommandsTotal
-            | Self::RawSpoolCheckpointBatchRecordsTotal
-            | Self::RawSpoolCheckpointBatchesTotal
-            | Self::RawSpoolHealthy
-            | Self::RawSpoolPendingBytes
-            | Self::RawSpoolPendingRecords
-            | Self::RawSpoolSegmentBytes
-            | Self::RawSpoolSegments
-            | Self::RawSpoolUnsyncedAgeSeconds
-            | Self::RawSpoolUnsyncedBytes
-            | Self::RawSpoolUnsyncedRecords => &["request_kind"],
-            Self::IngestRequestsTotal => &["request_kind", "status", "reason"],
-            Self::IngestSealStageTotal => &["stage"],
-            Self::IngestStageTotal => &["request_kind", "stage"],
-            Self::IngestStorageInsertTotal | Self::IngestWorkerCompletedTotal => {
-                &["request_kind", "status"]
-            }
-            Self::IngestTransformedRowsTotal => &["storage_signal", "request_kind"],
-            Self::IngestWorkerDispatchTotal => &["request_kind", "outcome"],
-            Self::IngestWorkerQueueCapacity => &["state"],
-            Self::MaintenanceConsecutiveFailures => &["job"],
-            Self::MaintenanceDurationSeconds => &["job", "storage_signal"],
-            Self::MaintenanceFailuresTotal => &["job", "reason"],
-            Self::MaintenanceRunsTotal => &["job", "status", "reason"],
-            Self::DucklakeCheckpointRunsTotal => &["status", "reason"],
-            Self::Otlp2recordsTransformEventsTotal => &["request_kind", "event"],
             Self::PhaseDurationSeconds => &[
                 "request_kind",
                 "route_template",
@@ -507,30 +200,11 @@ impl MetricName {
             ],
             Self::QueryDurationSeconds | Self::QueryTimeoutsTotal => &["route_template"],
             Self::QueryRequestsTotal => &["route_template", "status", "reason"],
-            Self::RawSpoolCheckpointedRecordsTotal => &["request_kind", "reason"],
-            Self::RawSpoolRecordsTotal | Self::RawSpoolReplayedRecordsTotal => {
-                &["request_kind", "status"]
-            }
-            Self::AdmissionReductionsTotal
-            | Self::IngestInflightMemoryBoundBytes
-            | Self::MaintenancePaused
-            | Self::DucklakeCheckpointSupported
-            | Self::DucklakeMaintenanceEnabled
-            | Self::ObservedFreshnessLagSeconds
-            | Self::ProjectedBufferSeconds
-            | Self::ProjectedSealSeconds
-            | Self::ProjectedVisibilitySeconds
-            | Self::RuntimeMemoryLimitBytes
-            | Self::RuntimeRssBytes
-            | Self::SealEwmaBytesPerSecond => &[],
         }
     }
 }
 
 impl Metrics {
-    /// Select the lock shard for a metric id. A given id always maps
-    /// to the same shard, so read-modify-write counters/gauges remain correct
-    /// without a single global lock. FNV-1a keeps this branch-free and cheap.
     fn shard_for(&self, metric_id: &MetricId) -> &Mutex<MetricsInner> {
         let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
         hash_metric_part(&mut hash, metric_id.name.as_bytes());
@@ -543,36 +217,14 @@ impl Metrics {
 
     pub fn inc(&self, name: MetricName, labels: &[(&str, &str)], by: u64) {
         assert_eq!(name.shape(), MetricShape::Counter);
-        self.inc_registered(name, labels, by);
-    }
-
-    fn inc_registered(&self, name: MetricName, labels: &[(&str, &str)], by: u64) {
         validate_metric_labels(name, labels);
         let metric_id = MetricId::new(name.as_str(), labels);
         let mut inner = self.shard_for(&metric_id).lock_or_poisoned();
         *inner.counters.entry(metric_id).or_default() += by;
     }
 
-    pub fn set_counter(&self, name: MetricName, labels: &[(&str, &str)], value: u64) {
-        assert_eq!(name.shape(), MetricShape::Counter);
-        self.set_counter_registered(name, labels, value);
-    }
-
-    fn set_counter_registered(&self, name: MetricName, labels: &[(&str, &str)], value: u64) {
-        validate_metric_labels(name, labels);
-        let metric_id = MetricId::new(name.as_str(), labels);
-        self.shard_for(&metric_id)
-            .lock_or_poisoned()
-            .counters
-            .insert(metric_id, value);
-    }
-
     pub fn gauge(&self, name: MetricName, labels: &[(&str, &str)], value: f64) {
         assert_eq!(name.shape(), MetricShape::Gauge);
-        self.gauge_registered(name, labels, value);
-    }
-
-    fn gauge_registered(&self, name: MetricName, labels: &[(&str, &str)], value: f64) {
         validate_metric_labels(name, labels);
         let metric_id = MetricId::new(name.as_str(), labels);
         self.shard_for(&metric_id)
@@ -582,89 +234,17 @@ impl Metrics {
     }
 
     pub fn observe_seconds(&self, name: MetricName, labels: &[(&str, &str)], seconds: f64) {
-        self.observe_seconds_n(name, labels, 1, seconds);
-    }
-
-    pub fn observe_seconds_n(
-        &self,
-        name: MetricName,
-        labels: &[(&str, &str)],
-        count: u64,
-        seconds: f64,
-    ) {
         assert_eq!(name.shape(), MetricShape::Observation);
-        self.observe_seconds_n_registered(name, labels, count, seconds);
-    }
-
-    fn observe_seconds_n_registered(
-        &self,
-        name: MetricName,
-        labels: &[(&str, &str)],
-        count: u64,
-        seconds: f64,
-    ) {
         validate_metric_labels(name, labels);
-        if count == 0 {
-            return;
-        }
         let count_id = MetricId::new(&format!("{}_count", name.as_str()), labels);
         let sum_id = MetricId::new(&format!("{}_sum", name.as_str()), labels);
         {
             let mut inner = self.shard_for(&count_id).lock_or_poisoned();
-            *inner.counters.entry(count_id).or_default() += count;
+            *inner.counters.entry(count_id).or_default() += 1;
         }
         let mut inner = self.shard_for(&sum_id).lock_or_poisoned();
         let current = inner.gauges.get(&sum_id).copied().unwrap_or(0.0);
         inner.gauges.insert(sum_id, current + seconds);
-    }
-
-    pub fn set_observation(
-        &self,
-        name: MetricName,
-        labels: &[(&str, &str)],
-        count: u64,
-        seconds: f64,
-    ) {
-        assert_eq!(name.shape(), MetricShape::Observation);
-        validate_metric_labels(name, labels);
-        let count_id = MetricId::new(&format!("{}_count", name.as_str()), labels);
-        let sum_id = MetricId::new(&format!("{}_sum", name.as_str()), labels);
-        self.shard_for(&count_id)
-            .lock_or_poisoned()
-            .counters
-            .insert(count_id, count);
-        self.shard_for(&sum_id)
-            .lock_or_poisoned()
-            .gauges
-            .insert(sum_id, seconds);
-    }
-
-    pub fn observe_request_phase_seconds(&self, request_kind: &str, phase: &str, seconds: f64) {
-        self.observe_labeled_phase_seconds(&[("request_kind", request_kind)], phase, seconds);
-    }
-
-    pub fn observe_request_phase_seconds_n(
-        &self,
-        request_kind: &str,
-        phase: &str,
-        count: u64,
-        seconds: f64,
-    ) {
-        self.observe_labeled_phase_seconds_n(
-            &[("request_kind", request_kind)],
-            phase,
-            count,
-            seconds,
-        );
-    }
-
-    pub fn observe_storage_signal_phase_seconds(
-        &self,
-        storage_signal: &str,
-        phase: &str,
-        seconds: f64,
-    ) {
-        self.observe_labeled_phase_seconds(&[("storage_signal", storage_signal)], phase, seconds);
     }
 
     pub fn observe_query_route_phase_seconds(
@@ -673,41 +253,10 @@ impl Metrics {
         phase: &str,
         seconds: f64,
     ) {
-        self.observe_labeled_phase_seconds(&[("route_template", route_template)], phase, seconds);
-    }
-
-    fn observe_labeled_phase_seconds(&self, labels: &[(&str, &str)], phase: &str, seconds: f64) {
-        self.observe_labeled_phase_seconds_n(labels, phase, 1, seconds);
-    }
-
-    fn observe_labeled_phase_seconds_n(
-        &self,
-        labels: &[(&str, &str)],
-        phase: &str,
-        count: u64,
-        seconds: f64,
-    ) {
-        let mut phase_labels = Vec::with_capacity(labels.len() + 1);
-        phase_labels.extend_from_slice(labels);
-        phase_labels.push(("phase", phase));
-        self.observe_seconds_n(
+        self.observe_seconds(
             MetricName::PhaseDurationSeconds,
-            &phase_labels,
-            count,
+            &[("route_template", route_template), ("phase", phase)],
             seconds,
-        );
-    }
-
-    pub fn ingest_request(&self, request_kind: &str, status: u16, reason: &str) {
-        let status = status_label(status);
-        self.inc(
-            MetricName::IngestRequestsTotal,
-            &[
-                ("request_kind", request_kind),
-                ("status", status.as_ref()),
-                ("reason", reason),
-            ],
-            1,
         );
     }
 
@@ -736,32 +285,19 @@ impl Metrics {
         }
     }
 
-    pub fn maintenance_run(&self, job: &str, status: &str, reason: &str, seconds: f64) {
-        self.inc(
-            MetricName::MaintenanceRunsTotal,
-            &[("job", job), ("status", status), ("reason", reason)],
-            1,
-        );
-        self.observe_seconds(
-            MetricName::MaintenanceDurationSeconds,
-            &[("job", job), ("storage_signal", "all")],
-            seconds,
-        );
-    }
-
     pub fn render_prometheus(&self) -> String {
         let (counters, gauges) = self.merged_shards();
         let mut out = String::new();
-        for (id, v) in &counters {
+        for (id, value) in &counters {
             out.push_str(&id.render_prometheus());
             out.push(' ');
-            out.push_str(&v.to_string());
+            out.push_str(&value.to_string());
             out.push('\n');
         }
-        for (id, v) in &gauges {
+        for (id, value) in &gauges {
             out.push_str(&id.render_prometheus());
             out.push(' ');
-            out.push_str(&format!("{v:.6}"));
+            out.push_str(&format!("{value:.6}"));
             out.push('\n');
         }
         out
@@ -771,69 +307,34 @@ impl Metrics {
         let (counters, gauges) = self.merged_shards();
         counters
             .iter()
-            .map(|(id, v)| MetricSample::counter(id.name.clone(), metric_labels_map(id), *v as f64))
-            .chain(
-                gauges
-                    .iter()
-                    .map(|(id, v)| MetricSample::gauge(id.name.clone(), metric_labels_map(id), *v)),
-            )
+            .map(|(id, value)| {
+                MetricSample::counter(id.name.clone(), metric_labels_map(id), *value as f64)
+            })
+            .chain(gauges.iter().map(|(id, value)| {
+                MetricSample::gauge(id.name.clone(), metric_labels_map(id), *value)
+            }))
             .collect()
     }
 
-    /// Merge all shards into sorted maps for a stable, deduplicated read. Each
-    /// key lives in exactly one shard, so the merge never collides. Locks one
-    /// shard at a time, so it cannot deadlock against the per-key writers.
     fn merged_shards(&self) -> (BTreeMap<MetricId, u64>, BTreeMap<MetricId, f64>) {
         let mut counters: BTreeMap<MetricId, u64> = BTreeMap::new();
         let mut gauges: BTreeMap<MetricId, f64> = BTreeMap::new();
         for shard in &self.shards {
             let inner = shard.lock_or_poisoned();
-            counters.extend(inner.counters.iter().map(|(k, v)| (k.clone(), *v)));
-            gauges.extend(inner.gauges.iter().map(|(k, v)| (k.clone(), *v)));
+            counters.extend(
+                inner
+                    .counters
+                    .iter()
+                    .map(|(key, value)| (key.clone(), *value)),
+            );
+            gauges.extend(
+                inner
+                    .gauges
+                    .iter()
+                    .map(|(key, value)| (key.clone(), *value)),
+            );
         }
         (counters, gauges)
-    }
-
-    pub fn write_snapshot_to_storage(&self, storage: &Storage) -> Result<usize> {
-        let samples = self.snapshot();
-        if samples.is_empty() {
-            return Ok(0);
-        }
-        // Sanctioned internal producer: operator self-telemetry is queryable when
-        // enabled, but it has no raw-spool replay record and does not enter the
-        // external ingest write buffer.
-        let counters = samples
-            .iter()
-            .filter(|sample| sample.kind() == MetricKind::Counter)
-            .cloned()
-            .collect::<Vec<_>>();
-        let gauges = samples
-            .iter()
-            .filter(|sample| sample.kind() == MetricKind::Gauge)
-            .cloned()
-            .collect::<Vec<_>>();
-        let mut rows = 0;
-        if !counters.is_empty() {
-            let batch = metric_samples_batch(&counters, StorageSignal::MetricSum)?;
-            rows += storage
-                .commit_operator_metrics_snapshot(
-                    StorageSignal::MetricSum,
-                    &batch,
-                    "canardstack_operator_metrics",
-                )?
-                .rows;
-        }
-        if !gauges.is_empty() {
-            let batch = metric_samples_batch(&gauges, StorageSignal::MetricGauge)?;
-            rows += storage
-                .commit_operator_metrics_snapshot(
-                    StorageSignal::MetricGauge,
-                    &batch,
-                    "canardstack_operator_metrics",
-                )?
-                .rows;
-        }
-        Ok(rows)
     }
 }
 
@@ -853,15 +354,10 @@ impl Timer {
     }
 }
 
-/// Render an HTTP status as a label without allocating for the handful of
-/// statuses the hot ingest/query paths actually emit.
 fn status_label(status: u16) -> Cow<'static, str> {
     match status {
         200 => Cow::Borrowed("200"),
-        202 => Cow::Borrowed("202"),
         400 => Cow::Borrowed("400"),
-        413 => Cow::Borrowed("413"),
-        415 => Cow::Borrowed("415"),
         429 => Cow::Borrowed("429"),
         500 => Cow::Borrowed("500"),
         503 => Cow::Borrowed("503"),
@@ -907,113 +403,11 @@ fn escape_label_value(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-fn metric_samples_batch(samples: &[MetricSample], signal: StorageSignal) -> Result<RecordBatch> {
-    let rows = samples.len();
-    // v2 storage uses TIMESTAMP_NS for record-time columns and emits both
-    // `int_value`/`double_value`. Operator self-telemetry samples are all
-    // `f64`, so the int channel is left null and consumers reading the table
-    // coalesce to the double channel.
-    let timestamp_ns = Utc::now()
-        .timestamp_nanos_opt()
-        .unwrap_or_else(|| Utc::now().timestamp_micros() * 1_000);
-    let resource_attributes = json!({"service.name": "canardstack"}).to_string();
-    let mut fields = vec![
-        Field::new(
-            "time_unix_nano",
-            DataType::Timestamp(TimeUnit::Nanosecond, None),
-            true,
-        ),
-        Field::new(
-            "start_time_unix_nano",
-            DataType::Timestamp(TimeUnit::Nanosecond, None),
-            true,
-        ),
-        Field::new("name", DataType::Utf8, true),
-        Field::new("description", DataType::Utf8, true),
-        Field::new("unit", DataType::Utf8, true),
-        Field::new("int_value", DataType::Int64, true),
-        Field::new("double_value", DataType::Float64, true),
-        Field::new("service_name", DataType::Utf8, true),
-        Field::new("service_namespace", DataType::Utf8, true),
-        Field::new("service_instance_id", DataType::Utf8, true),
-        Field::new("resource_attributes", DataType::Utf8, true),
-        Field::new("scope_name", DataType::Utf8, true),
-        Field::new("scope_version", DataType::Utf8, true),
-        Field::new("scope_attributes", DataType::Utf8, true),
-        Field::new("metric_attributes", DataType::Utf8, true),
-        Field::new("flags", DataType::UInt32, true),
-        Field::new("exemplars_json", DataType::Utf8, true),
-    ];
-    let mut arrays: Vec<ArrayRef> = vec![
-        Arc::new(TimestampNanosecondArray::from(vec![
-            Some(timestamp_ns);
-            rows
-        ])),
-        Arc::new(TimestampNanosecondArray::from(vec![None::<i64>; rows])),
-        Arc::new(StringArray::from(
-            samples
-                .iter()
-                .map(|sample| Some(sample.name.clone()))
-                .collect::<Vec<_>>(),
-        )),
-        Arc::new(StringArray::from(vec![None::<String>; rows])),
-        Arc::new(StringArray::from(vec![None::<String>; rows])),
-        // int_value channel: unused for operator telemetry.
-        Arc::new(arrow58::array::Int64Array::from(vec![None::<i64>; rows])),
-        Arc::new(Float64Array::from(
-            samples
-                .iter()
-                .map(|sample| Some(sample.value))
-                .collect::<Vec<_>>(),
-        )),
-        Arc::new(StringArray::from(vec![
-            Some("canardstack".to_string());
-            rows
-        ])),
-        Arc::new(StringArray::from(vec![None::<String>; rows])),
-        Arc::new(StringArray::from(vec![None::<String>; rows])),
-        Arc::new(StringArray::from(vec![Some(resource_attributes); rows])),
-        Arc::new(StringArray::from(vec![
-            Some("canardstack".to_string());
-            rows
-        ])),
-        Arc::new(StringArray::from(vec![None::<String>; rows])),
-        Arc::new(StringArray::from(vec![Some("{}".to_string()); rows])),
-        Arc::new(StringArray::from(
-            samples
-                .iter()
-                .map(|sample| Some(labels_json(&sample.labels).to_string()))
-                .collect::<Vec<_>>(),
-        )),
-        Arc::new(UInt32Array::from(vec![None::<u32>; rows])),
-        Arc::new(StringArray::from(vec![None::<String>; rows])),
-    ];
-    if signal == StorageSignal::MetricSum {
-        fields.push(Field::new("aggregation_temporality", DataType::Int32, true));
-        fields.push(Field::new("is_monotonic", DataType::Boolean, true));
-        arrays.push(Arc::new(Int32Array::from(vec![Some(2); rows])));
-        arrays.push(Arc::new(BooleanArray::from(vec![Some(true); rows])));
-    }
-    RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
-        .context("build operator metrics RecordBatch")
-}
-
-fn labels_json(labels: &BTreeMap<String, String>) -> Value {
-    let mut map = Map::new();
-    for (k, v) in labels {
-        map.insert(k.clone(), Value::String(v.clone()));
-    }
-    Value::Object(map)
-}
-
 #[cfg(test)]
 mod snapshot_tests {
     use super::*;
     use std::collections::BTreeSet;
 
-    /// Reduce a rendered `/metrics` line to its metric base name: drop the value,
-    /// drop the `{labels}`, and collapse the histogram `_count`/`_sum` pair onto
-    /// the base name so a histogram counts as one metric.
     fn base_name(line: &str) -> Option<String> {
         let head = line.split([' ', '{']).next()?;
         if !head.starts_with("canardstack_") {
@@ -1034,299 +428,28 @@ mod snapshot_tests {
             .collect()
     }
 
-    /// Drive a fixed, representative sequence of metric emissions that mirrors
-    /// what production code emits (one sample per metric name), so the rendered
-    /// surface can be pinned exactly. This is the post-diet contract guard: any
-    /// future add/drop of a metric name must update this set deliberately.
     fn emit_representative_surface(metrics: &Metrics) {
-        // Ingest request + query request envelopes.
-        metrics.ingest_request("logs", 202, "accepted");
-        metrics.ingest_request("logs", 429, "raw_spool_full");
         metrics.query_request("/api/v1/query_range", 200, "ok", 0.1);
         metrics.query_request("/api/v1/query_range", 504, "query_timeout", 0.1);
-
-        // Worker dispatch + worker completion + storage insert.
-        metrics.inc(
-            MetricName::IngestWorkerDispatchTotal,
-            &[("request_kind", "logs"), ("outcome", "queued")],
-            1,
-        );
-        metrics.inc(
-            MetricName::IngestWorkerCompletedTotal,
-            &[("request_kind", "logs"), ("status", "buffered")],
-            1,
-        );
-        metrics.inc(
-            MetricName::IngestStorageInsertTotal,
-            &[("request_kind", "logs"), ("status", "ok")],
-            1,
+        metrics.observe_query_route_phase_seconds("/api/v1/query_range", "query_execute", 0.1);
+        metrics.gauge(
+            MetricName::AdmissionCapacity,
+            &[("admission", "query_cheap")],
+            1.0,
         );
         metrics.gauge(
-            MetricName::IngestWorkerQueueCapacity,
-            &[("state", "capacity")],
-            1024.0,
-        );
-
-        // Accepted-body + transform + buffered counters.
-        metrics.inc(
-            MetricName::IngestRequestBytesTotal,
-            &[("request_kind", "logs"), ("encoding", "identity")],
-            10,
-        );
-        metrics.inc(
-            MetricName::IngestDecodedBytesTotal,
-            &[("request_kind", "logs"), ("encoding", "identity")],
-            10,
-        );
-        metrics.inc(
-            MetricName::IngestRecordsTotal,
-            &[("request_kind", "logs")],
-            1,
-        );
-        metrics.inc(
-            MetricName::IngestTransformedRowsTotal,
-            &[("storage_signal", "logs"), ("request_kind", "logs")],
-            1,
-        );
-        metrics.inc(
-            MetricName::IngestUnsupportedHistogramsTotal,
-            &[("request_kind", "metrics")],
-            1,
-        );
-        metrics.inc(
-            MetricName::IngestBufferedRowsTotal,
-            &[("storage_signal", "logs")],
-            1,
-        );
-        metrics.inc(
-            MetricName::IngestBufferedBytesTotal,
-            &[("storage_signal", "logs")],
-            10,
-        );
-
-        // Ingest durable-boundary funnel (per request) and seal-boundary funnel
-        // (per seal operation).
-        metrics.inc(
-            MetricName::IngestStageTotal,
-            &[("request_kind", "logs"), ("stage", "spooled")],
-            1,
-        );
-        metrics.inc(
-            MetricName::IngestSealStageTotal,
-            &[("stage", "committed")],
-            1,
-        );
-
-        // In-flight gauge (the `_max`, `_pressure`, and `_capacity_bytes`
-        // derivatives were dropped).
-        metrics.gauge(
-            MetricName::IngestInflightBytes,
-            &[("storage_signal", "logs")],
+            MetricName::AdmissionInUse,
+            &[("admission", "query_cheap")],
             0.0,
         );
-
-        // Runtime memory.
-        metrics.gauge(MetricName::RuntimeRssBytes, &[], 1.0);
-        metrics.gauge(MetricName::RuntimeMemoryLimitBytes, &[], 1.0);
-        metrics.inc(
-            MetricName::IngestRuntimeMemoryUnknownTotal,
-            &[("request_kind", "logs")],
-            1,
-        );
-
-        // Raw spool per-`request_kind` surface (aggregate no-label copies dropped).
-        metrics.inc(
-            MetricName::RawSpoolRecordsTotal,
-            &[("request_kind", "logs"), ("status", "spooled")],
-            1,
-        );
-        metrics.inc(
-            MetricName::RawSpoolBytesTotal,
-            &[("request_kind", "logs")],
-            10,
-        );
-        metrics.inc(
-            MetricName::RawSpoolAppendBatchesTotal,
-            &[("request_kind", "logs")],
-            1,
-        );
-        metrics.inc(
-            MetricName::RawSpoolAppendBatchRecordsTotal,
-            &[("request_kind", "logs")],
-            1,
-        );
-        metrics.inc(
-            MetricName::RawSpoolAppendBatchEncodedBytesTotal,
-            &[("request_kind", "logs")],
-            10,
-        );
-        metrics.set_counter(
-            MetricName::RawSpoolAppendSyncsTotal,
-            &[("request_kind", "logs")],
-            1,
-        );
-        metrics.set_counter(
-            MetricName::RawSpoolAppendSyncFailuresTotal,
-            &[("request_kind", "logs")],
-            0,
-        );
-        metrics.set_counter(
-            MetricName::RawSpoolAppendFileFsyncsTotal,
-            &[("request_kind", "logs")],
-            1,
-        );
-        metrics.inc(
-            MetricName::RawSpoolCheckpointBatchesTotal,
-            &[("request_kind", "logs")],
-            1,
-        );
-        metrics.inc(
-            MetricName::RawSpoolCheckpointBatchRecordsTotal,
-            &[("request_kind", "logs")],
-            1,
-        );
-        metrics.inc(
-            MetricName::RawSpoolCheckpointBatchCommandsTotal,
-            &[("request_kind", "logs")],
-            1,
-        );
-        metrics.inc(
-            MetricName::RawSpoolReplayedRecordsTotal,
-            &[("request_kind", "logs"), ("status", "ok")],
-            1,
-        );
-        metrics.inc(
-            MetricName::RawSpoolCheckpointedRecordsTotal,
-            &[("request_kind", "logs"), ("reason", "storage_committed")],
-            1,
-        );
-        for name in [
-            MetricName::RawSpoolSegmentBytes,
-            MetricName::RawSpoolSegments,
-            MetricName::RawSpoolPendingRecords,
-            MetricName::RawSpoolPendingBytes,
-            MetricName::RawSpoolUnsyncedRecords,
-            MetricName::RawSpoolUnsyncedBytes,
-            MetricName::RawSpoolUnsyncedAgeSeconds,
-            MetricName::RawSpoolHealthy,
-        ] {
-            metrics.gauge(name, &[("request_kind", "logs")], 0.0);
-        }
-
-        // Coarse always-on phases (the fine spool micro-timings are gated).
-        for phase in [
-            "decompress",
-            "otlp_transform",
-            "timestamp_validation",
-            "storage_buffer",
-            "ingest_worker",
-            "raw_spool_append",
-            "raw_spool_checkpoint",
-            "query_execute",
-            "writer_lock_wait",
-        ] {
-            metrics.observe_request_phase_seconds("logs", phase, 0.001);
-        }
-        for phase in [
-            "storage_prepare",
-            "storage_arrow_write_buffer",
-            "storage_duckdb_arrow_append",
-            "storage_ducklake_commit",
-        ] {
-            metrics.observe_storage_signal_phase_seconds("logs", phase, 0.001);
-        }
-        // The coarse batch-checkpoint phase is emitted once, label-free.
-        metrics.observe_seconds(
-            MetricName::PhaseDurationSeconds,
-            &[("phase", "raw_spool_checkpoint")],
-            0.001,
-        );
-
-        // Fine spool micro-timings: only emitted with `detailed-metrics`.
-        #[cfg(feature = "detailed-metrics")]
-        for phase in [
-            "raw_spool_append_queue_wait",
-            "raw_spool_append_batch_wait",
-            "raw_spool_append_encode",
-            "raw_spool_append_write",
-            "raw_spool_append_fsync",
-            "raw_spool_checkpoint_queue_wait",
-            "raw_spool_checkpoint_batch_wait",
-        ] {
-            metrics.observe_request_phase_seconds("logs", phase, 0.001);
-        }
-
-        // DuckDB / Arrow flush counters.
-        metrics.inc(
-            MetricName::DuckdbArrowAppendsTotal,
-            &[("storage_signal", "logs")],
-            1,
-        );
-        metrics.inc(
-            MetricName::DuckdbArrowAppendedRowsTotal,
-            &[("storage_signal", "logs")],
-            1,
-        );
-        metrics.inc(
-            MetricName::ArrowFlushesTotal,
-            &[("storage_signal", "logs")],
-            1,
-        );
-        metrics.inc(
-            MetricName::ArrowFlushRowsTotal,
-            &[("storage_signal", "logs")],
-            1,
-        );
-
-        // Admission surface (the per-kind rejection/reduction snapshot counters
-        // were consolidated into the live inc-counter + one reductions counter).
-        metrics.gauge(MetricName::AdmissionCapacity, &[("admission", "seal")], 1.0);
-        metrics.gauge(MetricName::AdmissionInUse, &[("admission", "seal")], 0.0);
         metrics.inc(
             MetricName::AdmissionRejectionsTotal,
-            &[("admission", "query"), ("reason", "freshness_debt")],
+            &[
+                ("admission", "query"),
+                ("reason", "heavy_query_admission_full"),
+            ],
             1,
         );
-        metrics.set_counter(MetricName::AdmissionReductionsTotal, &[], 1);
-        metrics.gauge(MetricName::SealEwmaBytesPerSecond, &[], 1.0);
-        metrics.gauge(MetricName::ProjectedSealSeconds, &[], 0.0);
-        metrics.gauge(MetricName::ProjectedBufferSeconds, &[], 0.0);
-        metrics.gauge(MetricName::ProjectedVisibilitySeconds, &[], 0.0);
-        metrics.gauge(MetricName::ObservedFreshnessLagSeconds, &[], 0.0);
-        metrics.gauge(MetricName::IngestInflightMemoryBoundBytes, &[], 1.0);
-
-        // Maintenance.
-        metrics.maintenance_run("seal", "ok", "ok", 0.01);
-        metrics.inc(
-            MetricName::MaintenanceFailuresTotal,
-            &[("job", "seal"), ("reason", "seal_failed")],
-            1,
-        );
-        metrics.gauge(
-            MetricName::MaintenanceConsecutiveFailures,
-            &[("job", "seal")],
-            0.0,
-        );
-        metrics.gauge(MetricName::MaintenancePaused, &[], 0.0);
-
-        // Arrow write buffer operator gauges.
-        metrics.gauge(
-            MetricName::ArrowWriteBufferRows,
-            &[("storage_signal", "logs")],
-            0.0,
-        );
-        metrics.gauge(
-            MetricName::ArrowWriteBufferBytes,
-            &[("storage_signal", "logs")],
-            0.0,
-        );
-        metrics.gauge(
-            MetricName::ArrowWriteBufferAgeSeconds,
-            &[("storage_signal", "logs")],
-            0.0,
-        );
-
-        // Storage / freshness operator gauges.
         metrics.gauge(
             MetricName::StoragePhysicalBytes,
             &[("storage_signal", "all")],
@@ -1352,13 +475,6 @@ mod snapshot_tests {
             &[("storage_signal", "logs")],
             0.0,
         );
-        metrics.gauge(
-            MetricName::IngestToQueryLagSeconds,
-            &[("storage_signal", "logs")],
-            0.0,
-        );
-
-        // HTTP connection counters.
         metrics.inc(
             MetricName::HttpConnectionRequestsTotal,
             &[("mode", "keep_alive")],
@@ -1376,81 +492,21 @@ mod snapshot_tests {
         );
     }
 
-    /// The exact post-diet metric base-name set the lean default build renders.
-    fn expected_lean_surface() -> BTreeSet<String> {
+    fn expected_surface() -> BTreeSet<String> {
         [
             "canardstack_admission_capacity",
             "canardstack_admission_in_use",
-            "canardstack_admission_reductions_total",
             "canardstack_admission_rejections_total",
-            "canardstack_arrow_flush_rows_total",
-            "canardstack_arrow_flushes_total",
-            "canardstack_arrow_write_buffer_age_seconds",
-            "canardstack_arrow_write_buffer_bytes",
-            "canardstack_arrow_write_buffer_rows",
-            "canardstack_duckdb_arrow_appended_rows_total",
-            "canardstack_duckdb_arrow_appends_total",
             "canardstack_ducklake_active_data_file_rows",
             "canardstack_ducklake_active_data_files",
             "canardstack_freshness_watermark_timestamp",
             "canardstack_http_connection_closes_total",
             "canardstack_http_connection_errors_total",
             "canardstack_http_connection_requests_total",
-            "canardstack_ingest_buffered_bytes_total",
-            "canardstack_ingest_buffered_rows_total",
-            "canardstack_ingest_decoded_bytes_total",
-            "canardstack_ingest_inflight_bytes",
-            "canardstack_ingest_inflight_memory_bound_bytes",
-            "canardstack_ingest_records_total",
-            "canardstack_ingest_request_bytes_total",
-            "canardstack_ingest_requests_total",
-            "canardstack_ingest_runtime_memory_unknown_total",
-            "canardstack_ingest_seal_stage_total",
-            "canardstack_ingest_stage_total",
-            "canardstack_ingest_storage_insert_total",
-            "canardstack_ingest_to_query_lag_seconds",
-            "canardstack_ingest_transformed_rows_total",
-            "canardstack_ingest_unsupported_histograms_total",
-            "canardstack_ingest_worker_completed_total",
-            "canardstack_ingest_worker_dispatch_total",
-            "canardstack_ingest_worker_queue_capacity",
-            "canardstack_maintenance_consecutive_failures",
-            "canardstack_maintenance_duration_seconds",
-            "canardstack_maintenance_failures_total",
-            "canardstack_maintenance_paused",
-            "canardstack_maintenance_runs_total",
-            "canardstack_observed_freshness_lag_seconds",
             "canardstack_phase_duration_seconds",
-            "canardstack_projected_buffer_seconds",
-            "canardstack_projected_seal_seconds",
-            "canardstack_projected_visibility_seconds",
             "canardstack_query_duration_seconds",
             "canardstack_query_requests_total",
             "canardstack_query_timeouts_total",
-            "canardstack_raw_spool_append_batch_encoded_bytes_total",
-            "canardstack_raw_spool_append_batch_records_total",
-            "canardstack_raw_spool_append_batches_total",
-            "canardstack_raw_spool_append_file_fsyncs_total",
-            "canardstack_raw_spool_append_sync_failures_total",
-            "canardstack_raw_spool_append_syncs_total",
-            "canardstack_raw_spool_bytes_total",
-            "canardstack_raw_spool_checkpoint_batch_commands_total",
-            "canardstack_raw_spool_checkpoint_batch_records_total",
-            "canardstack_raw_spool_checkpoint_batches_total",
-            "canardstack_raw_spool_checkpointed_records_total",
-            "canardstack_raw_spool_healthy",
-            "canardstack_raw_spool_pending_bytes",
-            "canardstack_raw_spool_pending_records",
-            "canardstack_raw_spool_records_total",
-            "canardstack_raw_spool_replayed_records_total",
-            "canardstack_raw_spool_segment_bytes",
-            "canardstack_raw_spool_segments",
-            "canardstack_raw_spool_unsynced_age_seconds",
-            "canardstack_raw_spool_unsynced_bytes",
-            "canardstack_raw_spool_unsynced_records",
-            "canardstack_runtime_memory_limit_bytes",
-            "canardstack_runtime_rss_bytes",
-            "canardstack_seal_ewma_bytes_per_second",
             "canardstack_storage_logical_rows",
             "canardstack_storage_physical_bytes",
         ]
@@ -1459,141 +515,42 @@ mod snapshot_tests {
         .collect()
     }
 
-    /// Metric names removed by the diet must never reappear on the surface.
-    const DROPPED_NAMES: &[&str] = &[
-        "canardstack_ingest_inflight_bytes_max",
-        "canardstack_ingest_inflight_pressure_max",
-        "canardstack_ingest_inflight_capacity_bytes",
-        "canardstack_ingest_inflight_pressure",
-        "canardstack_raw_spool_append_batch_records",
-        "canardstack_raw_spool_append_batch_encoded_bytes",
-        "canardstack_ingest_rejections_total",
-        "canardstack_query_rejections_total",
-        "canardstack_query_admission_rejections_total",
-        "canardstack_query_admission_reductions_total",
-        "canardstack_ingest_freshness_budget_rejections_total",
-        "canardstack_ingest_requests_queued_total",
-    ];
-
     #[test]
-    fn render_prometheus_matches_post_diet_surface() {
+    fn representative_metric_surface_matches_registry() {
         let metrics = Metrics::default();
         emit_representative_surface(&metrics);
-        let rendered = metrics.render_prometheus();
-        let names = rendered_base_names(&metrics);
 
-        assert_eq!(
-            names,
-            expected_lean_surface(),
-            "metric base-name surface drifted from the pinned post-diet set"
-        );
-
-        // Match each dropped name at a metric-name boundary (`{` for a labeled
-        // series or ` ` for a bare one) so a surviving longer name that merely
-        // shares a prefix (e.g. `_total`) is not a false positive.
-        for dropped in DROPPED_NAMES {
-            let with_labels = format!("{dropped}{{");
-            let bare = format!("{dropped} ");
-            assert!(
-                !rendered.contains(&with_labels) && !rendered.contains(&bare),
-                "dropped metric `{dropped}` reappeared on the surface"
-            );
-        }
-
-        // The retired `spool_lane` label key must be gone everywhere.
-        assert!(
-            !rendered.contains("spool_lane="),
-            "retired `spool_lane` label key is still emitted"
-        );
-    }
-
-    #[test]
-    fn coarse_phases_are_always_present() {
-        let metrics = Metrics::default();
-        emit_representative_surface(&metrics);
-        let rendered = metrics.render_prometheus();
-        for phase in [
-            "phase=\"decompress\"",
-            "phase=\"otlp_transform\"",
-            "phase=\"storage_buffer\"",
-            "phase=\"ingest_worker\"",
-            "phase=\"raw_spool_append\"",
-            "phase=\"raw_spool_checkpoint\"",
-            "phase=\"query_execute\"",
-            "phase=\"writer_lock_wait\"",
-        ] {
-            assert!(rendered.contains(phase), "missing coarse phase {phase}");
-        }
-    }
-
-    #[cfg(not(feature = "detailed-metrics"))]
-    #[test]
-    fn fine_phases_absent_in_lean_build() {
-        let metrics = Metrics::default();
-        emit_representative_surface(&metrics);
-        let rendered = metrics.render_prometheus();
-        for phase in [
-            "phase=\"raw_spool_append_queue_wait\"",
-            "phase=\"raw_spool_append_batch_wait\"",
-            "phase=\"raw_spool_append_encode\"",
-            "phase=\"raw_spool_append_write\"",
-            "phase=\"raw_spool_append_fsync\"",
-            "phase=\"raw_spool_checkpoint_queue_wait\"",
-            "phase=\"raw_spool_checkpoint_batch_wait\"",
-        ] {
-            assert!(
-                !rendered.contains(phase),
-                "fine phase {phase} must be gated out of the lean build"
-            );
-        }
-    }
-
-    #[cfg(feature = "detailed-metrics")]
-    #[test]
-    fn fine_phases_present_with_detailed_metrics() {
-        let metrics = Metrics::default();
-        emit_representative_surface(&metrics);
-        let rendered = metrics.render_prometheus();
-        for phase in [
-            "phase=\"raw_spool_append_queue_wait\"",
-            "phase=\"raw_spool_append_batch_wait\"",
-            "phase=\"raw_spool_append_encode\"",
-            "phase=\"raw_spool_append_write\"",
-            "phase=\"raw_spool_append_fsync\"",
-            "phase=\"raw_spool_checkpoint_queue_wait\"",
-            "phase=\"raw_spool_checkpoint_batch_wait\"",
-        ] {
-            assert!(
-                rendered.contains(phase),
-                "fine phase {phase} must be present with detailed-metrics"
-            );
-        }
-    }
-
-    #[test]
-    fn metric_registry_names_are_unique() {
-        let names = MetricName::ALL
+        assert_eq!(rendered_base_names(&metrics), expected_surface());
+        let registry = MetricName::ALL
             .iter()
-            .map(|metric| metric.as_str())
+            .map(|name| name.as_str().to_string())
             .collect::<BTreeSet<_>>();
-        assert_eq!(
-            names.len(),
-            MetricName::ALL.len(),
-            "metric registry contains duplicate Prometheus names"
-        );
+        assert_eq!(registry, expected_surface());
     }
 
     #[test]
-    fn pinned_lean_surface_is_registered() {
-        let registered = MetricName::ALL
+    #[should_panic(expected = "unsupported label key")]
+    fn rejects_unknown_label_keys() {
+        let metrics = Metrics::default();
+        metrics.gauge(MetricName::AdmissionCapacity, &[("kind", "cheap")], 1.0);
+    }
+
+    #[test]
+    fn snapshot_preserves_metric_kind() {
+        let metrics = Metrics::default();
+        metrics.query_request("/api/v1/query", 200, "ok", 0.1);
+        metrics.gauge(
+            MetricName::AdmissionCapacity,
+            &[("admission", "query_cheap")],
+            1.0,
+        );
+
+        let samples = metrics.snapshot();
+        assert!(samples
             .iter()
-            .map(|metric| metric.as_str().to_string())
-            .collect::<BTreeSet<_>>();
-        for expected in expected_lean_surface() {
-            assert!(
-                registered.contains(&expected),
-                "pinned metric `{expected}` is missing from MetricName"
-            );
-        }
+            .any(|sample| sample.kind() == MetricKind::Counter));
+        assert!(samples
+            .iter()
+            .any(|sample| sample.kind() == MetricKind::Gauge));
     }
 }

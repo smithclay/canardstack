@@ -1,7 +1,4 @@
 use crate::config::Config;
-use crate::signal::StorageSignal;
-use arrow58::array::{Array, TimestampNanosecondArray};
-use arrow58::record_batch::RecordBatch;
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -92,69 +89,6 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-pub fn validate_otlp_http_content_type(headers: &HashMap<String, String>) -> ApiResult<()> {
-    let Some(value) = headers.get("content-type") else {
-        return Err(ApiError::new(
-            400,
-            "missing_content_type",
-            "content-type is required",
-        ));
-    };
-    let value = value
-        .split(';')
-        .next()
-        .unwrap_or(value)
-        .trim()
-        .to_ascii_lowercase();
-    let accepted = matches!(
-        value.as_str(),
-        "application/json"
-            | "application/otlp+json"
-            | "application/x-protobuf"
-            | "application/protobuf"
-            | "application/otlp"
-    );
-    if accepted {
-        Ok(())
-    } else {
-        Err(ApiError::new(
-            400,
-            "unsupported_content_type",
-            format!("unsupported content-type {value}"),
-        ))
-    }
-}
-
-pub fn validate_body_size(body_len: usize, config: &Config) -> ApiResult<()> {
-    if body_len > config.operator.max_body_bytes {
-        Err(ApiError::new(
-            400,
-            "payload_too_large",
-            format!(
-                "payload has {body_len} bytes; max is {}",
-                config.operator.max_body_bytes
-            ),
-        ))
-    } else {
-        Ok(())
-    }
-}
-
-pub fn parse_required_time(value: Option<&Value>, field: &'static str) -> ApiResult<DateTime<Utc>> {
-    let raw = value
-        .and_then(Value::as_str)
-        .ok_or_else(|| ApiError::new(400, "missing_time_range", format!("{field} is required")))?;
-    DateTime::parse_from_rfc3339(raw)
-        .map(|dt| dt.with_timezone(&Utc))
-        .map_err(|_| {
-            ApiError::new(
-                400,
-                "invalid_time_range",
-                format!("{field} must be RFC3339"),
-            )
-        })
-}
-
 pub fn validate_range(from: DateTime<Utc>, to: DateTime<Utc>, max_secs: i64) -> ApiResult<()> {
     if to <= from {
         return Err(ApiError::new(
@@ -188,77 +122,4 @@ pub fn parse_limit(value: Option<&Value>, default: usize, max: usize) -> ApiResu
     } else {
         Ok(limit)
     }
-}
-
-pub fn validate_arrow_timestamp_skew(
-    batch: &RecordBatch,
-    signal: StorageSignal,
-    config: &Config,
-) -> ApiResult<()> {
-    let now_ms = Utc::now().timestamp_millis();
-    let min_ms = now_ms - config.operator.late_accept_secs * 1000;
-    let max_ms = now_ms + config.operator.future_accept_secs * 1000;
-    let timestamp = arrow_timestamp_nanos(batch, signal)?;
-    for row in 0..timestamp.len() {
-        if timestamp.is_null(row) {
-            return Err(ApiError::new(
-                400,
-                "invalid_timestamp",
-                format!("{signal} timestamp is required and must be parseable"),
-            ));
-        }
-        // Arrow timestamps land here as nanoseconds (otlp2records 0.8.0
-        // emits `Timestamp(Nanosecond)` for every record-time column);
-        // skew-window math is still milliseconds.
-        let ts = timestamp.value(row) / 1_000_000;
-        if ts <= 0 {
-            return Err(ApiError::new(
-                400,
-                "invalid_timestamp",
-                format!("{signal} timestamp is required and must be positive"),
-            ));
-        }
-        if ts < min_ms {
-            return Err(ApiError::new(
-                400,
-                "timestamp_too_old",
-                format!("{signal} timestamp is outside late-arrival window"),
-            ));
-        }
-        if ts > max_ms {
-            return Err(ApiError::new(
-                400,
-                "timestamp_in_future",
-                format!("{signal} timestamp is outside future-skew window"),
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn arrow_timestamp_nanos(
-    batch: &RecordBatch,
-    signal: StorageSignal,
-) -> ApiResult<&TimestampNanosecondArray> {
-    // Use the same per-signal record-time column as the storage layer
-    // (`time_unix_nano` for logs/metrics, `start_time_unix_nano` for spans).
-    let name = crate::storage::schema::table_timestamp_column(signal);
-    let idx = batch.schema().index_of(name).map_err(|_| {
-        ApiError::new(
-            400,
-            "invalid_timestamp",
-            format!("{signal} timestamp is required and must be parseable"),
-        )
-    })?;
-    batch
-        .column(idx)
-        .as_any()
-        .downcast_ref::<TimestampNanosecondArray>()
-        .ok_or_else(|| {
-            ApiError::new(
-                400,
-                "invalid_timestamp",
-                format!("{signal} timestamp is required and must be parseable"),
-            )
-        })
 }

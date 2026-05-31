@@ -1,24 +1,85 @@
+x-duckdb-service-image: &duckdb-service-image
+  build:
+    context: .
+    dockerfile: Dockerfile.duckdb-service
+    args:
+      DUCKDB_IMAGE: ${DUCKDB_IMAGE:-duckdb/duckdb:latest}
+  image: ${DUCKDB_SERVICE_IMAGE:-canardstack-duckdb:local}
+
 services:
+  ducklake-catalog:
+    <<: *duckdb-service-image
+    entrypoint: ["/bin/sh", "/usr/local/bin/duckdb-quack-catalog.sh"]
+    ports:
+      - "${QUACK_PORT:-9494}:9494"
+    environment:
+      HOME: /var/lib/duckdb
+      DUCKLAKE_CATALOG_DB: /var/lib/ducklake/catalog/catalog.duckdb
+      QUACK_BIND: quack:127.0.0.1:9495
+      QUACK_TLS_PORT: "9494"
+      QUACK_TOKEN: ${QUACK_TOKEN:-dev-quack-token}
+    volumes:
+      - duckdb-catalog-home:/var/lib/duckdb
+      - ducklake-catalog:/var/lib/ducklake/catalog
+      - ./config/compose/duckdb-quack-catalog.sh:/usr/local/bin/duckdb-quack-catalog.sh:ro
+    restart: unless-stopped
+
+  ingest:
+    <<: *duckdb-service-image
+    entrypoint: ["/bin/sh", "/usr/local/bin/duckdb-otlp-ingest.sh"]
+    depends_on:
+      - ducklake-catalog
+    ports:
+      - "${OTLP_PORT:-4319}:4319"
+    environment:
+      HOME: /var/lib/duckdb
+      DUCKDB_INGEST_DB: /var/lib/duckdb/ingest.duckdb
+      DUCKLAKE_ATTACH_URI: ducklake:quack:ducklake-catalog:9494
+      DUCKLAKE_DATA_PATH: /var/lib/ducklake/data/
+      OTLP_BIND: otlp:0.0.0.0:4319
+      OTLP_TOKEN: ${OTLP_TOKEN:-dev-otlp-token-123456}
+      QUACK_TOKEN: ${QUACK_TOKEN:-dev-quack-token}
+    volumes:
+      - duckdb-ingest-home:/var/lib/duckdb
+      - ducklake-data:/var/lib/ducklake/data
+      - ./config/compose/duckdb-otlp-ingest.sh:/usr/local/bin/duckdb-otlp-ingest.sh:ro
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:4319/healthz"]
+      interval: 5s
+      timeout: 5s
+      start_period: 20s
+      retries: 12
+    restart: unless-stopped
+
   canardstack:
     image: ${CANARDSTACK_IMAGE:-ghcr.io/smithclay/canardstack:latest}
+    depends_on:
+      ducklake-catalog:
+        condition: service_started
+      ingest:
+        condition: service_healthy
     ports:
-      - "4318:4318"
+      - "${CANARDSTACK_PORT:-4318}:4318"
     environment:
       CANARDSTACK_BIND: 0.0.0.0:4318
       CANARDSTACK_API_KEY: ${CANARDSTACK_API_KEY:-dev-canardstack-key}
       CANARDSTACK_ADMIN_API_KEY: ${CANARDSTACK_ADMIN_API_KEY:-dev-canardstack-admin-key}
       CANARDSTACK_DATA_DIR: /var/lib/canardstack
-      CANARDSTACK_DUCKDB_EXTENSION_DIR: /usr/local/lib/duckdb/extensions
-      CANARDSTACK_DUCKLAKE_ATTACH_URI: ${CANARDSTACK_DUCKLAKE_ATTACH_URI:-}
-      motherduck_token: ${motherduck_token:-${MOTHERDUCK_TOKEN:-}}
+      CANARDSTACK_DUCKLAKE_ATTACH_URI: ${CANARDSTACK_DUCKLAKE_ATTACH_URI:-ducklake:quack:ducklake-catalog:9494}
+      CANARDSTACK_DUCKLAKE_DATA_PATH: ${CANARDSTACK_DUCKLAKE_DATA_PATH:-/var/lib/ducklake/data/}
+      CANARDSTACK_DUCKLAKE_QUACK_TOKEN: ${QUACK_TOKEN:-dev-quack-token}
+      CANARDSTACK_DUCKLAKE_QUACK_INSECURE_TLS: "true"
+      motherduck_token: ${motherduck_token:-}
     volumes:
       - canardstack-data:/var/lib/canardstack
+      - ducklake-data:/var/lib/ducklake/data
     healthcheck:
       test: ["CMD", "canardstack", "healthcheck", "--endpoint", "http://127.0.0.1:4318/healthz"]
       interval: 5s
       timeout: 5s
       start_period: 20s
       retries: 12
+    restart: on-failure
 
   grafana:
     image: grafana/grafana-oss:latest
@@ -26,7 +87,7 @@ services:
       canardstack:
         condition: service_healthy
     ports:
-      - "3000:3000"
+      - "${GRAFANA_PORT:-3000}:3000"
     environment:
       CANARDSTACK_API_KEY: ${CANARDSTACK_API_KEY:-dev-canardstack-key}
       GF_AUTH_ANONYMOUS_ENABLED: "true"
@@ -37,53 +98,11 @@ services:
     volumes:
       - grafana-data:/var/lib/grafana
       - ./config/grafana/provisioning:/etc/grafana/provisioning:ro
-      - ./config/grafana/dashboards:/etc/grafana/dashboards:ro
-
-  smoke:
-    profiles: ["smoke"]
-    image: ${CANARDSTACK_IMAGE:-ghcr.io/smithclay/canardstack:latest}
-    depends_on:
-      canardstack:
-        condition: service_healthy
-    environment:
-      CANARDSTACK_API_KEY: ${CANARDSTACK_API_KEY:-dev-canardstack-key}
-      CANARDSTACK_ADMIN_API_KEY: ${CANARDSTACK_ADMIN_API_KEY:-dev-canardstack-admin-key}
-    command: ["canardstack", "smoke-http", "--endpoint", "http://canardstack:4318"]
-
-  canardstack-bench:
-    profiles: ["bench"]
-    image: ${CANARDSTACK_IMAGE:-ghcr.io/smithclay/canardstack:latest}
-    ports:
-      - "4319:4318"
-    cpus: "${CANARDSTACK_BENCH_CPUS:-2.0}"
-    mem_limit: "${CANARDSTACK_BENCH_MEMORY:-4g}"
-    memswap_limit: "${CANARDSTACK_BENCH_MEMORY:-4g}"
-    labels:
-      canardstack.benchmark.cpus: "${CANARDSTACK_BENCH_CPUS:-2.0}"
-      canardstack.benchmark.memory: "${CANARDSTACK_BENCH_MEMORY:-4g}"
-    environment:
-      CANARDSTACK_BIND: 0.0.0.0:4318
-      CANARDSTACK_API_KEY: ${CANARDSTACK_API_KEY:-dev-canardstack-key}
-      CANARDSTACK_ADMIN_API_KEY: ${CANARDSTACK_ADMIN_API_KEY:-dev-canardstack-admin-key}
-      CANARDSTACK_DATA_DIR: /var/lib/canardstack
-      CANARDSTACK_DUCKDB_EXTENSION_DIR: /usr/local/lib/duckdb/extensions
-      CANARDSTACK_DUCKLAKE_ATTACH_URI: ${CANARDSTACK_DUCKLAKE_ATTACH_URI:-}
-      CANARDSTACK_DUCKDB_MEMORY_LIMIT: ${CANARDSTACK_BENCH_DUCKDB_MEMORY_LIMIT:-1GiB}
-      CANARDSTACK_PROCESS_MEMORY_LIMIT_BYTES: ${CANARDSTACK_BENCH_PROCESS_MEMORY_LIMIT_BYTES:-3221225472}
-      CANARDSTACK_BENCHMARK_CPU_LIMIT: ${CANARDSTACK_BENCH_CPUS:-2.0}
-      CANARDSTACK_BENCHMARK_MEMORY_LIMIT: ${CANARDSTACK_BENCH_MEMORY:-4g}
-      CANARDSTACK_BENCHMARK_RESOURCE_NOTE: "Docker VM capped to ${CANARDSTACK_BENCH_CPUS:-2.0} CPU / ${CANARDSTACK_BENCH_MEMORY:-4g} memory; not cloud-equivalent Linux hardware"
-      motherduck_token: ${motherduck_token:-${MOTHERDUCK_TOKEN:-}}
-    volumes:
-      - canardstack-bench-data:/var/lib/canardstack
-    healthcheck:
-      test: ["CMD", "canardstack", "healthcheck", "--endpoint", "http://127.0.0.1:4318/healthz"]
-      interval: 5s
-      timeout: 5s
-      start_period: 20s
-      retries: 12
 
 volumes:
   canardstack-data:
-  canardstack-bench-data:
+  duckdb-catalog-home:
+  duckdb-ingest-home:
+  ducklake-catalog:
+  ducklake-data:
   grafana-data:

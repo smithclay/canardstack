@@ -12,26 +12,23 @@ All telemetry query paths use the internal query engine protections:
 - DuckDB memory limits.
 - Query concurrency guards.
 
-Ingest is at-least-once and v0 does not dedup, so query results can contain
-duplicate rows after a crash-recovery (see "Delivery semantics" in
-`v0-architecture.md`).
+Telemetry writes happen outside canardstack, typically through
+[`duckdb-otlp`](https://github.com/smithclay/duckdb-otlp). Query results reflect
+whatever rows are visible in the attached DuckLake catalog.
 
 ## Discovery Metadata Spine
 
 Prometheus label values, Prometheus series, Prometheus metric metadata, Loki
 label values, Loki series, and Tempo tag values read from the shared
-`metadata_summary` table. The `metadata_refresh` scheduler job re-aggregates the
-daily `(signal, event_date)` summary buckets derived from committed telemetry
-timestamps, keeping the timestamp-day scan off the ingest commit path. It uses
-canonical `otlp2records` columns directly where available and derives
-compatibility labels such as `deployment_environment`, `http_route`, and
-`http_method` from canonical JSON attribute columns.
+`metadata_summary` table maintained by the writer side. The query server reads
+canonical OTAP-style columns directly where available and derives compatibility
+labels such as `deployment_environment`, `http_route`, and `http_method` from
+canonical JSON attribute columns.
 
 These reads still run through the bounded `QueryEngine` path with normal
 concurrency, timeout, memory, range, and result-limit controls. An in-process
 cache stores only bounded discovery responses, keyed by API family, metadata
-kind, label/tag name, and exact normalized time range. Successful metadata refreshes
-advance a generation counter, invalidating stale cache entries.
+kind, label/tag name, and exact normalized time range.
 
 ## Prometheus Metrics Subset
 
@@ -133,24 +130,12 @@ Search returns trace summaries. TraceQL is not implemented.
 
 ## Non-API Surfaces
 
-The remaining HTTP endpoints are operational or ingest endpoints:
+The remaining HTTP endpoints are operational endpoints:
 
-- `POST /v1/logs`
-- `POST /v1/traces`
-- `POST /v1/metrics`
 - `GET /`
 - `GET /metrics`
 - `GET /api/admin/health/storage`
-- `GET /api/admin/health/ingest`
-- `GET /api/admin/health/maintenance`
 - `GET /api/admin/health/queries`
-- `POST /api/admin/maintenance/pause`
-- `POST /api/admin/maintenance/resume`
-- `POST /api/admin/maintenance/seal`
-- `POST /api/admin/maintenance/checkpoint/dry-run`
-- `POST /api/admin/maintenance/checkpoint/run`
-- `POST /api/admin/maintenance/retention/dry-run`
-- `POST /api/admin/maintenance/retention/run`
 
 Direct DuckDB/DuckLake SQL access is available outside Canardstack through
 DuckDB CLI, MotherDuck, or SQL clients. That path is intentionally separate from

@@ -1,7 +1,5 @@
 use crate::admission_control::AdmissionController;
 use crate::config::Config;
-use crate::ingest::Ingestor;
-use crate::maintenance::Maintenance;
 use crate::metadata::Metadata;
 use crate::metrics::Metrics;
 use crate::query::QueryEngine;
@@ -12,11 +10,9 @@ use std::sync::Arc;
 pub struct AppState {
     pub config: Config,
     pub storage: Arc<Storage>,
-    pub ingestor: Arc<Ingestor>,
     pub admission: AdmissionController,
     pub queries: QueryEngine,
     pub metadata: Metadata,
-    pub maintenance: Maintenance,
     pub metrics: Arc<Metrics>,
 }
 
@@ -39,23 +35,13 @@ impl AppState {
     {
         let storage = Arc::new(Storage::open(&config)?);
         storage_hook(&storage);
-        let ingestor = Arc::new(Ingestor::new(config.clone())?);
         let admission = AdmissionController::new(&config);
         let metrics = Arc::new(Metrics::default());
-        if config.operator.serve_role.accepts_ingest() {
-            ingestor.start_ingest_workers(storage.clone())?;
-            let replayed = ingestor.replay_raw_spool(&storage, &admission, metrics.clone())?;
-            if replayed > 0 {
-                tracing::info!(event = "raw_spool_replayed", records = replayed);
-            }
-        }
         Ok(Self {
             storage,
-            ingestor,
             admission,
             queries: QueryEngine::new(&config),
             metadata: Metadata::new(),
-            maintenance: Maintenance::new(&config),
             metrics,
             config,
         })
