@@ -64,6 +64,16 @@ It starts a DuckDB Quack catalog, a DuckDB `duckdb-otlp` ingest process,
 canardstack, and Grafana. The ingest endpoint is on `localhost:4319`,
 canardstack is on `localhost:4318`, and Grafana is on `localhost:3000`.
 
+Run a Compose-local logs ingest benchmark:
+
+```bash
+scripts/bench-compose-logs.py --targets 10000 --duration 60 --flush
+```
+
+The benchmark reports accepted log datapoints/second, accepted `202`
+responses/second, and average Docker CPU percentage for ingest, catalog, and
+canardstack containers.
+
 ## Query
 
 canardstack serves:
