@@ -12,9 +12,9 @@ Use these settings for each datasource:
 
 | Signal | Datasource type | URL |
 | --- | --- | --- |
-| Metrics | Prometheus | `http://localhost:4318` |
-| Logs | Loki | `http://localhost:4318` |
-| Traces | Tempo | `http://localhost:4318` |
+| Metrics | Prometheus | `http://localhost:9090` |
+| Logs | Loki | `http://localhost:9090` |
+| Traces | Tempo | `http://localhost:9090` |
 
 Each datasource must send:
 
@@ -32,13 +32,13 @@ responses:
 
 ```bash
 curl -sS -H 'Authorization: Bearer dev-canardstack-key' \
-  http://127.0.0.1:4318/api/v1/labels
+  http://127.0.0.1:9090/api/v1/labels
 
 curl -sS -H 'Authorization: Bearer dev-canardstack-key' \
-  http://127.0.0.1:4318/loki/api/v1/label/service_name/values
+  http://127.0.0.1:9090/loki/api/v1/label/service_name/values
 
 curl -sS -H 'Authorization: Bearer dev-canardstack-key' \
-  http://127.0.0.1:4318/api/search/tags
+  http://127.0.0.1:9090/api/search/tags
 ```
 
 ## Keep Panels Simple

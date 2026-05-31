@@ -4,7 +4,7 @@ set -eu
 ingest_db="${DUCKDB_INGEST_DB:-/var/lib/duckdb/ingest.duckdb}"
 attach_uri="${DUCKLAKE_ATTACH_URI:-ducklake:quack:ducklake-catalog:9494}"
 data_path="${DUCKLAKE_DATA_PATH:-/var/lib/ducklake/data/}"
-otlp_bind="${OTLP_BIND:-otlp:0.0.0.0:4319}"
+otlp_bind="${OTLP_BIND:-otlp:0.0.0.0:4318}"
 otlp_token="${OTLP_TOKEN:-dev-otlp-token-123456}"
 quack_token="${QUACK_TOKEN:-dev-quack-token}"
 quack_scope="${attach_uri#ducklake:}"

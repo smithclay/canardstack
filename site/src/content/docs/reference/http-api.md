@@ -14,7 +14,7 @@ key is configured.
 | `GET` | `/metrics` | Process-local Prometheus metrics. |
 | `GET` | `/api/status/buildinfo` | Build/version metadata. |
 | `GET` | `/api/admin/health/storage` | Storage details. |
-| `GET` | `/api/admin/health/queries` | Query limits and admission state. |
+| `GET` | `/api/admin/health/queries` | Query limits and capacity usage. |
 
 Admin routes use `CANARDSTACK_ADMIN_API_KEY` when configured.
 

@@ -12,13 +12,13 @@ DuckDB writer has already populated with `duckdb-otlp`.
 CANARDSTACK_DUCKLAKE_ATTACH_URI=ducklake:/path/to/catalog.ducklake \
 CANARDSTACK_DUCKLAKE_DATA_PATH=/path/to/ducklake-data \
 CANARDSTACK_API_KEY=dev-canardstack-key \
-canardstack serve --listen 127.0.0.1:4318
+canardstack serve --listen 127.0.0.1:9090
 ```
 
 ## Check Health
 
 ```bash
-canardstack healthcheck --endpoint http://127.0.0.1:4318/healthz
+canardstack healthcheck --endpoint http://127.0.0.1:9090/healthz
 ```
 
 The health check must be able to attach DuckLake and prepare a read query
@@ -28,7 +28,7 @@ against `otlp_logs`.
 
 ```bash
 curl -sS -H 'Authorization: Bearer dev-canardstack-key' \
-  http://127.0.0.1:4318/loki/api/v1/labels
+  http://127.0.0.1:9090/loki/api/v1/labels
 ```
 
 For exact route contracts, see [HTTP API reference](/reference/http-api/).

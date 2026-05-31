@@ -50,7 +50,7 @@ fn parse_endpoint(mut args: impl Iterator<Item = String>) -> Result<Option<Strin
         }
     }
     Ok(Some(endpoint.unwrap_or_else(|| {
-        "http://127.0.0.1:4318/healthz".to_string()
+        "http://127.0.0.1:9090/healthz".to_string()
     })))
 }
 
@@ -127,6 +127,14 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(url, "http://127.0.0.1:4319/healthz");
+    }
+
+    #[test]
+    fn parse_endpoint_uses_default_query_port() {
+        let url = parse_endpoint([].into_iter().map(str::to_string))
+            .unwrap()
+            .unwrap();
+        assert_eq!(url, "http://127.0.0.1:9090/healthz");
     }
 
     #[test]

@@ -24,7 +24,7 @@ CANARDSTACK_DUCKLAKE_DATA_PATH=/path/to/ducklake-data \
 canardstack serve
 ```
 
-The HTTP server listens on `127.0.0.1:4318` by default. Use `--listen` or
+The HTTP server listens on `127.0.0.1:9090` by default. Use `--listen` or
 `CANARDSTACK_BIND` to change it.
 
 ```bash
@@ -61,8 +61,8 @@ docker compose -f compose.yaml -f compose.build.yaml up --build
 ```
 
 It starts a DuckDB Quack catalog, a DuckDB `duckdb-otlp` ingest process,
-canardstack, and Grafana. The ingest endpoint is on `localhost:4319`,
-canardstack is on `localhost:4318`, and Grafana is on `localhost:3000`.
+canardstack, and Grafana. The OTLP/HTTP ingest endpoint is on `localhost:4318`,
+canardstack is on `localhost:9090`, and Grafana is on `localhost:3000`.
 
 Run a Compose-local logs ingest benchmark:
 

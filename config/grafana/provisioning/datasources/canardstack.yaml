@@ -5,7 +5,7 @@ datasources:
     uid: canardstack-prometheus
     type: prometheus
     access: proxy
-    url: http://canardstack:4318
+    url: http://canardstack:9090
     isDefault: true
     editable: true
     jsonData:
@@ -19,7 +19,7 @@ datasources:
     uid: canardstack-loki
     type: loki
     access: proxy
-    url: http://canardstack:4318
+    url: http://canardstack:9090
     editable: true
     jsonData:
       httpHeaderName1: Authorization
@@ -31,7 +31,7 @@ datasources:
     uid: canardstack-tempo
     type: tempo
     access: proxy
-    url: http://canardstack:4318
+    url: http://canardstack:9090
     editable: true
     jsonData:
       httpHeaderName1: Authorization
