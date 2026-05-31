@@ -1,5 +1,5 @@
 ---
-title: API Reference
+title: HTTP API Reference
 description: HTTP routes served by canardstack.
 ---
 

@@ -5,6 +5,18 @@ import starlightClientMermaid from '@pasqal-io/starlight-client-mermaid';
 export default defineConfig({
   site: 'https://smithclay.github.io',
   base: '/canardstack',
+  redirects: {
+    '/get-started': '/tutorials/local-observability-stack',
+    '/quickstart/serve': '/how-to/serve-ducklake',
+    '/guides/lakehouse-ingest': '/how-to/write-with-duckdb-otlp',
+    '/guides/query-with-grafana': '/how-to/connect-grafana',
+    '/guides/query-with-duckdb': '/how-to/query-ducklake-with-sql',
+    '/reference/api': '/reference/http-api',
+    '/reference/schema': '/reference/storage-schema',
+    '/reference/server': '/reference/runtime',
+    '/reference/operational-limits': '/reference/runtime',
+    '/architecture': '/explanation/query-only-architecture',
+  },
   integrations: [
     starlight({
       title: 'canardstack',
@@ -27,34 +39,36 @@ export default defineConfig({
       plugins: [starlightClientMermaid()],
       sidebar: [
         {
-          label: 'Tutorials',
+          label: 'Start',
           items: [
             { label: 'Overview', link: '/' },
-            { label: 'Get Started', link: '/get-started/' },
-            { label: 'Serve DuckLake', link: '/quickstart/serve/' },
+            {
+              label: 'Tutorial: local observability stack',
+              link: '/tutorials/local-observability-stack/',
+            },
           ],
         },
         {
           label: 'How-to Guides',
           items: [
-            { label: 'Write with duckdb-otlp', link: '/guides/lakehouse-ingest/' },
-            { label: 'Query with Grafana', link: '/guides/query-with-grafana/' },
-            { label: 'Query with DuckDB SQL', link: '/guides/query-with-duckdb/' },
+            { label: 'Serve an existing DuckLake catalog', link: '/how-to/serve-ducklake/' },
+            { label: 'Write telemetry with duckdb-otlp', link: '/how-to/write-with-duckdb-otlp/' },
+            { label: 'Connect Grafana', link: '/how-to/connect-grafana/' },
+            { label: 'Query DuckLake with SQL', link: '/how-to/query-ducklake-with-sql/' },
           ],
         },
         {
           label: 'Reference',
           items: [
-            { label: 'API', link: '/reference/api/' },
-            { label: 'Schema', link: '/reference/schema/' },
-            { label: 'Server Contract', link: '/reference/server/' },
-            { label: 'Operational Limits', link: '/reference/operational-limits/' },
+            { label: 'HTTP API', link: '/reference/http-api/' },
+            { label: 'Storage schema', link: '/reference/storage-schema/' },
+            { label: 'Runtime contract', link: '/reference/runtime/' },
           ],
         },
         {
           label: 'Explanation',
           items: [
-            { label: 'Architecture', link: '/architecture/' },
+            { label: 'Query-only architecture', link: '/explanation/query-only-architecture/' },
           ],
         },
         {

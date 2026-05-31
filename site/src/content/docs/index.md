@@ -7,7 +7,7 @@ hero:
     file: ../../assets/canardstack.png
   actions:
     - text: Get Started
-      link: /get-started/
+      link: /tutorials/local-observability-stack/
       icon: right-arrow
     - text: View on GitHub
       link: https://github.com/smithclay/canardstack
@@ -24,12 +24,13 @@ Telemetry writes are handled outside canardstack. Use
 write OpenTelemetry data into DuckLake tables, then point canardstack at that
 catalog for query serving.
 
-## Docs Map
+## Choose a path
 
 | Need | Start here |
 | --- | --- |
-| Learn the local flow | [Get Started](/get-started/) |
-| Serve an existing DuckLake catalog | [Serve DuckLake](/quickstart/serve/) |
-| Do a specific task | [How-to guides](/guides/lakehouse-ingest/) |
-| Look up exact contracts | [Reference](/reference/api/) |
-| Understand the design | [Architecture](/architecture/) |
+| Learn the local flow by running it | [Local observability stack tutorial](/tutorials/local-observability-stack/) |
+| Run canardstack against existing data | [Serve an existing DuckLake catalog](/how-to/serve-ducklake/) |
+| Populate DuckLake for canardstack | [Write telemetry with duckdb-otlp](/how-to/write-with-duckdb-otlp/) |
+| Connect Grafana or query directly | [How-to guides](/how-to/connect-grafana/) |
+| Look up exact contracts | [HTTP API reference](/reference/http-api/) |
+| Understand the query-only design | [Query-only architecture](/explanation/query-only-architecture/) |

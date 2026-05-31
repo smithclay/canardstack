@@ -1,5 +1,5 @@
 ---
-title: Schema Reference
+title: Storage Schema Reference
 description: DuckLake table contract expected by canardstack.
 ---
 

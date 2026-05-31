@@ -1,13 +1,16 @@
 ---
-title: Get Started
-description: Run the local duckdb-otlp to canardstack query flow.
+title: Local Observability Stack
+description: Learn the duckdb-otlp to canardstack query flow by running it locally.
 ---
 
-This tutorial validates the query-only shape on your machine with Docker:
+In this tutorial, you will run the local query-only flow with Docker:
 
 ```text
 duckdb-otlp OTLP writer -> Quack DuckLake catalog -> canardstack query APIs
 ```
+
+You will send sample logs to `duckdb-otlp`, flush them to DuckLake, and query
+them back through canardstack.
 
 ## Prerequisites
 
@@ -28,10 +31,11 @@ This starts:
 - canardstack on `localhost:4318`
 - Grafana on `localhost:3000`
 
+Grafana and canardstack are ready when the containers finish starting.
+
 ## Send Logs
 
-Use any OTLP/HTTP exporter, or post the sample logs from a sibling
-`../duckdb-otlp` checkout:
+Post the sample logs from a sibling `../duckdb-otlp` checkout:
 
 ```bash
 curl -sS -X POST http://localhost:4319/v1/logs \
@@ -48,6 +52,8 @@ docker compose exec ingest sh -c \
   "printf '%s\n' \"SELECT * FROM otlp_flush('otlp:0.0.0.0:4319');\" > /tmp/duckdb-otlp-ingest.sql"
 ```
 
+The rows are now visible in the DuckLake catalog.
+
 ## Query Logs
 
 Grafana is provisioned with Prometheus, Loki, and Tempo datasources pointing at
@@ -62,11 +68,13 @@ curl -sS -G http://localhost:4318/loki/api/v1/query_range \
   --data-urlencode 'limit=10'
 ```
 
-For the local single-process smoke against a sibling `../duckdb-otlp` checkout,
-run `scripts/e2e-duckdb-otlp-local.py`.
+You should receive a Loki success response containing streams for
+`test-service`.
 
 ## Next
 
-- [Serve DuckLake](/quickstart/serve/) shows the smallest server command.
-- [Query with Grafana](/guides/query-with-grafana/) connects Grafana datasources.
-- [Schema Reference](/reference/schema/) lists the table contract.
+- [Serve an existing DuckLake catalog](/how-to/serve-ducklake/) shows the
+  smallest server command.
+- [Connect Grafana](/how-to/connect-grafana/) shows the datasource settings.
+- [Storage schema reference](/reference/storage-schema/) lists the table
+  contract.

@@ -12,7 +12,7 @@
 
 canardstack is an experimental query server for observability data stored in [DuckLake](https://ducklake.select/). It exposes bounded Prometheus, Loki, and Tempo-compatible HTTP APIs for Grafana-style clients.
 
-Write telemetry with [duckdb-otlp](https://github.com/smithclay/duckdb-otlp) in a DuckDB process, then point canardstack at the resulting DuckLake catalog for query serving.
+Write telemetry with [duckdb-otlp](https://github.com/smithclay/duckdb-otlp) in a DuckDB process, then point canardstack at the resulting DuckLake catalog for query serving in Grafana.
 
 ## Quick Start
 

@@ -1,10 +1,10 @@
 ---
-title: Query with DuckDB SQL
+title: Query DuckLake with SQL
 description: Query the DuckLake telemetry tables directly with DuckDB.
 ---
 
-canardstack does not expose SQL through its HTTP API. Use DuckDB, MotherDuck, or
-another SQL client when you want direct access to the DuckLake tables.
+This guide shows you how to query the DuckLake telemetry tables directly with
+DuckDB SQL. canardstack does not expose SQL through its HTTP API.
 
 ## Attach DuckLake
 

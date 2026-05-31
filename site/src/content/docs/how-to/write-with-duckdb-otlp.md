@@ -1,10 +1,10 @@
 ---
-title: Write with duckdb-otlp
+title: Write Telemetry with duckdb-otlp
 description: Populate DuckLake tables for canardstack to query.
 ---
 
-Use `duckdb-otlp` as the OTLP writer. canardstack only reads the resulting
-DuckLake catalog.
+This guide shows you how to use `duckdb-otlp` as the OTLP writer. canardstack
+only reads the resulting DuckLake catalog.
 
 ## Start a Local Writer
 

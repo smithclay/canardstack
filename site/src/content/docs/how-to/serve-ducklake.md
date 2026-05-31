@@ -1,10 +1,10 @@
 ---
-title: Serve DuckLake
+title: Serve an Existing DuckLake Catalog
 description: Start canardstack against an existing DuckLake catalog.
 ---
 
-Use this when a DuckDB writer has already populated DuckLake tables with
-`duckdb-otlp`.
+This guide shows you how to start canardstack against DuckLake tables that a
+DuckDB writer has already populated with `duckdb-otlp`.
 
 ## Start the Query Server
 
@@ -31,4 +31,4 @@ curl -sS -H 'Authorization: Bearer dev-canardstack-key' \
   http://127.0.0.1:4318/loki/api/v1/labels
 ```
 
-For exact route contracts, see [API Reference](/reference/api/).
+For exact route contracts, see [HTTP API reference](/reference/http-api/).

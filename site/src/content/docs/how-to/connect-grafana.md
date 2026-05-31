@@ -1,10 +1,10 @@
 ---
-title: Query with Grafana
+title: Connect Grafana
 description: Connect Grafana to canardstack metrics, logs, and traces.
 ---
 
-canardstack speaks enough Prometheus, Loki, and Tempo for Grafana to inspect
-stored telemetry.
+This guide shows you how to connect Grafana datasources to canardstack for
+stored metrics, logs, and traces.
 
 ## Add Datasources
 
